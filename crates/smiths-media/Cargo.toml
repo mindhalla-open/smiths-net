@@ -1,0 +1,13 @@
+[package]
+name         = "smiths-media"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+license      = { workspace = true }
+description  = "RTP/RTCP session, jitter buffer, media router (passthrough)."
+
+[dependencies]
+smiths-core = { workspace = true }
+
+[lints]
+workspace = true

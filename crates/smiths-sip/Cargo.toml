@@ -1,0 +1,13 @@
+[package]
+name         = "smiths-sip"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+license      = { workspace = true }
+description  = "RFC 3261 SIP signaling: transport, parser, transactions, dialogs, auth."
+
+[dependencies]
+smiths-core = { workspace = true }
+
+[lints]
+workspace = true

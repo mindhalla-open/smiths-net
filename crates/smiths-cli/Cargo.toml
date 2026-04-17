@@ -1,0 +1,25 @@
+[package]
+name         = "smiths-cli"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+license      = { workspace = true }
+description  = "smiths-net binary: CLI, config loading, and subsystem wiring."
+
+[[bin]]
+name = "smiths-net"
+path = "src/main.rs"
+
+[dependencies]
+smiths-core        = { workspace = true }
+tokio              = { workspace = true }
+tokio-util         = { workspace = true }
+axum               = { workspace = true }
+clap               = { workspace = true }
+serde_json         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow             = { workspace = true }
+
+[lints]
+workspace = true

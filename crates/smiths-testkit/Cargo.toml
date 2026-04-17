@@ -1,0 +1,13 @@
+[package]
+name         = "smiths-testkit"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+license      = { workspace = true }
+description  = "Integration-test helpers: fake UAC/UAS, pcap compare, call assertions."
+
+[dependencies]
+smiths-core = { workspace = true }
+
+[lints]
+workspace = true

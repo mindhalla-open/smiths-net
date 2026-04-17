@@ -1,0 +1,12 @@
+[package]
+name         = "smiths-proto"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+license      = { workspace = true }
+description  = "Wire schema shared by core, WASM plugins, and sidecar plugins."
+
+[dependencies]
+
+[lints]
+workspace = true
