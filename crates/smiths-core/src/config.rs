@@ -23,6 +23,8 @@ pub struct Config {
     pub core: CoreConfig,
     /// Logging, health endpoint, metrics bind (metrics added later).
     pub observability: ObservabilityConfig,
+    /// SIP signaling configuration.
+    pub sip: SipConfig,
 }
 
 /// Core runtime tuning.
@@ -53,6 +55,41 @@ impl Default for ObservabilityConfig {
             health_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
         }
     }
+}
+
+/// SIP signaling configuration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SipConfig {
+    /// Socket addresses to bind for SIP signaling.
+    pub bind: Vec<SocketAddr>,
+    /// Enabled transports. Only `udp` is wired in Phase 1.
+    pub transports: Vec<SipTransport>,
+    /// Grace period to finish in-flight transactions on shutdown.
+    pub drain_timeout_secs: u64,
+}
+
+impl Default for SipConfig {
+    fn default() -> Self {
+        Self {
+            bind: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5060)],
+            transports: vec![SipTransport::Udp],
+            drain_timeout_secs: 10,
+        }
+    }
+}
+
+/// Transport protocols enabled for SIP signaling.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SipTransport {
+    /// RFC 3261 SIP over UDP.
+    #[default]
+    Udp,
+    /// RFC 3261 SIP over TCP. Not yet wired in Phase 1.
+    Tcp,
+    /// RFC 5630 SIP over TLS. Not yet wired in Phase 1.
+    Tls,
 }
 
 /// Format for `tracing-subscriber` output.

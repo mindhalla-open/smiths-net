@@ -2,12 +2,16 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use axum::{Json, Router, routing::get};
 use clap::Parser;
-use smiths_core::{Config, Event, EventBus, LogFormat, Shutdown, SystemEvent};
+use smiths_core::{Config, Event, EventBus, LogFormat, Shutdown, SipTransport, SystemEvent};
+use smiths_sip::{Transport as _, UasServer, UdpTransport};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -51,18 +55,36 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = Shutdown::new();
     let bus = EventBus::new(1024);
 
+    // ---- health HTTP endpoint ----
     let health = tokio::spawn(serve_health(
         config.observability.health_bind,
         shutdown.token(),
     ));
 
-    // Publish Ready even if there are no subscribers yet — it's a
-    // no-op then, not an error worth propagating.
+    // ---- SIP subsystem ----
+    let mut sip_handles: Vec<JoinHandle<()>> = Vec::new();
+    let udp_enabled = config.sip.transports.contains(&SipTransport::Udp);
+    if !udp_enabled {
+        warn!("no UDP SIP transport configured; signaling disabled");
+    }
+    for bind in &config.sip.bind {
+        if !udp_enabled {
+            break;
+        }
+        match spawn_sip_udp(*bind, bus.clone(), shutdown.token()).await {
+            Ok(handles) => sip_handles.extend(handles),
+            Err(e) => warn!(%bind, ?e, "failed to start SIP on bind; continuing"),
+        }
+    }
+
     if let Err(err) = bus.publish(Event::System(SystemEvent::Ready)) {
-        warn!(?err, "no bus subscribers at startup (expected in Phase 0)");
+        // Expected if nothing subscribed yet (Phase 0 remnant).
+        warn!(?err, "no bus subscribers at startup");
     }
     info!(
         health_bind = %config.observability.health_bind,
+        sip_binds = ?config.sip.bind,
+        sip_transports = ?config.sip.transports,
         "smiths-net ready"
     );
 
@@ -73,6 +95,11 @@ async fn main() -> anyhow::Result<()> {
     info!("shutdown signal received; draining");
     let _ = bus.publish(Event::System(SystemEvent::ShutdownRequested));
 
+    for h in sip_handles {
+        if let Err(err) = h.await {
+            warn!(?err, "SIP task panicked during shutdown");
+        }
+    }
     match health.await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => warn!(?err, "health server returned error on shutdown"),
@@ -82,6 +109,26 @@ async fn main() -> anyhow::Result<()> {
     let _ = bus.publish(Event::System(SystemEvent::ShutdownComplete));
     info!("graceful shutdown complete");
     Ok(())
+}
+
+async fn spawn_sip_udp(
+    bind: SocketAddr,
+    bus: EventBus,
+    cancel: CancellationToken,
+) -> anyhow::Result<Vec<JoinHandle<()>>> {
+    let transport = UdpTransport::bind(bind)
+        .await
+        .with_context(|| format!("binding UDP on {bind}"))?;
+    let local = transport.local_addr()?;
+    let transport = Arc::new(transport);
+
+    let (tx, rx) = mpsc::channel(1024);
+    let reader = transport.spawn_reader(tx, cancel.clone());
+
+    let server = UasServer::new(Arc::clone(&transport), bus);
+    let server_handle = tokio::spawn(server.run(rx, cancel));
+    info!(%local, "SIP UDP listening");
+    Ok(vec![reader, server_handle])
 }
 
 fn init_tracing(level: &str, format: LogFormat) -> anyhow::Result<()> {

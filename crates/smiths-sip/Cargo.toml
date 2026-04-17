@@ -8,6 +8,16 @@ description  = "RFC 3261 SIP signaling: transport, parser, transactions, dialogs
 
 [dependencies]
 smiths-core = { workspace = true }
+tokio       = { workspace = true }
+tokio-util  = { workspace = true }
+bytes       = { workspace = true }
+rsip        = { workspace = true }
+dashmap     = { workspace = true }
+tracing     = { workspace = true }
+thiserror   = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "test-util"] }
 
 [lints]
 workspace = true

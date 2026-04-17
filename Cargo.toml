@@ -5,7 +5,7 @@ members  = ["crates/*"]
 [workspace.package]
 edition      = "2024"
 rust-version = "1.85"
-version      = "0.0.0"
+version      = "0.1.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
@@ -45,6 +45,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # errors
 thiserror = "2"
 anyhow    = "1"
+
+# SIP
+rsip    = "0.4"
+bytes   = "1"
+dashmap = "6"
 
 # internal crates
 smiths-core    = { path = "crates/smiths-core" }

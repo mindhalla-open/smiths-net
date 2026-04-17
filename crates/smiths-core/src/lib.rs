@@ -12,7 +12,7 @@ pub mod event;
 pub mod shutdown;
 
 pub use bus::EventBus;
-pub use config::{Config, CoreConfig, LogFormat, ObservabilityConfig};
+pub use config::{Config, CoreConfig, LogFormat, ObservabilityConfig, SipConfig, SipTransport};
 pub use error::Error;
-pub use event::{Event, SystemEvent};
+pub use event::{Event, SipEvent, SystemEvent};
 pub use shutdown::Shutdown;

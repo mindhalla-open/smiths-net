@@ -17,3 +17,15 @@ log_format = "json"
 
 # HTTP bind for the /health endpoint.
 health_bind = "127.0.0.1:8080"
+
+[sip]
+# Socket addresses to bind for SIP. 0.0.0.0 = all interfaces.
+bind = ["0.0.0.0:5060"]
+
+# Enabled transports. Only "udp" is wired in Phase 1; "tcp" and "tls"
+# land in Phase 6.
+transports = ["udp"]
+
+# Grace period (seconds) to finish in-flight transactions on shutdown.
+drain_timeout_secs = 10
+
