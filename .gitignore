@@ -1,0 +1,6 @@
+/.idea
+/.vscode
+/.claude
+/target
+/docs
+.DS_Store
