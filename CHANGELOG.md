@@ -7,9 +7,19 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
-### Added
+### Added — Python client sample
 
-- Full-binary end-to-end test (`crates/smiths-cli/tests/e2e.rs`):
+- `examples/python-client/` — pure-stdlib Python 3.9+ demo: a tiny SIP
+  UAC (`SipUAC`), μ-law codec, RTP v2 packet builder, WAV I/O helpers,
+  sine-wave generator. Three runnable scripts:
+  - `demo_call.py` — in-process two-UA round-trip through the engine.
+  - `speaker.py` / `listener.py` — two-terminal (or two-host) variant
+    using a shared rendezvous key.
+- Exercises the engine's rendezvous bridge over real UDP with no Python
+  dependencies. README documents install, two-UA usage, troubleshooting,
+  and the MCP migration path (Phase 5).
+
+### Added
   spawns the real `smiths-net` binary with a temp TOML on ephemeral
   ports, polls `/health`, drives `OPTIONS` + an unknown method over UDP,
   sends `SIGTERM`, and asserts a clean exit. Pure Rust, no external

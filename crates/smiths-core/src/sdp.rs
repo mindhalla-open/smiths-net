@@ -7,7 +7,7 @@
 //! endpoint derived from the offer — SIP never introspects the parse
 //! tree.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// Outcome of running offer/answer against an inbound SDP offer.
 #[derive(Clone, Debug)]
@@ -35,6 +35,17 @@ pub enum NegotiationOutcome {
 /// concurrent requests without locking.
 pub trait SdpNegotiator: Send + Sync {
     /// Consume an SDP offer body and produce an answer carrying
-    /// `local_rtp_port` as the engine's media port.
-    fn negotiate_audio(&self, offer_body: &str, local_rtp_port: u16) -> NegotiationOutcome;
+    /// `local_rtp_port` as the engine's media port and `local_ip` as
+    /// the engine-side address to publish in `c=` / `o=`.
+    ///
+    /// `local_ip` lets the caller override whatever address the
+    /// negotiator was seeded with — essential when the signaling
+    /// transport is bound to `0.0.0.0` / `::` and the routable address
+    /// varies by peer.
+    fn negotiate_audio(
+        &self,
+        offer_body: &str,
+        local_ip: IpAddr,
+        local_rtp_port: u16,
+    ) -> NegotiationOutcome;
 }

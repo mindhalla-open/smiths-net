@@ -132,13 +132,22 @@ impl Negotiator {
 }
 
 impl SdpNegotiator for Negotiator {
-    fn negotiate_audio(&self, offer_body: &str, local_rtp_port: u16) -> NegotiationOutcome {
+    fn negotiate_audio(
+        &self,
+        offer_body: &str,
+        local_ip: IpAddr,
+        local_rtp_port: u16,
+    ) -> NegotiationOutcome {
         let offer = match SessionDescription::parse(offer_body) {
             Ok(o) => o,
             Err(e) => return NegotiationOutcome::Malformed(e.to_string()),
         };
         let remote_media = first_audio_endpoint(&offer);
-        match self.answer(&offer, local_rtp_port) {
+        // Per-call override: always honor the caller's `local_ip` over
+        // whatever the negotiator was seeded with.
+        let mut scoped = self.clone();
+        scoped.local_ip = local_ip;
+        match scoped.answer(&offer, local_rtp_port) {
             NegotiationResult::Answer(sdp) => NegotiationOutcome::Accepted {
                 answer_body: sdp.to_string(),
                 remote_media,

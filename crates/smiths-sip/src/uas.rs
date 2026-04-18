@@ -263,10 +263,17 @@ impl<T: Transport> UasServer<T> {
             };
             // Safe unwrap: `has_offer` verified Some(body) above.
             let body = req.body.as_deref().unwrap_or_default();
-            match self
-                .negotiator
-                .negotiate_audio(body, endpoint.local_addr.port())
-            {
+            // When the signaling transport is bound to a wildcard
+            // (0.0.0.0 / ::), `media_bind_ip` is unroutable. Ask the
+            // kernel which local address it would use to reach `peer`
+            // and publish *that* in SDP — otherwise the remote UA
+            // tries to sendto(0.0.0.0) and fails.
+            let effective_local_ip = resolve_local_ip_for(self.media_bind_ip, peer).await;
+            match self.negotiator.negotiate_audio(
+                body,
+                effective_local_ip,
+                endpoint.local_addr.port(),
+            ) {
                 NegotiationOutcome::Accepted {
                     answer_body,
                     remote_media,
@@ -680,6 +687,34 @@ fn build_response(
     let mut bytes = out.into_bytes();
     bytes.extend_from_slice(body);
     bytes
+}
+
+/// Pick the local IP to publish in outbound SDP for a given peer.
+///
+/// - If `bind_ip` is a concrete address, trust it.
+/// - Otherwise (wildcard `0.0.0.0` / `::`) use the kernel's routing
+///   table: bind an ephemeral UDP socket, `connect(peer)` to pick a
+///   route (no packets sent), and read back the local address the
+///   kernel chose. Fall back to loopback if anything fails.
+async fn resolve_local_ip_for(bind_ip: IpAddr, peer: SocketAddr) -> IpAddr {
+    if !bind_ip.is_unspecified() {
+        return bind_ip;
+    }
+    let unspec: SocketAddr = match peer {
+        SocketAddr::V4(_) => ([0, 0, 0, 0], 0).into(),
+        SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    if let Ok(sock) = tokio::net::UdpSocket::bind(unspec).await
+        && sock.connect(peer).await.is_ok()
+        && let Ok(addr) = sock.local_addr()
+        && !addr.ip().is_unspecified()
+    {
+        return addr.ip();
+    }
+    match peer {
+        SocketAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        SocketAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    }
 }
 
 /// Monotonic, process-unique tag for `From` / `To`.
