@@ -1,0 +1,3 @@
+[submodule "docs"]
+	path = docs
+	url = git@github.com:friday-mindhalla/smiths-net-docs.git

@@ -2,7 +2,6 @@
 /.vscode
 /.claude
 /target
-/docs
 /tmp
 
 .DS_Store
