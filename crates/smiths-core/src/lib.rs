@@ -5,6 +5,7 @@
 //! error type. It pulls in no sibling workspace crates — it is the root
 //! of the dependency graph.
 
+pub mod ai;
 pub mod bus;
 pub mod call;
 pub mod config;
@@ -14,6 +15,10 @@ pub mod media;
 pub mod sdp;
 pub mod shutdown;
 
+pub use ai::{
+    AiProvider, AiRegistry, CapabilityDescriptor, ConcurrencyHint, LatencyHint, ProviderError,
+    ValidationError, validate_controls,
+};
 pub use bus::EventBus;
 pub use call::{DialogKey, DialogRecord, DialogState};
 pub use config::{

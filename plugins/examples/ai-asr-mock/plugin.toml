@@ -1,0 +1,7 @@
+name        = "ai-asr-mock"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["ai.asr"]
+abi         = "1.0"
+description = "Reference ASR plugin: advertises a realistic `ai.asr` descriptor, transcription is a length-based mock until a real engine lands."

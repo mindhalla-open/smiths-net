@@ -198,24 +198,68 @@ class McpStdioClient(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
-# Stub STT / LLM + real TTS (macOS `say` if present, fallback sine otherwise).
+# MCP-driven AI: every STT / LLM / TTS hop goes through the engine's
+# tool registry → plugin sidecar. The agent owns zero inference code.
 # ---------------------------------------------------------------------------
 
 
-def stub_stt(received_wire: bytes) -> str:
-    """Pretend to transcribe caller audio. Real impl: Whisper sidecar."""
-    duration_s = len(received_wire) / 8000.0
-    if duration_s < 0.3:
-        return "(silence)"
-    return f"[mock STT: caller said ~{duration_s:.1f} s of audio]"
+def mcp_transcribe(
+    mcp: "McpStdioClient",
+    pcmu_wire: bytes,
+    language: str = "ru",
+) -> str:
+    """Decode μ-law → PCM16 locally (the wire format is PCM16 in this
+    protocol), base64, hand to the engine's `transcribe` tool. Real
+    replacement: `ai-asr-whisper` plugin (post-MVP P22)."""
+    import base64
+
+    from smiths_client import pcmu_to_pcm16
+
+    pcm = pcmu_to_pcm16(pcmu_wire)
+    b64 = base64.b64encode(pcm).decode("ascii")
+    result = mcp.call_tool(
+        "transcribe",
+        {
+            "plugin": "ai-asr-mock",
+            "audio_base64": b64,
+            "sample_rate": 8000,
+            "language": language,
+        },
+        timeout=15.0,
+    )
+    if result.get("isError"):
+        raise RuntimeError(f"transcribe failed: {result}")
+    payload = result.get("structuredContent") or {}
+    return payload.get("text", "")
 
 
-def stub_llm(transcript: str) -> str:
-    """Pretend to run an LLM. Real impl: `ai.llm.completion` capability."""
-    # The demo always responds with the same greeting. A real agent
-    # would build a prompt around `transcript` and call e.g. Ollama.
-    _ = transcript
-    return AGENT_REPLY_TEXT
+def mcp_llm_chat(
+    mcp: "McpStdioClient",
+    user_text: str,
+    system_prompt: str | None = None,
+) -> str:
+    """One-shot LLM chat via the engine. Returns the assistant's reply
+    text. Real replacement: any `ai-llm-*` plugin."""
+    messages: list[dict] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_text})
+    result = mcp.call_tool(
+        "llm_chat",
+        {
+            "plugin": "ai-llm-mock",
+            "messages": messages,
+            "controls": {"temperature": 0.3, "max_tokens": 128},
+        },
+        timeout=15.0,
+    )
+    if result.get("isError"):
+        raise RuntimeError(f"llm_chat failed: {result}")
+    payload = result.get("structuredContent") or {}
+    msg = (payload.get("message") or {}).get("content")
+    if not msg:
+        raise RuntimeError(f"llm_chat returned no message: {payload}")
+    return msg
 
 
 def mcp_synthesize(mcp: "McpStdioClient", text: str, voice: str = "irina") -> bytes:
@@ -290,12 +334,25 @@ def run_agent(engine_sip: tuple[str, int], mcp: McpStdioClient) -> None:
         uac.close()
         return
 
-    # -------- STT (mock) --------
-    transcript = stub_stt(received)
-    print(f"[agent] STT: {transcript}")
+    # -------- STT (engine plugin via MCP) --------
+    try:
+        transcript = mcp_transcribe(mcp, received, language="ru")
+    except Exception as e:
+        print(f"[agent] transcribe failed: {e}")
+        uac.close()
+        return
+    print(f"[agent] STT: {transcript!r}")
 
-    # -------- LLM (mock) --------
-    reply_text = stub_llm(transcript)
+    # -------- LLM (engine plugin via MCP) --------
+    try:
+        reply_text = mcp_llm_chat(
+            mcp,
+            user_text=transcript,
+            system_prompt="You are Alice, a polite Russian phone operator. Answer briefly.",
+        )
+    except Exception as e:
+        print(f"[agent] llm_chat failed: {e}")
+        reply_text = AGENT_REPLY_TEXT
     print(f"[agent] LLM → {reply_text!r}")
 
     # -------- TTS (real, via the engine's `ai-tts-mock` plugin) --------

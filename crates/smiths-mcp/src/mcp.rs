@@ -278,16 +278,14 @@ const ERR_FORBIDDEN: i64 = -32002;
 mod tests {
     use super::*;
     use crate::control::ControlState;
+    use crate::tool::test_support::empty_registry;
     use smiths_core::EventBus;
 
     fn ctx() -> (ToolContext, CancellationToken) {
         let bus = EventBus::new(8);
         let cancel = CancellationToken::new();
         let (state, _task) = ControlState::spawn(&bus, cancel.clone());
-        (
-            ToolContext::new(state, smiths_plugin::AiRegistry::new()),
-            cancel,
-        )
+        (ToolContext::new(state, empty_registry()), cancel)
     }
 
     #[tokio::test(flavor = "multi_thread")]

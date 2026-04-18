@@ -57,20 +57,13 @@ SMITHS__OBSERVABILITY__LOG_FORMAT=pretty \
 - [ ] `cargo fmt --check` passes
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
 - [ ] `cargo test --workspace` passes
-- [ ] Relevant TODO items in `docs/plans/todo.md` checked off
 - [ ] `CHANGELOG.md` updated under the `[Unreleased]` section
-- [ ] `docs/architecture/*` updated if the change is architectural
-- [ ] New modules respect the MVP guardrails in
-  `docs/architecture/04-post-mvp-scope.md § Summary matrix`
 
 ## Where things live
 
 | Area                  | Doc                                                  |
 |-----------------------|------------------------------------------------------|
-| Project goals + scope | `docs/openswitch.md`, `README.md`                    |
-| Architecture          | `docs/architecture/`                                 |
-| Phase-by-phase plan   | `docs/plans/` (`00-roadmap.md` is the index)         |
-| Live implementation   | `docs/plans/todo.md`                                 |
+| Project goals + scope | `README.md`                                          |
 | Release notes         | `CHANGELOG.md`                                       |
 
 ## Commit style

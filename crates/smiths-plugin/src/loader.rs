@@ -8,9 +8,9 @@
 use std::path::Path;
 
 use serde_json::Value;
+use smiths_core::ai::CapabilityDescriptor;
 use tracing::{info, warn};
 
-use crate::descriptor::CapabilityDescriptor;
 use crate::error::Error;
 use crate::manifest::{Manifest, PluginType};
 use crate::registry::{AiRegistry, PluginEntry};

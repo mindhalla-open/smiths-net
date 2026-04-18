@@ -4,8 +4,11 @@
 //! MCP and A2A adapters. New tools land as their own module when they
 //! grow beyond a few lines.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use smiths_core::ai::{AiProvider, CapabilityDescriptor, validate_controls};
 
 use crate::tool::{Tool, ToolContext, ToolError};
 
@@ -20,6 +23,8 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(ListAiProvidersTool);
     reg.register(DescribeProviderTool);
     reg.register(SynthesizeTool);
+    reg.register(TranscribeTool);
+    reg.register(LlmChatTool);
     reg
 }
 
@@ -181,7 +186,7 @@ impl Tool for ListAiProvidersTool {
             .into_iter()
             .filter_map(|e| {
                 let capabilities: Vec<_> = e
-                    .capabilities
+                    .capabilities()
                     .iter()
                     .filter(|d| filter.as_ref().is_none_or(|f| &d.capability == f))
                     .collect();
@@ -189,10 +194,10 @@ impl Tool for ListAiProvidersTool {
                     return None;
                 }
                 Some(json!({
-                    "plugin":       e.manifest.name,
-                    "version":      e.manifest.version,
-                    "description":  e.manifest.description,
-                    "abi":          e.manifest.abi,
+                    "plugin":       e.name(),
+                    "version":      e.version(),
+                    "description":  e.description(),
+                    "abi":          e.abi(),
                     "capabilities": capabilities.iter().map(|d| json!({
                         "capability": d.capability,
                         "model_id":   d.model_id,
@@ -241,11 +246,11 @@ impl Tool for DescribeProviderTool {
             .get(name)
             .ok_or_else(|| ToolError::NotFound(format!("plugin {name}")))?;
         Ok(json!({
-            "plugin":       entry.manifest.name,
-            "version":      entry.manifest.version,
-            "description":  entry.manifest.description,
-            "abi":          entry.manifest.abi,
-            "capabilities": entry.capabilities,
+            "plugin":       entry.name(),
+            "version":      entry.version(),
+            "description":  entry.description(),
+            "abi":          entry.abi(),
+            "capabilities": entry.capabilities(),
         }))
     }
 }
@@ -301,7 +306,7 @@ impl Tool for SynthesizeTool {
             .ok_or_else(|| ToolError::NotFound(format!("plugin {plugin_name}")))?;
 
         let descriptor = entry
-            .capabilities
+            .capabilities()
             .iter()
             .find(|d| d.capability == "ai.tts")
             .ok_or_else(|| {
@@ -326,7 +331,7 @@ impl Tool for SynthesizeTool {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             let submitted = args.get("controls").cloned().unwrap_or(Value::Null);
-            if let Err(e) = smiths_plugin::validate_controls(&declared, &submitted) {
+            if let Err(e) = validate_controls(&declared, &submitted) {
                 return Err(ToolError::InvalidArguments(format!(
                     "{}: {}",
                     e.field, e.reason
@@ -341,16 +346,14 @@ impl Tool for SynthesizeTool {
             "controls": args.get("controls"),
             "output": args.get("output"),
         });
-        let audio = entry
-            .sidecar
-            .call("synthesize", params)
+        entry
+            .invoke("synthesize", params)
             .await
-            .map_err(|e| ToolError::Internal(format!("plugin `{plugin_name}`: {e}")))?;
-        Ok(audio)
+            .map_err(|e| ToolError::Internal(e.to_string()))
     }
 }
 
-fn voice_is_known(descriptor: &smiths_plugin::CapabilityDescriptor, voice: &str) -> bool {
+fn voice_is_known(descriptor: &CapabilityDescriptor, voice: &str) -> bool {
     let Some(voices) = descriptor.extra.get("voices").and_then(Value::as_array) else {
         return true; // Plugin didn't declare any voice list — permissive.
     };
@@ -359,19 +362,176 @@ fn voice_is_known(descriptor: &smiths_plugin::CapabilityDescriptor, voice: &str)
         .any(|v| v.get("id").and_then(Value::as_str) == Some(voice))
 }
 
+/// Look up a plugin and validate controls for a named capability.
+/// Returns the provider handle on success. Common prologue for every
+/// AI-tool invocation.
+fn resolve_and_validate(
+    ctx: &ToolContext,
+    plugin_name: &str,
+    capability: &str,
+    args: &Value,
+) -> Result<Arc<dyn AiProvider>, ToolError> {
+    let entry = ctx
+        .plugins
+        .get(plugin_name)
+        .ok_or_else(|| ToolError::NotFound(format!("plugin {plugin_name}")))?;
+    let descriptor = entry
+        .capabilities()
+        .iter()
+        .find(|d| d.capability == capability)
+        .ok_or_else(|| {
+            ToolError::InvalidArguments(format!(
+                "plugin `{plugin_name}` does not provide `{capability}`"
+            ))
+        })?;
+    if let Some(declared) = descriptor.extra.get("controls").and_then(Value::as_object) {
+        let declared: std::collections::BTreeMap<String, Value> = declared
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let submitted = args.get("controls").cloned().unwrap_or(Value::Null);
+        if let Err(e) = validate_controls(&declared, &submitted) {
+            return Err(ToolError::InvalidArguments(format!(
+                "{}: {}",
+                e.field, e.reason
+            )));
+        }
+    }
+    Ok(entry)
+}
+
+/// `transcribe` — invoke an `ai.asr` plugin on a base64-encoded audio
+/// buffer. Returns the transcript plus metadata the plugin supplies.
+pub struct TranscribeTool;
+
+#[async_trait]
+impl Tool for TranscribeTool {
+    fn name(&self) -> &'static str {
+        "transcribe"
+    }
+
+    fn description(&self) -> &'static str {
+        "Invoke an `ai.asr` plugin on a base64-encoded PCM16 audio \
+         buffer. Returns the transcript and confidence."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "plugin":       { "type": "string", "description": "ASR plugin name." },
+                "audio_base64": { "type": "string", "description": "Base64 of PCM16 LE bytes." },
+                "sample_rate":  { "type": "integer", "description": "Audio sample rate in Hz (default 8000)." },
+                "language":     { "type": "string",  "description": "BCP-47 tag or `auto`." },
+                "controls":     { "type": "object",  "description": "Provider-specific controls." }
+            },
+            "required": ["plugin", "audio_base64"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let plugin_name = args
+            .get("plugin")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("plugin required".into()))?;
+        let audio = args
+            .get("audio_base64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("audio_base64 required".into()))?;
+        let entry = resolve_and_validate(ctx, plugin_name, "ai.asr", &args)?;
+
+        let params = json!({
+            "audio_base64": audio,
+            "sample_rate": args.get("sample_rate"),
+            "language": args.get("language"),
+            "controls": args.get("controls"),
+        });
+        entry
+            .invoke("transcribe", params)
+            .await
+            .map_err(|e| ToolError::Internal(e.to_string()))
+    }
+}
+
+/// `llm_chat` — invoke an `ai.llm.chat` plugin with a messages array.
+/// Returns the assistant message plus any token-usage metadata.
+pub struct LlmChatTool;
+
+#[async_trait]
+impl Tool for LlmChatTool {
+    fn name(&self) -> &'static str {
+        "llm_chat"
+    }
+
+    fn description(&self) -> &'static str {
+        "Invoke an `ai.llm.chat` plugin with a messages array \
+         (`[{role, content}, ...]`). Non-streaming one-shot."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "plugin":   { "type": "string", "description": "LLM plugin name." },
+                "messages": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role":    { "type": "string", "enum": ["system", "user", "assistant", "tool"] },
+                            "content": { "type": "string" }
+                        },
+                        "required": ["role", "content"]
+                    }
+                },
+                "controls": { "type": "object", "description": "Provider-specific controls." }
+            },
+            "required": ["plugin", "messages"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let plugin_name = args
+            .get("plugin")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("plugin required".into()))?;
+        let messages = args
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ToolError::InvalidArguments("messages required".into()))?;
+        if messages.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "messages must not be empty".into(),
+            ));
+        }
+        let entry = resolve_and_validate(ctx, plugin_name, "ai.llm.chat", &args)?;
+
+        let params = json!({
+            "messages": messages,
+            "controls": args.get("controls"),
+        });
+        entry
+            .invoke("chat", params)
+            .await
+            .map_err(|e| ToolError::Internal(e.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::control::ControlState;
+    use crate::tool::test_support::empty_registry;
     use smiths_core::EventBus;
-    use smiths_plugin::AiRegistry;
     use tokio_util::sync::CancellationToken;
 
     fn ctx_with_state() -> (ToolContext, CancellationToken) {
         let bus = EventBus::new(8);
         let cancel = CancellationToken::new();
         let (state, _task) = ControlState::spawn(&bus, cancel.clone());
-        (ToolContext::new(state, AiRegistry::new()), cancel)
+        (ToolContext::new(state, empty_registry()), cancel)
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -402,13 +562,19 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 6);
-        assert!(reg.get("list_calls").is_some());
-        assert!(reg.get("get_call_status").is_some());
-        assert!(reg.get("health").is_some());
-        assert!(reg.get("list_ai_providers").is_some());
-        assert!(reg.get("describe_provider").is_some());
-        assert!(reg.get("synthesize").is_some());
+        assert_eq!(reg.len(), 8);
+        for name in [
+            "list_calls",
+            "get_call_status",
+            "health",
+            "list_ai_providers",
+            "describe_provider",
+            "synthesize",
+            "transcribe",
+            "llm_chat",
+        ] {
+            assert!(reg.get(name).is_some(), "missing tool: {name}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -419,6 +585,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transcribe_without_plugin_is_not_found() {
+        let (ctx, _c) = ctx_with_state();
+        let err = TranscribeTool
+            .call(json!({"plugin": "nope", "audio_base64": ""}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn llm_chat_rejects_empty_messages() {
+        let (ctx, _c) = ctx_with_state();
+        let err = LlmChatTool
+            .call(json!({"plugin": "x", "messages": []}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

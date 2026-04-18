@@ -12,9 +12,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use smiths_core::ai::AiRegistry;
 use thiserror::Error;
-
-use smiths_plugin::AiRegistry;
 
 use crate::control::ControlState;
 
@@ -23,16 +22,17 @@ use crate::control::ControlState;
 pub struct ToolContext {
     /// Live engine state, updated by the event-bus subscription.
     pub state: ControlState,
-    /// Loaded AI plugins. Empty registry when no plugins dir is
-    /// configured or when every plugin failed to load — tools that
-    /// depend on it should return a clean error in that case.
-    pub plugins: AiRegistry,
+    /// Loaded AI plugins behind the core trait seam. Empty registry
+    /// when no plugins dir is configured or when every plugin failed
+    /// to load — tools that depend on it should return a clean error
+    /// in that case.
+    pub plugins: Arc<dyn AiRegistry>,
 }
 
 impl ToolContext {
     /// Build a context from its components.
     #[must_use]
-    pub const fn new(state: ControlState, plugins: AiRegistry) -> Self {
+    pub fn new(state: ControlState, plugins: Arc<dyn AiRegistry>) -> Self {
         Self { state, plugins }
     }
 }
@@ -114,5 +114,35 @@ impl ToolRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Tiny [`AiRegistry`] double used by MCP tests without dragging in
+    //! the real plugin host.
+
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use smiths_core::ai::{AiProvider, AiRegistry};
+
+    /// Registry with no providers. Every lookup returns `None`.
+    pub(crate) struct EmptyRegistry;
+
+    #[async_trait]
+    impl AiRegistry for EmptyRegistry {
+        fn get(&self, _name: &str) -> Option<Arc<dyn AiProvider>> {
+            None
+        }
+        fn snapshot(&self) -> Vec<Arc<dyn AiProvider>> {
+            Vec::new()
+        }
+        async fn shutdown_all(&self) {}
+    }
+
+    /// Convenience: build an `Arc<dyn AiRegistry>` holding an [`EmptyRegistry`].
+    pub(crate) fn empty_registry() -> Arc<dyn AiRegistry> {
+        Arc::new(EmptyRegistry)
     }
 }

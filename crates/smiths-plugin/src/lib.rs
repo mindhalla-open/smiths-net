@@ -1,27 +1,37 @@
 //! Plugin discovery, manifest parsing, and capability registry.
 //!
 //! Today's scope — **sidecar plugins only** (`type = "sidecar"`). WASM
-//! and embedded-script tiers land later. A plugin is:
+//! and embedded-script tiers land later and live in the re-exported
+//! sub-namespaces [`wasm`] / [`script`] / [`sidecar`]. A plugin is:
 //!
 //! 1. A directory under `plugins.dir` containing `plugin.toml`.
 //! 2. An executable entry point (relative to that directory).
 //!
-//! At boot the loader spawns each plugin via [`smiths_sidecar::Sidecar`],
+//! At boot the loader spawns each plugin via [`sidecar::Sidecar`],
 //! calls `describe_capabilities`, validates the returned descriptors
 //! against `05-ai-plugin-protocol.md`, and registers them in the
-//! [`AiRegistry`]. The MCP layer reads that registry to serve
-//! `list_ai_providers` / `describe_provider` / `synthesize` tools and
-//! uses [`validate_controls`] to strict-reject unknown parameters.
+//! [`AiRegistry`]. Plugin metadata and the control-schema validator
+//! live in `smiths-core::ai`; this crate just implements the traits
+//! and owns the host-tier sub-crates.
 
-pub mod controls;
-pub mod descriptor;
 pub mod error;
 pub mod loader;
 pub mod manifest;
 pub mod registry;
 
-pub use controls::{ValidationError, validate_controls};
-pub use descriptor::CapabilityDescriptor;
+// Host tiers owned by the plugin umbrella — this is the one documented
+// cross-sibling exception in the dependency graph.
+pub use smiths_script as script;
+pub use smiths_sidecar as sidecar;
+pub use smiths_wasm as wasm;
+
+// Re-export the trait seams and common data types from core so crate
+// consumers don't need a second import path.
+pub use smiths_core::ai::{
+    AiProvider, AiRegistry as AiRegistryTrait, CapabilityDescriptor, ConcurrencyHint, LatencyHint,
+    ProviderError, ValidationError, validate_controls,
+};
+
 pub use error::Error;
 pub use loader::{LoadReport, load_plugins};
 pub use manifest::{Manifest, PluginType};

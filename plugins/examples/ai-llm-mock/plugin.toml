@@ -1,0 +1,7 @@
+name        = "ai-llm-mock"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["ai.llm.chat"]
+abi         = "1.0"
+description = "Reference LLM-chat plugin: advertises a realistic `ai.llm.chat` descriptor; completions are canned until a real backend is wired in."

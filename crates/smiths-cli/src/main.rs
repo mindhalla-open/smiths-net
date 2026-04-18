@@ -8,8 +8,8 @@ use anyhow::Context as _;
 use axum::{Json, Router, routing::get};
 use clap::{Parser, ValueEnum};
 use smiths_core::{
-    Config, Event, EventBus, LogFormat, MediaFabric, SdpNegotiator, Shutdown, SipTransport,
-    SystemEvent,
+    AiRegistry, Config, Event, EventBus, LogFormat, MediaFabric, SdpNegotiator, Shutdown,
+    SipTransport, SystemEvent,
 };
 use smiths_mcp::{ControlState, ToolContext};
 use smiths_media::UdpMediaFabric;
@@ -102,7 +102,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let registry = Arc::new(smiths_mcp::tools::builtin_registry());
-    let tool_ctx = ToolContext::new(control_state, ai_registry.clone());
+    let ai_registry_dyn: Arc<dyn AiRegistry> = Arc::new(ai_registry.clone());
+    let tool_ctx = ToolContext::new(control_state, ai_registry_dyn);
 
     // MCP stdio is now additive: it runs alongside SIP / health / A2A
     // rather than replacing them, so agents can receive push

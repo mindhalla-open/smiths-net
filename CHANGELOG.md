@@ -7,6 +7,37 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added — `transcribe` + `llm_chat` MCP tools (P4 slice 3)
+
+- **`transcribe`** MCP tool: accepts base64 PCM16 + language hint,
+  dispatches to any plugin providing `ai.asr`, returns transcript
+  with confidence + duration. Full `resolve_and_validate` helper
+  factored out so `transcribe` / `llm_chat` / future `embed` share
+  the same plugin-lookup + strict control-validation prologue.
+- **`llm_chat`** MCP tool: `messages`-array in, `{message, usage,
+  finish_reason}` out. Rejects empty `messages`. Dispatches to any
+  plugin providing `ai.llm.chat`.
+- **Reference plugin `plugins/examples/ai-asr-mock/`** — pure-stdlib
+  Python sidecar advertising a realistic `ai.asr` descriptor
+  (`languages: [auto, ru, en]`, `features`, `input_formats`,
+  `controls: {language, beam_size}`). Transcription stubbed to a
+  duration-derived placeholder; shape identical to what Whisper
+  would return.
+- **Reference plugin `plugins/examples/ai-llm-mock/`** — advertises
+  `ai.llm.chat` with `context_window`, `features: ["system_prompt"]`,
+  `controls: {temperature, max_tokens}`; canned-response rule table
+  keyed on the last user turn.
+- **`voice_agent.py` goes zero-AI-code**: dropped `stub_stt` /
+  `stub_llm` entirely. New `mcp_transcribe()` + `mcp_llm_chat()`
+  helpers invoke the engine's tools; every inference hop now flows
+  through MCP → sidecar plugin. Three tools involved per call:
+  `transcribe` → `llm_chat` → `synthesize`.
+- Two new unit tests: `transcribe_without_plugin_is_not_found`,
+  `llm_chat_rejects_empty_messages`. Builtins registry test updated
+  (5 → 6 → 8 tools).
+- Release binary: 3.4 MB → **3.5 MB** (two extra tools + refactored
+  validation helper).
+
 ### Added — Digest auth + REGISTER (Phase 1 catch-up)
 
 - **`smiths-sip::auth::digest`** module — RFC 2617 + RFC 8760
