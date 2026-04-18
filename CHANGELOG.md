@@ -7,6 +7,50 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-18
+
+Phase 5 slice 2 — MCP grows a real push channel, and the first
+end-to-end voice-agent demo lands on top of it. The agent spawns the
+engine, drains `notifications/call/*` frames over stdio, parks a SIP
+UA on a rendezvous key, and runs a full STT → LLM → TTS pipeline
+against bridged RTP. TTS is real (macOS `say`); STT and LLM are
+stubbed at exactly the call sites where the post-MVP `ai.*` plugins
+will slot in.
+
+### Added — MCP server-pushed notifications
+
+- MCP stdio server now emits JSON-RPC notifications on dialog
+  lifecycle: `notifications/call/created` and
+  `notifications/call/terminated`, published by subscribing to the
+  engine's `SipEvent::DialogCreated` / `DialogTerminated`. Single-loop
+  multiplex on stdout — no mutex needed.
+- `smiths_mcp::mcp::run_stdio` signature grew an `EventBus` argument.
+
+### Changed — `--mcp stdio` is now additive
+
+- `--mcp stdio` no longer suppresses SIP, health HTTP, or A2A.
+  MCP stdio runs alongside whatever else is configured, so an agent can
+  spawn the engine as a subprocess *and* have the engine serve real
+  incoming calls at the same time. stdin EOF still terminates the
+  process (the shutdown token is triggered).
+- Logs routed to stderr when `--mcp stdio` is active so stdout stays
+  on the JSON-RPC wire.
+
+### Added — Voice-agent demo (`examples/python-client/`)
+
+- **`voice_agent.py`** — spawns the engine with `--mcp stdio`, drains
+  MCP push notifications, parks a `SipUAC` on rendezvous key
+  `voicebot`, and on an incoming call runs a **STT → LLM → TTS**
+  pipeline against the bridged RTP. TTS is real (macOS `say`); STT and
+  LLM are stubbed pending the plugin system (P22 of post-MVP). The
+  stubs sit exactly where the real `ai.*` plugin calls will land.
+- **`voice_caller.py`** — simulated inbound caller: dials
+  `sip:voicebot@engine`, streams a greeting WAV, records the agent's
+  reply, and hangs up.
+- README gained a "Voice agent" section with run instructions and an
+  honest breakdown of what's real vs. mocked + where the real plugins
+  slot in.
+
 ## [0.3.0] - 2026-04-18
 
 Phase 5 first slice — real control plane. The engine grows a typed
@@ -320,7 +364,8 @@ boot-and-shutdown binary. No SIP / media / plugins yet.
 
 - `.gitignore`: added `.DS_Store` to the ignore list.
 
-[Unreleased]: https://github.com/mindhalla/smiths-net/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/mindhalla/smiths-net/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/mindhalla/smiths-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mindhalla/smiths-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mindhalla/smiths-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mindhalla/smiths-net/releases/tag/v0.1.0

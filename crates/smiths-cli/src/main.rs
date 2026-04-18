@@ -22,12 +22,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-/// Which transport to run MCP on.
+/// Which transport to run MCP on. Can be combined with SIP — MCP
+/// is additive; SIP / health / A2A all come from `config` as usual.
+/// stdin EOF terminates the process.
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
 enum McpMode {
-    /// Run MCP over stdio and exit when stdin closes. No other
-    /// subsystems start — this is the mode LLM clients use when they
-    /// spawn the engine as a child process.
+    /// Run MCP over stdio alongside any other enabled subsystems.
+    /// Logs are routed to stderr so stdout stays on the JSON-RPC wire.
     Stdio,
 }
 
@@ -85,25 +86,22 @@ async fn main() -> anyhow::Result<()> {
     let registry = Arc::new(smiths_mcp::tools::builtin_registry());
     let tool_ctx = ToolContext::new(control_state);
 
-    // Stdio MCP takes over the process — no SIP, no health HTTP.
-    if cli.mcp == Some(McpMode::Stdio) {
-        info!("entering MCP stdio mode (no SIP, no health HTTP)");
-        let stdio_cancel = shutdown.token();
-        let mcp_task = tokio::spawn(async move {
-            if let Err(e) = smiths_mcp::mcp::run_stdio(registry, tool_ctx, stdio_cancel).await {
+    // MCP stdio is now additive: it runs alongside SIP / health / A2A
+    // rather than replacing them, so agents can receive push
+    // notifications about calls the engine is serving.
+    let mcp_stdio_task: Option<JoinHandle<()>> = if cli.mcp == Some(McpMode::Stdio) {
+        let reg = Arc::clone(&registry);
+        let ctx = tool_ctx.clone();
+        let bus = bus.clone();
+        let cancel = shutdown.token();
+        Some(tokio::spawn(async move {
+            if let Err(e) = smiths_mcp::mcp::run_stdio(reg, ctx, bus, cancel).await {
                 warn!(?e, "MCP stdio server error");
             }
-        });
-        // Either SIGTERM or stdin-EOF ends the process.
-        tokio::select! {
-            r = shutdown.wait_for_signal() => r.context("installing signal handlers")?,
-            _ = mcp_task => {}
-        }
-        shutdown.trigger();
-        let _ = control_task.await;
-        info!("graceful shutdown complete");
-        return Ok(());
-    }
+        }))
+    } else {
+        None
+    };
 
     // ---- health HTTP endpoint ----
     let health = tokio::spawn(serve_health(
@@ -165,10 +163,20 @@ async fn main() -> anyhow::Result<()> {
         "smiths-net ready"
     );
 
-    shutdown
-        .wait_for_signal()
-        .await
-        .context("installing signal handlers")?;
+    // Either SIGINT/SIGTERM or MCP-stdio exit (stdin EOF) triggers
+    // shutdown. The latter is how an LLM host kills an MCP subprocess.
+    if let Some(mcp_task) = mcp_stdio_task {
+        tokio::select! {
+            r = shutdown.wait_for_signal() => r.context("installing signal handlers")?,
+            _ = mcp_task => info!("MCP stdio closed; shutting down"),
+        }
+    } else {
+        shutdown
+            .wait_for_signal()
+            .await
+            .context("installing signal handlers")?;
+    }
+    shutdown.trigger();
     info!("shutdown signal received; draining");
     let _ = bus.publish(Event::System(SystemEvent::ShutdownRequested));
 

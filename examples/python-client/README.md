@@ -45,6 +45,8 @@ cargo build --release
 | `listener.py`      | Standalone UA that records received RTP to a WAV.            |
 | `mcp_demo.py`      | Spawns the engine in `--mcp stdio` mode, walks MCP handshake + tool calls. |
 | `a2a_demo.py`      | Talks to the A2A HTTP endpoint (same tool set, JSON-RPC over HTTP). |
+| `voice_agent.py`   | Full voice-agent demo: MCP notifications + STT/LLM/TTS on bridged RTP. |
+| `voice_caller.py`  | Simulated inbound caller that dials the voice agent. |
 
 ## Where files live
 
@@ -126,6 +128,41 @@ Claude Code, add to its MCP config:
   }
 }
 ```
+
+### Voice agent (MCP notifications + STT → LLM → TTS)
+
+The biggest demo — a Python "voice agent" that spawns the engine,
+subscribes to MCP push notifications, acts as the SIP callee through
+`SipUAC`, and runs a full STT → LLM → TTS pipeline against the
+bridged RTP.
+
+```bash
+cargo build --release
+
+# Terminal 1 — agent (it spawns smiths-net internally)
+python3 examples/python-client/voice_agent.py
+
+# Terminal 2 — simulated caller
+python3 examples/python-client/voice_caller.py \
+    --wav tmp/smiths-hello.wav \
+    --out tmp/voice-agent-reply.wav
+
+afplay tmp/voice-agent-reply.wav   # "Алло, Алиса слушает вас"
+```
+
+Architecture honest-note:
+
+- **Real today**: MCP push notifications
+  (`notifications/call/created` / `terminated`), SIP / SDP / RTP
+  bridging, μ-law codec, engine-allocated media sockets.
+- **Real on the Python side**: agent-side TTS via macOS `say`
+  (produces a PCM16 mono 8 kHz WAV, encoded to PCMU and streamed).
+- **Mocked**: STT (returns a placeholder from audio duration) and LLM
+  (always replies with the fixed greeting). These are the hooks where
+  the real **`ai.*` plugins** (P22 in post-MVP) will plug in — the
+  agent's `stub_stt` / `stub_llm` functions stay intact, but their
+  bodies will change to `await mcp.call_tool("ai_invoke", ...)` once
+  the plugin system ships.
 
 ### A2A HTTP
 

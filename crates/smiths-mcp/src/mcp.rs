@@ -1,14 +1,16 @@
 //! MCP (Model Context Protocol) server over stdio.
 //!
 //! Implements the subset of the MCP spec our control plane needs today:
-//! `initialize`, `tools/list`, `tools/call`. Framing is newline-delimited
-//! JSON-RPC 2.0, the dialect used by the reference MCP stdio transport
-//! — each line of stdin is one request, each line of stdout is one
-//! response. All logging goes to `stderr` so it doesn't corrupt the
-//! wire.
+//! `initialize`, `tools/list`, `tools/call`, plus **server-pushed
+//! notifications** for SIP dialog lifecycle (`notifications/call/created`,
+//! `notifications/call/terminated`).
+//!
+//! Framing is newline-delimited JSON-RPC 2.0: each line of stdin is one
+//! request, each line of stdout is one response or notification. All
+//! logging goes to `stderr` so it doesn't corrupt the wire.
 //!
 //! Not yet:
-//! * resources / prompts / notifications
+//! * resources / prompts
 //! * authentication (token or OAuth)
 //! * per-tool rate limiting
 //!
@@ -18,7 +20,9 @@
 use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
+use smiths_core::{Event, EventBus, SipEvent};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -30,14 +34,21 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Run the MCP server against `stdin` / `stdout`. Returns when stdin
 /// EOFs or `cancel` fires.
+///
+/// The server multiplexes two writers onto stdout: request handlers
+/// (one response per stdin frame) and bus-driven notifications
+/// (fire-and-forget). They share a single `select!` loop so ordering
+/// is serial and no mutex is required on stdout.
 pub async fn run_stdio(
     registry: Arc<ToolRegistry>,
     ctx: ToolContext,
+    bus: EventBus,
     cancel: CancellationToken,
 ) -> std::io::Result<()> {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
     let mut stdout = tokio::io::stdout();
+    let mut bus_rx = bus.subscribe();
     info!(
         tools = registry.len(),
         protocol = PROTOCOL_VERSION,
@@ -59,24 +70,58 @@ pub async fn run_stdio(
                         return Err(e);
                     }
                 }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let response = handle_frame(trimmed, &registry, &ctx).await;
+                if let Some(resp) = response {
+                    write_frame(&mut stdout, &resp).await?;
+                }
             }
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let response = handle_frame(trimmed, &registry, &ctx).await;
-        if let Some(resp) = response {
-            let mut buf = serde_json::to_vec(&resp).unwrap_or_default();
-            buf.push(b'\n');
-            stdout.write_all(&buf).await?;
-            stdout.flush().await?;
+            event = bus_rx.recv() => match event {
+                Ok(ev) => {
+                    if let Some(notif) = event_to_notification(&ev) {
+                        write_frame(&mut stdout, &notif).await?;
+                    }
+                }
+                Err(RecvError::Lagged(n)) => {
+                    debug!("MCP stdio bus lagged: {n} events dropped");
+                }
+                Err(RecvError::Closed) => {
+                    debug!("MCP stdio bus closed");
+                }
+            },
         }
     }
     info!("MCP stdio server stopped");
     Ok(())
+}
+
+/// Serialize one JSON-RPC frame and write it as a single line to stdout.
+async fn write_frame(stdout: &mut tokio::io::Stdout, frame: &Value) -> std::io::Result<()> {
+    let mut buf = serde_json::to_vec(frame).unwrap_or_default();
+    buf.push(b'\n');
+    stdout.write_all(&buf).await?;
+    stdout.flush().await
+}
+
+/// Translate a bus event into an MCP notification frame. `None` for
+/// events we don't expose (keeps the wire quiet and forward-compatible).
+fn event_to_notification(event: &Event) -> Option<Value> {
+    match event {
+        Event::Sip(SipEvent::DialogCreated { call_id }) => Some(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/call/created",
+            "params": { "call_id": call_id },
+        })),
+        Event::Sip(SipEvent::DialogTerminated { call_id }) => Some(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/call/terminated",
+            "params": { "call_id": call_id },
+        })),
+        _ => None,
+    }
 }
 
 /// Parse one JSON-RPC request line and produce an optional response.
