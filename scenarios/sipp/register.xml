@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Exercise the engine's REGISTER + digest auth path under load.
+  Flow: REGISTER → 401 Unauthorized → REGISTER + Authorization → 200 OK.
+
+  Credential defaults match the engine's in-memory test store:
+    username = sipp
+    realm    = smiths.test
+    password = s3cret
+
+  Add the account to the engine before running:
+    store.insert(Credentials {
+        username: "sipp".into(),
+        realm:    "smiths.test".into(),
+        password: "s3cret".into(),
+    });
+-->
+<scenario name="REGISTER-with-digest-auth">
+
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/UDP [local_ip]:[local_port];branch=[branch]
+      From: sipp <sip:sipp@smiths.test>;tag=[call_number]
+      To: sipp <sip:sipp@smiths.test>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:sipp@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Expires: 60
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="401" auth="true"/>
+
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/UDP [local_ip]:[local_port];branch=[branch]
+      From: sipp <sip:sipp@smiths.test>;tag=[call_number]
+      To: sipp <sip:sipp@smiths.test>
+      Call-ID: [call_id]
+      CSeq: 2 REGISTER
+      Contact: <sip:sipp@[local_ip]:[local_port]>
+      [authentication username=sipp password=s3cret]
+      Max-Forwards: 70
+      Expires: 60
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200"/>
+
+  <!-- End-of-scenario latency capture — sipp reports this in its stats. -->
+  <ResponseTimeRepartition value="10, 20, 30, 40, 50, 100, 150, 200, 500, 1000"/>
+  <CallLengthRepartition  value="10, 50, 100, 500, 1000, 5000, 10000"/>
+
+</scenario>

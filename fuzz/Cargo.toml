@@ -1,0 +1,25 @@
+[package]
+name         = "smiths-fuzz"
+version      = "0.0.0"
+publish      = false
+edition      = "2024"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rsip          = "0.4"
+smiths-sip    = { path = "../crates/smiths-sip" }
+
+[[bin]]
+name              = "sip_parser"
+path              = "fuzz_targets/sip_parser.rs"
+test              = false
+doc               = false
+bench             = false
+doctest           = false
+
+[profile.release]
+debug = 1

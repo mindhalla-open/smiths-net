@@ -14,7 +14,7 @@ use smiths_core::{
 use smiths_mcp::{ControlState, ToolContext};
 use smiths_media::UdpMediaFabric;
 use smiths_sdp::Negotiator;
-use smiths_sip::{Transport as _, UasServer, UdpTransport};
+use smiths_sip::{TcpTransport, Transport as _, UasServer, UdpTransport};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -136,24 +136,37 @@ async fn main() -> anyhow::Result<()> {
 
     let mut sip_handles: Vec<JoinHandle<()>> = Vec::new();
     let udp_enabled = config.sip.transports.contains(&SipTransport::Udp);
-    if !udp_enabled {
-        warn!("no UDP SIP transport configured; signaling disabled");
+    let tcp_enabled = config.sip.transports.contains(&SipTransport::Tcp);
+    if !udp_enabled && !tcp_enabled {
+        warn!("no SIP transports configured; signaling disabled");
     }
     for bind in &config.sip.bind {
-        if !udp_enabled {
-            break;
-        }
         let addr = bind.socket_addr();
-        match spawn_sip_udp(
-            addr,
-            bus.clone(),
-            shutdown.token(),
-            Arc::clone(&media_fabric),
-        )
-        .await
-        {
-            Ok(handles) => sip_handles.extend(handles),
-            Err(e) => warn!(%bind, ?e, "failed to start SIP on bind; continuing"),
+        if udp_enabled {
+            match spawn_sip_udp(
+                addr,
+                bus.clone(),
+                shutdown.token(),
+                Arc::clone(&media_fabric),
+            )
+            .await
+            {
+                Ok(handles) => sip_handles.extend(handles),
+                Err(e) => warn!(%bind, ?e, "failed to start SIP/UDP on bind; continuing"),
+            }
+        }
+        if tcp_enabled {
+            match spawn_sip_tcp(
+                addr,
+                bus.clone(),
+                shutdown.token(),
+                Arc::clone(&media_fabric),
+            )
+            .await
+            {
+                Ok(handles) => sip_handles.extend(handles),
+                Err(e) => warn!(%bind, ?e, "failed to start SIP/TCP on bind; continuing"),
+            }
         }
     }
 
@@ -247,6 +260,29 @@ async fn spawn_sip_udp(
         .with_context(|| format!("building UAS on {local}"))?;
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP UDP listening");
+    Ok(vec![reader, server_handle])
+}
+
+async fn spawn_sip_tcp(
+    bind: SocketAddr,
+    bus: EventBus,
+    cancel: CancellationToken,
+    media_fabric: Arc<dyn MediaFabric>,
+) -> anyhow::Result<Vec<JoinHandle<()>>> {
+    let transport = TcpTransport::bind(bind)
+        .await
+        .with_context(|| format!("binding TCP on {bind}"))?;
+    let local = transport.local_addr()?;
+    let transport = Arc::new(transport);
+
+    let (tx, rx) = mpsc::channel(1024);
+    let reader = transport.spawn_reader(tx, cancel.clone());
+
+    let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(local.ip()));
+    let server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
+        .with_context(|| format!("building UAS on {local}"))?;
+    let server_handle = tokio::spawn(server.run(rx, cancel));
+    info!(%local, "SIP TCP listening");
     Ok(vec![reader, server_handle])
 }
 

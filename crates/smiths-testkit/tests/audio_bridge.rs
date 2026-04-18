@@ -14,10 +14,10 @@ use smiths_media::UdpMediaFabric;
 use smiths_sdp::Negotiator;
 use smiths_sip::Transport as _;
 use smiths_sip::{UasServer, UdpTransport};
+use smiths_testkit::FakeUac;
 use smiths_testkit::codec::{pcm16_to_pcmu, pcmu_to_pcm16};
 use smiths_testkit::rtp::RtpPacket;
 use smiths_testkit::signal::sine_wave;
-use smiths_testkit::uac::TestUac;
 use smiths_testkit::wav::write_mono_pcm16;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -60,8 +60,8 @@ async fn two_uas_call_preserves_audio_byte_for_byte() {
     let (engine_addr, cancel, engine_task) = start_engine().await;
 
     // Two test UACs bind fresh SIP + RTP sockets.
-    let mut ua_a = TestUac::bind(engine_addr).await.unwrap();
-    let mut ua_b = TestUac::bind(engine_addr).await.unwrap();
+    let mut ua_a = FakeUac::bind(engine_addr).await.unwrap();
+    let mut ua_b = FakeUac::bind(engine_addr).await.unwrap();
 
     // Launch both INVITEs concurrently; the second one triggers the bridge.
     let (inv_a, inv_b) = tokio::join!(ua_a.invite(RENDEZVOUS), ua_b.invite(RENDEZVOUS));

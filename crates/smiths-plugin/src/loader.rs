@@ -9,7 +9,7 @@ use std::path::Path;
 
 use serde_json::Value;
 use smiths_core::ai::CapabilityDescriptor;
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 
 use crate::error::Error;
 use crate::manifest::{Manifest, PluginType};
@@ -29,6 +29,7 @@ pub struct LoadReport {
 ///
 /// If `root` doesn't exist, returns an empty report (operators turn
 /// plugins on by creating the directory — no error).
+#[instrument(skip(registry), fields(root = %root.display()))]
 pub async fn load_plugins(root: &Path, registry: &AiRegistry) -> Result<LoadReport, Error> {
     let mut report = LoadReport::default();
     if !root.exists() {
@@ -60,6 +61,7 @@ pub async fn load_plugins(root: &Path, registry: &AiRegistry) -> Result<LoadRepo
     Ok(report)
 }
 
+#[instrument(skip(registry), fields(dir = %dir.display()))]
 async fn load_one(dir: &Path, registry: &AiRegistry) -> Result<String, Error> {
     // `plugin.toml` must exist or the directory isn't a plugin — skip
     // silently by reporting a clean NotFound at the loader boundary.

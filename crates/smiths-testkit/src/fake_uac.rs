@@ -16,7 +16,7 @@ use tokio::time::timeout;
 const RECV_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Minimal fake UAC used by the audio-bridge test harness.
-pub struct TestUac {
+pub struct FakeUac {
     /// UDP socket for SIP signaling.
     pub sip: UdpSocket,
     /// UDP socket that will carry RTP in this UA's direction.
@@ -35,7 +35,7 @@ pub struct TestUac {
     cseq: u32,
 }
 
-impl TestUac {
+impl FakeUac {
     /// Bind loopback sockets and capture the engine's SIP address.
     pub async fn bind(engine: SocketAddr) -> std::io::Result<Self> {
         let sip = UdpSocket::bind("127.0.0.1:0").await?;
@@ -147,6 +147,92 @@ impl TestUac {
         );
         self.sip.send_to(ack.as_bytes(), self.engine).await?;
         Ok(())
+    }
+
+    /// INVITE `sip:<rendezvous>@<engine>` with a PCMU-only SDP offer,
+    /// expecting a non-2xx final response (e.g. `401 Unauthorized`,
+    /// `488 Not Acceptable`, `404 Not Found`). ACKs the response
+    /// hop-by-hop with the same `Via` branch per RFC 3261 §17.1.1.3
+    /// and returns the raw response text.
+    ///
+    /// Returns `Err` if the engine answered with a 2xx instead — the
+    /// caller expected rejection, and a dialog would be leaked.
+    pub async fn invite_expect_rejection(&mut self, rendezvous: &str) -> std::io::Result<String> {
+        self.cseq += 1;
+        let cseq = self.cseq;
+        let branch = format!("z9hG4bK-{}", unique_u32());
+        let local_sip = self.sip_addr()?;
+        let local_rtp = self.rtp_addr()?;
+        let offer = offer_sdp_pcmu(&local_rtp);
+        let invite = format!(
+            "INVITE sip:{rv}@{eng} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {sip};branch={branch};rport\r\n\
+             From: Tester <sip:tester@{sip}>;tag={ftag}\r\n\
+             To: Target <sip:{rv}@{eng}>\r\n\
+             Call-ID: {cid}\r\n\
+             CSeq: {cseq} INVITE\r\n\
+             Max-Forwards: 70\r\n\
+             Contact: <sip:tester@{sip}>\r\n\
+             Content-Type: application/sdp\r\n\
+             Content-Length: {clen}\r\n\
+             \r\n\
+             {offer}",
+            rv = rendezvous,
+            eng = self.engine,
+            sip = local_sip,
+            branch = branch,
+            ftag = self.from_tag,
+            cid = self.call_id,
+            cseq = cseq,
+            clen = offer.len(),
+            offer = offer,
+        );
+        self.sip.send_to(invite.as_bytes(), self.engine).await?;
+
+        let mut buf = vec![0u8; 8192];
+        let msg = loop {
+            let (n, _) = timeout(RECV_TIMEOUT, self.sip.recv_from(&mut buf))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "INVITE timeout")
+                })??;
+            let m = String::from_utf8_lossy(&buf[..n]).into_owned();
+            if m.starts_with("SIP/2.0 1") {
+                continue; // provisional — wait for final
+            }
+            break m;
+        };
+
+        if msg.starts_with("SIP/2.0 2") {
+            return Err(std::io::Error::other(format!(
+                "expected rejection, got 2xx: {}",
+                first_line(&msg)
+            )));
+        }
+
+        // Pull the To-tag the engine attached to the error response and
+        // ACK the INVITE transaction so the UAS stops retransmitting.
+        self.to_tag = extract_to_tag(&msg);
+        let ack = format!(
+            "ACK sip:{rv}@{eng} SIP/2.0\r\n\
+             Via: SIP/2.0/UDP {sip};branch={branch};rport\r\n\
+             From: Tester <sip:tester@{sip}>;tag={ftag}\r\n\
+             To: Target <sip:{rv}@{eng}>;tag={ttag}\r\n\
+             Call-ID: {cid}\r\n\
+             CSeq: {cseq} ACK\r\n\
+             Max-Forwards: 70\r\n\
+             Content-Length: 0\r\n\r\n",
+            rv = rendezvous,
+            eng = self.engine,
+            sip = local_sip,
+            branch = branch,
+            ftag = self.from_tag,
+            ttag = self.to_tag.as_deref().unwrap_or(""),
+            cid = self.call_id,
+            cseq = cseq,
+        );
+        self.sip.send_to(ack.as_bytes(), self.engine).await?;
+        Ok(msg)
     }
 
     /// Send BYE and wait for `200 OK`.

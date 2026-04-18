@@ -13,7 +13,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::error::Error;
 use crate::rpc::{RpcRequest, RpcResponse};
@@ -52,6 +52,7 @@ impl Sidecar {
     /// on the hot path — the signature is contractual and future
     /// readiness checks (health ping, descriptor fetch) will await.
     #[allow(clippy::unused_async)]
+    #[instrument(skip_all, fields(dir = %plugin_dir.display(), entry = %entry.display()))]
     pub async fn spawn(
         name: impl Into<String>,
         plugin_dir: &Path,
@@ -131,6 +132,7 @@ impl Sidecar {
     }
 
     /// Same as [`Self::call`] with an explicit timeout override.
+    #[instrument(skip(self, params), fields(plugin = %self.inner.name, %method))]
     pub async fn call_with_timeout(
         &self,
         method: &str,

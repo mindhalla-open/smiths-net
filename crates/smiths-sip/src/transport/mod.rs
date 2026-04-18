@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 
 use bytes::Bytes;
 
+pub mod tcp;
 pub mod udp;
 
 /// A SIP message received from the network with its origin.

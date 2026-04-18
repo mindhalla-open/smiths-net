@@ -12,5 +12,5 @@ pub mod transport;
 pub mod uas;
 
 pub use error::Error;
-pub use transport::{Datagram, Transport, udp::UdpTransport};
+pub use transport::{Datagram, Transport, tcp::TcpTransport, udp::UdpTransport};
 pub use uas::UasServer;

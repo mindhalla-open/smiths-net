@@ -206,7 +206,12 @@ impl<T: Transport> UasServer<T> {
         }));
 
         // Retransmission dedupe — replay the cached FINAL response.
-        if let Some(branch) = req.branch.as_deref()
+        // ACK carries the same branch as the INVITE it acknowledges when
+        // the final response was non-2xx (RFC 3261 §17.1.1.3); replaying
+        // the 401/4xx on top of that ACK would loop the transaction, so
+        // the dedupe path skips ACK deliberately.
+        if req.method != "ACK"
+            && let Some(branch) = req.branch.as_deref()
             && let Some(cached) = self.dedupe.get(branch)
         {
             debug!(%peer, branch, "replaying cached response");
@@ -242,6 +247,7 @@ impl<T: Transport> UasServer<T> {
 
     /// `REGISTER` with digest auth. No registrar attached → blindly
     /// `200 OK` (dev mode). Registrar attached → full challenge-response.
+    #[instrument(skip_all, fields(%peer, call_id = %req.call_id.as_deref().unwrap_or("-")))]
     async fn handle_register(&self, req: &RequestSummary, peer: SocketAddr) {
         let Some(reg) = self.registrar.as_ref() else {
             self.respond(req, 200, "OK", Some(&next_tag()), &[], b"", peer)
@@ -274,8 +280,53 @@ impl<T: Transport> UasServer<T> {
         }
     }
 
+    /// Digest-authenticate an incoming INVITE. Returns `true` when the
+    /// request may proceed; emits the appropriate `401 Unauthorized` and
+    /// returns `false` otherwise. No registrar attached → every INVITE
+    /// is waved through (dev mode, matching `handle_register`).
+    async fn invite_auth_ok(&self, req: &RequestSummary, peer: SocketAddr) -> bool {
+        let Some(reg) = self.registrar.as_ref() else {
+            return true;
+        };
+        let ruri = req.request_uri.as_deref().unwrap_or("");
+        match req.authorization.as_deref() {
+            None => {
+                let challenge = reg.challenge(crate::auth::digest::Algorithm::Md5, false);
+                let hdr: [(&str, &str); 1] = [("WWW-Authenticate", &challenge)];
+                self.respond(req, 401, "Unauthorized", Some(&next_tag()), &hdr, b"", peer)
+                    .await;
+                false
+            }
+            Some(auth) => match reg.authenticate("INVITE", ruri, auth) {
+                Ok(user) => {
+                    info!(%user, %peer, "INVITE authenticated");
+                    true
+                }
+                Err(e) => {
+                    info!(?e, %peer, "INVITE auth failed; re-challenging");
+                    let stale = matches!(e, crate::auth::digest::AuthError::StaleNonce);
+                    let challenge = reg.challenge(crate::auth::digest::Algorithm::Md5, stale);
+                    let hdr: [(&str, &str); 1] = [("WWW-Authenticate", &challenge)];
+                    self.respond(req, 401, "Unauthorized", Some(&next_tag()), &hdr, b"", peer)
+                        .await;
+                    false
+                }
+            },
+        }
+    }
+
     #[allow(clippy::too_many_lines)] // negotiation + bridge wiring belong together
+    #[instrument(skip_all, fields(%peer, call_id = %req.call_id.as_deref().unwrap_or("-")))]
     async fn handle_invite(&self, req: &RequestSummary, peer: SocketAddr) {
+        // When a registrar is attached, INVITE requires digest auth. We
+        // challenge before emitting 100 Trying so the rejection path
+        // stays tight — no media allocation, no dialog state, just the
+        // 401 back to the caller. The ACK that closes the rejected
+        // transaction is handled by the normal ACK dispatch below.
+        if !self.invite_auth_ok(req, peer).await {
+            return;
+        }
+
         // 100 Trying short-circuits UDP INVITE retransmission.
         self.send_provisional(req, 100, "Trying", peer).await;
 
@@ -439,6 +490,7 @@ impl<T: Transport> UasServer<T> {
         }
     }
 
+    #[instrument(skip_all, fields(%peer, call_id = %req.call_id.as_deref().unwrap_or("-")))]
     async fn handle_bye(&self, req: &RequestSummary, peer: SocketAddr) {
         let Some(key) = in_dialog_key(req) else {
             self.respond(req, 400, "Bad Request", Some(&next_tag()), &[], &[], peer)

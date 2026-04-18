@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use smiths_core::media::{BridgeId, Endpoint, EndpointId, MediaError, MediaFabric};
 use tokio::net::UdpSocket;
+use tracing::{debug, instrument};
 
 use crate::bridge::{Bridge, Leg};
 
@@ -43,14 +44,17 @@ impl UdpMediaFabric {
 
 #[async_trait]
 impl MediaFabric for UdpMediaFabric {
+    #[instrument(skip(self), fields(%bind_ip))]
     async fn allocate(&self, bind_ip: IpAddr) -> Result<Endpoint, MediaError> {
         let socket = UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await?;
         let local_addr = socket.local_addr()?;
         let id = self.fresh_endpoint_id();
         self.endpoints.insert(id, Arc::new(socket));
+        debug!(?id, %local_addr, "media endpoint allocated");
         Ok(Endpoint { id, local_addr })
     }
 
+    #[instrument(skip(self), fields(?a, ?b, %peer_a, %peer_b))]
     async fn bridge(
         &self,
         a: EndpointId,
