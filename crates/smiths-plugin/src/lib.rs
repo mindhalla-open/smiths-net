@@ -14,6 +14,7 @@
 //! live in `smiths-core::ai`; this crate just implements the traits
 //! and owns the host-tier sub-crates.
 
+pub mod dispatcher;
 pub mod error;
 pub mod loader;
 pub mod manifest;
@@ -32,6 +33,7 @@ pub use smiths_core::ai::{
     ProviderError, ValidationError, validate_controls,
 };
 
+pub use dispatcher::{Dispatcher, Hook, HookReport, MemoryDispatcher};
 pub use error::Error;
 pub use loader::{LoadReport, load_plugins};
 pub use manifest::{Manifest, PluginType};

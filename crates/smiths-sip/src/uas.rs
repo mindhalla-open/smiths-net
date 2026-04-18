@@ -374,14 +374,14 @@ impl<T: Transport> UasServer<T> {
             match self.negotiator.negotiate_audio(
                 body,
                 effective_local_ip,
-                endpoint.local_addr.port(),
+                endpoint.local_addr().port(),
             ) {
                 NegotiationOutcome::Accepted {
                     answer_body,
                     remote_media,
                 } => (Some(endpoint), Some(answer_body), remote_media),
                 NegotiationOutcome::Mismatch => {
-                    self.media_fabric.release_endpoint(endpoint.id).await;
+                    self.media_fabric.release_endpoint(endpoint.id()).await;
                     info!(%peer, "SDP offer had no acceptable codec; 488");
                     self.respond(
                         req,
@@ -396,7 +396,7 @@ impl<T: Transport> UasServer<T> {
                     return;
                 }
                 NegotiationOutcome::Malformed(err) => {
-                    self.media_fabric.release_endpoint(endpoint.id).await;
+                    self.media_fabric.release_endpoint(endpoint.id()).await;
                     warn!(%peer, %err, "malformed SDP offer");
                     self.respond(req, 400, "Bad Request", Some(&next_tag()), &[], &[], peer)
                         .await;
@@ -419,7 +419,7 @@ impl<T: Transport> UasServer<T> {
             if let Some((_, pending)) = self.pending_bridges.remove(key) {
                 match self
                     .media_fabric
-                    .bridge(pending.endpoint, pending.remote_media, ep.id, remote_rtp)
+                    .bridge(pending.endpoint, pending.remote_media, ep.id(), remote_rtp)
                     .await
                 {
                     Ok(bid) => {
@@ -434,7 +434,7 @@ impl<T: Transport> UasServer<T> {
                     key.clone(),
                     PendingLeg {
                         dialog_key: dialog_key.clone(),
-                        endpoint: ep.id,
+                        endpoint: ep.id(),
                         remote_media: remote_rtp,
                     },
                 );
@@ -449,7 +449,7 @@ impl<T: Transport> UasServer<T> {
             state: DialogState::Early,
             peer_signal: peer,
             rendezvous,
-            media: endpoint.as_ref().map(|ep| ep.id),
+            media: endpoint.as_ref().map(|ep| ep.id()),
             remote_media,
         };
         self.dialogs.insert(dialog_key, record);

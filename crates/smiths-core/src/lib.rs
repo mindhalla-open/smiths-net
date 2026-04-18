@@ -27,6 +27,9 @@ pub use config::{
 };
 pub use error::Error;
 pub use event::{Event, SipEvent, SystemEvent};
-pub use media::{BridgeId, Endpoint, EndpointId, MediaError, MediaFabric};
+pub use media::{
+    BridgeId, Endpoint, EndpointId, EndpointKind, MediaEndpoint, MediaError, MediaFabric,
+    MediaSession,
+};
 pub use sdp::{NegotiationOutcome, SdpNegotiator};
 pub use shutdown::Shutdown;

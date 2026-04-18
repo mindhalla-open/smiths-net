@@ -7,8 +7,16 @@ license      = { workspace = true }
 description  = "WASM plugin host: wasmtime engine, guest ABI, host functions."
 
 [dependencies]
-smiths-core  = { workspace = true }
+smiths-core = { workspace = true }
 smiths-proto = { workspace = true }
+wasmtime    = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+wat   = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 
 [lints]
 workspace = true
