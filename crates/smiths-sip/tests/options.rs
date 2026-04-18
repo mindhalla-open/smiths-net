@@ -33,7 +33,7 @@ async fn spawn_uas() -> SocketAddr {
     let cancel = CancellationToken::new();
     let (tx, rx) = mpsc::channel(64);
     transport.spawn_reader(tx, cancel.clone());
-    let server = UasServer::new(Arc::clone(&transport), bus);
+    let server = UasServer::new(Arc::clone(&transport), bus).unwrap();
     tokio::spawn(server.run(rx, cancel));
     local
 }

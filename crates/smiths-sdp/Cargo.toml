@@ -8,6 +8,7 @@ description  = "SDP parse/generate and offer/answer negotiation."
 
 [dependencies]
 smiths-core = { workspace = true }
+thiserror   = { workspace = true }
 
 [lints]
 workspace = true

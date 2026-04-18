@@ -125,7 +125,8 @@ async fn spawn_sip_udp(
     let (tx, rx) = mpsc::channel(1024);
     let reader = transport.spawn_reader(tx, cancel.clone());
 
-    let server = UasServer::new(Arc::clone(&transport), bus);
+    let server = UasServer::new(Arc::clone(&transport), bus)
+        .with_context(|| format!("building UAS on {local}"))?;
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP UDP listening");
     Ok(vec![reader, server_handle])

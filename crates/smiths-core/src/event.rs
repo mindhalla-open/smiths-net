@@ -64,4 +64,14 @@ pub enum SipEvent {
         /// Human-readable reason.
         reason: String,
     },
+    /// A new dialog has been created (after a 2xx to `INVITE`).
+    DialogCreated {
+        /// `Call-ID` header value.
+        call_id: String,
+    },
+    /// An existing dialog has been terminated (after `BYE`).
+    DialogTerminated {
+        /// `Call-ID` header value.
+        call_id: String,
+    },
 }

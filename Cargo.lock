@@ -1035,6 +1035,7 @@ dependencies = [
  "serde_json",
  "smiths-core",
  "smiths-sip",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1065,6 +1066,9 @@ name = "smiths-media"
 version = "0.1.0"
 dependencies = [
  "smiths-core",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -1084,6 +1088,7 @@ name = "smiths-sdp"
 version = "0.1.0"
 dependencies = [
  "smiths-core",
+ "thiserror",
 ]
 
 [[package]]
@@ -1102,6 +1107,8 @@ dependencies = [
  "dashmap",
  "rsip",
  "smiths-core",
+ "smiths-media",
+ "smiths-sdp",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1113,6 +1120,11 @@ name = "smiths-testkit"
 version = "0.1.0"
 dependencies = [
  "smiths-core",
+ "smiths-sdp",
+ "smiths-sip",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

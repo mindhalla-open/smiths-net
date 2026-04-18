@@ -51,6 +51,9 @@ rsip    = "0.4"
 bytes   = "1"
 dashmap = "6"
 
+# test helpers
+tempfile = "3"
+
 # internal crates
 smiths-core    = { path = "crates/smiths-core" }
 smiths-proto   = { path = "crates/smiths-proto" }
