@@ -7,6 +7,136 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added — Digest auth + REGISTER (Phase 1 catch-up)
+
+- **`smiths-sip::auth::digest`** module — RFC 2617 + RFC 8760
+  primitives: `ha1` / `ha2` / `response_qop_auth` / `response_no_qop`,
+  `Algorithm::{Md5, Sha256}` with `parse` and `hash_hex`, and
+  `parse_authorization` for the `Digest` header dialect (quote-aware).
+  Two RFC 2617 test vectors pinned as regressions.
+- **`Registrar`** — stateful challenge/response engine on top of the
+  existing `CredentialStore`: issues short-lived nonces (5-minute
+  default TTL, configurable), re-challenges on bad response / stale
+  nonce / unknown user with fresh nonce and optional `stale=true`,
+  and uses constant-time equality on the response comparison.
+- **UAS handles `REGISTER`**: no registrar → 200 OK (dev mode).
+  Registrar attached → 401 Unauthorized + `WWW-Authenticate: Digest
+  realm=…, nonce=…, qop="auth", algorithm=MD5` on missing or bad
+  auth, 200 OK on valid auth. `UasServer::with_registrar(reg)`
+  builder.
+- **`RequestSummary`** gained `request_uri` + `authorization` fields;
+  `summarize_request` extracts both.
+- Nine new `auth::digest` unit tests (RFC vectors, parser, MD5/SHA-256
+  round-trips, bad password, unknown user, stale nonce).
+- Three new integration tests in `crates/smiths-sip/tests/register.rs`:
+  `register_challenge_then_authenticate`,
+  `register_wrong_password_re_challenges`,
+  `register_without_registrar_is_accepted_blindly`.
+- Workspace deps gained `md-5` `0.10`, `sha2` `0.10`, `hex` `0.4`.
+
+### Added — Plugin invocation loop (P4 slice 2)
+
+- **`smiths-plugin::controls`**: strict JSON-schema-ish validator with
+  structured `ValidationError { field, reason, hint }`. Supports the
+  subset plugins actually use today — `type`, `minimum`, `maximum`,
+  `enum` — and rejects unknown control keys with a `supported: [...]`
+  hint the agent can self-correct from. Eight unit tests cover the
+  happy and every failure path.
+- **`synthesize` MCP tool** (sixth built-in, served over MCP stdio +
+  A2A HTTP): looks up the plugin, verifies it provides `ai.tts`,
+  checks the voice against the declared list, runs the controls
+  through `validate_controls`, dispatches `synthesize` to the plugin
+  sidecar, returns the plugin's audio payload. Invalid input
+  short-circuits with `-32602 invalid-argument` before ever touching
+  the plugin.
+- **`ai-tts-mock` plugin** grew a real `synthesize` handler: shells
+  out to macOS `say` with a voice-id → macOS-voice map, reads the
+  8 kHz WAV back, and returns `{codec, sample_rate, frames,
+  duration_ms, audio_base64, voice}`. Linux fallback is silent audio
+  so CI still works. Validation (voice, codec, sample_rate) lives on
+  both sides.
+- **`voice_agent.py`** rewired: dropped its local `subprocess say`
+  TTS, gained `McpStdioClient.call_tool(name, args)` with full
+  request/response correlation (multi-threaded pending-queue), and
+  now does `mcp.call_tool("synthesize", ...)` → base64 decode → RTP
+  stream. The agent's code contains **zero** speech-synthesis logic
+  now — it's pure control over MCP.
+
+### Changed
+
+- `ToolRegistry` has 6 built-ins (was 5); `registry_contains_builtins`
+  test updated.
+- `smiths-plugin` re-exports `PluginEntry` so `smiths-mcp` can hold a
+  clone of the sidecar + descriptors inside `SynthesizeTool`.
+
+## [0.5.0] - 2026-04-18
+
+Phase 4 slice 1 — the plugin platform's foundation lands. Two crates
+that were stubs since v0.0.0 (`smiths-sidecar`, `smiths-plugin`)
+become real: subprocess supervisor with JSON-RPC 2.0 over stdio,
+`CapabilityDescriptor` + `AiRegistry`, fail-partial plugin scanner.
+MCP grows two new tools (`list_ai_providers`, `describe_provider`)
+served identically over MCP stdio and A2A HTTP. A reference Python
+plugin (`ai-tts-mock`) exercises the full handshake end-to-end.
+Actual invocation (`speak` / `transcribe` / `llm_chat`) lands next
+slice.
+
+### Added — Plugin platform (P4 slice 1: sidecar handshake)
+
+- **`smiths-sidecar`** promoted from stub to real: subprocess
+  supervisor + JSON-RPC 2.0 over newline-delimited stdio,
+  `tokio::process` under the hood. `Sidecar::spawn()` runs the
+  plugin with its directory as CWD, stderr forwarded to engine
+  tracing with `plugin=<name>`. Request/response correlation by id
+  in a shared pending-queue, per-call timeouts, `kill_on_drop` safety
+  net. Two self-contained tests via a shell-script stub.
+- **`smiths-plugin`** promoted from stub to real:
+  - `Manifest` (TOML, `deny_unknown_fields`) with `name`, `version`,
+    `type = "sidecar"` (wasm/script reserved), `entry`, `provides`,
+    `abi`, `description`. Rejects unsupported ABI majors with a
+    clear error.
+  - `CapabilityDescriptor` — common envelope (`capability`, `plugin`,
+    `model_id`, `abi`, `latency_ms`, `concurrency`) plus an opaque
+    `extra` for capability-specific fields (voices, controls, ...).
+    Validates `ai.*` namespace.
+  - `AiRegistry` — concurrent registry of loaded plugins + their
+    descriptors, keyed by plugin name. `snapshot()`, `capabilities()`,
+    `shutdown_all()` for the lifecycle.
+  - `load_plugins(root, registry)` — fail-partial scanner: walks the
+    plugins directory, spawns each as a sidecar, runs the
+    `describe_capabilities` handshake, sanity-checks descriptors
+    against the manifest's `provides`, registers successes. Missing
+    root dir is **not** an error (operators turn plugins on by
+    creating the directory).
+  - 8 unit/integration tests, including a full shell-script plugin
+    roundtrip.
+- **MCP tools** grown from 3 → 5:
+  - `list_ai_providers` — summary of every loaded plugin with
+    filterable capability list.
+  - `describe_provider` — full capability descriptor(s) for one plugin.
+  - Both obey the standard `Tool` trait, so they're served identically
+    over MCP stdio and A2A HTTP.
+- **`smiths-cli` / `[plugins]` config**:
+  - New `[plugins]` section, default `dir = "plugins"`.
+  - At startup, CLI calls `load_plugins` and logs a summary
+    (`plugins ready loaded=[...]` / per-plugin `plugin load failed`
+    warnings).
+  - `ai_registry.shutdown_all()` drains sidecars during graceful
+    shutdown.
+- **Reference plugin** at `plugins/examples/ai-tts-mock/`:
+  - `plugin.toml` declares `provides = ["ai.tts"]`, abi `1.0`.
+  - `main.py` (pure stdlib) implements `describe_capabilities` /
+    `shutdown` / `ping` per the spec. Returns a realistic `ai.tts`
+    descriptor: three voices (Russian + English), PCM+PCMU output,
+    rate/pitch/volume controls with full JSON-Schema constraints,
+    streaming hints, latency advisories.
+  - Synthesis itself is stubbed — the next slice (P4 + P22) wires
+    `speak` to RTP injection.
+- **`ToolContext`** grew an `AiRegistry` field; `smiths-mcp` now
+  depends on `smiths-plugin` to wire the capability surface.
+- Release binary: 3.1 MB → **3.4 MB** (plugin loader + JSON-RPC
+  supervisor).
+
 ## [0.4.0] - 2026-04-18
 
 Phase 5 slice 2 — MCP grows a real push channel, and the first
@@ -364,7 +494,7 @@ boot-and-shutdown binary. No SIP / media / plugins yet.
 
 - `.gitignore`: added `.DS_Store` to the ignore list.
 
-[Unreleased]: https://github.com/mindhalla/smiths-net/compare/v0.4.0...HEAD
+[0.5.0]: https://github.com/mindhalla/smiths-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mindhalla/smiths-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mindhalla/smiths-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mindhalla/smiths-net/compare/v0.1.0...v0.2.0

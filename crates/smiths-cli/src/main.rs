@@ -83,8 +83,26 @@ async fn main() -> anyhow::Result<()> {
     // Control-plane state is always spawned so MCP/A2A can serve tools
     // with live data. It's cheap and draining is cooperative.
     let (control_state, control_task) = ControlState::spawn(&bus, shutdown.token());
+
+    // Load plugins from the configured directory. Failures are per-
+    // plugin and logged; they don't block startup.
+    let ai_registry = smiths_plugin::AiRegistry::new();
+    match smiths_plugin::load_plugins(&config.plugins.dir, &ai_registry).await {
+        Ok(report) => {
+            if !report.loaded.is_empty() {
+                info!(loaded = ?report.loaded, "plugins ready");
+            }
+            if !report.failed.is_empty() {
+                for (dir, err) in &report.failed {
+                    warn!(%dir, %err, "plugin load failed");
+                }
+            }
+        }
+        Err(e) => warn!(?e, "plugin scan failed"),
+    }
+
     let registry = Arc::new(smiths_mcp::tools::builtin_registry());
-    let tool_ctx = ToolContext::new(control_state);
+    let tool_ctx = ToolContext::new(control_state, ai_registry.clone());
 
     // MCP stdio is now additive: it runs alongside SIP / health / A2A
     // rather than replacing them, so agents can receive push
@@ -196,6 +214,9 @@ async fn main() -> anyhow::Result<()> {
         Err(err) => warn!(?err, "health server task panicked"),
     }
     let _ = control_task.await;
+
+    // Drain plugin sidecars.
+    ai_registry.shutdown_all().await;
 
     let _ = bus.publish(Event::System(SystemEvent::ShutdownComplete));
     info!("graceful shutdown complete");

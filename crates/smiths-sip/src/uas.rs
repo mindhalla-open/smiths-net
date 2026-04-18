@@ -59,6 +59,10 @@ struct RequestSummary {
     /// User-part of the Request-URI (everything between `sip:` and the
     /// `@` on the request line). Used as a rendezvous key.
     ruri_user: Option<String>,
+    /// Full Request-URI from the request line, used by digest auth.
+    request_uri: Option<String>,
+    /// Raw `Authorization:` header value, if present.
+    authorization: Option<String>,
     /// Normalized `Content-Type` header value, lowercased without
     /// trailing whitespace or parameters.
     content_type: Option<String>,
@@ -104,6 +108,10 @@ pub struct UasServer<T: Transport> {
     /// at the same [`BridgeId`]; the first `BYE` releases it from the
     /// fabric and clears both entries.
     bridges_by_dialog: Arc<DashMap<DialogKey, BridgeId>>,
+    /// Registrar: digest-auths `REGISTER` against a [`CredentialStore`].
+    /// `None` = auth disabled, registrar accepts any REGISTER blindly
+    /// (dev convenience; never do that in prod).
+    registrar: Option<crate::auth::digest::Registrar>,
 }
 
 impl<T: Transport> UasServer<T> {
@@ -131,7 +139,15 @@ impl<T: Transport> UasServer<T> {
             media_bind_ip: local.ip(),
             pending_bridges: Arc::new(DashMap::new()),
             bridges_by_dialog: Arc::new(DashMap::new()),
+            registrar: None,
         })
+    }
+
+    /// Attach a digest registrar — `REGISTER` now requires valid auth.
+    #[must_use]
+    pub fn with_registrar(mut self, registrar: crate::auth::digest::Registrar) -> Self {
+        self.registrar = Some(registrar);
+        self
     }
 
     /// Run the UAS event loop. Exits when `cancel` fires or `rx` closes.
@@ -203,6 +219,7 @@ impl<T: Transport> UasServer<T> {
             "INVITE" => self.handle_invite(&req, peer).await,
             "ACK" => self.handle_ack(&req, peer),
             "BYE" => self.handle_bye(&req, peer).await,
+            "REGISTER" => self.handle_register(&req, peer).await,
             _ => {
                 self.respond(
                     &req,
@@ -221,6 +238,40 @@ impl<T: Transport> UasServer<T> {
     async fn handle_options(&self, req: &RequestSummary, peer: SocketAddr) {
         self.respond(req, 200, "OK", Some(&next_tag()), &[], b"", peer)
             .await;
+    }
+
+    /// `REGISTER` with digest auth. No registrar attached → blindly
+    /// `200 OK` (dev mode). Registrar attached → full challenge-response.
+    async fn handle_register(&self, req: &RequestSummary, peer: SocketAddr) {
+        let Some(reg) = self.registrar.as_ref() else {
+            self.respond(req, 200, "OK", Some(&next_tag()), &[], b"", peer)
+                .await;
+            return;
+        };
+        let ruri = req.request_uri.as_deref().unwrap_or("");
+        match req.authorization.as_deref() {
+            None => {
+                let challenge = reg.challenge(crate::auth::digest::Algorithm::Md5, false);
+                let hdr: [(&str, &str); 1] = [("WWW-Authenticate", &challenge)];
+                self.respond(req, 401, "Unauthorized", Some(&next_tag()), &hdr, b"", peer)
+                    .await;
+            }
+            Some(auth) => match reg.authenticate("REGISTER", ruri, auth) {
+                Ok(user) => {
+                    info!(%user, %peer, "REGISTER authenticated");
+                    self.respond(req, 200, "OK", Some(&next_tag()), &[], b"", peer)
+                        .await;
+                }
+                Err(e) => {
+                    info!(?e, %peer, "REGISTER auth failed; re-challenging");
+                    let stale = matches!(e, crate::auth::digest::AuthError::StaleNonce);
+                    let challenge = reg.challenge(crate::auth::digest::Algorithm::Md5, stale);
+                    let hdr: [(&str, &str); 1] = [("WWW-Authenticate", &challenge)];
+                    self.respond(req, 401, "Unauthorized", Some(&next_tag()), &hdr, b"", peer)
+                        .await;
+                }
+            },
+        }
     }
 
     #[allow(clippy::too_many_lines)] // negotiation + bridge wiring belong together
@@ -519,13 +570,16 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
     let request_line = lines.next().unwrap_or_default();
     let mut tokens = request_line.split_whitespace();
     let method = tokens.next().unwrap_or("").to_ascii_uppercase();
-    let ruri_user = tokens.next().and_then(ruri_user_from);
+    let ruri_raw = tokens.next();
+    let ruri_user = ruri_raw.and_then(ruri_user_from);
+    let request_uri = ruri_raw.map(str::to_owned);
 
     let mut branch = None;
     let mut call_id = None;
     let mut from_tag = None;
     let mut to_tag = None;
     let mut content_type: Option<String> = None;
+    let mut authorization: Option<String> = None;
 
     for line in lines {
         if line.is_empty() {
@@ -560,6 +614,11 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
             if !media_type.is_empty() {
                 content_type = Some(media_type);
             }
+        } else if authorization.is_none() && lower.starts_with("authorization:") {
+            let v = line.split_once(':').map_or("", |(_, v)| v).trim();
+            if !v.is_empty() {
+                authorization = Some(v.to_owned());
+            }
         }
     }
 
@@ -570,6 +629,8 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
         from_tag,
         to_tag,
         ruri_user,
+        request_uri,
+        authorization,
         content_type,
         body: (!body.is_empty()).then(|| body.to_owned()),
         raw: raw.clone(),

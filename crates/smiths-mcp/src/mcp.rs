@@ -284,7 +284,10 @@ mod tests {
         let bus = EventBus::new(8);
         let cancel = CancellationToken::new();
         let (state, _task) = ControlState::spawn(&bus, cancel.clone());
-        (ToolContext::new(state), cancel)
+        (
+            ToolContext::new(state, smiths_plugin::AiRegistry::new()),
+            cancel,
+        )
     }
 
     #[tokio::test(flavor = "multi_thread")]

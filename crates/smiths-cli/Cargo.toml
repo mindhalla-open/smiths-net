@@ -16,6 +16,7 @@ smiths-sip         = { workspace = true }
 smiths-sdp         = { workspace = true }
 smiths-media       = { workspace = true }
 smiths-mcp         = { workspace = true }
+smiths-plugin      = { workspace = true }
 tokio              = { workspace = true }
 tokio-util         = { workspace = true }
 axum               = { workspace = true }

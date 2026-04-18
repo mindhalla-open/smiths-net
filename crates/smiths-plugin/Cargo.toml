@@ -4,11 +4,22 @@ edition      = { workspace = true }
 rust-version = { workspace = true }
 version      = { workspace = true }
 license      = { workspace = true }
-description  = "Plugin manifest, registry, and hook dispatcher (tier-agnostic)."
+description  = "Plugin manifest, loader, capability registry."
 
 [dependencies]
-smiths-core  = { workspace = true }
-smiths-proto = { workspace = true }
+smiths-core    = { workspace = true }
+smiths-sidecar = { workspace = true }
+tokio          = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+toml           = "0.8"
+tracing        = { workspace = true }
+thiserror      = { workspace = true }
+dashmap        = { workspace = true }
+
+[dev-dependencies]
+tokio    = { workspace = true, features = ["macros", "test-util"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

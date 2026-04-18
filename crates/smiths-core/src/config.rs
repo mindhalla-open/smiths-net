@@ -31,6 +31,8 @@ pub struct Config {
     pub mcp: McpConfig,
     /// A2A HTTP adapter.
     pub a2a: A2aConfig,
+    /// Plugin loader settings.
+    pub plugins: PluginsConfig,
 }
 
 /// Core runtime tuning.
@@ -243,6 +245,23 @@ impl Default for A2aConfig {
         Self {
             enabled: false,
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7879),
+        }
+    }
+}
+
+/// Plugin loader settings.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PluginsConfig {
+    /// Directory the loader scans at startup. Each subdirectory is one
+    /// plugin. Missing directory → no plugins loaded, no error.
+    pub dir: std::path::PathBuf,
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            dir: std::path::PathBuf::from("plugins"),
         }
     }
 }

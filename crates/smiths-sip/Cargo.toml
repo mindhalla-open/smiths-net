@@ -13,6 +13,9 @@ tokio-util  = { workspace = true }
 bytes       = { workspace = true }
 rsip        = { workspace = true }
 dashmap     = { workspace = true }
+md-5        = { workspace = true }
+sha2        = { workspace = true }
+hex         = { workspace = true }
 tracing     = { workspace = true }
 thiserror   = { workspace = true }
 

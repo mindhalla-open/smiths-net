@@ -51,23 +51,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
 
-from smiths_client import (
-    SipUAC,
-    generate_sine_pcm16,
-    pcm16_to_pcmu,
-    read_wav_mono_pcm16_8k,
-    write_wav_mono_pcm16_8k,
-)
-from smiths_client import RtpPacket  # noqa: F401 — documented re-export
+from smiths_client import SipUAC, pcm16_to_pcmu
 
 RENDEZVOUS = "voicebot"
 AGENT_REPLY_TEXT = "Алло, Алиса слушает вас"
@@ -95,17 +85,48 @@ class McpStdioClient(threading.Thread):
         self._next_id = 0
         self._ready = threading.Event()
         self._stop = threading.Event()
+        # Correlation for synchronous `call_tool`: id → Event + slot.
+        self._pending: dict[int, tuple[threading.Event, list]] = {}
+        self._pending_lock = threading.Lock()
+        self._send_lock = threading.Lock()
 
-    def _send(self, method: str, params=None, *, notify: bool = False) -> None:
+    def _send(self, method: str, params=None, *, notify: bool = False) -> int | None:
+        """Send a JSON-RPC frame. Returns the assigned id (or None for notifications)."""
         assert self.proc is not None and self.proc.stdin is not None
-        frame: dict = {"jsonrpc": "2.0", "method": method}
-        if params is not None:
-            frame["params"] = params
-        if not notify:
-            self._next_id += 1
-            frame["id"] = self._next_id
-        self.proc.stdin.write((json.dumps(frame) + "\n").encode())
-        self.proc.stdin.flush()
+        with self._send_lock:
+            frame: dict = {"jsonrpc": "2.0", "method": method}
+            if params is not None:
+                frame["params"] = params
+            id_: int | None = None
+            if not notify:
+                self._next_id += 1
+                id_ = self._next_id
+                frame["id"] = id_
+            self.proc.stdin.write((json.dumps(frame) + "\n").encode())
+            self.proc.stdin.flush()
+            return id_
+
+    def call_tool(self, name: str, arguments: dict | None = None, *, timeout: float = 30.0) -> dict:
+        """Synchronously invoke an MCP tool and return its result."""
+        event = threading.Event()
+        slot: list = []
+        params = {"name": name, "arguments": arguments or {}}
+        with self._pending_lock:
+            id_ = self._send("tools/call", params)
+            if id_ is None:
+                raise RuntimeError("call_tool got no id")
+            self._pending[id_] = (event, slot)
+        if not event.wait(timeout):
+            with self._pending_lock:
+                self._pending.pop(id_, None)
+            raise TimeoutError(f"MCP call_tool({name}) timed out after {timeout} s")
+        frame = slot[0]
+        if "error" in frame:
+            err = frame["error"]
+            raise RuntimeError(
+                f"MCP error {err.get('code')}: {err.get('message')}"
+            )
+        return frame.get("result", {})
 
     def run(self) -> None:
         cmd = [str(self.binary), "--config", str(self.config), "--mcp", "stdio"]
@@ -135,14 +156,29 @@ class McpStdioClient(threading.Thread):
                 frame = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if "id" in frame and frame.get("id") == 1:
-                # initialize response
-                self._send("notifications/initialized", {}, notify=True)
-                self._ready.set()
+            # Route responses with an id to waiting callers; everything
+            # else either is our `initialize` response or a notification.
+            if "id" in frame:
+                rid = frame.get("id")
+                if rid == 1:
+                    self._send("notifications/initialized", {}, notify=True)
+                    self._ready.set()
+                    continue
+                with self._pending_lock:
+                    slot = self._pending.pop(rid, None)
+                if slot is not None:
+                    event, bucket = slot
+                    bucket.append(frame)
+                    event.set()
                 continue
             if "method" in frame and frame["method"].startswith("notifications/"):
                 self.on_notification(frame["method"], frame.get("params") or {})
         # stdout closed → engine exited.
+        # Wake up anybody still waiting so they don't hang forever.
+        with self._pending_lock:
+            for _id, (event, _) in self._pending.items():
+                event.set()
+            self._pending.clear()
 
     def wait_ready(self, timeout: float = 5.0) -> bool:
         return self._ready.wait(timeout)
@@ -182,33 +218,33 @@ def stub_llm(transcript: str) -> str:
     return AGENT_REPLY_TEXT
 
 
-def tts_to_pcm16(text: str, out_path: Path) -> bytes:
-    """Synthesize `text` as mono 16-bit PCM @ 8 kHz.
+def mcp_synthesize(mcp: "McpStdioClient", text: str, voice: str = "irina") -> bytes:
+    """Render `text` via the engine's `synthesize` MCP tool.
 
-    Real engine-side TTS lands as a plugin (P22). Here we shell out to
-    macOS `say`, or fall back to a noticeable beep so the demo still
-    produces audio on Linux.
+    Real engine-side TTS now flows through a loaded `ai.tts` plugin
+    (see `plugins/examples/ai-tts-mock/`). Agent owns no TTS code; it
+    just asks the engine which hands off to the plugin sidecar.
+    Returns raw PCM16 LE @ 8 kHz bytes.
     """
-    if shutil.which("say"):
-        voice = os.environ.get("SMITHS_TTS_VOICE", "Milena")  # Russian macOS voice
-        subprocess.run(
-            [
-                "say",
-                "-v",
-                voice,
-                "--file-format=WAVE",
-                "--data-format=LEI16@8000",
-                "-o",
-                str(out_path),
-                text,
-            ],
-            check=True,
-        )
-        return read_wav_mono_pcm16_8k(str(out_path))
-    # Fallback: 2 s of 600 Hz sine so there's at least *something* audible.
-    pcm = generate_sine_pcm16(600.0, 2.0, amplitude=10000)
-    write_wav_mono_pcm16_8k(str(out_path), pcm)
-    return pcm
+    result = mcp.call_tool(
+        "synthesize",
+        {
+            "plugin": "ai-tts-mock",
+            "text": text,
+            "voice": voice,
+            "output": {"codec": "pcm_s16le", "sample_rate": 8000},
+        },
+        timeout=15.0,
+    )
+    payload = result.get("structuredContent") or {}
+    if result.get("isError") or not payload:
+        raise RuntimeError(f"synthesize failed: {result}")
+    b64 = payload.get("audio_base64")
+    if not b64:
+        raise RuntimeError(f"synthesize returned no audio_base64: {payload}")
+    import base64
+
+    return base64.b64decode(b64)
 
 
 # ---------------------------------------------------------------------------
@@ -262,20 +298,20 @@ def run_agent(engine_sip: tuple[str, int], mcp: McpStdioClient) -> None:
     reply_text = stub_llm(transcript)
     print(f"[agent] LLM → {reply_text!r}")
 
-    # -------- TTS (real, via `say`) --------
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
-        wav_path = Path(fh.name)
+    # -------- TTS (real, via the engine's `ai-tts-mock` plugin) --------
     try:
-        reply_pcm = tts_to_pcm16(reply_text, wav_path)
-        print(
-            f"[agent] TTS: {len(reply_pcm) // 2} samples "
-            f"({len(reply_pcm) / 16000:.2f} s) -> streaming RTP"
-        )
-        # Small settle so the caller's recorder is armed.
-        time.sleep(0.2)
-        uac.stream_pcmu(pcm16_to_pcmu(reply_pcm))
-    finally:
-        wav_path.unlink(missing_ok=True)
+        reply_pcm = mcp_synthesize(mcp, reply_text, voice="irina")
+    except Exception as e:
+        print(f"[agent] TTS via MCP failed: {e}")
+        uac.close()
+        return
+    print(
+        f"[agent] TTS: {len(reply_pcm) // 2} samples "
+        f"({len(reply_pcm) / 16000:.2f} s) -> streaming RTP"
+    )
+    # Small settle so the caller's recorder is armed.
+    time.sleep(0.2)
+    uac.stream_pcmu(pcm16_to_pcmu(reply_pcm))
 
     # Let the BYE initiate from the caller's side (simpler flow).
     # The MCP notification will tell us when the dialog ends.

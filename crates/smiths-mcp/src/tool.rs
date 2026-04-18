@@ -14,6 +14,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
 
+use smiths_plugin::AiRegistry;
+
 use crate::control::ControlState;
 
 /// Context passed to every tool invocation.
@@ -21,13 +23,17 @@ use crate::control::ControlState;
 pub struct ToolContext {
     /// Live engine state, updated by the event-bus subscription.
     pub state: ControlState,
+    /// Loaded AI plugins. Empty registry when no plugins dir is
+    /// configured or when every plugin failed to load — tools that
+    /// depend on it should return a clean error in that case.
+    pub plugins: AiRegistry,
 }
 
 impl ToolContext {
-    /// Build a context from a [`ControlState`] handle.
+    /// Build a context from its components.
     #[must_use]
-    pub const fn new(state: ControlState) -> Self {
-        Self { state }
+    pub const fn new(state: ControlState, plugins: AiRegistry) -> Self {
+        Self { state, plugins }
     }
 }
 

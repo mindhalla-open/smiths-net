@@ -157,6 +157,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-buffer"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "bstr"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -247,6 +256,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
+name = "crypto-common"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
+dependencies = [
+ "generic-array",
+ "typenum",
+]
+
+[[package]]
 name = "darling"
 version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -302,6 +321,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3dd60d1080a57a05ab032377049e0591415d2b31afd7028356dbf3cc6dcb066"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "digest"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+dependencies = [
+ "block-buffer 0.10.4",
+ "crypto-common",
 ]
 
 [[package]]
@@ -407,9 +436,9 @@ dependencies = [
 
 [[package]]
 name = "generic-array"
-version = "0.14.9"
+version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bb6743198531e02858aeaea5398fcc883e71851fcbcb5a2f773e2fb6cb1edf2"
+checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
@@ -465,6 +494,12 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "http"
@@ -648,9 +683,19 @@ version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b5a279bb9607f9f53c22d496eade00d138d1bdcccd07d74650387cf94942a15"
 dependencies = [
- "block-buffer",
- "digest",
+ "block-buffer 0.9.0",
+ "digest 0.9.0",
  "opaque-debug",
+]
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -864,10 +909,10 @@ checksum = "b1690d2cc1b13c9ff67f48f59bd2b0bb9bb57e157b5cce2d0b27ccf8e11964c3"
 dependencies = [
  "bstr",
  "bytes",
- "md-5",
+ "md-5 0.9.1",
  "nom",
  "rsip-derives",
- "sha2",
+ "sha2 0.9.9",
  "uuid",
 ]
 
@@ -977,11 +1022,22 @@ version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d58a1e1bf39749807d89cf2d98ac2dfa0ff1cb3faa38fbb64dd88ac8013d800"
 dependencies = [
- "block-buffer",
+ "block-buffer 0.9.0",
  "cfg-if",
  "cpufeatures",
- "digest",
+ "digest 0.9.0",
  "opaque-debug",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -1017,7 +1073,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smiths-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1026,6 +1082,7 @@ dependencies = [
  "smiths-core",
  "smiths-mcp",
  "smiths-media",
+ "smiths-plugin",
  "smiths-sdp",
  "smiths-sip",
  "tempfile",
@@ -1037,7 +1094,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "figment",
@@ -1050,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-mcp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1058,6 +1115,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smiths-core",
+ "smiths-plugin",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -1066,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-media"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -1078,19 +1136,27 @@ dependencies = [
 
 [[package]]
 name = "smiths-plugin"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
+ "dashmap",
+ "serde",
+ "serde_json",
  "smiths-core",
- "smiths-proto",
+ "smiths-sidecar",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
 name = "smiths-proto"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "smiths-sdp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "smiths-core",
  "thiserror",
@@ -1098,19 +1164,28 @@ dependencies = [
 
 [[package]]
 name = "smiths-sidecar"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "smiths-core",
- "smiths-proto",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
 name = "smiths-sip"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "dashmap",
+ "hex",
+ "md-5 0.10.6",
  "rsip",
+ "sha2 0.10.9",
  "smiths-core",
  "smiths-media",
  "smiths-sdp",
@@ -1122,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-testkit"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "smiths-core",
  "smiths-media",
@@ -1135,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-wasm"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "smiths-core",
  "smiths-proto",

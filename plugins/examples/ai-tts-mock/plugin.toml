@@ -1,0 +1,7 @@
+name        = "ai-tts-mock"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["ai.tts"]
+abi         = "1.0"
+description = "Reference TTS plugin: advertises a realistic `ai.tts` descriptor, synthesis stubbed for now."
