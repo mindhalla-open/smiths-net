@@ -1,0 +1,31 @@
+# Default smiths-net configuration. Everything is optional; the defaults
+# below match what the engine uses when no config file is provided.
+#
+# Environment overrides use the prefix `SMITHS__` and `__` as section
+# separator, e.g. `SMITHS__OBSERVABILITY__LOG_LEVEL=debug`.
+
+[core]
+# 0 = auto-detect (num_cpus). Set to a positive integer to pin.
+worker_threads = 0
+
+[observability]
+# "trace" | "debug" | "info" | "warn" | "error"  (or any tracing-env-filter directive)
+log_level = "info"
+
+# "json" (production) | "pretty" (local dev)
+log_format = "json"
+
+# HTTP bind for the /health endpoint.
+health_bind = "127.0.0.1:8080"
+
+[sip]
+# Socket addresses to bind for SIP. 0.0.0.0 = all interfaces.
+bind = ["0.0.0.0:5060"]
+
+# Enabled transports. Only "udp" is wired in Phase 1; "tcp" and "tls"
+# land in Phase 6.
+transports = ["udp"]
+
+# Grace period (seconds) to finish in-flight transactions on shutdown.
+drain_timeout_secs = 10
+

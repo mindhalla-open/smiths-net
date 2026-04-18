@@ -1,0 +1,14 @@
+[package]
+name         = "smiths-plugin"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+license      = { workspace = true }
+description  = "Plugin manifest, registry, and hook dispatcher (tier-agnostic)."
+
+[dependencies]
+smiths-core  = { workspace = true }
+smiths-proto = { workspace = true }
+
+[lints]
+workspace = true

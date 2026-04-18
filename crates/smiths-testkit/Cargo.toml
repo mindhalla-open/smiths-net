@@ -1,0 +1,22 @@
+[package]
+name         = "smiths-testkit"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+license      = { workspace = true }
+description  = "Integration-test helpers: fake UAC/UAS, RTP, μ-law, minimal WAV, signal generators."
+
+[dependencies]
+smiths-core = { workspace = true }
+smiths-sdp  = { workspace = true }
+tokio       = { workspace = true }
+tokio-util  = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+smiths-sip   = { workspace = true }
+smiths-media = { workspace = true }
+tokio        = { workspace = true, features = ["macros", "test-util"] }
+
+[lints]
+workspace = true
