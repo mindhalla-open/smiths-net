@@ -6,11 +6,12 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use axum::{Json, Router, routing::get};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use smiths_core::{
     Config, Event, EventBus, LogFormat, MediaFabric, SdpNegotiator, Shutdown, SipTransport,
     SystemEvent,
 };
+use smiths_mcp::{ControlState, ToolContext};
 use smiths_media::UdpMediaFabric;
 use smiths_sdp::Negotiator;
 use smiths_sip::{Transport as _, UasServer, UdpTransport};
@@ -20,6 +21,15 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+/// Which transport to run MCP on.
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+enum McpMode {
+    /// Run MCP over stdio and exit when stdin closes. No other
+    /// subsystems start — this is the mode LLM clients use when they
+    /// spawn the engine as a child process.
+    Stdio,
+}
 
 /// CLI flags.
 #[derive(Debug, Parser)]
@@ -36,20 +46,29 @@ struct Cli {
     /// Override `observability.log_level` (`RUST_LOG` still takes precedence).
     #[arg(long, env = "SMITHS_LOG")]
     log: Option<String>,
+
+    /// Run only the MCP server on the chosen transport. Suppresses SIP
+    /// bind-up and the HTTP health endpoint so the process behaves as a
+    /// clean MCP server for an LLM host.
+    #[arg(long, value_enum)]
+    mcp: Option<McpMode>,
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // wiring of all subsystems belongs in one place
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let config = Config::load(&cli.config)
         .with_context(|| format!("loading config from {}", cli.config.display()))?;
 
+    // stdio MCP must not pollute stdout with logs or framing garbage.
+    // Route everything to stderr and shut off pretty/JSON frames.
     let level = cli
         .log
         .as_deref()
         .unwrap_or(&config.observability.log_level);
-    init_tracing(level, config.observability.log_format)?;
+    init_tracing(level, config.observability.log_format, cli.mcp.is_some())?;
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -59,6 +78,32 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown = Shutdown::new();
     let bus = EventBus::new(1024);
+
+    // Control-plane state is always spawned so MCP/A2A can serve tools
+    // with live data. It's cheap and draining is cooperative.
+    let (control_state, control_task) = ControlState::spawn(&bus, shutdown.token());
+    let registry = Arc::new(smiths_mcp::tools::builtin_registry());
+    let tool_ctx = ToolContext::new(control_state);
+
+    // Stdio MCP takes over the process — no SIP, no health HTTP.
+    if cli.mcp == Some(McpMode::Stdio) {
+        info!("entering MCP stdio mode (no SIP, no health HTTP)");
+        let stdio_cancel = shutdown.token();
+        let mcp_task = tokio::spawn(async move {
+            if let Err(e) = smiths_mcp::mcp::run_stdio(registry, tool_ctx, stdio_cancel).await {
+                warn!(?e, "MCP stdio server error");
+            }
+        });
+        // Either SIGTERM or stdin-EOF ends the process.
+        tokio::select! {
+            r = shutdown.wait_for_signal() => r.context("installing signal handlers")?,
+            _ = mcp_task => {}
+        }
+        shutdown.trigger();
+        let _ = control_task.await;
+        info!("graceful shutdown complete");
+        return Ok(());
+    }
 
     // ---- health HTTP endpoint ----
     let health = tokio::spawn(serve_health(
@@ -95,14 +140,28 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // ---- A2A HTTP adapter (optional) ----
+    let mut adapter_handles: Vec<JoinHandle<()>> = Vec::new();
+    if config.a2a.enabled {
+        let bind = config.a2a.bind;
+        let reg = Arc::clone(&registry);
+        let ctx = tool_ctx.clone();
+        let cancel = shutdown.token();
+        adapter_handles.push(tokio::spawn(async move {
+            if let Err(e) = smiths_mcp::a2a::serve_http(bind, reg, ctx, cancel).await {
+                warn!(%bind, ?e, "A2A HTTP server error");
+            }
+        }));
+    }
+
     if let Err(err) = bus.publish(Event::System(SystemEvent::Ready)) {
-        // Expected if nothing subscribed yet (Phase 0 remnant).
         warn!(?err, "no bus subscribers at startup");
     }
     info!(
         health_bind = %config.observability.health_bind,
         sip_binds = ?config.sip.bind,
         sip_transports = ?config.sip.transports,
+        a2a_enabled = config.a2a.enabled,
         "smiths-net ready"
     );
 
@@ -118,11 +177,17 @@ async fn main() -> anyhow::Result<()> {
             warn!(?err, "SIP task panicked during shutdown");
         }
     }
+    for h in adapter_handles {
+        if let Err(err) = h.await {
+            warn!(?err, "control adapter task panicked during shutdown");
+        }
+    }
     match health.await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => warn!(?err, "health server returned error on shutdown"),
         Err(err) => warn!(?err, "health server task panicked"),
     }
+    let _ = control_task.await;
 
     let _ = bus.publish(Event::System(SystemEvent::ShutdownComplete));
     info!("graceful shutdown complete");
@@ -155,13 +220,21 @@ async fn spawn_sip_udp(
     Ok(vec![reader, server_handle])
 }
 
-fn init_tracing(level: &str, format: LogFormat) -> anyhow::Result<()> {
+fn init_tracing(level: &str, format: LogFormat, mcp_stdio: bool) -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(level))
         .or_else(|_| EnvFilter::try_new("info"))
         .context("constructing tracing EnvFilter")?;
 
     let registry = tracing_subscriber::registry().with(filter);
+    // In MCP stdio mode, stdout is the JSON-RPC wire; divert logs to
+    // stderr regardless of the configured format.
+    if mcp_stdio {
+        registry
+            .with(fmt::layer().with_writer(std::io::stderr))
+            .init();
+        return Ok(());
+    }
     match format {
         LogFormat::Json => registry.with(fmt::layer().json()).init(),
         LogFormat::Pretty => registry.with(fmt::layer()).init(),

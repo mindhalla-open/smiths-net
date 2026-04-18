@@ -27,6 +27,10 @@ pub struct Config {
     pub observability: ObservabilityConfig,
     /// SIP signaling configuration.
     pub sip: SipConfig,
+    /// MCP control-plane server.
+    pub mcp: McpConfig,
+    /// A2A HTTP adapter.
+    pub a2a: A2aConfig,
 }
 
 /// Core runtime tuning.
@@ -198,6 +202,49 @@ pub enum SipTransport {
     Tcp,
     /// RFC 5630 SIP over TLS. Not yet wired in Phase 1.
     Tls,
+}
+
+/// MCP (Model Context Protocol) server settings.
+///
+/// `enabled_http` is off by default because the stdio variant is the
+/// canonical MCP entry point for LLM agents spawning the engine as a
+/// subprocess. HTTP is useful for long-running daemons.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpConfig {
+    /// Serve MCP over HTTP JSON-RPC when `true`. stdio is always
+    /// available via the `--mcp` CLI flag regardless of this setting.
+    pub enabled_http: bool,
+    /// HTTP bind for MCP.
+    pub http_bind: SocketAddr,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled_http: false,
+            http_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7878),
+        }
+    }
+}
+
+/// A2A (agent-to-agent) HTTP adapter settings.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct A2aConfig {
+    /// Serve the A2A HTTP API when `true`.
+    pub enabled: bool,
+    /// HTTP bind for A2A.
+    pub bind: SocketAddr,
+}
+
+impl Default for A2aConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7879),
+        }
+    }
 }
 
 /// Format for `tracing-subscriber` output.

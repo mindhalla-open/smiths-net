@@ -17,8 +17,8 @@ pub mod shutdown;
 pub use bus::EventBus;
 pub use call::{DialogKey, DialogRecord, DialogState};
 pub use config::{
-    BindSpec, BindSpecError, Config, CoreConfig, LogFormat, ObservabilityConfig, SipConfig,
-    SipTransport,
+    A2aConfig, BindSpec, BindSpecError, Config, CoreConfig, LogFormat, McpConfig,
+    ObservabilityConfig, SipConfig, SipTransport,
 };
 pub use error::Error;
 pub use event::{Event, SipEvent, SystemEvent};

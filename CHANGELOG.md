@@ -5,6 +5,59 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.3.0] - 2026-04-18
+
+Phase 5 first slice — real control plane. The engine grows a typed
+`Tool` abstraction served by two protocol adapters (MCP stdio + A2A
+HTTP) over the same registry. A live event-bus subscriber feeds tools
+a current view of dialogs. Two new Python demos drive both adapters
+with pure stdlib.
+
+### Added — Control plane: MCP + A2A
+
+- `smiths-mcp` crate promoted from stub to real implementation.
+  - **`Tool` trait + `ToolRegistry`**: adapter-agnostic operations.
+    Both MCP and A2A register the same tool set.
+  - **`ControlState`**: subscribes to the SIP event bus and maintains a
+    live view of dialogs (live + recently-terminated). Tools read from
+    it; adapters never touch dialog state directly.
+  - **Built-in tools**: `list_calls` (filter by phase), `get_call_status`,
+    `health`. All return structured JSON per a declared JSON Schema.
+  - **MCP stdio adapter** (`mcp` module): JSON-RPC 2.0 over line-
+    delimited stdin/stdout. Implements `initialize`, `initialized` /
+    `notifications/initialized`, `ping`, `tools/list`, `tools/call`,
+    `shutdown`. Protocol version `2024-11-05`. Logs diverted to stderr
+    so stdout stays clean.
+  - **A2A HTTP adapter** (`a2a` module): JSON-RPC 2.0 over HTTP POST
+    `/a2a`, discovery via `/.well-known/agent.json`, plain `/health`.
+    Same tool set as MCP.
+  - **Resource trait**: scaffold for the next pass (resources not yet
+    implemented; tool set is sufficient for this release).
+  - Eleven unit + integration tests covering control-state lifecycle,
+    tools, MCP dispatch, and JSON-RPC error frames.
+- `smiths-core::config` gained `[mcp]` and `[a2a]` sections
+  (`McpConfig { enabled_http, http_bind }`,
+  `A2aConfig { enabled, bind }`).
+- `smiths-cli`:
+  - New `--mcp stdio` flag. When set, the binary runs only the MCP
+    stdio server — no SIP, no health HTTP, logs routed to stderr.
+    Exits on stdin EOF or SIGTERM.
+  - In default mode, spawns a `ControlState` drain task and optionally
+    the A2A HTTP server when `a2a.enabled = true`.
+  - `smiths-ready` log line now includes `a2a_enabled`.
+- Python samples (`examples/python-client/`):
+  - **`mcp_demo.py`** — spawns the engine in `--mcp stdio` mode, walks
+    the full JSON-RPC handshake (`initialize`, tools/list, tools/call).
+    Pure stdlib — no `mcp` SDK dependency.
+  - **`a2a_demo.py`** — `urllib`-only HTTP client: reads the agent
+    card, lists tools, invokes each. Demonstrates that A2A and MCP are
+    the same tool set over a different wire.
+- README updated: explains the two control-plane adapters, includes a
+  ready-to-paste Claude Code MCP config block.
+- Release binary: 2.8 MB → **3.1 MB** (axum HTTP for A2A + MCP plumbing).
+
 ## [0.2.0] - 2026-04-18
 
 Phase 1 slice 2 — full INVITE/ACK/BYE dialog lifecycle with SDP
@@ -267,7 +320,8 @@ boot-and-shutdown binary. No SIP / media / plugins yet.
 
 - `.gitignore`: added `.DS_Store` to the ignore list.
 
-[Unreleased]: https://github.com/mindhalla/smiths-net/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/mindhalla/smiths-net/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/mindhalla/smiths-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mindhalla/smiths-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mindhalla/smiths-net/releases/tag/v0.1.0
 [0.0.0]: https://github.com/mindhalla/smiths-net/releases/tag/v0.0.0

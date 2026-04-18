@@ -4,10 +4,22 @@ edition      = { workspace = true }
 rust-version = { workspace = true }
 version      = { workspace = true }
 license      = { workspace = true }
-description  = "Model Context Protocol server (stdio + HTTP/SSE) for LLM agents."
+description  = "Control plane: Tool/Resource traits plus MCP (stdio) and A2A (HTTP) adapters."
 
 [dependencies]
 smiths-core = { workspace = true }
+tokio       = { workspace = true }
+tokio-util  = { workspace = true }
+async-trait = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+tracing     = { workspace = true }
+thiserror   = { workspace = true }
+axum        = { workspace = true }
+dashmap     = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "test-util"] }
 
 [lints]
 workspace = true
