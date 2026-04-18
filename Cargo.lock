@@ -1034,6 +1034,8 @@ dependencies = [
  "clap",
  "serde_json",
  "smiths-core",
+ "smiths-media",
+ "smiths-sdp",
  "smiths-sip",
  "tempfile",
  "tokio",
@@ -1046,6 +1048,7 @@ dependencies = [
 name = "smiths-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "figment",
  "serde",
  "thiserror",
@@ -1065,6 +1068,8 @@ dependencies = [
 name = "smiths-media"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "dashmap",
  "smiths-core",
  "tokio",
  "tokio-util",
@@ -1120,6 +1125,7 @@ name = "smiths-testkit"
 version = "0.1.0"
 dependencies = [
  "smiths-core",
+ "smiths-media",
  "smiths-sdp",
  "smiths-sip",
  "tokio",

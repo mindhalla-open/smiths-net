@@ -7,7 +7,12 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use axum::{Json, Router, routing::get};
 use clap::Parser;
-use smiths_core::{Config, Event, EventBus, LogFormat, Shutdown, SipTransport, SystemEvent};
+use smiths_core::{
+    Config, Event, EventBus, LogFormat, MediaFabric, SdpNegotiator, Shutdown, SipTransport,
+    SystemEvent,
+};
+use smiths_media::UdpMediaFabric;
+use smiths_sdp::Negotiator;
 use smiths_sip::{Transport as _, UasServer, UdpTransport};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -62,6 +67,11 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // ---- SIP subsystem ----
+    // One shared media fabric across every bind — media endpoints are
+    // handed out by token, not by socket address, so a single fabric
+    // serves all signaling transports.
+    let media_fabric: Arc<dyn MediaFabric> = Arc::new(UdpMediaFabric::new());
+
     let mut sip_handles: Vec<JoinHandle<()>> = Vec::new();
     let udp_enabled = config.sip.transports.contains(&SipTransport::Udp);
     if !udp_enabled {
@@ -71,7 +81,15 @@ async fn main() -> anyhow::Result<()> {
         if !udp_enabled {
             break;
         }
-        match spawn_sip_udp(*bind, bus.clone(), shutdown.token()).await {
+        let addr = bind.socket_addr();
+        match spawn_sip_udp(
+            addr,
+            bus.clone(),
+            shutdown.token(),
+            Arc::clone(&media_fabric),
+        )
+        .await
+        {
             Ok(handles) => sip_handles.extend(handles),
             Err(e) => warn!(%bind, ?e, "failed to start SIP on bind; continuing"),
         }
@@ -115,6 +133,7 @@ async fn spawn_sip_udp(
     bind: SocketAddr,
     bus: EventBus,
     cancel: CancellationToken,
+    media_fabric: Arc<dyn MediaFabric>,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let transport = UdpTransport::bind(bind)
         .await
@@ -125,7 +144,11 @@ async fn spawn_sip_udp(
     let (tx, rx) = mpsc::channel(1024);
     let reader = transport.spawn_reader(tx, cancel.clone());
 
-    let server = UasServer::new(Arc::clone(&transport), bus)
+    // Negotiator is per-bind so it can publish the correct local IP in
+    // `o=` / `c=`. A single-bind deployment has one negotiator; a
+    // multi-bind deployment has one per listener.
+    let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(local.ip()));
+    let server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
         .with_context(|| format!("building UAS on {local}"))?;
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP UDP listening");

@@ -25,11 +25,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use smiths_core::{Event, EventBus, SipEvent};
-use smiths_media::{Bridge, Leg};
-use smiths_sdp::{MediaKind, NegotiationResult, Negotiator, SessionDescription};
-use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, mpsc};
+use smiths_core::{
+    BridgeId, DialogKey, DialogRecord, DialogState, EndpointId, Event, EventBus, MediaFabric,
+    NegotiationOutcome, SdpNegotiator, SipEvent,
+};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
@@ -39,45 +39,14 @@ use crate::transport::{Datagram, Transport};
 /// dedupe.
 const DEDUPE_CAPACITY: usize = 4096;
 
-/// Dialog key: `(Call-ID, local tag, remote tag)`.
-type DialogKey = (String, String, String);
-
-/// Internal dialog record.
-#[derive(Debug)]
-struct Dialog {
-    call_id: String,
-    local_tag: String,
-    state: DialogState,
-    /// UDP socket bound for this dialog's local RTP endpoint. Kept alive
-    /// here so the OS-assigned port stays ours; the bridge (if any)
-    /// clones the `Arc` and drives the socket.
-    #[allow(dead_code)] // referenced via the bridge; field holds ownership
-    media_socket: Option<Arc<UdpSocket>>,
-    /// Rendezvous key this dialog joined, if any.
-    rendezvous: Option<String>,
-}
-
 /// First leg of a pending rendezvous bridge, waiting for a matching
-/// second `INVITE`.
-#[derive(Debug)]
+/// second `INVITE`. Holds only tokens — the socket lives in the
+/// [`MediaFabric`].
+#[derive(Clone, Debug)]
 struct PendingLeg {
     dialog_key: DialogKey,
-    media_socket: Arc<UdpSocket>,
-    remote_rtp: SocketAddr,
-}
-
-/// Handle to a live bridge shared between the two dialogs it connects.
-/// Wrapped in `Mutex<Option<…>>` so whichever side receives `BYE`
-/// first can `take()` it and drive `Bridge::shutdown`.
-type BridgeHandle = Arc<Mutex<Option<Bridge>>>;
-
-/// Dialog lifecycle state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DialogState {
-    /// Response was a 2xx-class — ACK not yet seen.
-    Early,
-    /// ACK received; call is established.
-    Confirmed,
+    endpoint: EndpointId,
+    remote_media: SocketAddr,
 }
 
 /// Parsed request summary.
@@ -101,46 +70,63 @@ struct RequestSummary {
 }
 
 /// UAS answering a subset of RFC 3261 requests.
+///
+/// Owns no sockets of its own beyond the SIP signaling transport. All
+/// media-plane resources are borrowed from the injected
+/// [`MediaFabric`]; SDP parsing/negotiation happens entirely through
+/// the injected [`SdpNegotiator`]. That split is what lets this crate
+/// depend on `smiths-core` only — no cross-sibling deps on
+/// `smiths-media` or `smiths-sdp`.
 pub struct UasServer<T: Transport> {
     transport: Arc<T>,
     bus: EventBus,
     /// `branch` → cached final response bytes.
     dedupe: Arc<DashMap<String, Bytes>>,
-    /// Active + early dialogs keyed by `(Call-ID, local-tag, remote-tag)`.
-    dialogs: Arc<DashMap<DialogKey, Dialog>>,
+    /// Active + early dialog records keyed by
+    /// `(Call-ID, local-tag, remote-tag)`. [`DialogRecord`] is
+    /// serializable — this is the HA snapshot surface.
+    dialogs: Arc<DashMap<DialogKey, DialogRecord>>,
     /// `Contact` header value used in responses that establish or
     /// target a dialog. Preformatted at startup from the local bind.
     contact: String,
-    /// SDP offer/answer engine used on `INVITE`.
-    negotiator: Negotiator,
-    /// IP to bind RTP sockets on when allocating a media port per
-    /// dialog. Mirrors the signaling transport's local IP.
+    /// Media fabric: allocator + bridge factory. All RTP sockets live
+    /// here; the UAS only ever holds [`EndpointId`] / [`BridgeId`].
+    media_fabric: Arc<dyn MediaFabric>,
+    /// SDP offer/answer engine. Opaque behind the trait.
+    negotiator: Arc<dyn SdpNegotiator>,
+    /// IP to bind RTP sockets on. Mirrors the signaling transport's
+    /// local IP.
     media_bind_ip: IpAddr,
     /// First-come leg of a rendezvous bridge, keyed by Request-URI
     /// user-part. The second `INVITE` with the same key pairs with it.
     pending_bridges: Arc<DashMap<String, PendingLeg>>,
-    /// Live bridges keyed by dialog. Both sides of a paired call hold
-    /// `Arc` clones of the same `BridgeHandle` so the first `BYE` can
-    /// tear the bridge down.
-    bridges_by_dialog: Arc<DashMap<DialogKey, BridgeHandle>>,
+    /// Live bridges keyed by dialog. Both sides of a paired call point
+    /// at the same [`BridgeId`]; the first `BYE` releases it from the
+    /// fabric and clears both entries.
+    bridges_by_dialog: Arc<DashMap<DialogKey, BridgeId>>,
 }
 
 impl<T: Transport> UasServer<T> {
     /// Build a new UAS. Reads the transport's local address to compose
-    /// the `Contact` header and seed the SDP negotiator.
-    pub fn new(transport: Arc<T>, bus: EventBus) -> Result<Self, crate::Error> {
+    /// the `Contact` header and derive the media bind IP.
+    pub fn new(
+        transport: Arc<T>,
+        bus: EventBus,
+        media_fabric: Arc<dyn MediaFabric>,
+        negotiator: Arc<dyn SdpNegotiator>,
+    ) -> Result<Self, crate::Error> {
         let local = transport.local_addr()?;
         // A bind of `0.0.0.0` or `[::]` would produce a non-routable
         // Contact — fine for localhost tests; the B2BUA work in later
         // phases will compute this per outbound peer.
         let contact = format!("<sip:smiths@{local}>");
-        let negotiator = Negotiator::with_default_codecs(local.ip());
         Ok(Self {
             transport,
             bus,
             dedupe: Arc::new(DashMap::new()),
             dialogs: Arc::new(DashMap::new()),
             contact,
+            media_fabric,
             negotiator,
             media_bind_ip: local.ip(),
             pending_bridges: Arc::new(DashMap::new()),
@@ -251,28 +237,17 @@ impl<T: Transport> UasServer<T> {
             return;
         }
 
-        // Parse + negotiate SDP when the body is `application/sdp`.
-        let offer_parsed: Option<SessionDescription> =
-            match (req.content_type.as_deref(), req.body.as_deref()) {
-                (Some("application/sdp"), Some(body)) => match SessionDescription::parse(body) {
-                    Ok(o) => Some(o),
-                    Err(e) => {
-                        warn!(%peer, ?e, "malformed SDP offer");
-                        self.respond(req, 400, "Bad Request", Some(&next_tag()), &[], &[], peer)
-                            .await;
-                        return;
-                    }
-                },
-                _ => None,
-            };
+        let has_offer =
+            matches!(req.content_type.as_deref(), Some("application/sdp")) && req.body.is_some();
 
-        // Allocate a local media socket + build an SDP answer whenever
-        // we have an offer.
-        let (media_socket, sdp_answer_body) = if let Some(offer) = offer_parsed.as_ref() {
-            let socket = match self.allocate_media_socket().await {
-                Ok(s) => s,
+        // Allocate a media endpoint first (so we can include its port
+        // in the answer), then negotiate. On any failure the endpoint
+        // is released so the fabric's table doesn't grow unbounded.
+        let (endpoint, sdp_answer_body, remote_media) = if has_offer {
+            let endpoint = match self.media_fabric.allocate(self.media_bind_ip).await {
+                Ok(ep) => ep,
                 Err(e) => {
-                    warn!(?e, "failed to allocate media port for INVITE");
+                    warn!(?e, "failed to allocate media endpoint for INVITE");
                     self.respond(
                         req,
                         500,
@@ -286,10 +261,18 @@ impl<T: Transport> UasServer<T> {
                     return;
                 }
             };
-            let port = socket.local_addr().map(|a| a.port()).unwrap_or_default();
-            match self.negotiator.answer(offer, port) {
-                NegotiationResult::Answer(sdp) => (Some(socket), Some(sdp.to_string())),
-                NegotiationResult::Mismatch => {
+            // Safe unwrap: `has_offer` verified Some(body) above.
+            let body = req.body.as_deref().unwrap_or_default();
+            match self
+                .negotiator
+                .negotiate_audio(body, endpoint.local_addr.port())
+            {
+                NegotiationOutcome::Accepted {
+                    answer_body,
+                    remote_media,
+                } => (Some(endpoint), Some(answer_body), remote_media),
+                NegotiationOutcome::Mismatch => {
+                    self.media_fabric.release_endpoint(endpoint.id).await;
                     info!(%peer, "SDP offer had no acceptable codec; 488");
                     self.respond(
                         req,
@@ -303,60 +286,64 @@ impl<T: Transport> UasServer<T> {
                     .await;
                     return;
                 }
+                NegotiationOutcome::Malformed(err) => {
+                    self.media_fabric.release_endpoint(endpoint.id).await;
+                    warn!(%peer, %err, "malformed SDP offer");
+                    self.respond(req, 400, "Bad Request", Some(&next_tag()), &[], &[], peer)
+                        .await;
+                    return;
+                }
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let local_tag = next_tag();
         let rendezvous = req.ruri_user.clone();
-        let dialog_key: DialogKey = (call_id.clone(), local_tag.clone(), remote_tag);
+        let dialog_key: DialogKey = (call_id.clone(), local_tag.clone(), remote_tag.clone());
 
-        // Try to bridge: need a rendezvous key, a local socket, and
-        // the peer RTP address from the offer.
-        if let (Some(key), Some(local_sock), Some(offer)) = (
-            rendezvous.as_ref(),
-            media_socket.as_ref(),
-            offer_parsed.as_ref(),
-        ) && let Some(remote_rtp) = sdp_remote_rtp(offer)
+        // Rendezvous pairing: need a key, an endpoint, and the peer RTP
+        // address from the offer.
+        if let (Some(key), Some(ep), Some(remote_rtp)) =
+            (rendezvous.as_ref(), endpoint.as_ref(), remote_media)
         {
             if let Some((_, pending)) = self.pending_bridges.remove(key) {
-                let leg_a = Leg {
-                    socket: pending.media_socket,
-                    peer: pending.remote_rtp,
-                };
-                let leg_b = Leg {
-                    socket: Arc::clone(local_sock),
-                    peer: remote_rtp,
-                };
-                let bridge = Bridge::spawn(&leg_a, &leg_b);
-                let handle: BridgeHandle = Arc::new(Mutex::new(Some(bridge)));
-                self.bridges_by_dialog
-                    .insert(pending.dialog_key, Arc::clone(&handle));
-                self.bridges_by_dialog
-                    .insert(dialog_key.clone(), Arc::clone(&handle));
-                info!(rendezvous = %key, "rendezvous bridge established");
+                match self
+                    .media_fabric
+                    .bridge(pending.endpoint, pending.remote_media, ep.id, remote_rtp)
+                    .await
+                {
+                    Ok(bid) => {
+                        self.bridges_by_dialog.insert(pending.dialog_key, bid);
+                        self.bridges_by_dialog.insert(dialog_key.clone(), bid);
+                        info!(rendezvous = %key, "rendezvous bridge established");
+                    }
+                    Err(e) => warn!(?e, rendezvous = %key, "rendezvous bridge failed"),
+                }
             } else {
                 self.pending_bridges.insert(
                     key.clone(),
                     PendingLeg {
                         dialog_key: dialog_key.clone(),
-                        media_socket: Arc::clone(local_sock),
-                        remote_rtp,
+                        endpoint: ep.id,
+                        remote_media: remote_rtp,
                     },
                 );
                 info!(rendezvous = %key, "rendezvous leg parked, awaiting peer");
             }
         }
 
-        let dialog = Dialog {
+        let record = DialogRecord {
             call_id: call_id.clone(),
             local_tag: local_tag.clone(),
+            remote_tag,
             state: DialogState::Early,
-            media_socket,
+            peer_signal: peer,
             rendezvous,
+            media: endpoint.as_ref().map(|ep| ep.id),
+            remote_media,
         };
-        self.dialogs.insert(dialog_key, dialog);
+        self.dialogs.insert(dialog_key, record);
 
         let mut extras: Vec<(&str, &str)> = vec![("Contact", self.contact.as_str())];
         if sdp_answer_body.is_some() {
@@ -377,14 +364,6 @@ impl<T: Transport> UasServer<T> {
         let _ = self
             .bus
             .publish(Event::Sip(SipEvent::DialogCreated { call_id }));
-    }
-
-    /// Bind a fresh UDP socket on an ephemeral port for this dialog.
-    /// Step 3 will use it for RTP forwarding; for now we just hold it.
-    async fn allocate_media_socket(&self) -> std::io::Result<Arc<UdpSocket>> {
-        let bind = SocketAddr::new(self.media_bind_ip, 0);
-        let socket = UdpSocket::bind(bind).await?;
-        Ok(Arc::new(socket))
     }
 
     fn handle_ack(&self, req: &RequestSummary, peer: SocketAddr) {
@@ -410,31 +389,33 @@ impl<T: Transport> UasServer<T> {
         };
 
         match self.dialogs.remove(&key) {
-            Some((_, dialog)) => {
+            Some((_, record)) => {
                 // Drop an unpaired pending leg if this was it.
-                if let Some(rv) = dialog.rendezvous.as_ref() {
-                    if let Some(entry) = self.pending_bridges.get(rv) {
-                        if entry.dialog_key == key {
-                            drop(entry);
-                            self.pending_bridges.remove(rv);
-                        }
+                if let Some(rv) = record.rendezvous.as_ref()
+                    && let Some(entry) = self.pending_bridges.get(rv)
+                {
+                    let same = entry.dialog_key == key;
+                    drop(entry);
+                    if same {
+                        self.pending_bridges.remove(rv);
                     }
                 }
-                // Tear down the live bridge if this dialog is part of one.
-                if let Some((_, handle)) = self.bridges_by_dialog.remove(&key) {
-                    // Remove the sibling's entry too.
-                    self.bridges_by_dialog
-                        .retain(|_, other| !Arc::ptr_eq(other, &handle));
-                    let bridge_opt = handle.lock().await.take();
-                    if let Some(bridge) = bridge_opt {
-                        bridge.shutdown().await;
-                        debug!(call_id = %dialog.call_id, "rendezvous bridge stopped");
-                    }
+                // Tear down the live bridge if this dialog is part of
+                // one. Whichever side BYE-s first wins the race; the
+                // second BYE finds no entry and the fabric release is
+                // idempotent.
+                if let Some((_, bid)) = self.bridges_by_dialog.remove(&key) {
+                    self.bridges_by_dialog.retain(|_, other| *other != bid);
+                    self.media_fabric.release_bridge(bid).await;
+                    debug!(call_id = %record.call_id, "rendezvous bridge stopped");
                 }
-                self.respond(req, 200, "OK", Some(&dialog.local_tag), &[], &[], peer)
+                if let Some(ep) = record.media {
+                    self.media_fabric.release_endpoint(ep).await;
+                }
+                self.respond(req, 200, "OK", Some(&record.local_tag), &[], &[], peer)
                     .await;
                 let _ = self.bus.publish(Event::Sip(SipEvent::DialogTerminated {
-                    call_id: dialog.call_id,
+                    call_id: record.call_id,
                 }));
             }
             None => {
@@ -603,17 +584,6 @@ fn ruri_user_from(request_uri: &str) -> Option<String> {
     } else {
         Some(user.to_owned())
     }
-}
-
-/// Extract the remote RTP endpoint from an SDP offer: first `m=audio`
-/// port + media-level or session-level `c=` address.
-fn sdp_remote_rtp(sdp: &SessionDescription) -> Option<SocketAddr> {
-    let audio = sdp.media.iter().find(|m| m.kind == MediaKind::Audio)?;
-    if audio.port == 0 {
-        return None;
-    }
-    let conn = audio.connection.as_ref().or(sdp.connection.as_ref())?;
-    Some(SocketAddr::new(conn.address, audio.port))
 }
 
 /// Split a SIP message text into `(headers, body)`. RFC 3261 uses

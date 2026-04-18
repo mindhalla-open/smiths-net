@@ -4,14 +4,16 @@
 //! something. As new sections land (sip, media, plugins, mcp) they add
 //! their own struct here and plug into [`Config`].
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::fmt;
+use std::net::{AddrParseError, IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::str::FromStr;
 
 use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::Error;
 
@@ -61,8 +63,8 @@ impl Default for ObservabilityConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SipConfig {
-    /// Socket addresses to bind for SIP signaling.
-    pub bind: Vec<SocketAddr>,
+    /// Addresses to bind for SIP signaling.
+    pub bind: Vec<BindSpec>,
     /// Enabled transports. Only `udp` is wired in Phase 1.
     pub transports: Vec<SipTransport>,
     /// Grace period to finish in-flight transactions on shutdown.
@@ -72,11 +74,117 @@ pub struct SipConfig {
 impl Default for SipConfig {
     fn default() -> Self {
         Self {
-            bind: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5060)],
+            bind: vec![BindSpec::Addr(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                5060,
+            ))],
             transports: vec![SipTransport::Udp],
             drain_timeout_secs: 10,
         }
     }
+}
+
+/// A SIP bind target — today a resolved `SocketAddr`, tomorrow may
+/// carry an interface name (`"eth0:5060"`, `"wg0:5060"`) resolved at
+/// runtime. Keeping this as an open newtype — not a bare `SocketAddr`
+/// — is the MVP guardrail for proxy/VPN transports (see
+/// `docs/architecture/04-post-mvp-scope.md §11`).
+///
+/// Accepts any string that parses as `SocketAddr` today. Interface
+/// syntax is reserved and returns a descriptive error pointing at the
+/// post-MVP work item.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BindSpec {
+    /// A concrete IP+port already resolved at config-load time.
+    Addr(SocketAddr),
+}
+
+impl BindSpec {
+    /// Resolve this spec to a concrete socket address for `bind()`.
+    ///
+    /// Infallible today — the `Addr` variant is the only one. Will
+    /// grow an async resolver once interface-name support lands.
+    #[must_use]
+    pub const fn socket_addr(&self) -> SocketAddr {
+        match self {
+            Self::Addr(a) => *a,
+        }
+    }
+}
+
+impl fmt::Display for BindSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Addr(a) => fmt::Display::fmt(a, f),
+        }
+    }
+}
+
+impl FromStr for BindSpec {
+    type Err = BindSpecError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Today: only the `ip:port` form. Interface form (e.g. `eth0:5060`,
+        // `wg0:5060`) is reserved; fail with a clear message until the
+        // post-MVP work lands. Heuristic: if the left side of the last `:`
+        // contains characters that cannot appear in an IP literal, assume
+        // it's an interface name.
+        match s.parse::<SocketAddr>() {
+            Ok(a) => Ok(Self::Addr(a)),
+            Err(parse_err) => {
+                if looks_like_iface_spec(s) {
+                    Err(BindSpecError::InterfaceUnsupported(s.to_owned()))
+                } else {
+                    Err(BindSpecError::Parse(parse_err))
+                }
+            }
+        }
+    }
+}
+
+impl Serialize for BindSpec {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for BindSpec {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        s.parse().map_err(de::Error::custom)
+    }
+}
+
+/// Errors produced when parsing a [`BindSpec`] string.
+#[derive(Debug, thiserror::Error)]
+pub enum BindSpecError {
+    /// The string isn't a valid `ip:port` literal.
+    #[error("invalid socket address: {0}")]
+    Parse(#[from] AddrParseError),
+    /// Interface-name syntax (e.g. `wg0:5060`) is reserved for the
+    /// post-MVP proxy/VPN work (see roadmap P16).
+    #[error(
+        "interface-name bind spec `{0}` is not yet supported \
+         (reserved for proxy/VPN work — roadmap P16); \
+         use an explicit `ip:port`"
+    )]
+    InterfaceUnsupported(String),
+}
+
+/// Heuristic: does the host part of `s` look like an interface name?
+///
+/// Interface names contain letters or `-` / `_` in a way that IPv4
+/// literals cannot, and that IPv6 literals only inside `[...]`. We
+/// split on the last `:` and inspect the host portion.
+fn looks_like_iface_spec(s: &str) -> bool {
+    let Some((host, _port)) = s.rsplit_once(':') else {
+        return false;
+    };
+    if host.starts_with('[') {
+        return false; // IPv6 literal
+    }
+    host.chars()
+        .any(|c| c.is_ascii_alphabetic() || c == '-' || c == '_')
 }
 
 /// Transport protocols enabled for SIP signaling.
@@ -150,6 +258,41 @@ mod tests {
             assert_eq!(c.observability.log_level, "debug");
             assert_eq!(c.observability.log_format, LogFormat::Pretty);
             assert_eq!(c.core.worker_threads, 4);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn bindspec_parses_ip_port() {
+        let spec: BindSpec = "127.0.0.1:5060".parse().unwrap();
+        assert_eq!(
+            spec,
+            BindSpec::Addr("127.0.0.1:5060".parse::<SocketAddr>().unwrap())
+        );
+        assert_eq!(spec.socket_addr().port(), 5060);
+    }
+
+    #[test]
+    fn bindspec_rejects_interface_form_with_roadmap_hint() {
+        let err = "wg0:5060".parse::<BindSpec>().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("wg0:5060"), "{msg}");
+        assert!(msg.contains("P16"), "{msg}");
+    }
+
+    #[test]
+    fn sip_bind_from_toml_string() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+                [sip]
+                bind = ["0.0.0.0:5060", "127.0.0.1:5070"]
+                "#,
+            )?;
+            let c = Config::load(Path::new("config.toml")).unwrap();
+            assert_eq!(c.sip.bind.len(), 2);
+            assert_eq!(c.sip.bind[1].socket_addr().port(), 5070);
             Ok(())
         });
     }

@@ -5,7 +5,9 @@
 //! (matched by case-insensitive codec name *and* clock rate; payload
 //! type numbers follow the offer to stay passthrough-friendly).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+
+use smiths_core::sdp::{NegotiationOutcome, SdpNegotiator};
 
 use crate::types::{
     ConnectionInfo, MediaDescription, MediaKind, Origin, RtpMap, SessionDescription,
@@ -127,6 +129,36 @@ impl Negotiator {
             media: vec![answer_media],
         })
     }
+}
+
+impl SdpNegotiator for Negotiator {
+    fn negotiate_audio(&self, offer_body: &str, local_rtp_port: u16) -> NegotiationOutcome {
+        let offer = match SessionDescription::parse(offer_body) {
+            Ok(o) => o,
+            Err(e) => return NegotiationOutcome::Malformed(e.to_string()),
+        };
+        let remote_media = first_audio_endpoint(&offer);
+        match self.answer(&offer, local_rtp_port) {
+            NegotiationResult::Answer(sdp) => NegotiationOutcome::Accepted {
+                answer_body: sdp.to_string(),
+                remote_media,
+            },
+            NegotiationResult::Mismatch => NegotiationOutcome::Mismatch,
+        }
+    }
+}
+
+/// Extract the first audio RTP endpoint from a parsed offer.
+///
+/// `None` when there is no `m=audio`, the port is 0 (hold), or there
+/// is no connection line at either media or session level.
+fn first_audio_endpoint(sdp: &SessionDescription) -> Option<SocketAddr> {
+    let audio = sdp.media.iter().find(|m| m.kind == MediaKind::Audio)?;
+    if audio.port == 0 {
+        return None;
+    }
+    let conn = audio.connection.as_ref().or(sdp.connection.as_ref())?;
+    Some(SocketAddr::new(conn.address, audio.port))
 }
 
 fn unix_seconds() -> u64 {

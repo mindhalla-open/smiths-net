@@ -9,7 +9,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use smiths_core::EventBus;
+use smiths_core::{EventBus, MediaFabric, SdpNegotiator};
+use smiths_media::UdpMediaFabric;
+use smiths_sdp::Negotiator;
 use smiths_sip::Transport as _;
 use smiths_sip::{UasServer, UdpTransport};
 use smiths_testkit::codec::{pcm16_to_pcmu, pcmu_to_pcm16};
@@ -38,7 +40,9 @@ async fn start_engine() -> (SocketAddr, CancellationToken, JoinHandle<()>) {
     let cancel = CancellationToken::new();
     let (tx, rx) = mpsc::channel(64);
     transport.spawn_reader(tx, cancel.clone());
-    let server = UasServer::new(Arc::clone(&transport), bus).unwrap();
+    let fabric: Arc<dyn MediaFabric> = Arc::new(UdpMediaFabric::new());
+    let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(addr.ip()));
+    let server = UasServer::new(Arc::clone(&transport), bus, fabric, negotiator).unwrap();
     let handle = tokio::spawn(server.run(rx, cancel.clone()));
     (addr, cancel, handle)
 }

@@ -7,9 +7,7 @@ license      = { workspace = true }
 description  = "RFC 3261 SIP signaling: transport, parser, transactions, dialogs, auth."
 
 [dependencies]
-smiths-core  = { workspace = true }
-smiths-media = { workspace = true }
-smiths-sdp   = { workspace = true }
+smiths-core = { workspace = true }
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }
 bytes       = { workspace = true }
@@ -19,7 +17,12 @@ tracing     = { workspace = true }
 thiserror   = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "test-util"] }
+# Integration tests wire the real media + SDP implementations through
+# the trait seams defined in `smiths-core` — the `smiths-sip` crate
+# itself depends only on those seams.
+smiths-media = { workspace = true }
+smiths-sdp   = { workspace = true }
+tokio        = { workspace = true, features = ["macros", "test-util"] }
 
 [lints]
 workspace = true

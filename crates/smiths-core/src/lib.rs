@@ -6,13 +6,22 @@
 //! of the dependency graph.
 
 pub mod bus;
+pub mod call;
 pub mod config;
 pub mod error;
 pub mod event;
+pub mod media;
+pub mod sdp;
 pub mod shutdown;
 
 pub use bus::EventBus;
-pub use config::{Config, CoreConfig, LogFormat, ObservabilityConfig, SipConfig, SipTransport};
+pub use call::{DialogKey, DialogRecord, DialogState};
+pub use config::{
+    BindSpec, BindSpecError, Config, CoreConfig, LogFormat, ObservabilityConfig, SipConfig,
+    SipTransport,
+};
 pub use error::Error;
 pub use event::{Event, SipEvent, SystemEvent};
+pub use media::{BridgeId, Endpoint, EndpointId, MediaError, MediaFabric};
+pub use sdp::{NegotiationOutcome, SdpNegotiator};
 pub use shutdown::Shutdown;

@@ -6,5 +6,7 @@
 //! UDP payload as opaque bytes and never parses RTP.
 
 pub mod bridge;
+pub mod fabric;
 
 pub use bridge::{Bridge, Leg};
+pub use fabric::UdpMediaFabric;

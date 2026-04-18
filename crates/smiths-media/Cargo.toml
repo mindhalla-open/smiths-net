@@ -10,6 +10,8 @@ description  = "RTP/RTCP session, jitter buffer, media router (passthrough)."
 smiths-core = { workspace = true }
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }
+async-trait = { workspace = true }
+dashmap     = { workspace = true }
 tracing     = { workspace = true }
 
 [dev-dependencies]

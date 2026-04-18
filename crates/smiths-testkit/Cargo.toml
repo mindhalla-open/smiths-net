@@ -14,8 +14,9 @@ tokio-util  = { workspace = true }
 tracing     = { workspace = true }
 
 [dev-dependencies]
-smiths-sip = { workspace = true }
-tokio      = { workspace = true, features = ["macros", "test-util"] }
+smiths-sip   = { workspace = true }
+smiths-media = { workspace = true }
+tokio        = { workspace = true, features = ["macros", "test-util"] }
 
 [lints]
 workspace = true

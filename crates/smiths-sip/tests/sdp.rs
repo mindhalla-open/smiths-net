@@ -5,8 +5,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use smiths_core::EventBus;
-use smiths_sdp::{MediaKind, SessionDescription};
+use smiths_core::{EventBus, MediaFabric, SdpNegotiator};
+use smiths_media::UdpMediaFabric;
+use smiths_sdp::{MediaKind, Negotiator, SessionDescription};
 use smiths_sip::{Transport as _, UasServer, UdpTransport};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -23,7 +24,9 @@ async fn spawn_uas() -> SocketAddr {
     let cancel = CancellationToken::new();
     let (tx, rx) = mpsc::channel(64);
     transport.spawn_reader(tx, cancel.clone());
-    let server = UasServer::new(Arc::clone(&transport), bus).unwrap();
+    let fabric: Arc<dyn MediaFabric> = Arc::new(UdpMediaFabric::new());
+    let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(local.ip()));
+    let server = UasServer::new(Arc::clone(&transport), bus, fabric, negotiator).unwrap();
     tokio::spawn(server.run(rx, cancel));
     local
 }
