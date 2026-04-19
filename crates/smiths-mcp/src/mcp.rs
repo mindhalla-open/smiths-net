@@ -1,0 +1,518 @@
+//! MCP (Model Context Protocol) server over stdio.
+//!
+//! Implements the subset of the MCP spec our control plane needs today:
+//! `initialize`, `tools/list`, `tools/call`, plus **server-pushed
+//! notifications** for SIP dialog lifecycle (`notifications/call/created`,
+//! `notifications/call/terminated`).
+//!
+//! Framing is newline-delimited JSON-RPC 2.0: each line of stdin is one
+//! request, each line of stdout is one response or notification. All
+//! logging goes to `stderr` so it doesn't corrupt the wire.
+//!
+//! Not yet:
+//! * resources / prompts
+//! * authentication (token or OAuth)
+//! * per-tool rate limiting
+//!
+//! Add them as their own request handlers when we need them — the
+//! dispatch loop is a plain `match` on `method`.
+
+use std::sync::Arc;
+
+use serde_json::{Map, Value, json};
+use smiths_core::{Event, EventBus, Metrics, PluginEvent, SipEvent};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::broadcast::error::RecvError;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+
+use crate::dispatch::invoke_audited;
+use crate::rate_limit::RateLimiter;
+use crate::resource::ResourceRegistry;
+use crate::tool::{ToolContext, ToolError, ToolRegistry};
+
+/// Actor label recorded in audit events for this adapter.
+const ACTOR: &str = "mcp-stdio";
+
+/// Protocol version we advertise in `initialize`. Matches the MCP
+/// `2024-11-05` revision subset we implement.
+const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Run the MCP server against `stdin` / `stdout`. Returns when stdin
+/// EOFs or `cancel` fires.
+///
+/// The server multiplexes two writers onto stdout: request handlers
+/// (one response per stdin frame) and bus-driven notifications
+/// (fire-and-forget). They share a single `select!` loop so ordering
+/// is serial and no mutex is required on stdout.
+pub async fn run_stdio(
+    registry: Arc<ToolRegistry>,
+    resources: Arc<ResourceRegistry>,
+    rate_limiter: Arc<RateLimiter>,
+    metrics: Arc<Metrics>,
+    ctx: ToolContext,
+    bus: EventBus,
+    cancel: CancellationToken,
+) -> std::io::Result<()> {
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin);
+    let mut stdout = tokio::io::stdout();
+    let mut bus_rx = bus.subscribe();
+    info!(
+        tools = registry.len(),
+        resources = resources.len(),
+        protocol = PROTOCOL_VERSION,
+        "MCP stdio server ready"
+    );
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => break,
+            n = reader.read_line(&mut line) => {
+                match n {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(?e, "stdin read error");
+                        return Err(e);
+                    }
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let response = handle_frame(
+                    trimmed,
+                    &registry,
+                    &resources,
+                    &rate_limiter,
+                    &metrics,
+                    &ctx,
+                )
+                .await;
+                if let Some(resp) = response {
+                    write_frame(&mut stdout, &resp).await?;
+                }
+            }
+            event = bus_rx.recv() => match event {
+                Ok(ev) => {
+                    if let Some(notif) = event_to_notification(&ev) {
+                        write_frame(&mut stdout, &notif).await?;
+                    }
+                }
+                Err(RecvError::Lagged(n)) => {
+                    debug!("MCP stdio bus lagged: {n} events dropped");
+                }
+                Err(RecvError::Closed) => {
+                    debug!("MCP stdio bus closed");
+                }
+            },
+        }
+    }
+    info!("MCP stdio server stopped");
+    Ok(())
+}
+
+/// Serialize one JSON-RPC frame and write it as a single line to stdout.
+async fn write_frame(stdout: &mut tokio::io::Stdout, frame: &Value) -> std::io::Result<()> {
+    let mut buf = serde_json::to_vec(frame).unwrap_or_default();
+    buf.push(b'\n');
+    stdout.write_all(&buf).await?;
+    stdout.flush().await
+}
+
+/// Translate a bus event into an MCP notification frame. `None` for
+/// events we don't expose (keeps the wire quiet and forward-compatible).
+pub(crate) fn event_to_notification(event: &Event) -> Option<Value> {
+    match event {
+        Event::Sip(SipEvent::DialogCreated { call_id, .. }) => Some(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/call/created",
+            "params": { "call_id": call_id },
+        })),
+        Event::Sip(SipEvent::DialogTerminated { call_id }) => Some(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/call/terminated",
+            "params": { "call_id": call_id },
+        })),
+        Event::Plugin(PluginEvent::Notification {
+            plugin,
+            method,
+            params,
+        }) => Some(json!({
+            "jsonrpc": "2.0",
+            "method":  format!("notifications/plugin/{method}"),
+            "params": {
+                "plugin": plugin,
+                // Forward the plugin's params verbatim so structured
+                // fields (call_id, text, confidence, is_final, ...)
+                // stay typed for the client.
+                "data": params.clone().unwrap_or(Value::Null),
+            },
+        })),
+        _ => None,
+    }
+}
+
+/// Parse one JSON-RPC request line and produce an optional response.
+/// Notifications (no `id`) return `None`.
+async fn handle_frame(
+    line: &str,
+    registry: &ToolRegistry,
+    resources: &ResourceRegistry,
+    rate_limiter: &Arc<RateLimiter>,
+    metrics: &Arc<Metrics>,
+    ctx: &ToolContext,
+) -> Option<Value> {
+    // Parse loosely — we emit parse-error with id=null if malformed.
+    let req: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => {
+            return Some(error_response(
+                &Value::Null,
+                ERR_PARSE,
+                &format!("parse error: {e}"),
+            ));
+        }
+    };
+
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    let Some(method) = req.get("method").and_then(Value::as_str) else {
+        return Some(error_response(&id, ERR_INVALID_REQUEST, "missing method"));
+    };
+    let params = req.get("params").cloned().unwrap_or(Value::Null);
+
+    let is_notification = req.get("id").is_none();
+    let result = dispatch(
+        method,
+        params,
+        registry,
+        resources,
+        rate_limiter,
+        metrics,
+        ctx,
+        ACTOR,
+    )
+    .await;
+
+    if is_notification {
+        // Per JSON-RPC 2.0: notifications never get a response, even
+        // on error.
+        return None;
+    }
+    match result {
+        Ok(value) => Some(json!({ "jsonrpc": "2.0", "id": id, "result": value })),
+        Err((code, message)) => Some(error_response(&id, code, &message)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch(
+    method: &str,
+    params: Value,
+    registry: &ToolRegistry,
+    resources: &ResourceRegistry,
+    rate_limiter: &Arc<RateLimiter>,
+    metrics: &Arc<Metrics>,
+    ctx: &ToolContext,
+    actor: &str,
+) -> Result<Value, (i64, String)> {
+    match method {
+        "initialize" => Ok(initialize_response()),
+        "initialized" | "notifications/initialized" | "shutdown" => Ok(Value::Null),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(tools_list_response(registry)),
+        "tools/call" => tools_call(params, registry, rate_limiter, metrics, ctx, actor).await,
+        "resources/list" => Ok(resources_list_response(resources)),
+        "resources/read" => resources_read(params, resources, ctx).await,
+        other => Err((ERR_METHOD_NOT_FOUND, format!("unknown method: {other}"))),
+    }
+}
+
+fn initialize_response() -> Value {
+    json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "serverInfo": {
+            "name": "smiths-net",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "capabilities": {
+            "tools":     { "listChanged": false },
+            "resources": { "listChanged": false, "subscribe": false },
+        }
+    })
+}
+
+fn tools_list_response(registry: &ToolRegistry) -> Value {
+    let tools: Vec<_> = registry
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name(),
+                "description": t.description(),
+                "inputSchema": t.input_schema(),
+            })
+        })
+        .collect();
+    json!({ "tools": tools })
+}
+
+fn resources_list_response(registry: &ResourceRegistry) -> Value {
+    let resources: Vec<_> = registry
+        .iter()
+        .map(|r| {
+            json!({
+                "uri":         r.uri(),
+                "name":        r.uri(),
+                "description": r.description(),
+            })
+        })
+        .collect();
+    json!({ "resources": resources })
+}
+
+async fn resources_read(
+    params: Value,
+    registry: &ResourceRegistry,
+    ctx: &ToolContext,
+) -> Result<Value, (i64, String)> {
+    let uri = params
+        .get("uri")
+        .and_then(Value::as_str)
+        .ok_or((ERR_INVALID_PARAMS, "missing `uri`".to_owned()))?;
+    let Some(resource) = registry.get(uri) else {
+        return Err((ERR_METHOD_NOT_FOUND, format!("unknown resource: {uri}")));
+    };
+    match resource.read(ctx).await {
+        Ok(content) => Ok(json!({
+            "contents": [ {
+                "uri":      uri,
+                "mimeType": content.mime_type(),
+                "text":     content.text(),
+            } ],
+        })),
+        Err(e) => Err(map_tool_error(&e)),
+    }
+}
+
+fn map_tool_error(err: &ToolError) -> (i64, String) {
+    let code = match err {
+        ToolError::InvalidArguments(_) => ERR_INVALID_PARAMS,
+        ToolError::NotFound(_) => ERR_TOOL_NOT_FOUND,
+        ToolError::Forbidden(_) => ERR_FORBIDDEN,
+        ToolError::Internal(_) => ERR_INTERNAL,
+    };
+    (code, err.to_string())
+}
+
+pub(crate) async fn tools_call(
+    params: Value,
+    registry: &ToolRegistry,
+    rate_limiter: &Arc<RateLimiter>,
+    metrics: &Arc<Metrics>,
+    ctx: &ToolContext,
+    actor: &str,
+) -> Result<Value, (i64, String)> {
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or((ERR_INVALID_PARAMS, "missing `name`".to_owned()))?;
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::default()));
+
+    match invoke_audited(registry, rate_limiter, metrics, ctx, actor, name, args).await {
+        Ok(output) => {
+            // MCP `tools/call` response wraps output as a content
+            // array; we always return a single JSON text block.
+            let text = serde_json::to_string(&output).unwrap_or_default();
+            Ok(json!({
+                "content": [ { "type": "text", "text": text } ],
+                "isError": false,
+                "structuredContent": output,
+            }))
+        }
+        Err(err) => {
+            let (code, _) = tool_error_code(&err);
+            let message = err.to_string();
+            debug!(%name, %message, "tool returned error");
+            // MCP wraps tool errors in the success envelope with
+            // `isError: true`, rather than JSON-RPC error frames.
+            // That's per the spec.
+            let _ = code; // currently unused; reserved for audit logging
+            Ok(json!({
+                "content": [ { "type": "text", "text": message } ],
+                "isError": true,
+            }))
+        }
+    }
+}
+
+fn tool_error_code(err: &ToolError) -> (i64, &'static str) {
+    match err {
+        ToolError::InvalidArguments(_) => (ERR_INVALID_PARAMS, "invalid arguments"),
+        ToolError::NotFound(_) => (ERR_TOOL_NOT_FOUND, "not found"),
+        ToolError::Forbidden(_) => (ERR_FORBIDDEN, "forbidden"),
+        ToolError::Internal(_) => (ERR_INTERNAL, "internal"),
+    }
+}
+
+fn error_response(id: &Value, code: i64, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message }
+    })
+}
+
+// JSON-RPC 2.0 standard error codes, extended with MCP-style app codes.
+pub(crate) const ERR_PARSE: i64 = -32700;
+pub(crate) const ERR_INVALID_REQUEST: i64 = -32600;
+pub(crate) const ERR_METHOD_NOT_FOUND: i64 = -32601;
+pub(crate) const ERR_INVALID_PARAMS: i64 = -32602;
+pub(crate) const ERR_INTERNAL: i64 = -32603;
+// App-range codes (MCP convention: -32000..-32099).
+pub(crate) const ERR_TOOL_NOT_FOUND: i64 = -32001;
+pub(crate) const ERR_FORBIDDEN: i64 = -32002;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::ControlState;
+    use crate::tool::test_support::{default_config, empty_registry, null_media};
+    use smiths_core::EventBus;
+
+    fn ctx() -> (ToolContext, CancellationToken) {
+        let bus = EventBus::new(8);
+        let cancel = CancellationToken::new();
+        let (state, _task) = ControlState::spawn(&bus, cancel.clone());
+        (
+            ToolContext::new(state, empty_registry(), default_config(), null_media()),
+            cancel,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_returns_server_info() {
+        let reg = crate::tools::builtin_registry();
+        let (c, _cancel) = ctx();
+        let frame = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        let res = crate::resource::builtin_registry();
+        let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await.unwrap();
+        assert_eq!(resp["jsonrpc"], "2.0");
+        assert_eq!(resp["id"], 1);
+        assert_eq!(resp["result"]["serverInfo"]["name"], "smiths-net");
+        assert_eq!(resp["result"]["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tools_list_contains_builtins() {
+        let reg = crate::tools::builtin_registry();
+        let (c, _cancel) = ctx();
+        let frame = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let res = crate::resource::builtin_registry();
+        let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await.unwrap();
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"list_calls"));
+        assert!(names.contains(&"get_call_status"));
+        assert!(names.contains(&"health"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tools_call_health_ok() {
+        let reg = crate::tools::builtin_registry();
+        let (c, _cancel) = ctx();
+        let frame = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"health","arguments":{}}}"#;
+        let res = crate::resource::builtin_registry();
+        let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await.unwrap();
+        assert_eq!(resp["result"]["isError"], false);
+        assert_eq!(resp["result"]["structuredContent"]["status"], "ok");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_method_returns_error() {
+        let reg = crate::tools::builtin_registry();
+        let (c, _cancel) = ctx();
+        let frame = r#"{"jsonrpc":"2.0","id":4,"method":"does/not/exist"}"#;
+        let res = crate::resource::builtin_registry();
+        let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await.unwrap();
+        assert_eq!(resp["error"]["code"], ERR_METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn notification_produces_no_response() {
+        let reg = crate::tools::builtin_registry();
+        let (c, _cancel) = ctx();
+        let res = crate::resource::builtin_registry();
+        // No `id` — this is a notification.
+        let frame = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await;
+        assert!(resp.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resources_list_contains_builtins() {
+        let reg = crate::tools::builtin_registry();
+        let res = crate::resource::builtin_registry();
+        let (c, _cancel) = ctx();
+        let frame = r#"{"jsonrpc":"2.0","id":5,"method":"resources/list"}"#;
+        let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await.unwrap();
+        let uris: Vec<&str> = resp["result"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["uri"].as_str().unwrap())
+            .collect();
+        assert!(uris.contains(&"health://status"));
+        assert!(uris.contains(&"sip://calls"));
+        assert!(uris.contains(&"config://current"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resources_read_health_returns_status_ok() {
+        let reg = crate::tools::builtin_registry();
+        let res = crate::resource::builtin_registry();
+        let (c, _cancel) = ctx();
+        let frame = r#"{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"health://status"}}"#;
+        let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await.unwrap();
+        let body = resp["result"]["contents"][0]["text"].as_str().unwrap();
+        let v: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["status"], "ok");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resources_read_unknown_uri_is_error() {
+        let reg = crate::tools::builtin_registry();
+        let res = crate::resource::builtin_registry();
+        let (c, _cancel) = ctx();
+        let frame =
+            r#"{"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":"no://such"}}"#;
+        let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await.unwrap();
+        assert_eq!(resp["error"]["code"], ERR_METHOD_NOT_FOUND);
+    }
+}

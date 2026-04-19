@@ -1,0 +1,13 @@
+[package]
+name         = "smiths-script"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+license      = { workspace = true }
+description  = "Embedded DSL host for script-tier plugins (Rhai/Lua/Starlark)."
+
+[dependencies]
+smiths-core = { workspace = true }
+
+[lints]
+workspace = true

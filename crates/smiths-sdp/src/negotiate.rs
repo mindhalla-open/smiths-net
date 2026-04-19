@@ -155,6 +155,36 @@ impl SdpNegotiator for Negotiator {
             NegotiationResult::Mismatch => NegotiationOutcome::Mismatch,
         }
     }
+
+    fn build_offer(&self, local_ip: IpAddr, local_rtp_port: u16) -> String {
+        let formats: Vec<u8> = self.supported.iter().map(|c| c.payload_type).collect();
+        let rtpmaps: Vec<RtpMap> = self.supported.clone();
+        let sdp = SessionDescription {
+            origin: Origin {
+                username: "smiths".into(),
+                session_id: unix_seconds(),
+                session_version: unix_seconds(),
+                address: local_ip,
+            },
+            session_name: "smiths-net".into(),
+            connection: Some(ConnectionInfo { address: local_ip }),
+            media: vec![MediaDescription {
+                kind: MediaKind::Audio,
+                port: local_rtp_port,
+                protocol: "RTP/AVP".into(),
+                formats,
+                rtpmap: rtpmaps,
+                direction: crate::Direction::SendRecv,
+                connection: None,
+            }],
+        };
+        sdp.to_string()
+    }
+
+    fn parse_remote_rtp(&self, answer_body: &str) -> Option<SocketAddr> {
+        let sdp = SessionDescription::parse(answer_body).ok()?;
+        first_audio_endpoint(&sdp)
+    }
 }
 
 /// Extract the first audio RTP endpoint from a parsed offer.

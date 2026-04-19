@@ -1,0 +1,21 @@
+[package]
+name         = "rust-logger"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+publish      = false
+description  = "Minimal WASM plugin example — calls the smiths::log host function."
+
+# Independent workspace root — this crate targets wasm32 and has its
+# own release profile; it must not inherit the parent workspace's
+# lints / deps.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto           = true
+codegen-units = 1
+opt-level     = "s"
+strip         = "symbols"

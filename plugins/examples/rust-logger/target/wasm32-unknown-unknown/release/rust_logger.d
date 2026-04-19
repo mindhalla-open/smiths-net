@@ -1,0 +1,1 @@
+/Users/shkabenkov/Documents/coding/own/mindhalla/smiths-net/plugins/examples/rust-logger/target/wasm32-unknown-unknown/release/rust_logger.wasm: /Users/shkabenkov/Documents/coding/own/mindhalla/smiths-net/plugins/examples/rust-logger/src/lib.rs

@@ -6,10 +6,16 @@
 //! state — per the HA MVP guardrail, everything here is `Serialize`
 //! and `Deserialize` so a future replication layer can snapshot the
 //! full call set without touching SIP internals.
+//!
+//! Also hosts the [`CallOriginator`] seam — MCP / A2A tools that
+//! place outbound calls go through this trait, not through the SIP
+//! crate directly, so the control plane stays adapter-agnostic.
 
 use std::net::SocketAddr;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::media::EndpointId;
 
@@ -63,6 +69,49 @@ impl DialogRecord {
             self.remote_tag.clone(),
         )
     }
+}
+
+/// Errors surfaced by a [`CallOriginator`] operation.
+#[derive(Debug, Error)]
+pub enum CallError {
+    /// The target URI could not be parsed or resolved.
+    #[error("invalid target: {0}")]
+    InvalidTarget(String),
+    /// Remote peer rejected the INVITE (4xx/5xx/6xx final response).
+    #[error("rejected: {status} {reason}")]
+    Rejected {
+        /// Numeric status code from the SIP response.
+        status: u16,
+        /// Human-readable reason phrase.
+        reason: String,
+    },
+    /// No dialog exists for the supplied Call-ID.
+    #[error("no such call: {0}")]
+    NotFound(String),
+    /// Operation timed out waiting for a response.
+    #[error("timeout after {millis} ms")]
+    Timeout {
+        /// Configured budget for the operation.
+        millis: u64,
+    },
+    /// Transport / fabric / parser failure — opaque message.
+    #[error("{0}")]
+    Internal(String),
+}
+
+/// Originator surface consumed by the MCP `make_call` / `end_call`
+/// tools. Implemented by `smiths-sip::UacClient`; the trait seam
+/// keeps `smiths-mcp` free of any direct dependency on the SIP crate.
+#[async_trait]
+pub trait CallOriginator: Send + Sync {
+    /// Place an outbound call to `target` (a SIP URI like
+    /// `sip:alice@example.com:5060`). Returns the freshly-allocated
+    /// `Call-ID` once the remote sends 200 OK.
+    async fn place_call(&self, target: &str) -> Result<String, CallError>;
+
+    /// Tear down one of our outbound calls by `Call-ID`. No-op /
+    /// `NotFound` for unknown ids.
+    async fn hangup(&self, call_id: &str) -> Result<(), CallError>;
 }
 
 #[cfg(test)]

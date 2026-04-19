@@ -28,4 +28,9 @@ more. Everything else — routing, auth, AI features, storage — lives in
 
 ## License
 
-TBD.
+Licensed under the [Apache License, Version 2.0](LICENSE) — permissive,
+with an explicit patent grant.
+
+Contributions are accepted under the [Developer Certificate of
+Origin](https://developercertificate.org/): sign off each commit with
+`git commit -s`. No CLA.

@@ -1,8 +1,9 @@
 //! [`MediaFabric`] implementation on plain UDP.
 //!
-//! Owns all media sockets. Hands out opaque [`EndpointId`] handles to
-//! the signaling layer, which never touches a socket directly. On
-//! [`MediaFabric::bridge`], spins up the byte-transparent forwarder
+//! Owns all media sockets, one pair per endpoint (even RTP / odd
+//! RTCP). Hands out [`MediaEndpoint`] trait objects to the signaling
+//! layer, which never touches a socket directly. On
+//! [`MediaFabric::bridge`], spins up the SSRC-rewriting forwarder
 //! from [`crate::bridge`] and retains the [`Bridge`] so that a later
 //! `release_bridge` call can await its shutdown.
 
@@ -12,17 +13,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use smiths_core::media::{BridgeId, Endpoint, EndpointId, MediaError, MediaFabric};
+use smiths_core::media::{BridgeId, Endpoint, EndpointId, MediaEndpoint, MediaError, MediaFabric};
 use tokio::net::UdpSocket;
+use tracing::{debug, instrument};
 
 use crate::bridge::{Bridge, Leg};
+use crate::port_allocator::{DEFAULT_MAX_ATTEMPTS, allocate_rtp_rtcp_pair};
+
+/// RTP + RTCP socket pair the fabric owns for one endpoint.
+struct EndpointSockets {
+    rtp: Arc<UdpSocket>,
+    /// RTCP socket kept bound even though the MVP bridge ignores it —
+    /// holding it prevents another allocation from claiming the
+    /// paired port, and leaves the door open for RTCP passthrough.
+    _rtcp: Arc<UdpSocket>,
+}
 
 /// Default UDP-backed [`MediaFabric`].
 #[derive(Default)]
 pub struct UdpMediaFabric {
     next_endpoint: AtomicU64,
     next_bridge: AtomicU64,
-    endpoints: DashMap<EndpointId, Arc<UdpSocket>>,
+    endpoints: DashMap<EndpointId, EndpointSockets>,
     bridges: DashMap<BridgeId, Bridge>,
 }
 
@@ -43,14 +55,28 @@ impl UdpMediaFabric {
 
 #[async_trait]
 impl MediaFabric for UdpMediaFabric {
-    async fn allocate(&self, bind_ip: IpAddr) -> Result<Endpoint, MediaError> {
-        let socket = UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await?;
-        let local_addr = socket.local_addr()?;
+    #[instrument(skip(self), fields(%bind_ip))]
+    async fn allocate(&self, bind_ip: IpAddr) -> Result<Arc<dyn MediaEndpoint>, MediaError> {
+        let pair = allocate_rtp_rtcp_pair(bind_ip, DEFAULT_MAX_ATTEMPTS).await?;
         let id = self.fresh_endpoint_id();
-        self.endpoints.insert(id, Arc::new(socket));
-        Ok(Endpoint { id, local_addr })
+        let rtp_addr = pair.rtp_addr;
+        let rtcp_addr = pair.rtcp_addr;
+        self.endpoints.insert(
+            id,
+            EndpointSockets {
+                rtp: Arc::new(pair.rtp),
+                _rtcp: Arc::new(pair.rtcp),
+            },
+        );
+        debug!(?id, %rtp_addr, %rtcp_addr, "media endpoint allocated");
+        Ok(Arc::new(Endpoint {
+            id,
+            local_addr: rtp_addr,
+            rtcp_addr: Some(rtcp_addr),
+        }))
     }
 
+    #[instrument(skip(self), fields(?a, ?b, %peer_a, %peer_b))]
     async fn bridge(
         &self,
         a: EndpointId,
@@ -62,13 +88,16 @@ impl MediaFabric for UdpMediaFabric {
             .endpoints
             .get(&a)
             .ok_or(MediaError::UnknownEndpoint(a))?
+            .rtp
             .clone();
         let sock_b = self
             .endpoints
             .get(&b)
             .ok_or(MediaError::UnknownEndpoint(b))?
+            .rtp
             .clone();
 
+        let id = self.fresh_bridge_id();
         let leg_a = Leg {
             socket: sock_a,
             peer: peer_a,
@@ -77,8 +106,7 @@ impl MediaFabric for UdpMediaFabric {
             socket: sock_b,
             peer: peer_b,
         };
-        let bridge = Bridge::spawn(&leg_a, &leg_b);
-        let id = self.fresh_bridge_id();
+        let bridge = Bridge::spawn(id, &leg_a, &leg_b);
         self.bridges.insert(id, bridge);
         Ok(id)
     }
@@ -90,9 +118,25 @@ impl MediaFabric for UdpMediaFabric {
     }
 
     async fn release_endpoint(&self, id: EndpointId) {
-        // Dropping the Arc<UdpSocket> closes the socket unless a
-        // forwarder task still holds a clone.
+        // Dropping the `EndpointSockets` closes both UDP sockets unless
+        // a forwarder task still holds a clone of `rtp`.
         self.endpoints.remove(&id);
+    }
+
+    async fn send_packet(
+        &self,
+        src: EndpointId,
+        dest: SocketAddr,
+        bytes: &[u8],
+    ) -> Result<(), MediaError> {
+        let sock = self
+            .endpoints
+            .get(&src)
+            .ok_or(MediaError::UnknownEndpoint(src))?
+            .rtp
+            .clone();
+        sock.send_to(bytes, dest).await.map_err(MediaError::Io)?;
+        Ok(())
     }
 }
 
@@ -107,8 +151,9 @@ mod tests {
     async fn allocate_returns_bound_local_addr() {
         let fab = UdpMediaFabric::new();
         let ep = fab.allocate(IpAddr::V4(Ipv4Addr::LOCALHOST)).await.unwrap();
-        assert_eq!(ep.local_addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_ne!(ep.local_addr.port(), 0);
+        assert_eq!(ep.local_addr().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_ne!(ep.local_addr().port(), 0);
+        assert_eq!(ep.local_addr().port() % 2, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -124,40 +169,62 @@ mod tests {
         let addr_ua_b = ua_b.local_addr().unwrap();
 
         let bid = fab
-            .bridge(ep_a.id, addr_ua_a, ep_b.id, addr_ua_b)
+            .bridge(ep_a.id(), addr_ua_a, ep_b.id(), addr_ua_b)
             .await
             .unwrap();
 
-        ua_a.send_to(b"ping-a", ep_a.local_addr).await.unwrap();
-        let mut buf = [0u8; 64];
+        // Minimal valid RTP header (V=2, PT=0 PCMU, SEQ=1, TS=0, SSRC=0xDEAD_BEEF)
+        // + 4 bytes of payload. Must be parseable by the SSRC router.
+        let rtp_a_to_b: &[u8] = &[
+            0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4,
+        ];
+        ua_a.send_to(rtp_a_to_b, ep_a.local_addr()).await.unwrap();
+        let mut buf = [0u8; 256];
         let (n, _) = timeout(Duration::from_secs(1), ua_b.recv_from(&mut buf))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(&buf[..n], b"ping-a");
+        // Payload preserved.
+        assert_eq!(&buf[12..n], &[1, 2, 3, 4]);
 
         fab.release_bridge(bid).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn bridge_with_unknown_endpoint_errors() {
         let fab = UdpMediaFabric::new();
+        let ep = fab.allocate(IpAddr::V4(Ipv4Addr::LOCALHOST)).await.unwrap();
+        let bogus = EndpointId(9999);
         let err = fab
             .bridge(
-                EndpointId(999),
+                ep.id(),
                 "127.0.0.1:1".parse().unwrap(),
-                EndpointId(998),
+                bogus,
                 "127.0.0.1:2".parse().unwrap(),
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, MediaError::UnknownEndpoint(_)));
+        assert!(matches!(err, MediaError::UnknownEndpoint(x) if x == bogus));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn release_bridge_is_idempotent() {
         let fab = UdpMediaFabric::new();
-        // Releasing a non-existent bridge is a no-op.
-        fab.release_bridge(BridgeId(42)).await;
+        let ep_a = fab.allocate(IpAddr::V4(Ipv4Addr::LOCALHOST)).await.unwrap();
+        let ep_b = fab.allocate(IpAddr::V4(Ipv4Addr::LOCALHOST)).await.unwrap();
+        let ua_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ua_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bid = fab
+            .bridge(
+                ep_a.id(),
+                ua_a.local_addr().unwrap(),
+                ep_b.id(),
+                ua_b.local_addr().unwrap(),
+            )
+            .await
+            .unwrap();
+        fab.release_bridge(bid).await;
+        // Second release must not panic or block.
+        fab.release_bridge(bid).await;
     }
 }

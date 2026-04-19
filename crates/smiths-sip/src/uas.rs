@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use smiths_core::metrics::{Metrics, SipCodeLabel, SipMethodLabel};
 use smiths_core::{
     BridgeId, DialogKey, DialogRecord, DialogState, EndpointId, Event, EventBus, MediaFabric,
     NegotiationOutcome, SdpNegotiator, SipEvent,
@@ -59,6 +60,10 @@ struct RequestSummary {
     /// User-part of the Request-URI (everything between `sip:` and the
     /// `@` on the request line). Used as a rendezvous key.
     ruri_user: Option<String>,
+    /// Full Request-URI from the request line, used by digest auth.
+    request_uri: Option<String>,
+    /// Raw `Authorization:` header value, if present.
+    authorization: Option<String>,
     /// Normalized `Content-Type` header value, lowercased without
     /// trailing whitespace or parameters.
     content_type: Option<String>,
@@ -104,6 +109,17 @@ pub struct UasServer<T: Transport> {
     /// at the same [`BridgeId`]; the first `BYE` releases it from the
     /// fabric and clears both entries.
     bridges_by_dialog: Arc<DashMap<DialogKey, BridgeId>>,
+    /// Registrar: digest-auths `REGISTER` against a [`CredentialStore`].
+    /// `None` = auth disabled, registrar accepts any REGISTER blindly
+    /// (dev convenience; never do that in prod).
+    registrar: Option<crate::auth::digest::Registrar>,
+    /// Prometheus metrics. Defaults to [`Metrics::noop`] so tests and
+    /// single-server setups can ignore observability entirely.
+    metrics: Arc<Metrics>,
+    /// Shared correlator for responses to locally-originated requests
+    /// (the [`crate::UacClient`]). `None` = UAS-only deployment;
+    /// responses are simply dropped (old behaviour).
+    response_router: Option<Arc<crate::ResponseRouter>>,
 }
 
 impl<T: Transport> UasServer<T> {
@@ -131,7 +147,34 @@ impl<T: Transport> UasServer<T> {
             media_bind_ip: local.ip(),
             pending_bridges: Arc::new(DashMap::new()),
             bridges_by_dialog: Arc::new(DashMap::new()),
+            registrar: None,
+            metrics: Metrics::noop(),
+            response_router: None,
         })
+    }
+
+    /// Attach a digest registrar — `REGISTER` now requires valid auth.
+    #[must_use]
+    pub fn with_registrar(mut self, registrar: crate::auth::digest::Registrar) -> Self {
+        self.registrar = Some(registrar);
+        self
+    }
+
+    /// Attach a shared metrics handle. Without this, the UAS uses a
+    /// throwaway registry — safe for tests, invisible to operators.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Install a [`crate::ResponseRouter`] so responses arriving on
+    /// the UAS's socket get forwarded to the UAC. Without this, the
+    /// UAS drops responses (pre-UAC behaviour).
+    #[must_use]
+    pub fn with_response_router(mut self, router: Arc<crate::ResponseRouter>) -> Self {
+        self.response_router = Some(router);
+        self
     }
 
     /// Run the UAS event loop. Exits when `cancel` fires or `rx` closes.
@@ -177,12 +220,29 @@ impl<T: Transport> UasServer<T> {
                 self.handle_request(summary, peer).await;
             }
             rsip::SipMessage::Response(_) => {
-                debug!(%peer, "ignoring unsolicited response (no UAC state yet)");
+                if let Some(router) = self.response_router.as_ref() {
+                    if let Some(branch) = extract_via_branch(&dg.bytes) {
+                        let delivered = router.deliver(&branch, dg.bytes.clone());
+                        if !delivered {
+                            debug!(%peer, branch, "response with unknown branch; dropped");
+                        }
+                    } else {
+                        debug!(%peer, "response without Via branch; dropped");
+                    }
+                } else {
+                    debug!(%peer, "ignoring response (no UAC attached)");
+                }
             }
         }
     }
 
     async fn handle_request(&self, req: RequestSummary, peer: SocketAddr) {
+        self.metrics
+            .sip_requests
+            .get_or_create(&SipMethodLabel {
+                method: req.method.clone(),
+            })
+            .inc();
         let _ = self.bus.publish(Event::Sip(SipEvent::RequestReceived {
             peer,
             method: req.method.clone(),
@@ -190,7 +250,12 @@ impl<T: Transport> UasServer<T> {
         }));
 
         // Retransmission dedupe — replay the cached FINAL response.
-        if let Some(branch) = req.branch.as_deref()
+        // ACK carries the same branch as the INVITE it acknowledges when
+        // the final response was non-2xx (RFC 3261 §17.1.1.3); replaying
+        // the 401/4xx on top of that ACK would loop the transaction, so
+        // the dedupe path skips ACK deliberately.
+        if req.method != "ACK"
+            && let Some(branch) = req.branch.as_deref()
             && let Some(cached) = self.dedupe.get(branch)
         {
             debug!(%peer, branch, "replaying cached response");
@@ -203,6 +268,7 @@ impl<T: Transport> UasServer<T> {
             "INVITE" => self.handle_invite(&req, peer).await,
             "ACK" => self.handle_ack(&req, peer),
             "BYE" => self.handle_bye(&req, peer).await,
+            "REGISTER" => self.handle_register(&req, peer).await,
             _ => {
                 self.respond(
                     &req,
@@ -223,8 +289,88 @@ impl<T: Transport> UasServer<T> {
             .await;
     }
 
+    /// `REGISTER` with digest auth. No registrar attached → blindly
+    /// `200 OK` (dev mode). Registrar attached → full challenge-response.
+    #[instrument(skip_all, fields(%peer, call_id = %req.call_id.as_deref().unwrap_or("-")))]
+    async fn handle_register(&self, req: &RequestSummary, peer: SocketAddr) {
+        let Some(reg) = self.registrar.as_ref() else {
+            self.respond(req, 200, "OK", Some(&next_tag()), &[], b"", peer)
+                .await;
+            return;
+        };
+        let ruri = req.request_uri.as_deref().unwrap_or("");
+        match req.authorization.as_deref() {
+            None => {
+                let challenge = reg.challenge(crate::auth::digest::Algorithm::Md5, false);
+                let hdr: [(&str, &str); 1] = [("WWW-Authenticate", &challenge)];
+                self.respond(req, 401, "Unauthorized", Some(&next_tag()), &hdr, b"", peer)
+                    .await;
+            }
+            Some(auth) => match reg.authenticate("REGISTER", ruri, auth) {
+                Ok(user) => {
+                    info!(%user, %peer, "REGISTER authenticated");
+                    self.respond(req, 200, "OK", Some(&next_tag()), &[], b"", peer)
+                        .await;
+                }
+                Err(e) => {
+                    info!(?e, %peer, "REGISTER auth failed; re-challenging");
+                    let stale = matches!(e, crate::auth::digest::AuthError::StaleNonce);
+                    let challenge = reg.challenge(crate::auth::digest::Algorithm::Md5, stale);
+                    let hdr: [(&str, &str); 1] = [("WWW-Authenticate", &challenge)];
+                    self.respond(req, 401, "Unauthorized", Some(&next_tag()), &hdr, b"", peer)
+                        .await;
+                }
+            },
+        }
+    }
+
+    /// Digest-authenticate an incoming INVITE. Returns `true` when the
+    /// request may proceed; emits the appropriate `401 Unauthorized` and
+    /// returns `false` otherwise. No registrar attached → every INVITE
+    /// is waved through (dev mode, matching `handle_register`).
+    async fn invite_auth_ok(&self, req: &RequestSummary, peer: SocketAddr) -> bool {
+        let Some(reg) = self.registrar.as_ref() else {
+            return true;
+        };
+        let ruri = req.request_uri.as_deref().unwrap_or("");
+        match req.authorization.as_deref() {
+            None => {
+                let challenge = reg.challenge(crate::auth::digest::Algorithm::Md5, false);
+                let hdr: [(&str, &str); 1] = [("WWW-Authenticate", &challenge)];
+                self.respond(req, 401, "Unauthorized", Some(&next_tag()), &hdr, b"", peer)
+                    .await;
+                false
+            }
+            Some(auth) => match reg.authenticate("INVITE", ruri, auth) {
+                Ok(user) => {
+                    info!(%user, %peer, "INVITE authenticated");
+                    true
+                }
+                Err(e) => {
+                    info!(?e, %peer, "INVITE auth failed; re-challenging");
+                    let stale = matches!(e, crate::auth::digest::AuthError::StaleNonce);
+                    let challenge = reg.challenge(crate::auth::digest::Algorithm::Md5, stale);
+                    let hdr: [(&str, &str); 1] = [("WWW-Authenticate", &challenge)];
+                    self.respond(req, 401, "Unauthorized", Some(&next_tag()), &hdr, b"", peer)
+                        .await;
+                    false
+                }
+            },
+        }
+    }
+
     #[allow(clippy::too_many_lines)] // negotiation + bridge wiring belong together
+    #[instrument(skip_all, fields(%peer, call_id = %req.call_id.as_deref().unwrap_or("-")))]
     async fn handle_invite(&self, req: &RequestSummary, peer: SocketAddr) {
+        // When a registrar is attached, INVITE requires digest auth. We
+        // challenge before emitting 100 Trying so the rejection path
+        // stays tight — no media allocation, no dialog state, just the
+        // 401 back to the caller. The ACK that closes the rejected
+        // transaction is handled by the normal ACK dispatch below.
+        if !self.invite_auth_ok(req, peer).await {
+            return;
+        }
+
         // 100 Trying short-circuits UDP INVITE retransmission.
         self.send_provisional(req, 100, "Trying", peer).await;
 
@@ -272,14 +418,14 @@ impl<T: Transport> UasServer<T> {
             match self.negotiator.negotiate_audio(
                 body,
                 effective_local_ip,
-                endpoint.local_addr.port(),
+                endpoint.local_addr().port(),
             ) {
                 NegotiationOutcome::Accepted {
                     answer_body,
                     remote_media,
                 } => (Some(endpoint), Some(answer_body), remote_media),
                 NegotiationOutcome::Mismatch => {
-                    self.media_fabric.release_endpoint(endpoint.id).await;
+                    self.media_fabric.release_endpoint(endpoint.id()).await;
                     info!(%peer, "SDP offer had no acceptable codec; 488");
                     self.respond(
                         req,
@@ -294,7 +440,7 @@ impl<T: Transport> UasServer<T> {
                     return;
                 }
                 NegotiationOutcome::Malformed(err) => {
-                    self.media_fabric.release_endpoint(endpoint.id).await;
+                    self.media_fabric.release_endpoint(endpoint.id()).await;
                     warn!(%peer, %err, "malformed SDP offer");
                     self.respond(req, 400, "Bad Request", Some(&next_tag()), &[], &[], peer)
                         .await;
@@ -317,7 +463,7 @@ impl<T: Transport> UasServer<T> {
             if let Some((_, pending)) = self.pending_bridges.remove(key) {
                 match self
                     .media_fabric
-                    .bridge(pending.endpoint, pending.remote_media, ep.id, remote_rtp)
+                    .bridge(pending.endpoint, pending.remote_media, ep.id(), remote_rtp)
                     .await
                 {
                     Ok(bid) => {
@@ -332,7 +478,7 @@ impl<T: Transport> UasServer<T> {
                     key.clone(),
                     PendingLeg {
                         dialog_key: dialog_key.clone(),
-                        endpoint: ep.id,
+                        endpoint: ep.id(),
                         remote_media: remote_rtp,
                     },
                 );
@@ -347,10 +493,11 @@ impl<T: Transport> UasServer<T> {
             state: DialogState::Early,
             peer_signal: peer,
             rendezvous,
-            media: endpoint.as_ref().map(|ep| ep.id),
+            media: endpoint.as_ref().map(|ep| ep.id()),
             remote_media,
         };
         self.dialogs.insert(dialog_key, record);
+        self.metrics.dialogs_active.inc();
 
         let mut extras: Vec<(&str, &str)> = vec![("Contact", self.contact.as_str())];
         if sdp_answer_body.is_some() {
@@ -368,9 +515,11 @@ impl<T: Transport> UasServer<T> {
         )
         .await;
 
-        let _ = self
-            .bus
-            .publish(Event::Sip(SipEvent::DialogCreated { call_id }));
+        let _ = self.bus.publish(Event::Sip(SipEvent::DialogCreated {
+            call_id,
+            media_endpoint: endpoint.as_ref().map(|ep| ep.id()),
+            remote_rtp: remote_media,
+        }));
     }
 
     fn handle_ack(&self, req: &RequestSummary, peer: SocketAddr) {
@@ -388,6 +537,7 @@ impl<T: Transport> UasServer<T> {
         }
     }
 
+    #[instrument(skip_all, fields(%peer, call_id = %req.call_id.as_deref().unwrap_or("-")))]
     async fn handle_bye(&self, req: &RequestSummary, peer: SocketAddr) {
         let Some(key) = in_dialog_key(req) else {
             self.respond(req, 400, "Bad Request", Some(&next_tag()), &[], &[], peer)
@@ -397,6 +547,7 @@ impl<T: Transport> UasServer<T> {
 
         match self.dialogs.remove(&key) {
             Some((_, record)) => {
+                self.metrics.dialogs_active.dec();
                 // Drop an unpaired pending leg if this was it.
                 if let Some(rv) = record.rendezvous.as_ref()
                     && let Some(entry) = self.pending_bridges.get(rv)
@@ -453,6 +604,12 @@ impl<T: Transport> UasServer<T> {
             warn!(%peer, ?e, "failed to send provisional response");
             return;
         }
+        self.metrics
+            .sip_responses
+            .get_or_create(&SipCodeLabel {
+                code: status.to_string(),
+            })
+            .inc();
         let _ = self.bus.publish(Event::Sip(SipEvent::ResponseSent {
             peer,
             status,
@@ -492,6 +649,12 @@ impl<T: Transport> UasServer<T> {
             warn!(%peer, ?e, "failed to send response");
             return;
         }
+        self.metrics
+            .sip_responses
+            .get_or_create(&SipCodeLabel {
+                code: status.to_string(),
+            })
+            .inc();
         let _ = self.bus.publish(Event::Sip(SipEvent::ResponseSent {
             peer,
             status,
@@ -503,6 +666,28 @@ impl<T: Transport> UasServer<T> {
 /// Key for an in-dialog request (ACK, BYE, re-INVITE).
 ///
 /// Incoming request sees From as remote and To as local.
+/// Extract the first `Via` header's `branch` parameter from any raw
+/// SIP message (request or response). Returns `None` when the header
+/// or parameter is missing. Used by the response-router forwarder.
+fn extract_via_branch(raw: &Bytes) -> Option<String> {
+    let text = std::str::from_utf8(raw).ok()?;
+    for line in text.split("\r\n") {
+        if line.is_empty() {
+            break; // headers done
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("via:") || lower.starts_with("v:") {
+            let idx = lower.find(";branch=")?;
+            let after = &line[idx + ";branch=".len()..];
+            let end = after
+                .find(|c: char| c == ';' || c == ',' || c.is_whitespace())
+                .unwrap_or(after.len());
+            return Some(after[..end].to_owned());
+        }
+    }
+    None
+}
+
 fn in_dialog_key(req: &RequestSummary) -> Option<DialogKey> {
     let call_id = req.call_id.clone()?;
     let local_tag = req.to_tag.clone()?;
@@ -519,13 +704,16 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
     let request_line = lines.next().unwrap_or_default();
     let mut tokens = request_line.split_whitespace();
     let method = tokens.next().unwrap_or("").to_ascii_uppercase();
-    let ruri_user = tokens.next().and_then(ruri_user_from);
+    let ruri_raw = tokens.next();
+    let ruri_user = ruri_raw.and_then(ruri_user_from);
+    let request_uri = ruri_raw.map(str::to_owned);
 
     let mut branch = None;
     let mut call_id = None;
     let mut from_tag = None;
     let mut to_tag = None;
     let mut content_type: Option<String> = None;
+    let mut authorization: Option<String> = None;
 
     for line in lines {
         if line.is_empty() {
@@ -560,6 +748,11 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
             if !media_type.is_empty() {
                 content_type = Some(media_type);
             }
+        } else if authorization.is_none() && lower.starts_with("authorization:") {
+            let v = line.split_once(':').map_or("", |(_, v)| v).trim();
+            if !v.is_empty() {
+                authorization = Some(v.to_owned());
+            }
         }
     }
 
@@ -570,6 +763,8 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
         from_tag,
         to_tag,
         ruri_user,
+        request_uri,
+        authorization,
         content_type,
         body: (!body.is_empty()).then(|| body.to_owned()),
         raw: raw.clone(),

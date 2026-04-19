@@ -5,17 +5,22 @@ standard library. Mirrors what `crates/smiths-testkit` does in Rust, so
 you can poke the engine from any machine on your LAN without touching
 the Rust toolchain.
 
-## Why no MCP yet?
+## Two ways to talk to the engine
 
-The engine's Model Context Protocol server will be soon.
-Until it lands there's nothing to talk to
-on the control plane. Even after Phase 5, **MCP drives call setup /
-teardown — media always rides SIP + RTP**. So the SIP client code in
-this folder stays relevant; a future `mcp_client.py` will add the
-control-plane sugar (`make_call("sip:room@engine")`, `list_calls()`).
+The engine now exposes **two control-plane adapters in addition to SIP**:
 
-For the sample you'll interact with the engine the same way a real
-softphone does: SIP over UDP + PCMU RTP.
+- **MCP stdio** — one process pair: an LLM host (Claude Code, Cursor,
+  or `mcp_demo.py`) spawns the engine with `--mcp stdio` and exchanges
+  JSON-RPC 2.0 frames over stdin/stdout.
+- **A2A HTTP** — long-running engine, clients post JSON-RPC to
+  `/a2a`, discover capabilities via `/.well-known/agent.json`.
+
+Both adapters serve the **same tool set**: `list_calls`,
+`get_call_status`, `health`. Media — when it flows — always rides SIP +
+RTP. MCP/A2A are the control plane, not the media plane.
+
+Run the control-plane demos alongside the SIP demos to see both
+halves.
 
 ## Requirements
 
@@ -38,6 +43,10 @@ cargo build --release
 | `demo_call.py`     | Two UACs in one process — A plays a sine wave, B records it. |
 | `speaker.py`       | Standalone UA that streams a WAV (or a generated sine) in.   |
 | `listener.py`      | Standalone UA that records received RTP to a WAV.            |
+| `mcp_demo.py`      | Spawns the engine in `--mcp stdio` mode, walks MCP handshake + tool calls. |
+| `a2a_demo.py`      | Talks to the A2A HTTP endpoint (same tool set, JSON-RPC over HTTP). |
+| `voice_agent.py`   | Full voice-agent demo: MCP notifications + STT/LLM/TTS on bridged RTP. |
+| `voice_caller.py`  | Simulated inbound caller that dials the voice agent. |
 
 ## Where files live
 
@@ -91,6 +100,92 @@ aplay  tmp/smiths-hello-received.wav     # Linux
 You'll hear the input audio round-tripped through the engine's
 rendezvous bridge, with the slight G.711 / 8 kHz "phone call" timbre
 introduced by μ-law encoding.
+
+## Control-plane demos (MCP + A2A)
+
+### MCP stdio
+
+```bash
+cargo build --release
+python3 examples/python-client/mcp_demo.py
+```
+
+The demo spawns `target/release/smiths-net --mcp stdio` as a subprocess
+and talks JSON-RPC 2.0 over its stdin/stdout. Output shows the
+`initialize` handshake, `tools/list`, and a few `tools/call` invocations.
+
+This is the same wire an LLM host (Claude Code) uses. To wire it into
+Claude Code, add to its MCP config:
+
+```jsonc
+{
+  "mcpServers": {
+    "smiths-net": {
+      "command": "/absolute/path/to/target/release/smiths-net",
+      "args": ["--config", "/absolute/path/to/examples/config.toml",
+               "--mcp", "stdio"]
+    }
+  }
+}
+```
+
+### Voice agent (MCP notifications + STT → LLM → TTS)
+
+The biggest demo — a Python "voice agent" that spawns the engine,
+subscribes to MCP push notifications, acts as the SIP callee through
+`SipUAC`, and runs a full STT → LLM → TTS pipeline against the
+bridged RTP.
+
+```bash
+cargo build --release
+
+# Terminal 1 — agent (it spawns smiths-net internally)
+python3 examples/python-client/voice_agent.py
+
+# Terminal 2 — simulated caller
+python3 examples/python-client/voice_caller.py \
+    --wav tmp/smiths-hello.wav \
+    --out tmp/voice-agent-reply.wav
+
+afplay tmp/voice-agent-reply.wav   # "Алло, Алиса слушает вас"
+```
+
+Architecture honest-note:
+
+- **Real today**: MCP push notifications
+  (`notifications/call/created` / `terminated`), SIP / SDP / RTP
+  bridging, μ-law codec, engine-allocated media sockets.
+- **Real on the Python side**: agent-side TTS via macOS `say`
+  (produces a PCM16 mono 8 kHz WAV, encoded to PCMU and streamed).
+- **Mocked**: STT (returns a placeholder from audio duration) and LLM
+  (always replies with the fixed greeting). These are the hooks where
+  the real **`ai.*` plugins** (P22 in post-MVP) will plug in — the
+  agent's `stub_stt` / `stub_llm` functions stay intact, but their
+  bodies will change to `await mcp.call_tool("ai_invoke", ...)` once
+  the plugin system ships.
+
+### A2A HTTP
+
+```bash
+# Enable A2A in the engine config:
+cat > tmp/a2a.toml <<'EOF'
+[observability]
+health_bind = "127.0.0.1:8080"
+[sip]
+bind = ["127.0.0.1:5060"]
+[a2a]
+enabled = true
+bind    = "127.0.0.1:7879"
+EOF
+./target/release/smiths-net --config tmp/a2a.toml &
+
+# In another terminal:
+python3 examples/python-client/a2a_demo.py
+```
+
+The demo fetches the agent card, lists tools, and invokes a few. Any
+A2A-compliant agent (Google A2A SDK, a custom HTTP bot, a curl loop)
+can drive the same endpoint.
 
 ## Two-terminal demo (LAN or loopback)
 

@@ -1,11 +1,12 @@
 [workspace]
 resolver = "3"
 members  = ["crates/*"]
+exclude  = ["fuzz"]
 
 [workspace.package]
 edition      = "2024"
 rust-version = "1.85"
-version      = "0.2.0"
+version      = "0.8.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
@@ -51,6 +52,29 @@ anyhow    = "1"
 rsip    = "0.4"
 bytes   = "1"
 dashmap = "6"
+md-5    = "0.11.0"
+sha2    = "0.11.0"
+hex     = "0.4"
+
+# WASM host
+wasmtime = { version = "43", default-features = false, features = ["cranelift", "runtime"] }
+wat      = "1"
+
+# TLS
+rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls   = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+rcgen          = "0.14"
+
+# Metrics
+prometheus-client = "0.24.1"
+
+# audio helpers
+base64 = "0.22"
+
+# async stream utilities (SSE bridge)
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures      = "0.3"
 
 # test helpers
 tempfile = "3"
@@ -63,6 +87,7 @@ smiths-sdp     = { path = "crates/smiths-sdp" }
 smiths-media   = { path = "crates/smiths-media" }
 smiths-plugin  = { path = "crates/smiths-plugin" }
 smiths-wasm    = { path = "crates/smiths-wasm" }
+smiths-script  = { path = "crates/smiths-script" }
 smiths-sidecar = { path = "crates/smiths-sidecar" }
 smiths-mcp     = { path = "crates/smiths-mcp" }
 smiths-testkit = { path = "crates/smiths-testkit" }
