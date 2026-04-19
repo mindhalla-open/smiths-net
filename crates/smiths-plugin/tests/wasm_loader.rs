@@ -11,7 +11,7 @@ use std::fs;
 use std::path::Path;
 
 use smiths_plugin::wasm::WasmEngine;
-use smiths_plugin::{AiRegistry, load_plugins};
+use smiths_plugin::{AiRegistry, LoaderOpts, load_plugins};
 use tempfile::tempdir;
 
 /// Inline WAT that advertises one `ai.log` capability. The descriptor
@@ -50,9 +50,11 @@ async fn loads_wasm_plugin_and_surfaces_capability() {
 
     let reg = AiRegistry::new();
     let engine = WasmEngine::new().expect("WasmEngine::new");
-    let report = load_plugins(root.path(), &reg, None, Some(engine))
-        .await
-        .unwrap();
+    let opts = LoaderOpts {
+        bus: None,
+        wasm_engine: Some(engine),
+    };
+    let report = load_plugins(root.path(), &reg, opts).await.unwrap();
     assert!(
         report.failed.is_empty(),
         "load failures: {:?}",
@@ -76,7 +78,9 @@ async fn wasm_plugin_without_engine_fails_partial() {
     let reg = AiRegistry::new();
     // No engine passed — loader must surface a descriptive failure
     // instead of panicking, and the registry stays empty.
-    let report = load_plugins(root.path(), &reg, None, None).await.unwrap();
+    let report = load_plugins(root.path(), &reg, LoaderOpts::default())
+        .await
+        .unwrap();
     assert!(report.loaded.is_empty());
     assert_eq!(report.failed.len(), 1);
     assert!(

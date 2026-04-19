@@ -49,9 +49,11 @@ async fn streaming_transcribe_emits_partials_on_bus() {
     let registry = AiRegistry::new();
     let tmp = stage_mock_in_temp();
 
-    let report = load_plugins(tmp.path(), &registry, Some(bus.clone()), None)
-        .await
-        .unwrap();
+    let opts = smiths_plugin::LoaderOpts {
+        bus: Some(bus.clone()),
+        wasm_engine: None,
+    };
+    let report = load_plugins(tmp.path(), &registry, opts).await.unwrap();
     assert!(
         report.failed.is_empty(),
         "load failures: {:?}",
