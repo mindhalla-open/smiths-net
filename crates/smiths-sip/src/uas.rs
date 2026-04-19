@@ -207,6 +207,7 @@ impl<T: Transport> UasServer<T> {
             Err(e) => {
                 let reason = e.to_string();
                 warn!(%peer, %reason, "malformed SIP message dropped");
+                self.metrics.sip_parse_errors.inc();
                 let _ = self
                     .bus
                     .publish(Event::Sip(SipEvent::ParseError { peer, reason }));

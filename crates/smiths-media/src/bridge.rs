@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use smiths_core::Metrics;
 use smiths_core::media::{BridgeId, MediaSession};
+use smiths_core::metrics::RtpDirLabel;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -57,7 +59,7 @@ pub struct RtcpLeg {
 }
 
 /// Runtime tunables for a bridge.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BridgeConfig {
     /// How often to emit RTCP Sender Reports. `None` disables
     /// emission entirely even if the legs carry RTCP sockets.
@@ -65,13 +67,27 @@ pub struct BridgeConfig {
     /// RFC 3550 §6.2 recommends ~5 s as the default for low-rate
     /// flows; tests override with tighter values.
     pub rtcp_interval: Option<Duration>,
+    /// Optional metrics handle. When present, forwarders and the SR
+    /// emitter increment `rtp_packets_forwarded` / `rtcp_sr_sent`;
+    /// when absent (tests, embedded use) the bridge runs silently.
+    pub metrics: Option<std::sync::Arc<Metrics>>,
 }
 
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
             rtcp_interval: Some(Duration::from_secs(5)),
+            metrics: None,
         }
+    }
+}
+
+impl std::fmt::Debug for BridgeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeConfig")
+            .field("rtcp_interval", &self.rtcp_interval)
+            .field("metrics", &self.metrics.is_some())
+            .finish()
     }
 }
 
@@ -119,6 +135,7 @@ impl Bridge {
             b.peer,
             ssrc_toward_b,
             stats_a_to_b.clone(),
+            cfg.metrics.clone(),
             cancel.clone(),
             "a->b",
         );
@@ -128,6 +145,7 @@ impl Bridge {
             a.peer,
             ssrc_toward_a,
             stats_b_to_a.clone(),
+            cfg.metrics.clone(),
             cancel.clone(),
             "b->a",
         );
@@ -143,6 +161,7 @@ impl Bridge {
                     ssrc_toward_b,
                     stats_a_to_b.clone(),
                     interval,
+                    cfg.metrics.clone(),
                     cancel.clone(),
                     "a->b",
                 ));
@@ -153,6 +172,7 @@ impl Bridge {
                     ssrc_toward_a,
                     stats_b_to_a.clone(),
                     interval,
+                    cfg.metrics.clone(),
                     cancel.clone(),
                     "b->a",
                 ));
@@ -215,12 +235,14 @@ impl MediaSession for Bridge {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // All args map 1:1 to forwarder state; grouping hides intent.
 fn spawn_rewriting_forward(
     recv: Arc<UdpSocket>,
     send: Arc<UdpSocket>,
     dest: SocketAddr,
     ssrc_out: u32,
     stats: StreamStats,
+    metrics: Option<Arc<Metrics>>,
     cancel: CancellationToken,
     dir: &'static str,
 ) -> JoinHandle<()> {
@@ -243,6 +265,12 @@ fn spawn_rewriting_forward(
                         stats.observe(&buf[..n]);
                         if let Err(e) = send.send_to(&buf[..n], dest).await {
                             warn!(dir, ?e, "bridge send failed");
+                        } else if let Some(m) = &metrics {
+                            m.rtp_packets_forwarded
+                                .get_or_create(&RtpDirLabel {
+                                    direction: dir.replace("->", "_to_"),
+                                })
+                                .inc();
                         }
                     }
                     Err(e) => {
@@ -263,6 +291,7 @@ fn spawn_sr_emitter(
     sender_ssrc: u32,
     stats: StreamStats,
     interval: Duration,
+    metrics: Option<Arc<Metrics>>,
     cancel: CancellationToken,
     dir: &'static str,
 ) -> JoinHandle<()> {
@@ -287,6 +316,8 @@ fn spawn_sr_emitter(
                     );
                     if let Err(e) = rtcp.socket.send_to(&pkt, rtcp.peer).await {
                         warn!(dir, ?e, "RTCP SR send failed");
+                    } else if let Some(m) = &metrics {
+                        m.rtcp_sr_sent.inc();
                     }
                 }
             }
@@ -537,6 +568,7 @@ mod tests {
             },
             &BridgeConfig {
                 rtcp_interval: Some(Duration::from_millis(100)),
+                metrics: None,
             },
         );
 

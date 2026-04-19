@@ -53,6 +53,7 @@ async fn loads_wasm_plugin_and_surfaces_capability() {
     let opts = LoaderOpts {
         bus: None,
         wasm_engine: Some(engine),
+        metrics: None,
     };
     let report = load_plugins(root.path(), &reg, opts).await.unwrap();
     assert!(
@@ -120,6 +121,7 @@ async fn invoke_round_trips_end_to_end_through_provider() {
     let opts = LoaderOpts {
         bus: None,
         wasm_engine: Some(engine),
+        metrics: None,
     };
     let report = load_plugins(root.path(), &reg, opts).await.unwrap();
     assert!(

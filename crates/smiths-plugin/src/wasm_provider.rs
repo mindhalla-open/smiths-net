@@ -11,13 +11,16 @@
 //! (`send_sip` / `send_rtp` / permission checks).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use smiths_core::Metrics;
 use smiths_core::ai::{AiProvider, CapabilityDescriptor, ProviderError, parse_descriptors};
 use smiths_wasm::{Module, WasmEngine};
 
 use crate::manifest::Manifest;
+use crate::registry::record_invocation;
 
 /// A WASM plugin registered with the engine's `AiRegistry`.
 #[derive(Clone, Debug)]
@@ -34,6 +37,9 @@ pub struct WasmProvider {
     /// Shared engine handle (same `WasmEngine` every WASM plugin
     /// uses, so state + fuel + epoch config are uniform).
     pub engine: WasmEngine,
+    /// Optional metrics handle; when present, each `invoke` records
+    /// `plugin_invocations` + `plugin_invoke_duration_seconds`.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 impl WasmProvider {
@@ -96,7 +102,16 @@ impl WasmProvider {
             dir,
             module,
             engine,
+            metrics: None,
         })
+    }
+
+    /// Attach a metrics handle. Builder-style so the loader can
+    /// install it after construction without a larger signature.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 }
 
@@ -122,8 +137,13 @@ impl AiProvider for WasmProvider {
         // engine's `invoke` ABI. Wasmtime's sync call runs on this
         // thread — acceptable at MVP scale, but the next slice should
         // park it on a blocking pool if plugins get compute-heavy.
-        self.engine
-            .call_invoke(&self.module, &self.manifest.name, method, &params)
-            .map_err(|e| ProviderError(format!("plugin `{}`: {e}", self.manifest.name)))
+        let name = &self.manifest.name;
+        let start = std::time::Instant::now();
+        let result = self
+            .engine
+            .call_invoke(&self.module, name, method, &params)
+            .map_err(|e| ProviderError(format!("plugin `{name}`: {e}")));
+        record_invocation(self.metrics.as_deref(), name, &result, start);
+        result
     }
 }

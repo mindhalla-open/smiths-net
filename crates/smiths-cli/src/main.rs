@@ -99,7 +99,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the shared media fabric before the WASM engine so guest
     // `send_rtp` can push packets through it.
-    let media_fabric: Arc<dyn MediaFabric> = Arc::new(UdpMediaFabric::new());
+    let media_fabric: Arc<dyn MediaFabric> =
+        Arc::new(UdpMediaFabric::new().with_metrics(Arc::clone(&metrics)));
 
     // Load plugins from the configured directory. Failures are per-
     // plugin and logged; they don't block startup.
@@ -122,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
     let loader_opts = smiths_plugin::LoaderOpts {
         bus: Some(bus.clone()),
         wasm_engine,
+        metrics: Some(Arc::clone(&metrics)),
     };
     match smiths_plugin::load_plugins(&config.plugins.dir, &ai_registry, loader_opts).await {
         Ok(report) => {

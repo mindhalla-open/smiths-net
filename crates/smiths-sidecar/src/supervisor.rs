@@ -10,9 +10,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use smiths_core::Metrics;
+use smiths_core::metrics::PluginLabel;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -116,7 +119,6 @@ pub struct Sidecar {
     inner: Arc<Inner>,
 }
 
-#[derive(Debug)]
 struct Inner {
     name: String,
     next_id: AtomicU64,
@@ -134,6 +136,21 @@ struct Inner {
     shutdown: CancellationToken,
     /// Supervisor task handle. Owned so `shutdown` can `await` it.
     supervisor: Mutex<Option<JoinHandle<()>>>,
+    /// Engine-wide metrics handle, optional because tests don't wire
+    /// one. Set at most once via [`Sidecar::with_metrics`]; the
+    /// supervise loop reads it on every respawn.
+    metrics: OnceLock<Arc<Metrics>>,
+}
+
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("name", &self.name)
+            .field("plugin_dir", &self.plugin_dir)
+            .field("entry", &self.entry)
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Sidecar {
@@ -172,6 +189,7 @@ impl Sidecar {
             policy,
             shutdown: CancellationToken::new(),
             supervisor: Mutex::new(None),
+            metrics: OnceLock::new(),
         });
 
         // First spawn runs synchronously so the caller sees a clean
@@ -189,6 +207,14 @@ impl Sidecar {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.inner.name
+    }
+
+    /// Attach an engine-wide metrics handle. Can only be called once
+    /// per sidecar; subsequent calls are no-ops (the first metrics
+    /// wins). Used by the plugin loader when `LoaderOpts::metrics` is
+    /// set, so `sidecar_restarts` counts flow through on respawn.
+    pub fn set_metrics(&self, metrics: Arc<Metrics>) {
+        let _ = self.inner.metrics.set(metrics);
     }
 
     /// Subscribe to plugin-initiated notifications (JSON-RPC frames
@@ -294,6 +320,7 @@ impl Clone for Sidecar {
     }
 }
 
+#[allow(clippy::too_many_lines)] // single-file supervisor loop; splitting hurts readability.
 /// Own one child from first byte of stdout through EOF; respawn on
 /// unexpected exit up to [`RestartPolicy::max_retries`]. Exits cleanly
 /// when `shutdown` fires.
@@ -368,6 +395,13 @@ async fn supervise_loop(
                 stderr = new_stderr;
                 attempts = 0;
                 backoff = inner.policy.initial_backoff;
+                if let Some(m) = inner.metrics.get() {
+                    m.sidecar_restarts
+                        .get_or_create(&PluginLabel {
+                            plugin: inner.name.clone(),
+                        })
+                        .inc();
+                }
                 info!(plugin = %inner.name, "sidecar respawned");
             }
             Err(e) => {
@@ -392,6 +426,13 @@ async fn supervise_loop(
                             stderr = se;
                             attempts = 0;
                             backoff = inner.policy.initial_backoff;
+                            if let Some(m) = inner.metrics.get() {
+                                m.sidecar_restarts
+                                    .get_or_create(&PluginLabel {
+                                        plugin: inner.name.clone(),
+                                    })
+                                    .inc();
+                            }
                             break;
                         }
                         Err(err) => {

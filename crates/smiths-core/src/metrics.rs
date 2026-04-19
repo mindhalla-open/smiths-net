@@ -49,21 +49,59 @@ pub struct ToolLabel {
     pub tool: String,
 }
 
+/// `rtp_packets_forwarded_total{direction="..."}` label. `direction` is
+/// either `"a_to_b"` or `"b_to_a"` — the bridge uses fixed strings so
+/// Prometheus cardinality stays bounded.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RtpDirLabel {
+    pub direction: String,
+}
+
+/// `plugin_invocations_total{plugin="...", outcome="..."}`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PluginOutcomeLabel {
+    pub plugin: String,
+    pub outcome: String,
+}
+
+/// `plugin_invoke_duration_seconds{plugin="..."}` / other per-plugin
+/// histograms and counters that only need the plugin-name dimension.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PluginLabel {
+    pub plugin: String,
+}
+
 /// All engine metrics. Handles are `Arc`-backed internally, so cloning
 /// the struct (or its containers) is cheap — the same counter is
 /// incremented whether you hold the original or a clone.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Metrics {
     /// SIP requests received, keyed by method.
     pub sip_requests: Family<SipMethodLabel, Counter>,
     /// SIP responses emitted, keyed by status code string.
     pub sip_responses: Family<SipCodeLabel, Counter>,
+    /// Parse failures on an inbound SIP datagram.
+    pub sip_parse_errors: Counter,
     /// Number of dialogs the engine currently considers live.
     pub dialogs_active: Gauge,
+    /// Number of active UDP bridges the media fabric is running.
+    pub bridges_active: Gauge,
+    /// RTP packets the bridge forwarded (post-SSRC-rewrite), keyed
+    /// by direction.
+    pub rtp_packets_forwarded: Family<RtpDirLabel, Counter>,
+    /// RTCP Sender Reports emitted by the bridge.
+    pub rtcp_sr_sent: Counter,
     /// Tool invocation outcome counts.
     pub tool_invocations: Family<ToolOutcomeLabel, Counter>,
     /// Tool call latency.
     pub tool_duration: Family<ToolLabel, Histogram, fn() -> Histogram>,
+    /// Plugin invocation outcomes (AI sidecar or WASM), keyed by
+    /// plugin name + outcome (`ok` / `error`).
+    pub plugin_invocations: Family<PluginOutcomeLabel, Counter>,
+    /// Plugin invoke latency, keyed by plugin name.
+    pub plugin_invoke_duration: Family<PluginLabel, Histogram, fn() -> Histogram>,
+    /// Sidecar supervisor respawns, keyed by plugin name.
+    pub sidecar_restarts: Family<PluginLabel, Counter>,
 }
 
 impl Metrics {
@@ -73,10 +111,18 @@ impl Metrics {
     pub fn register(registry: &mut Registry) -> Arc<Self> {
         let sip_requests = Family::<SipMethodLabel, Counter>::default();
         let sip_responses = Family::<SipCodeLabel, Counter>::default();
+        let sip_parse_errors = Counter::default();
         let dialogs_active = Gauge::default();
+        let bridges_active = Gauge::default();
+        let rtp_packets_forwarded = Family::<RtpDirLabel, Counter>::default();
+        let rtcp_sr_sent = Counter::default();
         let tool_invocations = Family::<ToolOutcomeLabel, Counter>::default();
         let tool_duration: Family<ToolLabel, Histogram, fn() -> Histogram> =
             Family::new_with_constructor(default_histogram);
+        let plugin_invocations = Family::<PluginOutcomeLabel, Counter>::default();
+        let plugin_invoke_duration: Family<PluginLabel, Histogram, fn() -> Histogram> =
+            Family::new_with_constructor(default_histogram);
+        let sidecar_restarts = Family::<PluginLabel, Counter>::default();
 
         registry.register(
             "sip_requests",
@@ -85,9 +131,29 @@ impl Metrics {
         );
         registry.register("sip_responses", "SIP responses sent", sip_responses.clone());
         registry.register(
+            "sip_parse_errors",
+            "SIP datagrams that failed to parse",
+            sip_parse_errors.clone(),
+        );
+        registry.register(
             "sip_dialogs_active",
             "Currently-live SIP dialogs",
             dialogs_active.clone(),
+        );
+        registry.register(
+            "media_bridges_active",
+            "Currently-live media bridges",
+            bridges_active.clone(),
+        );
+        registry.register(
+            "rtp_packets_forwarded",
+            "RTP packets the bridge forwarded (post-rewrite)",
+            rtp_packets_forwarded.clone(),
+        );
+        registry.register(
+            "rtcp_sr_sent",
+            "RTCP Sender Reports emitted by the bridge",
+            rtcp_sr_sent.clone(),
         );
         registry.register(
             "tool_invocations",
@@ -99,13 +165,35 @@ impl Metrics {
             "Tool call latency in seconds",
             tool_duration.clone(),
         );
+        registry.register(
+            "plugin_invocations",
+            "AiProvider::invoke outcomes, per plugin",
+            plugin_invocations.clone(),
+        );
+        registry.register(
+            "plugin_invoke_duration_seconds",
+            "AiProvider::invoke latency, per plugin",
+            plugin_invoke_duration.clone(),
+        );
+        registry.register(
+            "sidecar_restarts",
+            "Sidecar supervisor respawns, per plugin",
+            sidecar_restarts.clone(),
+        );
 
         Arc::new(Self {
             sip_requests,
             sip_responses,
+            sip_parse_errors,
             dialogs_active,
+            bridges_active,
+            rtp_packets_forwarded,
+            rtcp_sr_sent,
             tool_invocations,
             tool_duration,
+            plugin_invocations,
+            plugin_invoke_duration,
+            sidecar_restarts,
         })
     }
 

@@ -5,6 +5,52 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-04-20
+
+### Added — engine-wide metrics coverage
+
+- **`smiths-core::Metrics`** grew seven new fields covering the
+  subsystems that previously had no visibility:
+  - `sip_parse_errors` (counter) — incremented in UAS when rsip
+    rejects an inbound datagram. Pairs with the `ParseError` event.
+  - `bridges_active` (gauge) — in/dec on `MediaFabric::bridge` /
+    `release_bridge` so operators see the live passthrough count.
+  - `rtp_packets_forwarded{direction}` (counter family) —
+    `direction="a_to_b"` / `"b_to_a"`; incremented after successful
+    `send_to` in each forwarder task.
+  - `rtcp_sr_sent` (counter) — incremented in the SR emitter task
+    on each successful RTCP write.
+  - `plugin_invocations{plugin, outcome}` (counter family) —
+    recorded on every `AiProvider::invoke`; `outcome="ok"|"error"`.
+  - `plugin_invoke_duration_seconds{plugin}` (histogram family) —
+    same hook; uses the default latency buckets shared with the
+    tool-duration histogram.
+  - `sidecar_restarts{plugin}` (counter family) — emitted by the
+    supervisor each time `supervise_loop` successfully respawns a
+    crashed child.
+- **Metrics threading.** The CLI builds a single `Arc<Metrics>` at
+  boot and threads it through:
+  - `LoaderOpts::metrics` — every loaded `PluginEntry` and
+    `WasmProvider` receives it at registration time.
+  - `UdpMediaFabric::with_metrics` — fabric propagates it to every
+    bridge via `BridgeConfig::metrics`.
+  - `Sidecar::set_metrics` — set post-`spawn` (uses `OnceLock`
+    internally so the hot path reads without locking).
+- **Optional at every layer.** Each new hook checks `Option<Arc<
+  Metrics>>`; tests and embedded use that bypass the registry
+  continue to work unchanged.
+
+### Changed
+
+- `BridgeConfig` is no longer `#[derive(Default)]` — it now has an
+  explicit `Default` so the new `metrics` field initializes to
+  `None` without shifting the `rtcp_interval` default.
+- `PluginEntry` gained a `metrics: Option<Arc<Metrics>>` field.
+  Existing consumers that destructure the struct need the extra
+  field; construction via the loader is unaffected.
+- `Metrics` now derives `Debug` (required to keep `PluginEntry`'s
+  derive working).
+
 ## [0.11.0] - 2026-04-20
 
 ### Added — RTP stats + RTCP SR emission

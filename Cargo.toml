@@ -6,7 +6,7 @@ exclude  = ["fuzz"]
 [workspace.package]
 edition      = "2024"
 rust-version = "1.85"
-version      = "0.11.0"
+version      = "0.12.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
@@ -61,11 +61,11 @@ wasmtime = { version = "43", default-features = false, features = ["cranelift", 
 wat      = "1"
 
 # Wire schema (prost without build.rs — derives only)
-prost       = { version = "0.13", default-features = false, features = ["std", "derive"] }
-prost-types = { version = "0.13" }
+prost       = { version = "0.14.3", default-features = false, features = ["std", "derive"] }
+prost-types = { version = "0.14.3" }
 
 # Filesystem watching (hot reload for plugin dirs)
-notify = "6"
+notify = "8.2.0"
 
 # TLS
 rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
