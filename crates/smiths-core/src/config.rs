@@ -75,6 +75,10 @@ pub struct SipConfig {
     pub transports: Vec<SipTransport>,
     /// Grace period to finish in-flight transactions on shutdown.
     pub drain_timeout_secs: u64,
+    /// Filesystem paths to PEM-encoded TLS server cert + private key.
+    /// Required when `transports` contains `tls`. Ignored otherwise.
+    pub tls_cert_path: Option<std::path::PathBuf>,
+    pub tls_key_path: Option<std::path::PathBuf>,
 }
 
 impl Default for SipConfig {
@@ -86,6 +90,8 @@ impl Default for SipConfig {
             ))],
             transports: vec![SipTransport::Udp],
             drain_timeout_secs: 10,
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }

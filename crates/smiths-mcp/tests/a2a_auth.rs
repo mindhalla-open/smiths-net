@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use smiths_core::{Config, EventBus, RateLimitConfig};
+use smiths_core::{Config, EventBus, Metrics, RateLimitConfig};
 use smiths_mcp::{ControlState, RateLimiter, ToolContext, builtin_resources, tools};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -24,10 +24,13 @@ async fn spawn_server(bearer: Option<String>) -> (std::net::SocketAddr, Cancella
     let registry = Arc::new(tools::builtin_registry());
     let resources = Arc::new(builtin_resources());
     let rl = Arc::new(RateLimiter::new(&RateLimitConfig::default()));
+    let metrics = Metrics::noop();
 
     let c2 = cancel.clone();
     tokio::spawn(async move {
-        let _ = smiths_mcp::a2a::serve_http(addr, registry, resources, rl, bearer, ctx, c2).await;
+        let _ =
+            smiths_mcp::a2a::serve_http(addr, registry, resources, rl, metrics, bearer, ctx, c2)
+                .await;
     });
     // Let axum bind.
     tokio::time::sleep(Duration::from_millis(50)).await;

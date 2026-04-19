@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
-use smiths_core::{Event, EventBus, SipEvent};
+use smiths_core::{Event, EventBus, Metrics, SipEvent};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
@@ -49,6 +49,7 @@ pub async fn run_stdio(
     registry: Arc<ToolRegistry>,
     resources: Arc<ResourceRegistry>,
     rate_limiter: Arc<RateLimiter>,
+    metrics: Arc<Metrics>,
     ctx: ToolContext,
     bus: EventBus,
     cancel: CancellationToken,
@@ -83,8 +84,15 @@ pub async fn run_stdio(
                 if trimmed.is_empty() {
                     continue;
                 }
-                let response =
-                    handle_frame(trimmed, &registry, &resources, &rate_limiter, &ctx).await;
+                let response = handle_frame(
+                    trimmed,
+                    &registry,
+                    &resources,
+                    &rate_limiter,
+                    &metrics,
+                    &ctx,
+                )
+                .await;
                 if let Some(resp) = response {
                     write_frame(&mut stdout, &resp).await?;
                 }
@@ -141,6 +149,7 @@ async fn handle_frame(
     registry: &ToolRegistry,
     resources: &ResourceRegistry,
     rate_limiter: &Arc<RateLimiter>,
+    metrics: &Arc<Metrics>,
     ctx: &ToolContext,
 ) -> Option<Value> {
     // Parse loosely — we emit parse-error with id=null if malformed.
@@ -162,7 +171,16 @@ async fn handle_frame(
     let params = req.get("params").cloned().unwrap_or(Value::Null);
 
     let is_notification = req.get("id").is_none();
-    let result = dispatch(method, params, registry, resources, rate_limiter, ctx).await;
+    let result = dispatch(
+        method,
+        params,
+        registry,
+        resources,
+        rate_limiter,
+        metrics,
+        ctx,
+    )
+    .await;
 
     if is_notification {
         // Per JSON-RPC 2.0: notifications never get a response, even
@@ -181,6 +199,7 @@ async fn dispatch(
     registry: &ToolRegistry,
     resources: &ResourceRegistry,
     rate_limiter: &Arc<RateLimiter>,
+    metrics: &Arc<Metrics>,
     ctx: &ToolContext,
 ) -> Result<Value, (i64, String)> {
     match method {
@@ -188,7 +207,7 @@ async fn dispatch(
         "initialized" | "notifications/initialized" | "shutdown" => Ok(Value::Null),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools_list_response(registry)),
-        "tools/call" => tools_call(params, registry, rate_limiter, ctx).await,
+        "tools/call" => tools_call(params, registry, rate_limiter, metrics, ctx).await,
         "resources/list" => Ok(resources_list_response(resources)),
         "resources/read" => resources_read(params, resources, ctx).await,
         other => Err((ERR_METHOD_NOT_FOUND, format!("unknown method: {other}"))),
@@ -275,6 +294,7 @@ async fn tools_call(
     params: Value,
     registry: &ToolRegistry,
     rate_limiter: &Arc<RateLimiter>,
+    metrics: &Arc<Metrics>,
     ctx: &ToolContext,
 ) -> Result<Value, (i64, String)> {
     let name = params
@@ -286,7 +306,7 @@ async fn tools_call(
         .cloned()
         .unwrap_or_else(|| Value::Object(Map::default()));
 
-    match invoke_audited(registry, rate_limiter, ctx, ACTOR, name, args).await {
+    match invoke_audited(registry, rate_limiter, metrics, ctx, ACTOR, name, args).await {
         Ok(output) => {
             // MCP `tools/call` response wraps output as a content
             // array; we always return a single JSON text block.
@@ -364,7 +384,8 @@ mod tests {
         let frame = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
         let res = crate::resource::builtin_registry();
         let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
-        let resp = handle_frame(frame, &reg, &res, &rl, &c).await.unwrap();
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await.unwrap();
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"]["serverInfo"]["name"], "smiths-net");
@@ -378,7 +399,8 @@ mod tests {
         let frame = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
         let res = crate::resource::builtin_registry();
         let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
-        let resp = handle_frame(frame, &reg, &res, &rl, &c).await.unwrap();
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await.unwrap();
         let names: Vec<&str> = resp["result"]["tools"]
             .as_array()
             .unwrap()
@@ -397,7 +419,8 @@ mod tests {
         let frame = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"health","arguments":{}}}"#;
         let res = crate::resource::builtin_registry();
         let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
-        let resp = handle_frame(frame, &reg, &res, &rl, &c).await.unwrap();
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await.unwrap();
         assert_eq!(resp["result"]["isError"], false);
         assert_eq!(resp["result"]["structuredContent"]["status"], "ok");
     }
@@ -409,7 +432,8 @@ mod tests {
         let frame = r#"{"jsonrpc":"2.0","id":4,"method":"does/not/exist"}"#;
         let res = crate::resource::builtin_registry();
         let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
-        let resp = handle_frame(frame, &reg, &res, &rl, &c).await.unwrap();
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await.unwrap();
         assert_eq!(resp["error"]["code"], ERR_METHOD_NOT_FOUND);
     }
 
@@ -421,7 +445,8 @@ mod tests {
         // No `id` — this is a notification.
         let frame = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
-        let resp = handle_frame(frame, &reg, &res, &rl, &c).await;
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await;
         assert!(resp.is_none());
     }
 
@@ -432,7 +457,8 @@ mod tests {
         let (c, _cancel) = ctx();
         let frame = r#"{"jsonrpc":"2.0","id":5,"method":"resources/list"}"#;
         let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
-        let resp = handle_frame(frame, &reg, &res, &rl, &c).await.unwrap();
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await.unwrap();
         let uris: Vec<&str> = resp["result"]["resources"]
             .as_array()
             .unwrap()
@@ -451,7 +477,8 @@ mod tests {
         let (c, _cancel) = ctx();
         let frame = r#"{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"health://status"}}"#;
         let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
-        let resp = handle_frame(frame, &reg, &res, &rl, &c).await.unwrap();
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await.unwrap();
         let body = resp["result"]["contents"][0]["text"].as_str().unwrap();
         let v: Value = serde_json::from_str(body).unwrap();
         assert_eq!(v["status"], "ok");
@@ -465,7 +492,8 @@ mod tests {
         let frame =
             r#"{"jsonrpc":"2.0","id":7,"method":"resources/read","params":{"uri":"no://such"}}"#;
         let rl = Arc::new(RateLimiter::new(&smiths_core::RateLimitConfig::default()));
-        let resp = handle_frame(frame, &reg, &res, &rl, &c).await.unwrap();
+        let m = Metrics::noop();
+        let resp = handle_frame(frame, &reg, &res, &rl, &m, &c).await.unwrap();
         assert_eq!(resp["error"]["code"], ERR_METHOD_NOT_FOUND);
     }
 }

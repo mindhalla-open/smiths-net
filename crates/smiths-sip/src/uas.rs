@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use smiths_core::metrics::{Metrics, SipCodeLabel, SipMethodLabel};
 use smiths_core::{
     BridgeId, DialogKey, DialogRecord, DialogState, EndpointId, Event, EventBus, MediaFabric,
     NegotiationOutcome, SdpNegotiator, SipEvent,
@@ -112,6 +113,9 @@ pub struct UasServer<T: Transport> {
     /// `None` = auth disabled, registrar accepts any REGISTER blindly
     /// (dev convenience; never do that in prod).
     registrar: Option<crate::auth::digest::Registrar>,
+    /// Prometheus metrics. Defaults to [`Metrics::noop`] so tests and
+    /// single-server setups can ignore observability entirely.
+    metrics: Arc<Metrics>,
 }
 
 impl<T: Transport> UasServer<T> {
@@ -140,6 +144,7 @@ impl<T: Transport> UasServer<T> {
             pending_bridges: Arc::new(DashMap::new()),
             bridges_by_dialog: Arc::new(DashMap::new()),
             registrar: None,
+            metrics: Metrics::noop(),
         })
     }
 
@@ -147,6 +152,14 @@ impl<T: Transport> UasServer<T> {
     #[must_use]
     pub fn with_registrar(mut self, registrar: crate::auth::digest::Registrar) -> Self {
         self.registrar = Some(registrar);
+        self
+    }
+
+    /// Attach a shared metrics handle. Without this, the UAS uses a
+    /// throwaway registry — safe for tests, invisible to operators.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -199,6 +212,12 @@ impl<T: Transport> UasServer<T> {
     }
 
     async fn handle_request(&self, req: RequestSummary, peer: SocketAddr) {
+        self.metrics
+            .sip_requests
+            .get_or_create(&SipMethodLabel {
+                method: req.method.clone(),
+            })
+            .inc();
         let _ = self.bus.publish(Event::Sip(SipEvent::RequestReceived {
             peer,
             method: req.method.clone(),
@@ -453,6 +472,7 @@ impl<T: Transport> UasServer<T> {
             remote_media,
         };
         self.dialogs.insert(dialog_key, record);
+        self.metrics.dialogs_active.inc();
 
         let mut extras: Vec<(&str, &str)> = vec![("Contact", self.contact.as_str())];
         if sdp_answer_body.is_some() {
@@ -500,6 +520,7 @@ impl<T: Transport> UasServer<T> {
 
         match self.dialogs.remove(&key) {
             Some((_, record)) => {
+                self.metrics.dialogs_active.dec();
                 // Drop an unpaired pending leg if this was it.
                 if let Some(rv) = record.rendezvous.as_ref()
                     && let Some(entry) = self.pending_bridges.get(rv)
@@ -556,6 +577,12 @@ impl<T: Transport> UasServer<T> {
             warn!(%peer, ?e, "failed to send provisional response");
             return;
         }
+        self.metrics
+            .sip_responses
+            .get_or_create(&SipCodeLabel {
+                code: status.to_string(),
+            })
+            .inc();
         let _ = self.bus.publish(Event::Sip(SipEvent::ResponseSent {
             peer,
             status,
@@ -595,6 +622,12 @@ impl<T: Transport> UasServer<T> {
             warn!(%peer, ?e, "failed to send response");
             return;
         }
+        self.metrics
+            .sip_responses
+            .get_or_create(&SipCodeLabel {
+                code: status.to_string(),
+            })
+            .inc();
         let _ = self.bus.publish(Event::Sip(SipEvent::ResponseSent {
             peer,
             status,

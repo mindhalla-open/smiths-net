@@ -7,15 +7,17 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use axum::{Json, Router, routing::get};
 use clap::{Parser, ValueEnum};
+use prometheus_client::registry::Registry;
 use smiths_core::{
-    AiRegistry, Config, Event, EventBus, LogFormat, MediaFabric, SdpNegotiator, Shutdown,
+    AiRegistry, Config, Event, EventBus, LogFormat, MediaFabric, Metrics, SdpNegotiator, Shutdown,
     SipTransport, SystemEvent,
 };
 use smiths_mcp::{ControlState, ToolContext};
 use smiths_media::UdpMediaFabric;
 use smiths_sdp::Negotiator;
-use smiths_sip::{TcpTransport, Transport as _, UasServer, UdpTransport};
+use smiths_sip::{TcpTransport, TlsTransport, Transport as _, UasServer, UdpTransport};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -80,6 +82,14 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = Shutdown::new();
     let bus = EventBus::new(1024);
 
+    // One Prometheus registry, shared between the /metrics endpoint
+    // and every subsystem that increments counters.
+    let metrics_registry = Arc::new(Mutex::new(Registry::default()));
+    let metrics = {
+        let mut guard = metrics_registry.lock().await;
+        Metrics::register(&mut guard)
+    };
+
     // Control-plane state is always spawned so MCP/A2A can serve tools
     // with live data. It's cheap and draining is cooperative.
     let (control_state, control_task) = ControlState::spawn(&bus, shutdown.token());
@@ -115,11 +125,12 @@ async fn main() -> anyhow::Result<()> {
         let reg = Arc::clone(&registry);
         let res = Arc::clone(&resources);
         let rl = Arc::clone(&rate_limiter);
+        let met = Arc::clone(&metrics);
         let ctx = tool_ctx.clone();
         let bus = bus.clone();
         let cancel = shutdown.token();
         Some(tokio::spawn(async move {
-            if let Err(e) = smiths_mcp::mcp::run_stdio(reg, res, rl, ctx, bus, cancel).await {
+            if let Err(e) = smiths_mcp::mcp::run_stdio(reg, res, rl, met, ctx, bus, cancel).await {
                 warn!(?e, "MCP stdio server error");
             }
         }))
@@ -127,10 +138,11 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // ---- health HTTP endpoint ----
+    // ---- health + metrics HTTP endpoint ----
     let health = tokio::spawn(serve_health(
         config.observability.health_bind,
         shutdown.token(),
+        Arc::clone(&metrics_registry),
     ));
 
     // ---- SIP subsystem ----
@@ -142,8 +154,14 @@ async fn main() -> anyhow::Result<()> {
     let mut sip_handles: Vec<JoinHandle<()>> = Vec::new();
     let udp_enabled = config.sip.transports.contains(&SipTransport::Udp);
     let tcp_enabled = config.sip.transports.contains(&SipTransport::Tcp);
-    if !udp_enabled && !tcp_enabled {
+    let tls_enabled = config.sip.transports.contains(&SipTransport::Tls);
+    if !udp_enabled && !tcp_enabled && !tls_enabled {
         warn!("no SIP transports configured; signaling disabled");
+    }
+    if tls_enabled && (config.sip.tls_cert_path.is_none() || config.sip.tls_key_path.is_none()) {
+        warn!(
+            "sip.transports includes `tls` but tls_cert_path/tls_key_path are unset; disabling TLS"
+        );
     }
     for bind in &config.sip.bind {
         let addr = bind.socket_addr();
@@ -153,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
                 bus.clone(),
                 shutdown.token(),
                 Arc::clone(&media_fabric),
+                Arc::clone(&metrics),
             )
             .await
             {
@@ -166,11 +185,30 @@ async fn main() -> anyhow::Result<()> {
                 bus.clone(),
                 shutdown.token(),
                 Arc::clone(&media_fabric),
+                Arc::clone(&metrics),
             )
             .await
             {
                 Ok(handles) => sip_handles.extend(handles),
                 Err(e) => warn!(%bind, ?e, "failed to start SIP/TCP on bind; continuing"),
+            }
+        }
+        if tls_enabled
+            && let (Some(cert), Some(key)) = (&config.sip.tls_cert_path, &config.sip.tls_key_path)
+        {
+            match spawn_sip_tls(
+                addr,
+                cert,
+                key,
+                bus.clone(),
+                shutdown.token(),
+                Arc::clone(&media_fabric),
+                Arc::clone(&metrics),
+            )
+            .await
+            {
+                Ok(handles) => sip_handles.extend(handles),
+                Err(e) => warn!(%bind, ?e, "failed to start SIP/TLS on bind; continuing"),
             }
         }
     }
@@ -182,12 +220,13 @@ async fn main() -> anyhow::Result<()> {
         let reg = Arc::clone(&registry);
         let res = Arc::clone(&resources);
         let rl = Arc::clone(&rate_limiter);
+        let met = Arc::clone(&metrics);
         let bearer = config.a2a.bearer_token.clone();
         let ctx = tool_ctx.clone();
         let cancel = shutdown.token();
         adapter_handles.push(tokio::spawn(async move {
             if let Err(e) =
-                smiths_mcp::a2a::serve_http(bind, reg, res, rl, bearer, ctx, cancel).await
+                smiths_mcp::a2a::serve_http(bind, reg, res, rl, met, bearer, ctx, cancel).await
             {
                 warn!(%bind, ?e, "A2A HTTP server error");
             }
@@ -252,6 +291,7 @@ async fn spawn_sip_udp(
     bus: EventBus,
     cancel: CancellationToken,
     media_fabric: Arc<dyn MediaFabric>,
+    metrics: Arc<Metrics>,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let transport = UdpTransport::bind(bind)
         .await
@@ -267,9 +307,38 @@ async fn spawn_sip_udp(
     // multi-bind deployment has one per listener.
     let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(local.ip()));
     let server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
-        .with_context(|| format!("building UAS on {local}"))?;
+        .with_context(|| format!("building UAS on {local}"))?
+        .with_metrics(metrics);
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP UDP listening");
+    Ok(vec![reader, server_handle])
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_sip_tls(
+    bind: SocketAddr,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    bus: EventBus,
+    cancel: CancellationToken,
+    media_fabric: Arc<dyn MediaFabric>,
+    metrics: Arc<Metrics>,
+) -> anyhow::Result<Vec<JoinHandle<()>>> {
+    let transport = TlsTransport::bind(bind, cert, key)
+        .await
+        .with_context(|| format!("binding TLS on {bind}"))?;
+    let local = transport.local_addr()?;
+    let transport = Arc::new(transport);
+
+    let (tx, rx) = mpsc::channel(1024);
+    let reader = transport.spawn_reader(tx, cancel.clone());
+
+    let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(local.ip()));
+    let server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
+        .with_context(|| format!("building UAS on {local}"))?
+        .with_metrics(metrics);
+    let server_handle = tokio::spawn(server.run(rx, cancel));
+    info!(%local, "SIP TLS listening");
     Ok(vec![reader, server_handle])
 }
 
@@ -278,6 +347,7 @@ async fn spawn_sip_tcp(
     bus: EventBus,
     cancel: CancellationToken,
     media_fabric: Arc<dyn MediaFabric>,
+    metrics: Arc<Metrics>,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let transport = TcpTransport::bind(bind)
         .await
@@ -290,7 +360,8 @@ async fn spawn_sip_tcp(
 
     let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(local.ip()));
     let server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
-        .with_context(|| format!("building UAS on {local}"))?;
+        .with_context(|| format!("building UAS on {local}"))?
+        .with_metrics(metrics);
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP TCP listening");
     Ok(vec![reader, server_handle])
@@ -318,12 +389,19 @@ fn init_tracing(level: &str, format: LogFormat, mcp_stdio: bool) -> anyhow::Resu
     Ok(())
 }
 
-async fn serve_health(bind: SocketAddr, cancel: CancellationToken) -> anyhow::Result<()> {
-    let app = Router::new().route("/health", get(health_handler));
+async fn serve_health(
+    bind: SocketAddr,
+    cancel: CancellationToken,
+    registry: Arc<Mutex<Registry>>,
+) -> anyhow::Result<()> {
+    let app = Router::new()
+        .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
+        .with_state(registry);
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding health endpoint on {bind}"))?;
-    info!(%bind, "health endpoint listening");
+    info!(%bind, "health + metrics endpoint listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { cancel.cancelled().await })
@@ -335,4 +413,25 @@ async fn serve_health(bind: SocketAddr, cancel: CancellationToken) -> anyhow::Re
 
 async fn health_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+async fn metrics_handler(
+    axum::extract::State(registry): axum::extract::State<Arc<Mutex<Registry>>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::http::header::CONTENT_TYPE;
+    use axum::response::IntoResponse;
+    let mut out = String::new();
+    let guard = registry.lock().await;
+    if let Err(e) = prometheus_client::encoding::text::encode(&mut out, &guard) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")).into_response();
+    }
+    (
+        [(
+            CONTENT_TYPE,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )],
+        out,
+    )
+        .into_response()
 }

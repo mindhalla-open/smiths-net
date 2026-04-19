@@ -60,6 +60,15 @@ hex     = "0.4"
 wasmtime = { version = "43", default-features = false, features = ["cranelift", "runtime"] }
 wat      = "1"
 
+# TLS
+rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls   = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+rcgen          = "0.14"
+
+# Metrics
+prometheus-client = "0.23"
+
 # test helpers
 tempfile = "3"
 

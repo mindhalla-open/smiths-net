@@ -7,17 +7,20 @@ license      = { workspace = true }
 description  = "RFC 3261 SIP signaling: transport, parser, transactions, dialogs, auth."
 
 [dependencies]
-smiths-core = { workspace = true }
-tokio       = { workspace = true }
-tokio-util  = { workspace = true }
-bytes       = { workspace = true }
-rsip        = { workspace = true }
-dashmap     = { workspace = true }
-md-5        = { workspace = true }
-sha2        = { workspace = true }
-hex         = { workspace = true }
-tracing     = { workspace = true }
-thiserror   = { workspace = true }
+smiths-core    = { workspace = true }
+tokio          = { workspace = true }
+tokio-util     = { workspace = true }
+bytes          = { workspace = true }
+rsip           = { workspace = true }
+dashmap        = { workspace = true }
+md-5           = { workspace = true }
+sha2           = { workspace = true }
+hex            = { workspace = true }
+rustls         = { workspace = true }
+tokio-rustls   = { workspace = true }
+rustls-pemfile = { workspace = true }
+tracing        = { workspace = true }
+thiserror      = { workspace = true }
 
 [dev-dependencies]
 # Integration tests wire the real media + SDP implementations through
@@ -25,6 +28,8 @@ thiserror   = { workspace = true }
 # itself depends only on those seams.
 smiths-media = { workspace = true }
 smiths-sdp   = { workspace = true }
+rcgen        = { workspace = true }
+tempfile     = { workspace = true }
 tokio        = { workspace = true, features = ["macros", "test-util"] }
 
 [lints]

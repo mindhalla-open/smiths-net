@@ -28,6 +28,8 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use smiths_core::Metrics;
+
 use crate::dispatch::invoke_audited;
 use crate::rate_limit::RateLimiter;
 use crate::resource::ResourceRegistry;
@@ -42,6 +44,7 @@ struct AppState {
     registry: Arc<ToolRegistry>,
     resources: Arc<ResourceRegistry>,
     rate_limiter: Arc<RateLimiter>,
+    metrics: Arc<Metrics>,
     ctx: ToolContext,
     /// When set, every request must carry matching
     /// `Authorization: Bearer <token>` or we return 401.
@@ -49,11 +52,13 @@ struct AppState {
 }
 
 /// Bind on `addr` and serve the A2A API until `cancel` fires.
+#[allow(clippy::too_many_arguments)] // intentionally many — one wiring point is clearer than a builder for today's flow
 pub async fn serve_http(
     addr: SocketAddr,
     registry: Arc<ToolRegistry>,
     resources: Arc<ResourceRegistry>,
     rate_limiter: Arc<RateLimiter>,
+    metrics: Arc<Metrics>,
     bearer_token: Option<String>,
     ctx: ToolContext,
     cancel: CancellationToken,
@@ -62,6 +67,7 @@ pub async fn serve_http(
         registry,
         resources,
         rate_limiter,
+        metrics,
         ctx,
         bearer_token: bearer_token.map(Arc::from),
     };
@@ -228,6 +234,7 @@ async fn invoke_tool_http(state: &AppState, params: Value) -> Result<Value, (i64
     match invoke_audited(
         &state.registry,
         &state.rate_limiter,
+        &state.metrics,
         &state.ctx,
         ACTOR,
         name,

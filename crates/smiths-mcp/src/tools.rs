@@ -25,6 +25,7 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(SynthesizeTool);
     reg.register(TranscribeTool);
     reg.register(LlmChatTool);
+    reg.register(EmbedTool);
     reg.register(ReloadPluginTool);
     reg
 }
@@ -520,6 +521,71 @@ impl Tool for LlmChatTool {
     }
 }
 
+/// `embed` — invoke an `ai.embed` plugin with an array of text
+/// inputs. Returns one vector per input plus the shared dimension.
+pub struct EmbedTool;
+
+#[async_trait]
+impl Tool for EmbedTool {
+    fn name(&self) -> &'static str {
+        "embed"
+    }
+
+    fn description(&self) -> &'static str {
+        "Invoke an `ai.embed` plugin on an array of text inputs. \
+         Returns parallel-indexed embedding vectors."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "plugin":   { "type": "string", "description": "Embedding plugin name." },
+                "inputs":   {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": "Text strings to embed."
+                },
+                "controls": { "type": "object", "description": "Provider-specific controls." }
+            },
+            "required": ["plugin", "inputs"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let plugin_name = args
+            .get("plugin")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("plugin required".into()))?;
+        let inputs = args
+            .get("inputs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ToolError::InvalidArguments("inputs required".into()))?;
+        if inputs.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "inputs must not be empty".into(),
+            ));
+        }
+        if inputs.iter().any(|i| !i.is_string()) {
+            return Err(ToolError::InvalidArguments(
+                "every input must be a string".into(),
+            ));
+        }
+        let entry = resolve_and_validate(ctx, plugin_name, "ai.embed", &args)?;
+
+        let params = json!({
+            "inputs": inputs,
+            "controls": args.get("controls"),
+        });
+        entry
+            .invoke("embed", params)
+            .await
+            .map_err(|e| ToolError::Internal(e.to_string()))
+    }
+}
+
 /// `reload_plugin` — drain a loaded plugin's sidecar, re-parse its
 /// manifest, and re-spawn. Useful when a plugin file was edited on
 /// disk without restarting the engine.
@@ -605,7 +671,7 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 9);
+        assert_eq!(reg.len(), 10);
         for name in [
             "list_calls",
             "get_call_status",
@@ -615,10 +681,31 @@ mod tests {
             "synthesize",
             "transcribe",
             "llm_chat",
+            "embed",
             "reload_plugin",
         ] {
             assert!(reg.get(name).is_some(), "missing tool: {name}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embed_without_plugin_is_not_found() {
+        let (ctx, _c) = ctx_with_state();
+        let err = EmbedTool
+            .call(json!({"plugin": "nope", "inputs": ["hi"]}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn embed_rejects_empty_inputs() {
+        let (ctx, _c) = ctx_with_state();
+        let err = EmbedTool
+            .call(json!({"plugin": "x", "inputs": []}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -12,6 +12,7 @@ pub mod config;
 pub mod error;
 pub mod event;
 pub mod media;
+pub mod metrics;
 pub mod sdp;
 pub mod shutdown;
 
@@ -31,5 +32,6 @@ pub use media::{
     BridgeId, Endpoint, EndpointId, EndpointKind, MediaEndpoint, MediaError, MediaFabric,
     MediaSession,
 };
+pub use metrics::Metrics;
 pub use sdp::{NegotiationOutcome, SdpNegotiator};
 pub use shutdown::Shutdown;

@@ -1,0 +1,7 @@
+name        = "ai-embed-mock"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["ai.embed"]
+abi         = "1.0"
+description = "Reference embedding plugin: deterministic hash-based vectors. Swap for Sentence-Transformers / a managed embedding service later without changing the ABI."
