@@ -5,14 +5,17 @@
 //! G.711 μ-law codec, a minimal WAV writer, and a signal generator so
 //! end-to-end audio and signaling scenarios don't need external tools.
 
-pub mod codec;
 pub mod fake_uac;
 pub mod fake_uas;
-pub mod rtp;
 pub mod signal;
 pub mod wav;
 
-pub use codec::{pcm16_to_pcmu, pcmu_to_pcm16};
+// Codec and RTP packet types live in `smiths-media` now (production
+// code needs them for audio injection). Re-exported here so existing
+// tests keep their old import paths.
+pub use smiths_media::codec;
+pub use smiths_media::rtp;
+pub use smiths_media::{RtpPacket, pcm16_to_pcmu, pcmu_to_pcm16};
+
 pub use fake_uac::FakeUac;
 pub use fake_uas::{CapturedRequest, FakeUas};
-pub use rtp::RtpPacket;

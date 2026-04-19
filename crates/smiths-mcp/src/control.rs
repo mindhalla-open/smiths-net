@@ -5,11 +5,13 @@
 //! [`ToolContext`] and query it without caring how MCP or A2A delivered
 //! the request.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use dashmap::DashMap;
 use serde::Serialize;
+use smiths_core::media::EndpointId;
 use smiths_core::{Event, EventBus, SipEvent};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +40,16 @@ pub struct CallSnapshot {
     pub started_at: u64,
     /// Unix seconds the dialog ended, if it has.
     pub ended_at: Option<u64>,
+    /// Engine-allocated media endpoint ID for this dialog, if it
+    /// carries media. `None` for signaling-only calls or any dialog
+    /// where SDP negotiation didn't complete. Internal-use field; the
+    /// `speak` tool uses this to locate the call's audio leg.
+    #[serde(skip)]
+    pub media_endpoint: Option<EndpointId>,
+    /// Peer's RTP endpoint learned from the SDP offer, if any.
+    /// Same caveats as `media_endpoint`.
+    #[serde(skip)]
+    pub remote_rtp: Option<SocketAddr>,
 }
 
 /// Shared control-plane state. Cheap to clone.
@@ -66,7 +78,11 @@ impl ControlState {
                         biased;
                         () = cancel.cancelled() => break,
                         event = rx.recv() => match event {
-                            Ok(Event::Sip(SipEvent::DialogCreated { call_id })) => {
+                            Ok(Event::Sip(SipEvent::DialogCreated {
+                                call_id,
+                                media_endpoint,
+                                remote_rtp,
+                            })) => {
                                 state.calls.insert(
                                     call_id.clone(),
                                     CallSnapshot {
@@ -74,6 +90,8 @@ impl ControlState {
                                         phase: CallPhase::Live,
                                         started_at: unix_seconds(),
                                         ended_at: None,
+                                        media_endpoint,
+                                        remote_rtp,
                                     },
                                 );
                             }
@@ -163,6 +181,8 @@ mod tests {
 
         bus.publish(Event::Sip(SipEvent::DialogCreated {
             call_id: "call-1".into(),
+            media_endpoint: None,
+            remote_rtp: None,
         }))
         .unwrap();
         sleep(Duration::from_millis(20)).await;

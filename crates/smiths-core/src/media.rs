@@ -153,4 +153,16 @@ pub trait MediaFabric: Send + Sync {
 
     /// Drop an allocated endpoint. No-op if unknown.
     async fn release_endpoint(&self, id: EndpointId);
+
+    /// Send a raw UDP payload out through the endpoint's RTP socket.
+    /// The caller provides a complete RTP packet (or any other
+    /// datagram). Returns `UnknownEndpoint` when `src` was never
+    /// allocated or has been released. This is the primitive behind
+    /// engine-side audio injection (`speak`).
+    async fn send_packet(
+        &self,
+        src: EndpointId,
+        dest: SocketAddr,
+        bytes: &[u8],
+    ) -> Result<(), MediaError>;
 }

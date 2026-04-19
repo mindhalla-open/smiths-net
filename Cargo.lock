@@ -770,12 +770,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07bbe89c50d7a535e539b8c17bc0b49bdb77747034daa8087407d655f3f7cc1d"
 dependencies = [
  "futures-core",
+ "futures-sink",
 ]
 
 [[package]]
@@ -783,6 +799,23 @@ name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
+
+[[package]]
+name = "futures-executor"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baf29c38818342a3b26b5b923639e7b1f4a61fc5e76102d4b1981c6dc7a7579d"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
+name = "futures-io"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
 
 [[package]]
 name = "futures-macro"
@@ -813,9 +846,13 @@ version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "389ca41296e6190b48053de0321d02a77f32f8a5d2461dd38762c0593805c6d6"
 dependencies = [
+ "futures-channel",
  "futures-core",
+ "futures-io",
  "futures-macro",
+ "futures-sink",
  "futures-task",
+ "memchr",
  "pin-project-lite",
  "slab",
 ]
@@ -1809,6 +1846,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -1828,12 +1866,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
 ]
@@ -2127,7 +2167,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2149,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "figment",
@@ -2164,11 +2204,13 @@ dependencies = [
 
 [[package]]
 name = "smiths-mcp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "dashmap",
+ "futures",
  "hex",
  "prometheus-client",
  "reqwest",
@@ -2176,15 +2218,22 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "smiths-core",
+ "smiths-media",
+ "smiths-plugin",
+ "smiths-sdp",
+ "smiths-sip",
+ "smiths-testkit",
+ "tempfile",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tracing",
 ]
 
 [[package]]
 name = "smiths-media"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -2196,7 +2245,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-plugin"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -2215,18 +2264,18 @@ dependencies = [
 
 [[package]]
 name = "smiths-proto"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "smiths-script"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "smiths-core",
 ]
 
 [[package]]
 name = "smiths-sdp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "smiths-core",
  "thiserror",
@@ -2234,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sidecar"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2248,7 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sip"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -2272,7 +2321,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-testkit"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "smiths-core",
  "smiths-media",
@@ -2285,7 +2334,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-wasm"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "smiths-core",
@@ -2522,6 +2571,18 @@ checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
  "tokio",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -2916,6 +2977,19 @@ dependencies = [
  "indexmap",
  "wasm-encoder 0.244.0",
  "wasmparser 0.244.0",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

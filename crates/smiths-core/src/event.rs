@@ -9,6 +9,8 @@
 
 use std::net::SocketAddr;
 
+use crate::media::EndpointId;
+
 /// Top-level event envelope.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -68,6 +70,10 @@ pub enum SipEvent {
     DialogCreated {
         /// `Call-ID` header value.
         call_id: String,
+        /// Engine-allocated media endpoint, if the dialog carries media.
+        media_endpoint: Option<EndpointId>,
+        /// Peer's RTP endpoint learned from the SDP offer, if any.
+        remote_rtp: Option<SocketAddr>,
     },
     /// An existing dialog has been terminated (after `BYE`).
     DialogTerminated {

@@ -30,7 +30,12 @@ async fn admitted_health_call_increments_counter_and_observes_duration() {
     let bus = EventBus::new(16);
     let cancel = CancellationToken::new();
     let (state, _task) = ControlState::spawn(&bus, cancel.clone());
-    let ctx = ToolContext::new(state, Arc::new(EmptyRegistry), Arc::new(Config::default()));
+    let ctx = ToolContext::new(
+        state,
+        Arc::new(EmptyRegistry),
+        Arc::new(Config::default()),
+        Arc::new(smiths_media::UdpMediaFabric::new()),
+    );
 
     let mut registry = Registry::default();
     let metrics = Metrics::register(&mut registry);
@@ -59,7 +64,12 @@ async fn rate_limited_call_records_forbidden_without_latency() {
     let bus = EventBus::new(16);
     let cancel = CancellationToken::new();
     let (state, _task) = ControlState::spawn(&bus, cancel.clone());
-    let ctx = ToolContext::new(state, Arc::new(EmptyRegistry), Arc::new(Config::default()));
+    let ctx = ToolContext::new(
+        state,
+        Arc::new(EmptyRegistry),
+        Arc::new(Config::default()),
+        Arc::new(smiths_media::UdpMediaFabric::new()),
+    );
 
     let mut registry = Registry::default();
     let metrics = Metrics::register(&mut registry);

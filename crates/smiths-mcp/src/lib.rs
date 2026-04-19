@@ -19,6 +19,7 @@ pub mod audit;
 pub mod control;
 pub mod dispatch;
 pub mod mcp;
+pub mod mcp_http;
 pub mod rate_limit;
 pub mod resource;
 pub mod tool;

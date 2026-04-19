@@ -490,9 +490,11 @@ impl<T: Transport> UasServer<T> {
         )
         .await;
 
-        let _ = self
-            .bus
-            .publish(Event::Sip(SipEvent::DialogCreated { call_id }));
+        let _ = self.bus.publish(Event::Sip(SipEvent::DialogCreated {
+            call_id,
+            media_endpoint: endpoint.as_ref().map(|ep| ep.id()),
+            remote_rtp: remote_media,
+        }));
     }
 
     fn handle_ack(&self, req: &RequestSummary, peer: SocketAddr) {

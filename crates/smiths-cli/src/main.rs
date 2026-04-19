@@ -116,7 +116,17 @@ async fn main() -> anyhow::Result<()> {
     let rate_limiter = Arc::new(smiths_mcp::RateLimiter::new(&config.mcp.rate_limit));
     let ai_registry_dyn: Arc<dyn AiRegistry> = Arc::new(ai_registry.clone());
     let config_snapshot = Arc::new(config.clone());
-    let tool_ctx = ToolContext::new(control_state, ai_registry_dyn, config_snapshot);
+
+    // One shared media fabric — built here (before any adapter that
+    // might reach into it) so the control-plane ToolContext and the
+    // SIP subsystem see the same Arc.
+    let media_fabric: Arc<dyn MediaFabric> = Arc::new(UdpMediaFabric::new());
+    let tool_ctx = ToolContext::new(
+        control_state,
+        ai_registry_dyn,
+        config_snapshot,
+        Arc::clone(&media_fabric),
+    );
 
     // MCP stdio is now additive: it runs alongside SIP / health / A2A
     // rather than replacing them, so agents can receive push
@@ -146,11 +156,6 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // ---- SIP subsystem ----
-    // One shared media fabric across every bind — media endpoints are
-    // handed out by token, not by socket address, so a single fabric
-    // serves all signaling transports.
-    let media_fabric: Arc<dyn MediaFabric> = Arc::new(UdpMediaFabric::new());
-
     let mut sip_handles: Vec<JoinHandle<()>> = Vec::new();
     let udp_enabled = config.sip.transports.contains(&SipTransport::Udp);
     let tcp_enabled = config.sip.transports.contains(&SipTransport::Tcp);
@@ -229,6 +234,26 @@ async fn main() -> anyhow::Result<()> {
                 smiths_mcp::a2a::serve_http(bind, reg, res, rl, met, bearer, ctx, cancel).await
             {
                 warn!(%bind, ?e, "A2A HTTP server error");
+            }
+        }));
+    }
+
+    // ---- MCP HTTP + SSE adapter (optional) ----
+    if config.mcp.enabled_http {
+        let bind = config.mcp.http_bind;
+        let reg = Arc::clone(&registry);
+        let res = Arc::clone(&resources);
+        let rl = Arc::clone(&rate_limiter);
+        let met = Arc::clone(&metrics);
+        let ctx = tool_ctx.clone();
+        let bus_clone = bus.clone();
+        let cancel = shutdown.token();
+        adapter_handles.push(tokio::spawn(async move {
+            if let Err(e) =
+                smiths_mcp::mcp_http::serve_http(bind, reg, res, rl, met, ctx, bus_clone, cancel)
+                    .await
+            {
+                warn!(%bind, ?e, "MCP HTTP server error");
             }
         }));
     }

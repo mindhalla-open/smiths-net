@@ -5,7 +5,155 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-04-19
+
+### Added — Engine-side `speak` + MCP over HTTP + SSE
+
+- **Engine-side `speak(call_id, plugin, text, voice?, controls?)` tool.**
+  The agent no longer streams RTP itself. On invocation the engine
+  looks up the call's media endpoint, calls the plugin's `synthesize`,
+  decodes the returned PCM16, downsamples to 8 kHz, μ-law-encodes, and
+  streams 20 ms RTP frames through `MediaFabric::send_packet` with a
+  stable per-invocation SSRC. Returns
+  `{call_id, plugin, frames_sent, duration_ms, ssrc}`.
+- **`MediaFabric::send_packet(src, dest, bytes)` trait method** +
+  `UdpMediaFabric` impl. The primitive `speak` builds on; non-bridging
+  path for raw RTP emission.
+- **`SipEvent::DialogCreated` carries media info.** Now
+  `{ call_id, media_endpoint, remote_rtp }`. `ControlState`'s
+  `CallSnapshot` stores both so the `speak` tool can resolve
+  `call_id → (endpoint, remote)` without a new trait.
+- **`smiths-core::{rtp, codec}` modules promoted from testkit.**
+  Pure, dependency-free RTP packet builder/parser + G.711 μ-law
+  conversion. `smiths-media` and `smiths-testkit` re-export for
+  backward compat.
+- **`ToolContext` carries `Arc<dyn MediaFabric>`** so audio-injecting
+  tools have a first-class handle.
+- **Reference plugin `plugins/examples/ai-embed-mock/`** completes the
+  AI quartet. Deterministic SHA-256-seeded 128-dim vectors, optional
+  L2 normalization.
+- **`embed(plugin, inputs[], controls?)` MCP tool** dispatches to any
+  `ai.embed` plugin; strict control validation shared with the other
+  AI tools.
+- **MCP over HTTP + SSE (`smiths-mcp::mcp_http`).** Two routes:
+  `POST /mcp` (JSON-RPC, shares `dispatch` + audit + rate-limit +
+  metrics with stdio; actor label `mcp-http`), and `GET /mcp/events`
+  (text/event-stream forwarding bus-driven notifications with 15 s
+  keep-alive). Configured via `[mcp] enabled_http / http_bind`.
+- New integration tests: `speak_injects_rtp_into_live_call` (real
+  engine + `ai-tts-mock` subprocess, verifies PCMU RTP with stable
+  SSRC reaches UA), `post_tools_call_health_round_trip`,
+  `post_initialize_advertises_resources_and_tools`,
+  `sse_stream_receives_dialog_created_notification`.
+
+### Added — Control-plane hardening (Resources, auth, rate limit, audit, reload)
+
+- **`Resource` trait + `ResourceRegistry`.** Shipped impls:
+  `health://status`, `sip://calls`, `config://current` (with secret
+  redaction). Both MCP and A2A serve `resources/list` +
+  `resources/read`.
+- **Per-tool token-bucket rate limiter** (`smiths-mcp::RateLimiter`)
+  configured by `[mcp] rate_limit { per_sec, burst }`. Shared across
+  MCP stdio, MCP HTTP, and A2A via a single `invoke_audited` helper.
+- **Structured audit log** — one `info!` per tool call at target
+  `smiths_mcp::audit` with `actor`, `tool`, `args_hash` (SHA-256),
+  `outcome`, `duration_ms`, `error`.
+- **Bearer-token auth for A2A HTTP** — `[a2a] bearer_token` gates
+  `/a2a`; `/health` and `/.well-known/agent.json` stay public.
+- **`reload_plugin` tool + `AiRegistry::reload` trait method.** Drains
+  the current sidecar and respawns from the captured plugin directory.
+- **`ToolContext` gained `Arc<Config>`** so tools / resources read
+  engine settings without reaching back into CLI wiring.
+
+### Added — Sidecar hardening (restart policy)
+
+- **`RestartPolicy` with exponential backoff** in `smiths-sidecar`. A
+  supervisor task detects child exit via stdout EOF, respawns up to
+  `max_retries` with configurable `initial_backoff` / `max_backoff` /
+  `backoff_multiplier`. In-flight RPCs at crash time resolve to
+  `Error::Closed`; `no_restart()` keeps the old suicide-on-crash
+  behaviour. Five new tests including `sidecar_respawns_after_crash`
+  and `concurrent_calls_all_complete` (32 parallel RPCs).
+
+### Added — Phase 6 first slice (TLS + Prometheus)
+
+- **`smiths-sip::TlsTransport`** — `rustls` + SNI, inbound-only.
+  `[sip] tls_cert_path / tls_key_path` configures PEM cert + key on
+  disk. Shared framing module with the TCP transport. Self-signed
+  `rcgen`-based integration test (`tests/tls.rs`).
+- **Prometheus exporter.** `smiths-core::metrics::Metrics` registers
+  `sip_requests_total{method}`, `sip_responses_total{code}`,
+  `sip_dialogs_active`, `tool_invocations_total{tool,outcome}`,
+  `tool_duration_seconds{tool}` (histogram). UAS increments on every
+  request / response; `invoke_audited` records tool latency. CLI
+  exposes `/metrics` (OpenMetrics text) on the existing health HTTP
+  server.
+
+### Added — Phase 3 walking skeleton (WASM host)
+
+- **`smiths-wasm::WasmEngine`.** Wasmtime-backed host with per-call
+  fuel metering, one host function (`smiths::log`), inline-WAT tests
+  exercising host calls, trap isolation, fuel exhaustion, missing
+  exports, and OOB memory reads.
+- **`smiths-plugin::Dispatcher` trait + `MemoryDispatcher`.** Priority
+  ordering, per-event time budget skipping the slow tail, re-register
+  semantics.
+- **`plugins/examples/rust-logger/`** — minimal no_std cdylib targeting
+  `wasm32-unknown-unknown`, compiles from source; walking-skeleton
+  smoke test for the wasmtime host.
+
+### Added — Phase 2 slice 1 (media trait seams + SSRC router)
+
+- **`MediaEndpoint` trait + `EndpointKind`** (`Host` / `ServerReflexive`
+  / `Relayed`) in `smiths-core::media`. `MediaFabric::allocate` now
+  returns `Arc<dyn MediaEndpoint>`.
+- **`MediaSession` trait** — forwarding-session lifecycle.
+  `smiths-media::Bridge` implements it.
+- **Even-RTP / odd-RTCP port allocator** (`smiths-media::port_allocator`).
+- **SSRC-rewriting passthrough router** — `smiths-media::bridge` parses
+  RTP headers, rewrites SSRC per leg with a stable per-direction
+  engine SSRC, drops non-RTP packets. New `g711_bridge` test
+  verifies payload preserved **and** egress SSRC != ingress SSRC.
+
+### Added — Phase 1 completion (TCP + INVITE auth + testkit + fuzz + sipp)
+
+- **TCP SIP transport** (`smiths-sip::TcpTransport`) — Content-Length
+  + double-CRLF framing, per-peer mpsc writers, inbound accept loop
+  + lazy outbound connect. Wired into the CLI alongside UDP.
+- **INVITE digest auth** — `UasServer::invite_auth_ok` mirrors the
+  REGISTER challenge path. Dedupe now skips ACK so ACKs for rejected
+  INVITEs don't loop the transaction (RFC 3261 §17.1.1.3).
+- **`invite_401_cancel` integration test** — INVITE → 401 +
+  WWW-Authenticate → ACK → BYE returns 481 (proves no dialog leaked).
+- **Testkit helpers promoted:** `FakeUac` (renamed from `TestUac`) +
+  `FakeUas` + `CapturedRequest`. `FakeUac::invite_expect_rejection`
+  drives auth-challenge tests.
+- **SIP parser fuzz harness** — `fuzz/` crate via `cargo-fuzz` +
+  `libfuzzer-sys`, target `sip_parser`, workspace-excluded.
+- **sipp REGISTER load scenario** (`scenarios/sipp/register.xml`) with
+  digest auth + run-command docs.
+- **`#[instrument]` coverage audit** — spans added to UAS
+  `handle_invite` / `handle_register` / `handle_bye`, both stream
+  transports' `spawn_reader`, `UdpMediaFabric::{allocate, bridge}`,
+  plugin `load_plugins` / `load_one`, `Sidecar::{spawn, call_with_timeout}`.
+
+### Changed — Architecture refactor: `smiths-mcp` consumes core traits
+
+- **`smiths-mcp` no longer depends on `smiths-plugin`.** The AI-plugin
+  contract (`CapabilityDescriptor`, `validate_controls`, `AiProvider`,
+  `AiRegistry` traits, `ProviderError`) moved into `smiths-core::ai`.
+  `smiths-plugin` implements the traits; `smiths-mcp` consumes them
+  through the core seam. Mirrors the `MediaFabric` / `SdpNegotiator`
+  pattern. `docs/architecture/01-crate-layout.md` updated to match.
+- **`smiths-plugin` owns the host tiers.** Re-exports
+  `smiths-sidecar`, `smiths-wasm`, `smiths-script` as
+  `plugin::{sidecar, wasm, script}` — the single documented
+  cross-sibling exception.
+- **`smiths-script` crate scaffolded.** Stub today; placeholder for
+  the embedded DSL host (Rhai / Lua / Starlark).
+- **`docs/` moved to a git submodule** at
+  `git@github.com:friday-mindhalla/smiths-net-docs.git`. Parent repo
+  pins a commit via `.gitmodules`.
 
 ### Added — `transcribe` + `llm_chat` MCP tools (P4 slice 3)
 
@@ -525,6 +673,7 @@ boot-and-shutdown binary. No SIP / media / plugins yet.
 
 - `.gitignore`: added `.DS_Store` to the ignore list.
 
+[0.6.0]: https://github.com/mindhalla/smiths-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mindhalla/smiths-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mindhalla/smiths-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mindhalla/smiths-net/compare/v0.2.0...v0.3.0

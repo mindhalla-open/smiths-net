@@ -8,11 +8,13 @@
 pub mod ai;
 pub mod bus;
 pub mod call;
+pub mod codec;
 pub mod config;
 pub mod error;
 pub mod event;
 pub mod media;
 pub mod metrics;
+pub mod rtp;
 pub mod sdp;
 pub mod shutdown;
 
@@ -22,6 +24,7 @@ pub use ai::{
 };
 pub use bus::EventBus;
 pub use call::{DialogKey, DialogRecord, DialogState};
+pub use codec::{linear_to_ulaw, pcm16_to_pcmu, pcmu_to_pcm16, ulaw_to_linear};
 pub use config::{
     A2aConfig, BindSpec, BindSpecError, Config, CoreConfig, LogFormat, McpConfig,
     ObservabilityConfig, PluginsConfig, RateLimitConfig, SipConfig, SipTransport,
@@ -33,5 +36,6 @@ pub use media::{
     MediaSession,
 };
 pub use metrics::Metrics;
+pub use rtp::RtpPacket;
 pub use sdp::{NegotiationOutcome, SdpNegotiator};
 pub use shutdown::Shutdown;

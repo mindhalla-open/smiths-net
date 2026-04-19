@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use smiths_core::Config;
 use smiths_core::ai::AiRegistry;
+use smiths_core::media::MediaFabric;
 use thiserror::Error;
 
 use crate::control::ControlState;
@@ -32,16 +33,26 @@ pub struct ToolContext {
     /// read from this; tools that need a config knob copy it into their
     /// arg schema rather than reaching through here.
     pub config: Arc<Config>,
+    /// Media plane handle. Tools that inject or forward audio
+    /// (`speak`, future `listen`) reach in here; pure signaling /
+    /// stateful tools ignore it.
+    pub media: Arc<dyn MediaFabric>,
 }
 
 impl ToolContext {
     /// Build a context from its components.
     #[must_use]
-    pub fn new(state: ControlState, plugins: Arc<dyn AiRegistry>, config: Arc<Config>) -> Self {
+    pub fn new(
+        state: ControlState,
+        plugins: Arc<dyn AiRegistry>,
+        config: Arc<Config>,
+        media: Arc<dyn MediaFabric>,
+    ) -> Self {
         Self {
             state,
             plugins,
             config,
+            media,
         }
     }
 }
@@ -128,14 +139,16 @@ impl ToolRegistry {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    //! Tiny [`AiRegistry`] double used by MCP tests without dragging in
-    //! the real plugin host.
+    //! Tiny [`AiRegistry`] + [`MediaFabric`] doubles used by MCP
+    //! tests without dragging in the real plugin host.
 
+    use std::net::SocketAddr;
     use std::sync::Arc;
 
     use async_trait::async_trait;
     use smiths_core::Config;
     use smiths_core::ai::{AiProvider, AiRegistry};
+    use smiths_core::media::{BridgeId, EndpointId, MediaEndpoint, MediaError, MediaFabric};
 
     /// Registry with no providers. Every lookup returns `None`.
     pub(crate) struct EmptyRegistry;
@@ -151,6 +164,40 @@ pub(crate) mod test_support {
         async fn shutdown_all(&self) {}
     }
 
+    /// `MediaFabric` that errors on every operation. Every test that
+    /// exercises the signaling / tool surface but doesn't touch
+    /// media passes this in.
+    pub(crate) struct NullMedia;
+
+    #[async_trait]
+    impl MediaFabric for NullMedia {
+        async fn allocate(
+            &self,
+            _: std::net::IpAddr,
+        ) -> Result<Arc<dyn MediaEndpoint>, MediaError> {
+            Err(MediaError::PortExhausted("null fabric".into()))
+        }
+        async fn bridge(
+            &self,
+            _: EndpointId,
+            _: SocketAddr,
+            _: EndpointId,
+            _: SocketAddr,
+        ) -> Result<BridgeId, MediaError> {
+            Err(MediaError::PortExhausted("null fabric".into()))
+        }
+        async fn release_bridge(&self, _: BridgeId) {}
+        async fn release_endpoint(&self, _: EndpointId) {}
+        async fn send_packet(
+            &self,
+            _: EndpointId,
+            _: SocketAddr,
+            _: &[u8],
+        ) -> Result<(), MediaError> {
+            Err(MediaError::PortExhausted("null fabric".into()))
+        }
+    }
+
     /// Convenience: build an `Arc<dyn AiRegistry>` holding an [`EmptyRegistry`].
     pub(crate) fn empty_registry() -> Arc<dyn AiRegistry> {
         Arc::new(EmptyRegistry)
@@ -159,5 +206,11 @@ pub(crate) mod test_support {
     /// Default-config [`Arc<Config>`] for test contexts.
     pub(crate) fn default_config() -> Arc<Config> {
         Arc::new(Config::default())
+    }
+
+    /// `Arc<dyn MediaFabric>` that errors on every op — for tests that
+    /// don't exercise media.
+    pub(crate) fn null_media() -> Arc<dyn MediaFabric> {
+        Arc::new(NullMedia)
     }
 }

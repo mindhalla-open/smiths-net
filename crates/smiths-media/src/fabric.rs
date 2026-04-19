@@ -122,6 +122,22 @@ impl MediaFabric for UdpMediaFabric {
         // a forwarder task still holds a clone of `rtp`.
         self.endpoints.remove(&id);
     }
+
+    async fn send_packet(
+        &self,
+        src: EndpointId,
+        dest: SocketAddr,
+        bytes: &[u8],
+    ) -> Result<(), MediaError> {
+        let sock = self
+            .endpoints
+            .get(&src)
+            .ok_or(MediaError::UnknownEndpoint(src))?
+            .rtp
+            .clone();
+        sock.send_to(bytes, dest).await.map_err(MediaError::Io)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

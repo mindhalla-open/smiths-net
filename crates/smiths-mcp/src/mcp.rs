@@ -126,9 +126,9 @@ async fn write_frame(stdout: &mut tokio::io::Stdout, frame: &Value) -> std::io::
 
 /// Translate a bus event into an MCP notification frame. `None` for
 /// events we don't expose (keeps the wire quiet and forward-compatible).
-fn event_to_notification(event: &Event) -> Option<Value> {
+pub(crate) fn event_to_notification(event: &Event) -> Option<Value> {
     match event {
-        Event::Sip(SipEvent::DialogCreated { call_id }) => Some(json!({
+        Event::Sip(SipEvent::DialogCreated { call_id, .. }) => Some(json!({
             "jsonrpc": "2.0",
             "method": "notifications/call/created",
             "params": { "call_id": call_id },
@@ -179,6 +179,7 @@ async fn handle_frame(
         rate_limiter,
         metrics,
         ctx,
+        ACTOR,
     )
     .await;
 
@@ -193,7 +194,8 @@ async fn handle_frame(
     }
 }
 
-async fn dispatch(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch(
     method: &str,
     params: Value,
     registry: &ToolRegistry,
@@ -201,13 +203,14 @@ async fn dispatch(
     rate_limiter: &Arc<RateLimiter>,
     metrics: &Arc<Metrics>,
     ctx: &ToolContext,
+    actor: &str,
 ) -> Result<Value, (i64, String)> {
     match method {
         "initialize" => Ok(initialize_response()),
         "initialized" | "notifications/initialized" | "shutdown" => Ok(Value::Null),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools_list_response(registry)),
-        "tools/call" => tools_call(params, registry, rate_limiter, metrics, ctx).await,
+        "tools/call" => tools_call(params, registry, rate_limiter, metrics, ctx, actor).await,
         "resources/list" => Ok(resources_list_response(resources)),
         "resources/read" => resources_read(params, resources, ctx).await,
         other => Err((ERR_METHOD_NOT_FOUND, format!("unknown method: {other}"))),
@@ -290,12 +293,13 @@ fn map_tool_error(err: &ToolError) -> (i64, String) {
     (code, err.to_string())
 }
 
-async fn tools_call(
+pub(crate) async fn tools_call(
     params: Value,
     registry: &ToolRegistry,
     rate_limiter: &Arc<RateLimiter>,
     metrics: &Arc<Metrics>,
     ctx: &ToolContext,
+    actor: &str,
 ) -> Result<Value, (i64, String)> {
     let name = params
         .get("name")
@@ -306,7 +310,7 @@ async fn tools_call(
         .cloned()
         .unwrap_or_else(|| Value::Object(Map::default()));
 
-    match invoke_audited(registry, rate_limiter, metrics, ctx, ACTOR, name, args).await {
+    match invoke_audited(registry, rate_limiter, metrics, ctx, actor, name, args).await {
         Ok(output) => {
             // MCP `tools/call` response wraps output as a content
             // array; we always return a single JSON text block.
@@ -351,20 +355,20 @@ fn error_response(id: &Value, code: i64, message: &str) -> Value {
 }
 
 // JSON-RPC 2.0 standard error codes, extended with MCP-style app codes.
-const ERR_PARSE: i64 = -32700;
-const ERR_INVALID_REQUEST: i64 = -32600;
-const ERR_METHOD_NOT_FOUND: i64 = -32601;
-const ERR_INVALID_PARAMS: i64 = -32602;
-const ERR_INTERNAL: i64 = -32603;
+pub(crate) const ERR_PARSE: i64 = -32700;
+pub(crate) const ERR_INVALID_REQUEST: i64 = -32600;
+pub(crate) const ERR_METHOD_NOT_FOUND: i64 = -32601;
+pub(crate) const ERR_INVALID_PARAMS: i64 = -32602;
+pub(crate) const ERR_INTERNAL: i64 = -32603;
 // App-range codes (MCP convention: -32000..-32099).
-const ERR_TOOL_NOT_FOUND: i64 = -32001;
-const ERR_FORBIDDEN: i64 = -32002;
+pub(crate) const ERR_TOOL_NOT_FOUND: i64 = -32001;
+pub(crate) const ERR_FORBIDDEN: i64 = -32002;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::control::ControlState;
-    use crate::tool::test_support::{default_config, empty_registry};
+    use crate::tool::test_support::{default_config, empty_registry, null_media};
     use smiths_core::EventBus;
 
     fn ctx() -> (ToolContext, CancellationToken) {
@@ -372,7 +376,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (state, _task) = ControlState::spawn(&bus, cancel.clone());
         (
-            ToolContext::new(state, empty_registry(), default_config()),
+            ToolContext::new(state, empty_registry(), default_config(), null_media()),
             cancel,
         )
     }

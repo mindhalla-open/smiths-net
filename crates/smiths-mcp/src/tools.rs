@@ -4,12 +4,23 @@
 //! MCP and A2A adapters. New tools land as their own module when they
 //! grow beyond a few lines.
 
+#![allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+
 use std::sync::Arc;
 
+use std::time::{Duration, Instant};
+
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::{Value, json};
 use smiths_core::ai::{AiProvider, CapabilityDescriptor, validate_controls};
 
+use crate::control::CallPhase;
 use crate::tool::{Tool, ToolContext, ToolError};
 
 /// Build a fully-populated [`crate::ToolRegistry`] with the built-in
@@ -26,6 +37,7 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(TranscribeTool);
     reg.register(LlmChatTool);
     reg.register(EmbedTool);
+    reg.register(SpeakTool);
     reg.register(ReloadPluginTool);
     reg
 }
@@ -586,6 +598,260 @@ impl Tool for EmbedTool {
     }
 }
 
+/// `speak` — synthesize text via an `ai.tts` plugin and stream it as
+/// RTP (PCMU / 8 kHz / 20 ms frames) into a live call's media leg.
+/// The tool returns once the last packet has been queued; pacing
+/// happens in-process with a 20 ms sleep between frames so a real UA
+/// hears the audio at real-time rate.
+pub struct SpeakTool;
+
+/// RFC 3551 PCMU payload type.
+const PT_PCMU: u8 = 0;
+/// PCMU frame cadence (ITU-T G.711, 8 kHz → 20 ms = 160 samples).
+const FRAME_SAMPLES: usize = 160;
+const FRAME_INTERVAL: Duration = Duration::from_millis(20);
+
+#[async_trait]
+impl Tool for SpeakTool {
+    fn name(&self) -> &'static str {
+        "speak"
+    }
+
+    fn description(&self) -> &'static str {
+        "Synthesize text via an `ai.tts` plugin and stream it as RTP \
+         (PCMU / 8 kHz) into a live call's media leg. Returns after \
+         the final packet is sent."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "call_id": { "type": "string", "description": "SIP Call-ID of a live dialog." },
+                "plugin":  { "type": "string", "description": "ai.tts plugin name." },
+                "text":    { "type": "string", "description": "Text to synthesize." },
+                "voice":   { "type": "string", "description": "Voice id (optional)." },
+                "controls":{ "type": "object", "description": "Provider-specific controls." }
+            },
+            "required": ["call_id", "plugin", "text"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let call_id = args
+            .get("call_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("call_id required".into()))?;
+        let plugin_name = args
+            .get("plugin")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("plugin required".into()))?;
+        let text = args
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("text required".into()))?;
+
+        // Locate the call's media leg.
+        let snap = ctx
+            .state
+            .get_call(call_id)
+            .ok_or_else(|| ToolError::NotFound(format!("call {call_id}")))?;
+        if !matches!(snap.phase, CallPhase::Live) {
+            return Err(ToolError::InvalidArguments(format!(
+                "call {call_id} is not live (phase = {:?})",
+                snap.phase
+            )));
+        }
+        let endpoint = snap.media_endpoint.ok_or_else(|| {
+            ToolError::InvalidArguments(format!("call {call_id} has no media endpoint"))
+        })?;
+        let remote = snap.remote_rtp.ok_or_else(|| {
+            ToolError::InvalidArguments(format!("call {call_id} has no remote RTP address"))
+        })?;
+
+        // Ask the TTS plugin for PCM16 LE @ 16 kHz (the common case).
+        let provider = ctx
+            .plugins
+            .get(plugin_name)
+            .ok_or_else(|| ToolError::NotFound(format!("plugin {plugin_name}")))?;
+        let descriptor = provider
+            .capabilities()
+            .iter()
+            .find(|d| d.capability == "ai.tts")
+            .ok_or_else(|| {
+                ToolError::InvalidArguments(format!(
+                    "plugin `{plugin_name}` does not provide `ai.tts`"
+                ))
+            })?
+            .clone();
+
+        // Strict-validate controls against the descriptor, matching
+        // the `synthesize` tool.
+        if let Some(declared) = descriptor.extra.get("controls").and_then(Value::as_object) {
+            let declared: std::collections::BTreeMap<String, Value> = declared
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let submitted = args.get("controls").cloned().unwrap_or(Value::Null);
+            if let Err(e) = validate_controls(&declared, &submitted) {
+                return Err(ToolError::InvalidArguments(format!(
+                    "{}: {}",
+                    e.field, e.reason
+                )));
+            }
+        }
+
+        let synth = provider
+            .invoke(
+                "synthesize",
+                json!({
+                    "text": text,
+                    "voice": args.get("voice"),
+                    "controls": args.get("controls"),
+                    "output": {"codec": "pcm_s16le", "sample_rate": 16000},
+                }),
+            )
+            .await
+            .map_err(|e| ToolError::Internal(format!("synthesize: {e}")))?;
+
+        let (samples, sample_rate) = decode_pcm16(&synth)?;
+        let samples_8k = downsample_to_8k(&samples, sample_rate);
+        let mulaw = smiths_core::pcm16_to_pcmu(&samples_8k);
+
+        // Stream the μ-law bytes as 20 ms RTP frames.
+        let ssrc = fresh_ssrc();
+        let mut seq: u16 = fresh_seq();
+        let mut ts: u32 = 0;
+        let mut frames_sent = 0usize;
+        let started = Instant::now();
+
+        for (i, chunk) in mulaw.chunks(FRAME_SAMPLES).enumerate() {
+            let pkt = smiths_core::RtpPacket {
+                marker: i == 0,
+                payload_type: PT_PCMU,
+                sequence: seq,
+                timestamp: ts,
+                ssrc,
+                payload: chunk.to_vec(),
+            };
+            let bytes = pkt.encode();
+            ctx.media
+                .send_packet(endpoint, remote, &bytes)
+                .await
+                .map_err(|e| ToolError::Internal(format!("send_packet: {e}")))?;
+            frames_sent += 1;
+            seq = seq.wrapping_add(1);
+            ts = ts.wrapping_add(FRAME_SAMPLES as u32);
+            // Pace frames in wall-clock — skip the sleep after the
+            // last chunk so the tool returns promptly.
+            if i + 1 < mulaw.chunks(FRAME_SAMPLES).len() {
+                tokio::time::sleep(FRAME_INTERVAL).await;
+            }
+        }
+
+        Ok(json!({
+            "call_id":     call_id,
+            "plugin":      plugin_name,
+            "frames_sent": frames_sent,
+            "duration_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "ssrc":        ssrc,
+        }))
+    }
+}
+
+/// Pull PCM16 bytes out of a `synthesize` result. Returns the decoded
+/// `i16` samples plus the declared sample rate. Accepts both the flat
+/// `{codec, sample_rate, audio_base64}` shape used by the in-tree
+/// mock TTS and the nested `format` shape some third-party plugins
+/// might emit.
+fn decode_pcm16(synth: &Value) -> Result<(Vec<i16>, u32), ToolError> {
+    let b64 = synth
+        .get("audio_base64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::Internal("synthesize: missing audio_base64".into()))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| ToolError::Internal(format!("audio_base64 decode: {e}")))?;
+
+    let pick_str = |key: &str| -> Option<&str> {
+        synth.get(key).and_then(Value::as_str).or_else(|| {
+            synth
+                .get("format")
+                .and_then(|f| f.get(key))
+                .and_then(Value::as_str)
+        })
+    };
+    let pick_u64 = |key: &str| -> Option<u64> {
+        synth.get(key).and_then(Value::as_u64).or_else(|| {
+            synth
+                .get("format")
+                .and_then(|f| f.get(key))
+                .and_then(Value::as_u64)
+        })
+    };
+
+    let codec = pick_str("codec").unwrap_or("pcm_s16le");
+    if codec != "pcm_s16le" {
+        return Err(ToolError::Internal(format!(
+            "speak requires PCM16 LE; plugin returned codec `{codec}`"
+        )));
+    }
+    let sample_rate = u32::try_from(pick_u64("sample_rate").unwrap_or(16_000))
+        .map_err(|_| ToolError::Internal("sample_rate out of range".into()))?;
+    let samples: Vec<i16> = bytes
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    Ok((samples, sample_rate))
+}
+
+/// Naive rate-adapt to 8 kHz by decimation or fall-through. PCMU needs
+/// exactly 8 kHz; anything else (16 kHz, 22.05 kHz, 44.1 kHz, 48 kHz)
+/// is resampled with a crude pick-every-Nth. Good enough for a
+/// walking-skeleton `speak`; a production build would plug a proper
+/// resampler in at the same seam.
+fn downsample_to_8k(samples: &[i16], from_hz: u32) -> Vec<i16> {
+    if from_hz == 8_000 {
+        return samples.to_vec();
+    }
+    if from_hz < 8_000 {
+        // Upsample would need interpolation; not a path a modern TTS
+        // takes. Return the samples unchanged and let the output be
+        // slower than intended — preferable to a silent failure.
+        return samples.to_vec();
+    }
+    let step = f64::from(from_hz) / 8_000.0;
+    let out_len = ((samples.len() as f64) / step).floor() as usize;
+    (0..out_len)
+        .map(|i| {
+            let src = ((i as f64) * step).floor() as usize;
+            samples[src.min(samples.len() - 1)]
+        })
+        .collect()
+}
+
+/// Non-cryptographic SSRC for one speak invocation — collision-free
+/// across calls in a session thanks to the monotonic counter.
+fn fresh_ssrc() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    nanos
+        .wrapping_mul(0x9E37_79B1)
+        .wrapping_add(c.wrapping_mul(0x0100_0001B))
+}
+
+fn fresh_seq() -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static COUNTER: AtomicU16 = AtomicU16::new(0);
+    COUNTER.fetch_add(101, Ordering::Relaxed).wrapping_add(1000)
+}
+
 /// `reload_plugin` — drain a loaded plugin's sidecar, re-parse its
 /// manifest, and re-spawn. Useful when a plugin file was edited on
 /// disk without restarting the engine.
@@ -629,7 +895,7 @@ impl Tool for ReloadPluginTool {
 mod tests {
     use super::*;
     use crate::control::ControlState;
-    use crate::tool::test_support::{default_config, empty_registry};
+    use crate::tool::test_support::{default_config, empty_registry, null_media};
     use smiths_core::EventBus;
     use tokio_util::sync::CancellationToken;
 
@@ -638,7 +904,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (state, _task) = ControlState::spawn(&bus, cancel.clone());
         (
-            ToolContext::new(state, empty_registry(), default_config()),
+            ToolContext::new(state, empty_registry(), default_config(), null_media()),
             cancel,
         )
     }
@@ -671,7 +937,7 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 10);
+        assert_eq!(reg.len(), 11);
         for name in [
             "list_calls",
             "get_call_status",
@@ -682,10 +948,24 @@ mod tests {
             "transcribe",
             "llm_chat",
             "embed",
+            "speak",
             "reload_plugin",
         ] {
             assert!(reg.get(name).is_some(), "missing tool: {name}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn speak_without_call_is_not_found() {
+        let (ctx, _c) = ctx_with_state();
+        let err = SpeakTool
+            .call(
+                json!({"call_id": "nope", "plugin": "tts", "text": "hi"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

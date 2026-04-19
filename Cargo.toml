@@ -6,7 +6,7 @@ exclude  = ["fuzz"]
 [workspace.package]
 edition      = "2024"
 rust-version = "1.85"
-version      = "0.5.0"
+version      = "0.6.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
@@ -68,6 +68,13 @@ rcgen          = "0.14"
 
 # Metrics
 prometheus-client = "0.23"
+
+# audio helpers
+base64 = "0.22"
+
+# async stream utilities (SSE bridge)
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures      = "0.3"
 
 # test helpers
 tempfile = "3"

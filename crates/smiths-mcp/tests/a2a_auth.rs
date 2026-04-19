@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use smiths_core::media::{BridgeId, EndpointId, MediaEndpoint, MediaError, MediaFabric};
 use smiths_core::{Config, EventBus, Metrics, RateLimitConfig};
 use smiths_mcp::{ControlState, RateLimiter, ToolContext, builtin_resources, tools};
 use tokio::net::TcpListener;
@@ -20,7 +21,8 @@ async fn spawn_server(bearer: Option<String>) -> (std::net::SocketAddr, Cancella
     let (state, _task) = ControlState::spawn(&bus, cancel.clone());
     let ai_registry: Arc<dyn smiths_core::AiRegistry> = Arc::new(EmptyRegistry);
     let config = Arc::new(Config::default());
-    let ctx = ToolContext::new(state, ai_registry, config);
+    let media: Arc<dyn MediaFabric> = Arc::new(NullMedia);
+    let ctx = ToolContext::new(state, ai_registry, config, media);
     let registry = Arc::new(tools::builtin_registry());
     let resources = Arc::new(builtin_resources());
     let rl = Arc::new(RateLimiter::new(&RateLimitConfig::default()));
@@ -48,6 +50,34 @@ impl smiths_core::AiRegistry for EmptyRegistry {
         Vec::new()
     }
     async fn shutdown_all(&self) {}
+}
+
+struct NullMedia;
+
+#[async_trait::async_trait]
+impl MediaFabric for NullMedia {
+    async fn allocate(&self, _: std::net::IpAddr) -> Result<Arc<dyn MediaEndpoint>, MediaError> {
+        Err(MediaError::PortExhausted("null".into()))
+    }
+    async fn bridge(
+        &self,
+        _: EndpointId,
+        _: std::net::SocketAddr,
+        _: EndpointId,
+        _: std::net::SocketAddr,
+    ) -> Result<BridgeId, MediaError> {
+        Err(MediaError::PortExhausted("null".into()))
+    }
+    async fn release_bridge(&self, _: BridgeId) {}
+    async fn release_endpoint(&self, _: EndpointId) {}
+    async fn send_packet(
+        &self,
+        _: EndpointId,
+        _: std::net::SocketAddr,
+        _: &[u8],
+    ) -> Result<(), MediaError> {
+        Err(MediaError::PortExhausted("null".into()))
+    }
 }
 
 async fn post_rpc(
