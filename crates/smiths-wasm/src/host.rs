@@ -29,8 +29,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use smiths_core::{Event, EventBus, PluginEvent};
-use tracing::info;
+use smiths_core::media::MediaFabric;
+use smiths_core::{CallLookup, Event, EventBus, PluginEvent};
+use tracing::{info, warn};
 use wasmtime::{Caller, Linker};
 
 use crate::error::WasmError;
@@ -52,6 +53,9 @@ pub const PERM_EVENTS: &str = "events";
 /// Permission string required by `timer_set`.
 pub const PERM_TIMERS: &str = "timers";
 
+/// Permission string required by `send_rtp`.
+pub const PERM_SEND_RTP: &str = "send_rtp";
+
 /// Per-instance mutable state handed to each host-fn call. Rebuilt on
 /// every `Store::new`; the persistent part (the per-plugin KV map)
 /// and the permission set are injected on construction.
@@ -69,6 +73,10 @@ pub struct HostState {
     /// tests that don't exercise bus-bound host fns can leave it
     /// unset — those fns then trap with a descriptive message.
     pub bus: Option<EventBus>,
+    /// Call-id → (endpoint, `remote_rtp`) lookup for `send_rtp`.
+    pub call_lookup: Option<Arc<dyn CallLookup>>,
+    /// Media fabric handle for `send_rtp` to push packets through.
+    pub media_fabric: Option<Arc<dyn MediaFabric>>,
 }
 
 impl HostState {
@@ -82,6 +90,8 @@ impl HostState {
             state: Arc::new(DashMap::new()),
             permissions: Arc::new(HashSet::new()),
             bus: None,
+            call_lookup: None,
+            media_fabric: None,
         }
     }
 
@@ -99,6 +109,8 @@ impl HostState {
             state,
             permissions,
             bus: None,
+            call_lookup: None,
+            media_fabric: None,
         }
     }
 
@@ -107,6 +119,18 @@ impl HostState {
     #[must_use]
     pub fn with_bus(mut self, bus: Option<EventBus>) -> Self {
         self.bus = bus;
+        self
+    }
+
+    /// Attach call lookup + media fabric for `send_rtp`.
+    #[must_use]
+    pub fn with_media(
+        mut self,
+        call_lookup: Option<Arc<dyn CallLookup>>,
+        media_fabric: Option<Arc<dyn MediaFabric>>,
+    ) -> Self {
+        self.call_lookup = call_lookup;
+        self.media_fabric = media_fabric;
         self
     }
 
@@ -140,6 +164,9 @@ pub fn register(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
         .map_err(WasmError::Link)?;
     linker
         .func_wrap("smiths", "timer_set", host_timer_set)
+        .map_err(WasmError::Link)?;
+    linker
+        .func_wrap("smiths", "send_rtp", host_send_rtp)
         .map_err(WasmError::Link)?;
     Ok(())
 }
@@ -301,6 +328,66 @@ fn host_timer_set(
         std::thread::sleep(Duration::from_millis(delay_ms_u64));
         // Publish failures mean no subscribers — harmless to drop.
         let _ = bus.publish(Event::Plugin(PluginEvent::TimerFired { plugin, event_id }));
+    });
+    Ok(0)
+}
+
+/// `smiths::send_rtp(call_id_ptr, call_id_len, bytes_ptr, bytes_len) -> i32`
+/// — send one RTP (or generic UDP) packet out on the media endpoint
+/// of the call identified by `call_id`. Returns `0` on dispatch,
+/// `-1` when the call is unknown / has no media, and traps for
+/// permission / ABI errors. Requires the `send_rtp` permission.
+///
+/// The actual `MediaFabric::send_packet` call is `async`; wasmtime
+/// host fns are sync, so we spawn a fire-and-forget tokio task. The
+/// guest can confirm delivery by subscribing to events if it needs
+/// backpressure — RTP semantics are best-effort anyway.
+fn host_send_rtp(
+    mut caller: Caller<'_, HostState>,
+    call_id_ptr: i32,
+    call_id_len: i32,
+    bytes_ptr: i32,
+    bytes_len: i32,
+) -> wasmtime::Result<i32> {
+    caller.data().require(PERM_SEND_RTP, "send_rtp")?;
+    let lookup = caller
+        .data()
+        .call_lookup
+        .clone()
+        .ok_or_else(|| wasmtime::Error::msg("send_rtp: no CallLookup bound to HostState"))?;
+    let fabric = caller
+        .data()
+        .media_fabric
+        .clone()
+        .ok_or_else(|| wasmtime::Error::msg("send_rtp: no MediaFabric bound to HostState"))?;
+    let memory = caller
+        .get_export("memory")
+        .and_then(wasmtime::Extern::into_memory)
+        .ok_or_else(|| wasmtime::Error::msg("guest must export `memory`"))?;
+    let (call_id, payload) = {
+        let mem = memory.data(&caller);
+        let id_bytes = read_slice(mem, call_id_ptr, call_id_len, "send_rtp call_id")?;
+        let call_id = std::str::from_utf8(id_bytes)
+            .map_err(|e| wasmtime::Error::msg(format!("send_rtp call_id not UTF-8: {e}")))?
+            .to_owned();
+        let payload = read_slice(mem, bytes_ptr, bytes_len, "send_rtp payload")?.to_vec();
+        (call_id, payload)
+    };
+
+    let Some((endpoint, remote)) = lookup.endpoint_for(&call_id) else {
+        return Ok(-1);
+    };
+
+    // Requires a tokio runtime on the calling thread — the CLI wires
+    // the engine from inside one, so this holds in production. Tests
+    // that exercise `send_rtp` are `#[tokio::test]`.
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| wasmtime::Error::msg("send_rtp: no tokio runtime on this thread"))?;
+    let plugin = caller.data().plugin.clone();
+    handle.spawn(async move {
+        if let Err(e) = fabric.send_packet(endpoint, remote, &payload).await {
+            warn!(%plugin, ?e, "send_rtp dispatch failed");
+        }
     });
     Ok(0)
 }

@@ -5,6 +5,59 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-04-20
+
+### Added — RTP stats + RTCP SR emission
+
+- **`smiths-media::rtp_stats`** — per-direction `StreamStats`
+  tracker. Observes every forwarded RTP packet: counts, bytes,
+  highest sequence, last RTP timestamp + SSRC, and the RFC 3550
+  §A.8 interarrival jitter (smoothed at 1/16, stored in fixed
+  point). Snapshot is atomics-only, no locking.
+- **`smiths-media::rtcp`** — Sender Report builder + parser.
+  Packet layout per RFC 3550 §6.4.1 (28 bytes, no report blocks
+  yet). `ntp_now()` helper returns the 64-bit NTP timestamp with
+  the 1900-epoch offset. Five byte-layout round-trip tests cover
+  success and every rejection path.
+- **`Bridge` grew `spawn_with(id, a, b, cfg)`** — when the legs
+  carry `RtcpLeg` handles and `BridgeConfig::rtcp_interval` is
+  `Some`, the bridge fires periodic Sender Reports to each peer's
+  RTCP port. Stats travel through the forwarder path (observed
+  after SSRC rewrite so the SR's SSRC matches the egress SSRC).
+  `Bridge::stats()` returns a `BridgeStats` snapshot for both
+  directions.
+- **`UdpMediaFabric::bridge`** now populates `RtcpLeg` from the
+  already-allocated RTCP sockets (previously `_rtcp` — bound but
+  idle). Peer RTCP address is derived as `peer RTP port + 1` per
+  RFC 3550 §11; explicit `a=rtcp:` SDP lines can land later.
+- Two new integration tests: stats tick as packets flow; SRs land
+  on the peer within 2 s with the correct packet count.
+
+### Added — WASM `send_rtp` host fn
+
+- **`smiths::send_rtp(call_id_ptr, call_id_len, bytes_ptr, bytes_len) -> i32`**
+  — guest hands the host a call-id + payload; host looks up the
+  call's media endpoint + remote RTP address and dispatches via
+  `MediaFabric::send_packet`. Returns `0` on dispatch, `-1` for
+  unknown calls. Gated behind the new `"send_rtp"` permission.
+- **`smiths-core::CallLookup`** trait — seam for `call-id →
+  (EndpointId, SocketAddr)`. Lives in `smiths-core` so
+  `smiths-wasm` can consume it without linking the MCP crate.
+  `ControlState` implements it.
+- **`WasmEngine::with_media(lookup, fabric)`** — builder that
+  attaches both handles to every store the engine builds. CLI
+  wires control-plane state + `UdpMediaFabric` at boot.
+- Test coverage: `send_rtp` dispatches correctly through a
+  recording fabric; permission-denied traps cleanly; both paths
+  are verified inline via WAT.
+
+### Changed
+
+- CLI now builds `UdpMediaFabric` before the WASM engine so the
+  engine can carry its handle. Prior ordering put fabric
+  construction after the plugin load — moving it up kept the
+  single `Arc<dyn MediaFabric>` shared across all consumers.
+
 ## [0.10.0] - 2026-04-20
 
 ### Added — WASM host surface expansion

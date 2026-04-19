@@ -97,13 +97,20 @@ async fn main() -> anyhow::Result<()> {
     // with live data. It's cheap and draining is cooperative.
     let (control_state, control_task) = ControlState::spawn(&bus, shutdown.token());
 
+    // Build the shared media fabric before the WASM engine so guest
+    // `send_rtp` can push packets through it.
+    let media_fabric: Arc<dyn MediaFabric> = Arc::new(UdpMediaFabric::new());
+
     // Load plugins from the configured directory. Failures are per-
     // plugin and logged; they don't block startup.
     let ai_registry = smiths_plugin::AiRegistry::new();
     // Build a shared WASM engine so `type = "wasm"` manifests can load.
     // Failing this shouldn't block sidecar plugins — log and proceed.
     let wasm_engine = match smiths_plugin::wasm::WasmEngine::new() {
-        Ok(e) => Some(e.with_bus(bus.clone())),
+        Ok(e) => Some(
+            e.with_bus(bus.clone())
+                .with_media(Arc::new(control_state.clone()), Arc::clone(&media_fabric)),
+        ),
         Err(err) => {
             warn!(
                 ?err,
@@ -135,11 +142,6 @@ async fn main() -> anyhow::Result<()> {
     let rate_limiter = Arc::new(smiths_mcp::RateLimiter::new(&config.mcp.rate_limit));
     let ai_registry_dyn: Arc<dyn AiRegistry> = Arc::new(ai_registry.clone());
     let config_snapshot = Arc::new(config.clone());
-
-    // One shared media fabric — built here (before any adapter that
-    // might reach into it) so the control-plane ToolContext and the
-    // SIP subsystem see the same Arc.
-    let media_fabric: Arc<dyn MediaFabric> = Arc::new(UdpMediaFabric::new());
 
     // Shared response correlator. The UAS forwards responses to it;
     // the UAC subscribes by branch.

@@ -445,6 +445,176 @@ async fn timer_set_fires_timer_event_after_delay() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn send_rtp_dispatches_through_media_fabric() {
+    use async_trait::async_trait;
+    use smiths_core::CallLookup;
+    use smiths_core::media::{BridgeId, EndpointId, MediaEndpoint, MediaError, MediaFabric};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    // Stub fabric that records send_packet calls instead of touching
+    // UDP. Lets us verify the engine dispatched correctly without a
+    // real socket.
+    type SendLog = Arc<Mutex<Vec<(EndpointId, SocketAddr, Vec<u8>)>>>;
+
+    #[derive(Default)]
+    struct RecordingFabric {
+        sends: SendLog,
+    }
+    #[async_trait]
+    impl MediaFabric for RecordingFabric {
+        async fn allocate(
+            &self,
+            _: std::net::IpAddr,
+        ) -> Result<Arc<dyn MediaEndpoint>, MediaError> {
+            unimplemented!()
+        }
+        async fn bridge(
+            &self,
+            _: EndpointId,
+            _: SocketAddr,
+            _: EndpointId,
+            _: SocketAddr,
+        ) -> Result<BridgeId, MediaError> {
+            unimplemented!()
+        }
+        async fn release_bridge(&self, _: BridgeId) {}
+        async fn release_endpoint(&self, _: EndpointId) {}
+        async fn send_packet(
+            &self,
+            src: EndpointId,
+            dest: SocketAddr,
+            bytes: &[u8],
+        ) -> Result<(), MediaError> {
+            self.sends.lock().unwrap().push((src, dest, bytes.to_vec()));
+            Ok(())
+        }
+    }
+
+    // Stub CallLookup: only knows one call-id.
+    struct FixedLookup {
+        call_id: String,
+        endpoint: EndpointId,
+        remote: SocketAddr,
+    }
+    impl CallLookup for FixedLookup {
+        fn endpoint_for(&self, call_id: &str) -> Option<(EndpointId, SocketAddr)> {
+            (call_id == self.call_id).then_some((self.endpoint, self.remote))
+        }
+    }
+
+    let wat = r#"
+(module
+  (import "smiths" "send_rtp" (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  ;; call-id at 0..7 ("call-42"), payload at 16..20 (4 bytes)
+  (data (i32.const 0) "call-42")
+  (data (i32.const 16) "\01\02\03\04")
+  (func (export "run")
+    (call $send (i32.const 0) (i32.const 7) (i32.const 16) (i32.const 4))
+    drop))
+"#;
+    let fabric = Arc::new(RecordingFabric::default());
+    let sends = Arc::clone(&fabric.sends);
+    let lookup = Arc::new(FixedLookup {
+        call_id: "call-42".into(),
+        endpoint: EndpointId(7),
+        remote: "127.0.0.1:9999".parse().unwrap(),
+    });
+
+    let engine = WasmEngine::new()
+        .unwrap()
+        .with_media(lookup, fabric as Arc<dyn MediaFabric>);
+    engine.set_plugin_permissions("rtp-demo", ["send_rtp"]);
+    let module = compile(&engine, wat);
+    engine
+        .run_entry(&module, "run", FUEL, "rtp-demo")
+        .expect("run_entry");
+
+    // The spawn is fire-and-forget — yield to let it land.
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if !sends.lock().unwrap().is_empty() {
+            break;
+        }
+    }
+    let recorded = sends.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 1);
+    let (ep, dest, bytes) = &recorded[0];
+    assert_eq!(*ep, EndpointId(7));
+    assert_eq!(dest.port(), 9999);
+    assert_eq!(bytes.as_slice(), &[1, 2, 3, 4]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_rtp_without_permission_traps() {
+    use async_trait::async_trait;
+    use smiths_core::CallLookup;
+    use smiths_core::media::{BridgeId, EndpointId, MediaEndpoint, MediaError, MediaFabric};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    struct NoopFabric;
+    #[async_trait]
+    impl MediaFabric for NoopFabric {
+        async fn allocate(
+            &self,
+            _: std::net::IpAddr,
+        ) -> Result<Arc<dyn MediaEndpoint>, MediaError> {
+            unimplemented!()
+        }
+        async fn bridge(
+            &self,
+            _: EndpointId,
+            _: SocketAddr,
+            _: EndpointId,
+            _: SocketAddr,
+        ) -> Result<BridgeId, MediaError> {
+            unimplemented!()
+        }
+        async fn release_bridge(&self, _: BridgeId) {}
+        async fn release_endpoint(&self, _: EndpointId) {}
+        async fn send_packet(
+            &self,
+            _: EndpointId,
+            _: SocketAddr,
+            _: &[u8],
+        ) -> Result<(), MediaError> {
+            Ok(())
+        }
+    }
+    struct EmptyLookup;
+    impl CallLookup for EmptyLookup {
+        fn endpoint_for(&self, _: &str) -> Option<(EndpointId, SocketAddr)> {
+            None
+        }
+    }
+
+    let wat = r#"
+(module
+  (import "smiths" "send_rtp" (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "x")
+  (func (export "run")
+    (call $send (i32.const 0) (i32.const 1) (i32.const 0) (i32.const 1))
+    drop))
+"#;
+    let engine = WasmEngine::new()
+        .unwrap()
+        .with_media(Arc::new(EmptyLookup), Arc::new(NoopFabric));
+    // No permission registered.
+    let module = compile(&engine, wat);
+    let err = engine
+        .run_entry(&module, "run", FUEL, "no-perm")
+        .unwrap_err();
+    assert!(
+        matches!(err, WasmError::PermissionDenied { ref permission, .. } if permission == "send_rtp"),
+        "expected PermissionDenied(send_rtp), got {err:?}"
+    );
+}
+
 #[test]
 fn call_invoke_error_envelope_becomes_plugin_error() {
     let wat = r#"

@@ -71,6 +71,17 @@ impl DialogRecord {
     }
 }
 
+/// Seam for "given a call-id, where do I send RTP?" lookups. The MCP
+/// control plane implements this against its live `ControlState`;
+/// `smiths-wasm` consumes it via [`smiths-core::media::MediaFabric`]
+/// so WASM guests can call `smiths::send_rtp` without linking the
+/// MCP crate. Returns `None` for unknown / media-less calls.
+pub trait CallLookup: Send + Sync {
+    /// Return the media endpoint id + peer RTP address for `call_id`,
+    /// or `None` if the call is unknown or has no media attached.
+    fn endpoint_for(&self, call_id: &str) -> Option<(EndpointId, SocketAddr)>;
+}
+
 /// Errors surfaced by a [`CallOriginator`] operation.
 #[derive(Debug, Error)]
 pub enum CallError {

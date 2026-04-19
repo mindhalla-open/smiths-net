@@ -26,7 +26,8 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use serde_json::Value;
-use smiths_core::EventBus;
+use smiths_core::media::MediaFabric;
+use smiths_core::{CallLookup, EventBus};
 use wasmtime::{Config, Engine, Linker, Memory, Module, Store, Trap};
 
 use crate::error::WasmError;
@@ -42,7 +43,7 @@ pub const DEFAULT_FUEL: u64 = 1_000_000;
 /// plugin KV state and the per-plugin declared permission set both
 /// live on the engine so they survive the ephemeral [`Store`] we
 /// build per invocation.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WasmEngine {
     engine: Engine,
     /// Per-plugin `Arc<DashMap>` state. Created on first access via
@@ -57,6 +58,29 @@ pub struct WasmEngine {
     /// [`Self::with_bus`]; `None` on a bare-test engine means those
     /// host fns trap with a descriptive message when called.
     bus: Option<EventBus>,
+    /// Call-id → (endpoint, remote) lookup for `send_rtp`. Attached
+    /// via [`Self::with_media`]; `None` disables `send_rtp`.
+    call_lookup: Option<Arc<dyn CallLookup>>,
+    /// Media fabric handle for `send_rtp` dispatch. Attached via
+    /// [`Self::with_media`]; `None` disables `send_rtp`.
+    media_fabric: Option<Arc<dyn MediaFabric>>,
+}
+
+impl std::fmt::Debug for WasmEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `engine` is a wasmtime::Engine (no user-visible shape);
+        // list the runtime-visible fields with their cardinality/
+        // presence so logs stay human-readable without dumping the
+        // whole wasmtime state.
+        let _ = &self.engine;
+        f.debug_struct("WasmEngine")
+            .field("states", &self.states.len())
+            .field("permissions", &self.permissions.len())
+            .field("bus", &self.bus.is_some())
+            .field("call_lookup", &self.call_lookup.is_some())
+            .field("media_fabric", &self.media_fabric.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl WasmEngine {
@@ -76,6 +100,8 @@ impl WasmEngine {
             states: Arc::new(DashMap::new()),
             permissions: Arc::new(DashMap::new()),
             bus: None,
+            call_lookup: None,
+            media_fabric: None,
         })
     }
 
@@ -87,6 +113,20 @@ impl WasmEngine {
     #[must_use]
     pub fn with_bus(mut self, bus: EventBus) -> Self {
         self.bus = Some(bus);
+        self
+    }
+
+    /// Attach the call-lookup + media-fabric pair needed by
+    /// `smiths::send_rtp`. Without this, guests that call `send_rtp`
+    /// trap. Builder-style for the same reason as [`Self::with_bus`].
+    #[must_use]
+    pub fn with_media(
+        mut self,
+        call_lookup: Arc<dyn CallLookup>,
+        media_fabric: Arc<dyn MediaFabric>,
+    ) -> Self {
+        self.call_lookup = Some(call_lookup);
+        self.media_fabric = Some(media_fabric);
         self
     }
 
@@ -155,7 +195,9 @@ impl WasmEngine {
         let permissions = self.plugin_permissions(plugin);
         let mut store = Store::new(
             &self.engine,
-            HostState::for_plugin_with_state(plugin, state, permissions).with_bus(self.bus.clone()),
+            HostState::for_plugin_with_state(plugin, state, permissions)
+                .with_bus(self.bus.clone())
+                .with_media(self.call_lookup.clone(), self.media_fabric.clone()),
         );
         store.set_fuel(DEFAULT_FUEL).map_err(WasmError::Fuel)?;
         store.set_epoch_deadline(u64::MAX);
@@ -228,7 +270,9 @@ impl WasmEngine {
         let permissions = self.plugin_permissions(plugin);
         let mut store = Store::new(
             &self.engine,
-            HostState::for_plugin_with_state(plugin, state, permissions).with_bus(self.bus.clone()),
+            HostState::for_plugin_with_state(plugin, state, permissions)
+                .with_bus(self.bus.clone())
+                .with_media(self.call_lookup.clone(), self.media_fabric.clone()),
         );
         store.set_fuel(DEFAULT_FUEL).map_err(WasmError::Fuel)?;
         store.set_epoch_deadline(u64::MAX);
@@ -307,7 +351,9 @@ impl WasmEngine {
         let permissions = self.plugin_permissions(plugin);
         let mut store = Store::new(
             &self.engine,
-            HostState::for_plugin_with_state(plugin, state, permissions).with_bus(self.bus.clone()),
+            HostState::for_plugin_with_state(plugin, state, permissions)
+                .with_bus(self.bus.clone())
+                .with_media(self.call_lookup.clone(), self.media_fabric.clone()),
         );
         store.set_fuel(fuel).map_err(WasmError::Fuel)?;
         // Configure the store's epoch deadline. When a deadline is
