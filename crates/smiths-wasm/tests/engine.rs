@@ -346,6 +346,105 @@ fn call_invoke_round_trips_result_envelope() {
     assert_eq!(result, serde_json::Value::String("ok".into()));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_event_reaches_bus_subscriber() {
+    use smiths_core::{Event, EventBus, PluginEvent};
+    let wat = r#"
+(module
+  (import "smiths" "publish_event" (func $pub (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "chat")        ;; topic at 0..4
+  (data (i32.const 16) "hello")      ;; payload at 16..21
+  (func (export "run")
+    (call $pub (i32.const 0) (i32.const 4) (i32.const 16) (i32.const 5))
+    drop))
+"#;
+    let bus = EventBus::new(16);
+    let mut rx = bus.subscribe();
+    let engine = WasmEngine::new().unwrap().with_bus(bus);
+    engine.set_plugin_permissions("pub-plugin", ["events"]);
+    let module = compile(&engine, wat);
+    engine
+        .run_entry(&module, "run", FUEL, "pub-plugin")
+        .unwrap();
+
+    let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("bus should have seen the event")
+        .expect("bus recv");
+    match event {
+        Event::Plugin(PluginEvent::Published {
+            plugin,
+            topic,
+            data,
+        }) => {
+            assert_eq!(plugin, "pub-plugin");
+            assert_eq!(topic, "chat");
+            assert_eq!(&data, b"hello");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[test]
+fn publish_event_without_permission_traps() {
+    let wat = r#"
+(module
+  (import "smiths" "publish_event" (func $pub (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "t")
+  (data (i32.const 8) "x")
+  (func (export "run")
+    (call $pub (i32.const 0) (i32.const 1) (i32.const 8) (i32.const 1))
+    drop))
+"#;
+    let bus = smiths_core::EventBus::new(4);
+    let engine = WasmEngine::new().unwrap().with_bus(bus);
+    // No permissions registered → events is denied.
+    let module = compile(&engine, wat);
+    let err = engine
+        .run_entry(&module, "run", FUEL, "no-perm")
+        .unwrap_err();
+    assert!(
+        matches!(err, WasmError::PermissionDenied { ref permission, .. } if permission == "events"),
+        "expected PermissionDenied(events), got {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timer_set_fires_timer_event_after_delay() {
+    use smiths_core::{Event, EventBus, PluginEvent};
+    let wat = r#"
+(module
+  (import "smiths" "timer_set" (func $timer (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "run")
+    (call $timer (i32.const 40) (i32.const 42))
+    drop))
+"#;
+    let bus = EventBus::new(16);
+    let mut rx = bus.subscribe();
+    let engine = WasmEngine::new().unwrap().with_bus(bus);
+    engine.set_plugin_permissions("timer-plugin", ["timers"]);
+    let module = compile(&engine, wat);
+    engine
+        .run_entry(&module, "run", FUEL, "timer-plugin")
+        .unwrap();
+
+    // Wait up to 500 ms for the timer thread to fire back on the bus.
+    let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+        .await
+        .expect("timer should fire within 500 ms")
+        .expect("bus recv");
+    match event {
+        Event::Plugin(PluginEvent::TimerFired { plugin, event_id }) => {
+            assert_eq!(plugin, "timer-plugin");
+            assert_eq!(event_id, 42);
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
 #[test]
 fn call_invoke_error_envelope_becomes_plugin_error() {
     let wat = r#"

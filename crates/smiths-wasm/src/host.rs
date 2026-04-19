@@ -26,8 +26,10 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
+use smiths_core::{Event, EventBus, PluginEvent};
 use tracing::info;
 use wasmtime::{Caller, Linker};
 
@@ -44,6 +46,12 @@ pub type PluginPermissions = Arc<HashSet<String>>;
 /// Permission string required by [`state_set`] and [`state_get`].
 pub const PERM_STATE: &str = "state";
 
+/// Permission string required by `publish_event`.
+pub const PERM_EVENTS: &str = "events";
+
+/// Permission string required by `timer_set`.
+pub const PERM_TIMERS: &str = "timers";
+
 /// Per-instance mutable state handed to each host-fn call. Rebuilt on
 /// every `Store::new`; the persistent part (the per-plugin KV map)
 /// and the permission set are injected on construction.
@@ -57,6 +65,10 @@ pub struct HostState {
     /// Permissions the manifest declared. Checked by every gated
     /// host fn; empty set means the plugin can only call `log`.
     pub permissions: PluginPermissions,
+    /// Event bus handle for `publish_event` / `timer_set`. Optional so
+    /// tests that don't exercise bus-bound host fns can leave it
+    /// unset — those fns then trap with a descriptive message.
+    pub bus: Option<EventBus>,
 }
 
 impl HostState {
@@ -69,6 +81,7 @@ impl HostState {
             plugin: plugin.into(),
             state: Arc::new(DashMap::new()),
             permissions: Arc::new(HashSet::new()),
+            bus: None,
         }
     }
 
@@ -85,7 +98,16 @@ impl HostState {
             plugin: plugin.into(),
             state,
             permissions,
+            bus: None,
         }
+    }
+
+    /// Attach the engine's event bus to this state. Builder-style so
+    /// existing construction sites don't need to change signatures.
+    #[must_use]
+    pub fn with_bus(mut self, bus: Option<EventBus>) -> Self {
+        self.bus = bus;
+        self
     }
 
     /// Return a typed permission-denied trap if `permission` is not in
@@ -112,6 +134,12 @@ pub fn register(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
         .map_err(WasmError::Link)?;
     linker
         .func_wrap("smiths", "state_get", host_state_get)
+        .map_err(WasmError::Link)?;
+    linker
+        .func_wrap("smiths", "publish_event", host_publish_event)
+        .map_err(WasmError::Link)?;
+    linker
+        .func_wrap("smiths", "timer_set", host_timer_set)
         .map_err(WasmError::Link)?;
     Ok(())
 }
@@ -197,6 +225,84 @@ fn host_state_get(
     }
     data[start..end].copy_from_slice(&value[..to_write]);
     i32::try_from(value.len()).map_err(|_| wasmtime::Error::msg("value too large for i32 return"))
+}
+
+/// `smiths::publish_event(topic_ptr, topic_len, data_ptr, data_len) -> i32`
+/// — forward a free-form `(topic, data)` pair to the engine's event
+/// bus as [`PluginEvent::Published`]. Returns `0` on success;
+/// `-1` when no subscribers were live for the publish (non-fatal —
+/// lets the guest avoid holding on to data nobody is listening for).
+/// Requires the `events` permission.
+fn host_publish_event(
+    mut caller: Caller<'_, HostState>,
+    topic_ptr: i32,
+    topic_len: i32,
+    data_ptr: i32,
+    data_len: i32,
+) -> wasmtime::Result<i32> {
+    caller.data().require(PERM_EVENTS, "publish_event")?;
+    let bus = caller
+        .data()
+        .bus
+        .clone()
+        .ok_or_else(|| wasmtime::Error::msg("publish_event: no EventBus bound to HostState"))?;
+    let memory = caller
+        .get_export("memory")
+        .and_then(wasmtime::Extern::into_memory)
+        .ok_or_else(|| wasmtime::Error::msg("guest must export `memory`"))?;
+    let (topic, data) = {
+        let mem = memory.data(&caller);
+        let topic_bytes = read_slice(mem, topic_ptr, topic_len, "publish_event topic")?;
+        let topic = std::str::from_utf8(topic_bytes)
+            .map_err(|e| wasmtime::Error::msg(format!("publish_event topic not UTF-8: {e}")))?
+            .to_owned();
+        let data = read_slice(mem, data_ptr, data_len, "publish_event data")?.to_vec();
+        (topic, data)
+    };
+    let plugin = caller.data().plugin.clone();
+    match bus.publish(Event::Plugin(PluginEvent::Published {
+        plugin,
+        topic,
+        data,
+    })) {
+        Ok(_) => Ok(0),
+        Err(_) => Ok(-1),
+    }
+}
+
+/// `smiths::timer_set(delay_ms: i32, event_id: i32) -> i32` — schedule
+/// a one-shot host timer. When the delay elapses, the engine
+/// publishes a [`PluginEvent::TimerFired`] carrying `event_id` back
+/// on the bus. Returns `0` on schedule, traps on negative delay.
+/// Requires the `timers` permission.
+///
+/// Implementation note: uses a dedicated std thread rather than
+/// `tokio::spawn` so timers work in sync `run_entry` callers that
+/// don't have a tokio runtime on scope. The thread is cheap — it
+/// sleeps then publishes and exits.
+// `Caller` is passed by value to match wasmtime's `func_wrap` ABI; the
+// needless_pass_by_value lint is off-base for this signature shape.
+#[allow(clippy::needless_pass_by_value)]
+fn host_timer_set(
+    caller: Caller<'_, HostState>,
+    delay_ms: i32,
+    event_id: i32,
+) -> wasmtime::Result<i32> {
+    caller.data().require(PERM_TIMERS, "timer_set")?;
+    let bus = caller
+        .data()
+        .bus
+        .clone()
+        .ok_or_else(|| wasmtime::Error::msg("timer_set: no EventBus bound to HostState"))?;
+    let plugin = caller.data().plugin.clone();
+    let delay_ms_u64 =
+        u64::try_from(delay_ms).map_err(|_| wasmtime::Error::msg("timer_set: negative delay"))?;
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(delay_ms_u64));
+        // Publish failures mean no subscribers — harmless to drop.
+        let _ = bus.publish(Event::Plugin(PluginEvent::TimerFired { plugin, event_id }));
+    });
+    Ok(0)
 }
 
 /// Slice a bounded region of guest memory. Returns a descriptive

@@ -103,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
     // Build a shared WASM engine so `type = "wasm"` manifests can load.
     // Failing this shouldn't block sidecar plugins — log and proceed.
     let wasm_engine = match smiths_plugin::wasm::WasmEngine::new() {
-        Ok(e) => Some(e),
+        Ok(e) => Some(e.with_bus(bus.clone())),
         Err(err) => {
             warn!(
                 ?err,

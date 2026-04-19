@@ -5,6 +5,57 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-04-20
+
+### Added — WASM host surface expansion
+
+- **`smiths::publish_event(topic_ptr, topic_len, data_ptr, data_len) -> i32`**
+  — guest publishes `(topic, bytes)` to the engine's event bus as
+  `PluginEvent::Published`. Returns `0` on success, `-1` when no
+  subscribers were live (non-fatal). Requires the `events`
+  permission.
+- **`smiths::timer_set(delay_ms, event_id) -> i32`** — guest schedules
+  a one-shot host timer. When the delay elapses, the engine
+  publishes a `PluginEvent::TimerFired` carrying `event_id`.
+  Implementation uses a `std::thread` rather than `tokio::spawn` so
+  sync `run_entry` callers without a runtime still work. Requires
+  the `timers` permission.
+- **`WasmEngine::with_bus(EventBus)`** — builder that attaches the
+  engine-wide bus to every store the engine builds. CLI wires it
+  at boot, so `load_plugins` plugins get bus access without any
+  extra threading.
+- **`PluginEvent::Published` / `PluginEvent::TimerFired`** — two
+  new variants on the bus. Subscribers (MCP forwarder, sidecar
+  bridge, future routing agents) can react without linking the
+  WASM crate.
+
+### Added — plugin hot reload
+
+- **`smiths-plugin::watcher`** — `spawn(root, registry) ->
+  WatcherHandle` launches a background task that polls the plugins
+  directory and calls `AiRegistry::reload(name)` when `plugin.toml`
+  or an entry file changes. Uses `notify::PollWatcher` with
+  `compare_contents(true)` for same-second-edit detection
+  (platform-independent; macOS HFS+ and editor save bursts
+  handled). Bursts are debounced with a 250 ms trailing delay so a
+  noisy editor save only triggers one reload per plugin.
+- **`WatcherHandle`** — canceling it (drop or `shutdown().await`)
+  tears down the background task cleanly.
+- Integration test `hot_reload::watcher_triggers_reload_on_manifest_touch`
+  loads a sidecar stub, touches `plugin.toml`, and verifies the
+  registry swaps in a fresh `Arc<PluginEntry>` within 5 s.
+
+### Added — proto schema v1 frozen
+
+- **`smiths-proto`** grew `Envelope` / `Request` / `Response` /
+  `Notification` messages with prost-derive annotations — no
+  `build.rs`, no `protoc` dependency at compile time. Field
+  numbers are locked; future additions use fresh tags so old peers
+  decode correctly. Six round-trip tests cover each variant and
+  the empty-envelope edge case.
+- When the sidecar transport eventually migrates from JSON-RPC to
+  length-prefixed protobuf, these types serialize both sides.
+
 ## [0.9.0] - 2026-04-19
 
 ### Added — WASM plugin invocation dispatch

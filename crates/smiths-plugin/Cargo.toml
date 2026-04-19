@@ -19,12 +19,15 @@ toml           = "0.8"
 tracing        = { workspace = true }
 thiserror      = { workspace = true }
 dashmap        = { workspace = true }
+notify         = { workspace = true }
+tokio-util     = { workspace = true }
 
 [dev-dependencies]
-base64   = { workspace = true }
-tokio    = { workspace = true, features = ["macros", "test-util"] }
-tempfile = { workspace = true }
-wat      = { workspace = true }
+base64             = { workspace = true }
+tokio              = { workspace = true, features = ["macros", "test-util"] }
+tempfile           = { workspace = true }
+wat                = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

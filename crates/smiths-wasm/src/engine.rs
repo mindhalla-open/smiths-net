@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use serde_json::Value;
+use smiths_core::EventBus;
 use wasmtime::{Config, Engine, Linker, Memory, Module, Store, Trap};
 
 use crate::error::WasmError;
@@ -51,6 +52,11 @@ pub struct WasmEngine {
     /// [`Self::set_plugin_permissions`]; a miss returns an empty set,
     /// so an unregistered plugin can only use `log`.
     permissions: Arc<DashMap<String, PluginPermissions>>,
+    /// Engine-wide event bus forwarded to guests via
+    /// `smiths::publish_event` and `smiths::timer_set`. Attached via
+    /// [`Self::with_bus`]; `None` on a bare-test engine means those
+    /// host fns trap with a descriptive message when called.
+    bus: Option<EventBus>,
 }
 
 impl WasmEngine {
@@ -69,7 +75,19 @@ impl WasmEngine {
             engine,
             states: Arc::new(DashMap::new()),
             permissions: Arc::new(DashMap::new()),
+            bus: None,
         })
+    }
+
+    /// Attach an event bus. Every store the engine builds from now on
+    /// gets this bus on its [`HostState`] so `publish_event` and
+    /// `timer_set` can fan out guest-originated events back into the
+    /// engine. Builder-style so engine construction stays one-liner
+    /// for callers that don't use those host fns.
+    #[must_use]
+    pub fn with_bus(mut self, bus: EventBus) -> Self {
+        self.bus = Some(bus);
+        self
     }
 
     /// Fetch (or lazily create) the persistent KV store for `plugin`.
@@ -137,7 +155,7 @@ impl WasmEngine {
         let permissions = self.plugin_permissions(plugin);
         let mut store = Store::new(
             &self.engine,
-            HostState::for_plugin_with_state(plugin, state, permissions),
+            HostState::for_plugin_with_state(plugin, state, permissions).with_bus(self.bus.clone()),
         );
         store.set_fuel(DEFAULT_FUEL).map_err(WasmError::Fuel)?;
         store.set_epoch_deadline(u64::MAX);
@@ -210,7 +228,7 @@ impl WasmEngine {
         let permissions = self.plugin_permissions(plugin);
         let mut store = Store::new(
             &self.engine,
-            HostState::for_plugin_with_state(plugin, state, permissions),
+            HostState::for_plugin_with_state(plugin, state, permissions).with_bus(self.bus.clone()),
         );
         store.set_fuel(DEFAULT_FUEL).map_err(WasmError::Fuel)?;
         store.set_epoch_deadline(u64::MAX);
@@ -289,7 +307,7 @@ impl WasmEngine {
         let permissions = self.plugin_permissions(plugin);
         let mut store = Store::new(
             &self.engine,
-            HostState::for_plugin_with_state(plugin, state, permissions),
+            HostState::for_plugin_with_state(plugin, state, permissions).with_bus(self.bus.clone()),
         );
         store.set_fuel(fuel).map_err(WasmError::Fuel)?;
         // Configure the store's epoch deadline. When a deadline is
