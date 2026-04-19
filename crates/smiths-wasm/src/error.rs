@@ -48,4 +48,21 @@ pub enum WasmError {
     /// `Store::set_fuel` / fuel setup failed.
     #[error("wasm fuel configuration: {0}")]
     Fuel(#[source] wasmtime::Error),
+    /// Guest called a host fn it did not declare permission for.
+    /// Engine traps the guest; the plugin author must add the
+    /// permission to its `plugin.toml`.
+    #[error("wasm plugin `{plugin}` lacks permission `{permission}` required for `{op}`")]
+    PermissionDenied {
+        /// Plugin name from the host state.
+        plugin: String,
+        /// Permission string the plugin would need to declare.
+        permission: String,
+        /// Human-readable name of the host operation that was blocked.
+        op: String,
+    },
+    /// Guest returned a well-formed error envelope via the `invoke`
+    /// ABI (`{"error": "..."}`). Distinct from [`Self::Trap`] because
+    /// this is a cooperative plugin-level failure, not a runtime bug.
+    #[error("wasm plugin invoke error: {0}")]
+    PluginError(String),
 }

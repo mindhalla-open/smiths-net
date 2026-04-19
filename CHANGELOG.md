@@ -5,6 +5,57 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-04-19
+
+### Added — WASM plugin invocation dispatch
+
+- **`WasmEngine::call_invoke(module, plugin, method, &params) ->
+  Result<Value, WasmError>`** — the invoke trampoline. Guest ABI:
+  module exports `memory`, `alloc(len: i32) -> i32`, and
+  `invoke(method_ptr, method_len, params_ptr, params_len) -> i64`.
+  The host serializes `params` as JSON, allocates + writes both
+  buffers via `alloc`, calls `invoke`, and decodes the packed
+  `(ptr << 32) | len` response envelope.
+- **Response envelope** — the guest returns a JSON object matching
+  one of `{"result": X}` (success, `X` passed back to the caller)
+  or `{"error": "msg"}` (plugin-level failure surfaced as
+  `WasmError::PluginError`). Malformed envelopes trap.
+- **`WasmProvider::invoke` wired** — replaces the prior "not yet
+  wired" stub. Real WASM plugins now run full describe + invoke
+  through `AiRegistry`, matching sidecar semantics.
+- **`rust-logger` example** — grew `alloc` (4 KiB static bump
+  buffer) and `invoke` (fixed `{"result":"ok"}` envelope) exports
+  so it's a complete, buildable reference for the WASM tier.
+
+### Added — plugin permission model
+
+- **`permissions: Vec<String>`** — new `plugin.toml` field. Empty
+  by default; only the plugins that need gated host surfaces opt
+  in. Today's meaningful value: `"state"` (required by
+  `smiths::state_{get,set}`). Future slices key `"send_sip"`,
+  `"send_rtp"`, timers, etc. off the same list.
+- **`WasmEngine::set_plugin_permissions(name, perms)`** — engine-
+  side registry. Called at load time with the manifest's list; the
+  per-invocation `HostState` cheaply clones the resulting
+  `Arc<HashSet<String>>` so every host fn can gate in O(1).
+- **`WasmError::PermissionDenied { plugin, permission, op }`** —
+  typed trap variant so operators can distinguish "plugin over-
+  reach" from plain traps / fuel exhaustion / timeouts. Surfaces
+  the exact permission string the author needs to add to
+  `plugin.toml`.
+- **`HostState::for_plugin_with_state` signature grew a
+  `permissions` parameter** — single construction point now covers
+  the three pieces of per-call plugin context (name, persistent
+  state, permission set).
+
+### Changed
+
+- Tests for `state_get` / `state_set` now explicitly register the
+  `"state"` permission via `engine.set_plugin_permissions(...)` —
+  previously permission-free access was implicit, now it's the
+  *declared* path. `for_plugin` (the empty-default helper) now
+  grants no permissions, matching runtime behavior.
+
 ## [0.8.0] - 2026-04-18
 
 ### Added — bidirectional plugin RPC (streaming notifications)

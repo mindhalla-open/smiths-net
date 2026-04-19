@@ -25,6 +25,13 @@ pub struct Manifest {
     /// its `describe_capabilities` handshake actually returns.
     #[serde(default)]
     pub provides: Vec<String>,
+    /// Host-surface capabilities the plugin requires at runtime.
+    /// Currently meaningful values: `"state"` (persistent KV
+    /// `smiths::state_{get,set}`). Future values will gate
+    /// `send_sip`, `send_rtp`, timers, etc. Default: empty — plugins
+    /// that only need `smiths::log` can omit the field.
+    #[serde(default)]
+    pub permissions: Vec<String>,
     /// ABI revision the plugin was built against. Plugins written for
     /// a future major must be refused.
     #[serde(default = "default_abi")]

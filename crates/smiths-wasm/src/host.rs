@@ -5,14 +5,26 @@
 //! `(import "smiths" "<name>" ...)`. Keep the surface **intentionally
 //! small** — every new symbol is ABI we are forever committed to.
 //!
+//! ## Permissions
+//!
+//! Host fns that do more than log check the plugin's declared
+//! permission set before acting. The set is copied onto the
+//! [`HostState`] at store construction; a missing permission returns
+//! a trap carrying the plugin name + permission string so the
+//! plugin author knows exactly what to add to `plugin.toml`.
+//! `smiths::log` is unrestricted (it already pipes through tracing
+//! and is rate-limited by the subscriber).
+//!
 //! ## State persistence
 //!
 //! Guest state persists across invocations via [`state_set`] /
-//! [`state_get`]. Each plugin has its own key-value namespace keyed
-//! on the plugin name — two plugins can use the same key without
-//! collision. The map lives on the engine (not the per-call store)
-//! so data survives the ephemeral store drop between calls.
+//! [`state_get`] — both gated behind the `"state"` permission. Each
+//! plugin has its own key-value namespace keyed on the plugin name;
+//! two plugins can use the same key without collision. The map lives
+//! on the engine (not the per-call store) so data survives the
+//! ephemeral store drop between calls.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -25,9 +37,16 @@ use crate::error::WasmError;
 /// keep the ABI transparent to the guest's choice of encoding.
 pub type PluginState = Arc<DashMap<Vec<u8>, Vec<u8>>>;
 
+/// Per-plugin declared permission set. Cheap to clone — the inner
+/// `HashSet` is behind an `Arc`.
+pub type PluginPermissions = Arc<HashSet<String>>;
+
+/// Permission string required by [`state_set`] and [`state_get`].
+pub const PERM_STATE: &str = "state";
+
 /// Per-instance mutable state handed to each host-fn call. Rebuilt on
-/// every `Store::new`; the persistent part (the per-plugin KV map) is
-/// injected by [`HostState::for_plugin_with_state`].
+/// every `Store::new`; the persistent part (the per-plugin KV map)
+/// and the permission set are injected on construction.
 #[derive(Default)]
 pub struct HostState {
     /// Plugin instance name, for `plugin=...` in tracing events.
@@ -35,28 +54,51 @@ pub struct HostState {
     /// The plugin's persistent KV map. Cloned from the engine-side
     /// registry on Store construction so state survives across calls.
     pub state: PluginState,
+    /// Permissions the manifest declared. Checked by every gated
+    /// host fn; empty set means the plugin can only call `log`.
+    pub permissions: PluginPermissions,
 }
 
 impl HostState {
     /// Build state tagged with the invoking plugin's name and a fresh
-    /// KV map (not shared with any engine-wide registry). Useful for
-    /// tests that don't care about cross-call persistence.
+    /// KV map / empty permission set. Useful for tests that don't care
+    /// about cross-call persistence or permission gating.
     #[must_use]
     pub fn for_plugin(plugin: impl Into<String>) -> Self {
         Self {
             plugin: plugin.into(),
             state: Arc::new(DashMap::new()),
+            permissions: Arc::new(HashSet::new()),
         }
     }
 
     /// Build state for `plugin` with a caller-provided persistent KV
-    /// map — typically retrieved from the engine's state registry.
+    /// map and permission set — typically retrieved from the engine's
+    /// per-plugin registry at invocation time.
     #[must_use]
-    pub fn for_plugin_with_state(plugin: impl Into<String>, state: PluginState) -> Self {
+    pub fn for_plugin_with_state(
+        plugin: impl Into<String>,
+        state: PluginState,
+        permissions: PluginPermissions,
+    ) -> Self {
         Self {
             plugin: plugin.into(),
             state,
+            permissions,
         }
+    }
+
+    /// Return a typed permission-denied trap if `permission` is not in
+    /// the plugin's declared set.
+    fn require(&self, permission: &str, op: &str) -> wasmtime::Result<()> {
+        if self.permissions.contains(permission) {
+            return Ok(());
+        }
+        Err(wasmtime::Error::new(WasmError::PermissionDenied {
+            plugin: self.plugin.clone(),
+            permission: permission.to_owned(),
+            op: op.to_owned(),
+        }))
     }
 }
 
@@ -93,7 +135,8 @@ fn host_log(mut caller: Caller<'_, HostState>, ptr: i32, len: i32) -> wasmtime::
 
 /// `smiths::state_set(key_ptr, key_len, val_ptr, val_len) -> i32` —
 /// write `value` into the plugin's KV store under `key`. Returns
-/// `0` on success; any error path traps.
+/// `0` on success; any error path traps. Requires the `state`
+/// permission.
 fn host_state_set(
     mut caller: Caller<'_, HostState>,
     key_ptr: i32,
@@ -101,6 +144,7 @@ fn host_state_set(
     val_ptr: i32,
     val_len: i32,
 ) -> wasmtime::Result<i32> {
+    caller.data().require(PERM_STATE, "state_set")?;
     let memory = caller
         .get_export("memory")
         .and_then(wasmtime::Extern::into_memory)
@@ -117,6 +161,7 @@ fn host_state_set(
 /// bytes of the value into the guest buffer at `out_ptr`. Returns
 /// the value's full length (so the guest can detect truncation by
 /// comparing to `out_cap`), or `-1` when the key is missing.
+/// Requires the `state` permission.
 fn host_state_get(
     mut caller: Caller<'_, HostState>,
     key_ptr: i32,
@@ -124,6 +169,7 @@ fn host_state_get(
     out_ptr: i32,
     out_cap: i32,
 ) -> wasmtime::Result<i32> {
+    caller.data().require(PERM_STATE, "state_get")?;
     let memory = caller
         .get_export("memory")
         .and_then(wasmtime::Extern::into_memory)

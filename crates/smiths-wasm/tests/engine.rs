@@ -182,6 +182,7 @@ fn state_set_then_get_round_trips_within_one_guest_call() {
     (if (then unreachable))))
 "#;
     let engine = WasmEngine::new().unwrap();
+    engine.set_plugin_permissions("state-smoke", ["state"]);
     let module = compile(&engine, wat);
     engine
         .run_entry(&module, "run", FUEL, "state-smoke")
@@ -214,6 +215,7 @@ fn state_persists_across_two_run_entry_calls() {
     (if (then unreachable))))
 "#;
     let engine = WasmEngine::new().unwrap();
+    engine.set_plugin_permissions("persist-demo", ["state"]);
     let w = compile(&engine, writer);
     let r = compile(&engine, reader);
     engine.run_entry(&w, "run", FUEL, "persist-demo").unwrap();
@@ -246,6 +248,8 @@ fn state_is_namespaced_per_plugin() {
     (if (then unreachable))))
 "#;
     let engine = WasmEngine::new().unwrap();
+    engine.set_plugin_permissions("plugin-a", ["state"]);
+    engine.set_plugin_permissions("plugin-b", ["state"]);
     let w = compile(&engine, writer);
     let r = compile(&engine, reader);
     // Plugin A writes.
@@ -276,4 +280,95 @@ fn log_out_of_bounds_is_a_trap() {
         matches!(err, WasmError::Trap(_)),
         "expected Trap, got {err:?}"
     );
+}
+
+#[test]
+fn state_set_without_permission_traps_with_permission_denied() {
+    // Same write path as state_set_then_get_round_trips, but without
+    // registering the "state" permission. The engine must surface a
+    // typed PermissionDenied rather than a bare Trap so operators can
+    // distinguish "plugin bug" from "plugin over-reach".
+    let wat = r#"
+(module
+  (import "smiths" "state_set" (func $set (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "k")
+  (data (i32.const 8) "v")
+  (func (export "run")
+    (call $set (i32.const 0) (i32.const 1) (i32.const 8) (i32.const 1))
+    drop))
+"#;
+    let engine = WasmEngine::new().unwrap();
+    let module = compile(&engine, wat);
+    let err = engine
+        .run_entry(&module, "run", FUEL, "unprivileged")
+        .unwrap_err();
+    match err {
+        WasmError::PermissionDenied {
+            plugin,
+            permission,
+            op,
+        } => {
+            assert_eq!(plugin, "unprivileged");
+            assert_eq!(permission, "state");
+            assert_eq!(op, "state_set");
+        }
+        other => panic!("expected PermissionDenied, got {other:?}"),
+    }
+}
+
+#[test]
+fn call_invoke_round_trips_result_envelope() {
+    // Minimal guest: memory-export, bump alloc, and an `invoke` that
+    // always returns `{"result":"ok"}`. Exercises every step of the
+    // invoke ABI trampoline host-side.
+    let wat = r#"
+(module
+  (memory (export "memory") 1)
+  ;; Response envelope at offset 0, 15 bytes.
+  (data (i32.const 0) "{\"result\":\"ok\"}")
+  ;; Bump allocator starts at 512 (well past the envelope).
+  (global $HEAP (mut i32) (i32.const 512))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $HEAP))
+    (global.set $HEAP (i32.add (global.get $HEAP) (local.get $len)))
+    (local.get $ptr))
+  (func (export "invoke") (param i32 i32 i32 i32) (result i64)
+    ;; (0 << 32) | 15
+    i64.const 15))
+"#;
+    let engine = WasmEngine::new().unwrap();
+    let module = compile(&engine, wat);
+    let result = engine
+        .call_invoke(&module, "invoke-demo", "ping", &serde_json::json!({"x": 1}))
+        .expect("invoke should round-trip");
+    assert_eq!(result, serde_json::Value::String("ok".into()));
+}
+
+#[test]
+fn call_invoke_error_envelope_becomes_plugin_error() {
+    let wat = r#"
+(module
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{\"error\":\"nope\"}")
+  (global $HEAP (mut i32) (i32.const 512))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $HEAP))
+    (global.set $HEAP (i32.add (global.get $HEAP) (local.get $len)))
+    (local.get $ptr))
+  (func (export "invoke") (param i32 i32 i32 i32) (result i64)
+    ;; (0 << 32) | 16
+    i64.const 16))
+"#;
+    let engine = WasmEngine::new().unwrap();
+    let module = compile(&engine, wat);
+    let err = engine
+        .call_invoke(&module, "err-demo", "anything", &serde_json::Value::Null)
+        .unwrap_err();
+    match err {
+        WasmError::PluginError(msg) => assert_eq!(msg, "nope"),
+        other => panic!("expected PluginError, got {other:?}"),
+    }
 }

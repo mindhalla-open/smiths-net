@@ -58,6 +58,11 @@ impl WasmProvider {
             .load(&bytes)
             .map_err(|e| format!("compile {}: {e}", wasm_path.display()))?;
 
+        // Register the manifest's permission set with the engine
+        // *before* describe runs, so describe itself is gated by the
+        // same rules as any other guest entry point.
+        engine.set_plugin_permissions(&manifest.name, manifest.permissions.iter().cloned());
+
         let descriptor_bytes = engine
             .call_describe(&module, &manifest.name)
             .map_err(|e| format!("describe: {e}"))?;
@@ -112,11 +117,13 @@ impl AiProvider for WasmProvider {
     fn capabilities(&self) -> &[CapabilityDescriptor] {
         &self.capabilities
     }
-    async fn invoke(&self, _method: &str, _params: Value) -> Result<Value, ProviderError> {
-        Err(ProviderError(
-            "WASM plugin invocation is not yet wired — this tier only advertises capabilities. \
-             Full method dispatch lands with the next host-surface slice."
-                .into(),
-        ))
+    async fn invoke(&self, method: &str, params: Value) -> Result<Value, ProviderError> {
+        // Compilation ran at load; here we just trampoline through the
+        // engine's `invoke` ABI. Wasmtime's sync call runs on this
+        // thread — acceptable at MVP scale, but the next slice should
+        // park it on a blocking pool if plugins get compute-heavy.
+        self.engine
+            .call_invoke(&self.module, &self.manifest.name, method, &params)
+            .map_err(|e| ProviderError(format!("plugin `{}`: {e}", self.manifest.name)))
     }
 }
