@@ -102,19 +102,24 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let registry = Arc::new(smiths_mcp::tools::builtin_registry());
+    let resources = Arc::new(smiths_mcp::builtin_resources());
+    let rate_limiter = Arc::new(smiths_mcp::RateLimiter::new(&config.mcp.rate_limit));
     let ai_registry_dyn: Arc<dyn AiRegistry> = Arc::new(ai_registry.clone());
-    let tool_ctx = ToolContext::new(control_state, ai_registry_dyn);
+    let config_snapshot = Arc::new(config.clone());
+    let tool_ctx = ToolContext::new(control_state, ai_registry_dyn, config_snapshot);
 
     // MCP stdio is now additive: it runs alongside SIP / health / A2A
     // rather than replacing them, so agents can receive push
     // notifications about calls the engine is serving.
     let mcp_stdio_task: Option<JoinHandle<()>> = if cli.mcp == Some(McpMode::Stdio) {
         let reg = Arc::clone(&registry);
+        let res = Arc::clone(&resources);
+        let rl = Arc::clone(&rate_limiter);
         let ctx = tool_ctx.clone();
         let bus = bus.clone();
         let cancel = shutdown.token();
         Some(tokio::spawn(async move {
-            if let Err(e) = smiths_mcp::mcp::run_stdio(reg, ctx, bus, cancel).await {
+            if let Err(e) = smiths_mcp::mcp::run_stdio(reg, res, rl, ctx, bus, cancel).await {
                 warn!(?e, "MCP stdio server error");
             }
         }))
@@ -175,10 +180,15 @@ async fn main() -> anyhow::Result<()> {
     if config.a2a.enabled {
         let bind = config.a2a.bind;
         let reg = Arc::clone(&registry);
+        let res = Arc::clone(&resources);
+        let rl = Arc::clone(&rate_limiter);
+        let bearer = config.a2a.bearer_token.clone();
         let ctx = tool_ctx.clone();
         let cancel = shutdown.token();
         adapter_handles.push(tokio::spawn(async move {
-            if let Err(e) = smiths_mcp::a2a::serve_http(bind, reg, ctx, cancel).await {
+            if let Err(e) =
+                smiths_mcp::a2a::serve_http(bind, reg, res, rl, bearer, ctx, cancel).await
+            {
                 warn!(%bind, ?e, "A2A HTTP server error");
             }
         }));

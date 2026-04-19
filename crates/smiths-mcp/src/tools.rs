@@ -25,6 +25,7 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(SynthesizeTool);
     reg.register(TranscribeTool);
     reg.register(LlmChatTool);
+    reg.register(ReloadPluginTool);
     reg
 }
 
@@ -519,11 +520,50 @@ impl Tool for LlmChatTool {
     }
 }
 
+/// `reload_plugin` — drain a loaded plugin's sidecar, re-parse its
+/// manifest, and re-spawn. Useful when a plugin file was edited on
+/// disk without restarting the engine.
+pub struct ReloadPluginTool;
+
+#[async_trait]
+impl Tool for ReloadPluginTool {
+    fn name(&self) -> &'static str {
+        "reload_plugin"
+    }
+
+    fn description(&self) -> &'static str {
+        "Re-spawn one loaded AI plugin from disk (drains the current \
+         sidecar, re-runs the describe_capabilities handshake)."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "plugin": { "type": "string", "description": "Plugin name (as registered)." }
+            },
+            "required": ["plugin"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let name = args
+            .get("plugin")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("plugin required".into()))?;
+        match ctx.plugins.reload(name).await {
+            Ok(()) => Ok(json!({ "plugin": name, "status": "reloaded" })),
+            Err(e) => Err(ToolError::Internal(e.to_string())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::control::ControlState;
-    use crate::tool::test_support::empty_registry;
+    use crate::tool::test_support::{default_config, empty_registry};
     use smiths_core::EventBus;
     use tokio_util::sync::CancellationToken;
 
@@ -531,7 +571,10 @@ mod tests {
         let bus = EventBus::new(8);
         let cancel = CancellationToken::new();
         let (state, _task) = ControlState::spawn(&bus, cancel.clone());
-        (ToolContext::new(state, empty_registry()), cancel)
+        (
+            ToolContext::new(state, empty_registry(), default_config()),
+            cancel,
+        )
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -562,7 +605,7 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 8);
+        assert_eq!(reg.len(), 9);
         for name in [
             "list_calls",
             "get_call_status",
@@ -572,9 +615,20 @@ mod tests {
             "synthesize",
             "transcribe",
             "llm_chat",
+            "reload_plugin",
         ] {
             assert!(reg.get(name).is_some(), "missing tool: {name}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reload_plugin_unknown_is_error() {
+        let (ctx, _c) = ctx_with_state();
+        let err = ReloadPluginTool
+            .call(json!({"plugin": "ghost"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Internal(_)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -23,7 +23,7 @@ pub use bus::EventBus;
 pub use call::{DialogKey, DialogRecord, DialogState};
 pub use config::{
     A2aConfig, BindSpec, BindSpecError, Config, CoreConfig, LogFormat, McpConfig,
-    ObservabilityConfig, PluginsConfig, SipConfig, SipTransport,
+    ObservabilityConfig, PluginsConfig, RateLimitConfig, SipConfig, SipTransport,
 };
 pub use error::Error;
 pub use event::{Event, SipEvent, SystemEvent};

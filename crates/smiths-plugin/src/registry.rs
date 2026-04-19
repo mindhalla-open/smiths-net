@@ -7,6 +7,7 @@
 //! control plane consumes it through the `smiths-core` seam and never
 //! links this crate.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -25,6 +26,10 @@ use crate::manifest::Manifest;
 pub struct PluginEntry {
     /// Parsed manifest.
     pub manifest: Manifest,
+    /// Plugin directory (where `plugin.toml` and the entry executable
+    /// live). Captured at load so `reload` can respawn from the same
+    /// source without the caller reconstructing the path.
+    pub dir: PathBuf,
     /// Live subprocess handle.
     pub sidecar: Sidecar,
     /// Descriptors returned by `describe_capabilities` at load.
@@ -144,5 +149,19 @@ impl AiRegistryTrait for AiRegistry {
     }
     async fn shutdown_all(&self) {
         AiRegistry::shutdown_all(self).await;
+    }
+    async fn reload(&self, name: &str) -> Result<(), ProviderError> {
+        let Some(existing) = self.get(name) else {
+            return Err(ProviderError(format!("no loaded plugin named `{name}`")));
+        };
+        let dir = existing.dir.clone();
+        // Drop the old sidecar first so the OS releases stdio fds
+        // before we spawn its replacement.
+        existing.sidecar.shutdown().await;
+        self.plugins.remove(name);
+        crate::loader::load_one(&dir, self)
+            .await
+            .map(|_| ())
+            .map_err(|e| ProviderError(format!("reload `{name}`: {e}")))
     }
 }

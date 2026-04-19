@@ -211,6 +211,10 @@ pub enum SipTransport {
 /// `enabled_http` is off by default because the stdio variant is the
 /// canonical MCP entry point for LLM agents spawning the engine as a
 /// subprocess. HTTP is useful for long-running daemons.
+///
+/// `rate_limit` applies to **every** tool dispatcher — both MCP
+/// (stdio/HTTP) and A2A share the same token buckets, since the
+/// protection target is the engine, not the adapter.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpConfig {
@@ -219,6 +223,8 @@ pub struct McpConfig {
     pub enabled_http: bool,
     /// HTTP bind for MCP.
     pub http_bind: SocketAddr,
+    /// Token-bucket rate limit applied to tool invocations.
+    pub rate_limit: RateLimitConfig,
 }
 
 impl Default for McpConfig {
@@ -226,8 +232,25 @@ impl Default for McpConfig {
         Self {
             enabled_http: false,
             http_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7878),
+            rate_limit: RateLimitConfig::default(),
         }
     }
+}
+
+/// Token-bucket rate limit config for tool dispatch.
+///
+/// `per_sec == 0` disables the limiter entirely (the default —
+/// operators opt in when they start hosting external traffic).
+/// `burst == 0` falls back to `per_sec` so a bare `per_sec` override
+/// still works without an explicit burst.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// Sustained tokens / second refill rate. `0` = disabled.
+    pub per_sec: u32,
+    /// Maximum bucket depth (burst allowance). `0` = fall back to
+    /// `per_sec`.
+    pub burst: u32,
 }
 
 /// A2A (agent-to-agent) HTTP adapter settings.
@@ -238,6 +261,11 @@ pub struct A2aConfig {
     pub enabled: bool,
     /// HTTP bind for A2A.
     pub bind: SocketAddr,
+    /// Optional bearer token. When set, every HTTP request must carry
+    /// a matching `Authorization: Bearer <token>` header or the server
+    /// returns `401 Unauthorized`. `None` disables auth — fine for
+    /// local development, never for public deployments.
+    pub bearer_token: Option<String>,
 }
 
 impl Default for A2aConfig {
@@ -245,6 +273,7 @@ impl Default for A2aConfig {
         Self {
             enabled: false,
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7879),
+            bearer_token: None,
         }
     }
 }

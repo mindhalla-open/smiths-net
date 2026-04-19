@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use smiths_core::Config;
 use smiths_core::ai::AiRegistry;
 use thiserror::Error;
 
@@ -27,13 +28,21 @@ pub struct ToolContext {
     /// to load — tools that depend on it should return a clean error
     /// in that case.
     pub plugins: Arc<dyn AiRegistry>,
+    /// Engine configuration snapshot. Resources like `config://current`
+    /// read from this; tools that need a config knob copy it into their
+    /// arg schema rather than reaching through here.
+    pub config: Arc<Config>,
 }
 
 impl ToolContext {
     /// Build a context from its components.
     #[must_use]
-    pub fn new(state: ControlState, plugins: Arc<dyn AiRegistry>) -> Self {
-        Self { state, plugins }
+    pub fn new(state: ControlState, plugins: Arc<dyn AiRegistry>, config: Arc<Config>) -> Self {
+        Self {
+            state,
+            plugins,
+            config,
+        }
     }
 }
 
@@ -125,6 +134,7 @@ pub(crate) mod test_support {
     use std::sync::Arc;
 
     use async_trait::async_trait;
+    use smiths_core::Config;
     use smiths_core::ai::{AiProvider, AiRegistry};
 
     /// Registry with no providers. Every lookup returns `None`.
@@ -144,5 +154,10 @@ pub(crate) mod test_support {
     /// Convenience: build an `Arc<dyn AiRegistry>` holding an [`EmptyRegistry`].
     pub(crate) fn empty_registry() -> Arc<dyn AiRegistry> {
         Arc::new(EmptyRegistry)
+    }
+
+    /// Default-config [`Arc<Config>`] for test contexts.
+    pub(crate) fn default_config() -> Arc<Config> {
+        Arc::new(Config::default())
     }
 }

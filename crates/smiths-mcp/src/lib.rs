@@ -15,12 +15,18 @@
 //! wrapping the transport around the same trait set.
 
 pub mod a2a;
+pub mod audit;
 pub mod control;
+pub mod dispatch;
 pub mod mcp;
+pub mod rate_limit;
 pub mod resource;
 pub mod tool;
 pub mod tools;
 
 pub use control::ControlState;
-pub use resource::{Resource, ResourceContent};
+pub use rate_limit::RateLimiter;
+pub use resource::{
+    Resource, ResourceContent, ResourceRegistry, builtin_registry as builtin_resources,
+};
 pub use tool::{Tool, ToolContext, ToolError, ToolRegistry};

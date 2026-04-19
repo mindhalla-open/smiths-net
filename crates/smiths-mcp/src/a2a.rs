@@ -17,9 +17,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::extract::{Request, State};
+use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, extract};
 use serde_json::{Map, Value, json};
@@ -27,26 +28,52 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::dispatch::invoke_audited;
+use crate::rate_limit::RateLimiter;
+use crate::resource::ResourceRegistry;
 use crate::tool::{ToolContext, ToolError, ToolRegistry};
+
+/// Actor label recorded in audit events for this adapter.
+const ACTOR: &str = "a2a-http";
 
 /// Wiring shared between routes.
 #[derive(Clone)]
 struct AppState {
     registry: Arc<ToolRegistry>,
+    resources: Arc<ResourceRegistry>,
+    rate_limiter: Arc<RateLimiter>,
     ctx: ToolContext,
+    /// When set, every request must carry matching
+    /// `Authorization: Bearer <token>` or we return 401.
+    bearer_token: Option<Arc<str>>,
 }
 
 /// Bind on `addr` and serve the A2A API until `cancel` fires.
 pub async fn serve_http(
     addr: SocketAddr,
     registry: Arc<ToolRegistry>,
+    resources: Arc<ResourceRegistry>,
+    rate_limiter: Arc<RateLimiter>,
+    bearer_token: Option<String>,
     ctx: ToolContext,
     cancel: CancellationToken,
 ) -> std::io::Result<()> {
-    let state = AppState { registry, ctx };
+    let state = AppState {
+        registry,
+        resources,
+        rate_limiter,
+        ctx,
+        bearer_token: bearer_token.map(Arc::from),
+    };
+    // Only `/a2a` requires auth; discovery (`agent.json`) and the
+    // liveness probe (`health`) stay public so load balancers and
+    // other agents can still find us.
     let app = Router::new()
+        .route(
+            "/a2a",
+            post(rpc).route_layer(middleware::from_fn_with_state(state.clone(), bearer_auth)),
+        )
         .route("/.well-known/agent.json", get(agent_card))
-        .route("/a2a", post(rpc))
         .route("/health", get(health))
         .with_state(state);
     let listener = TcpListener::bind(addr).await?;
@@ -57,6 +84,23 @@ pub async fn serve_http(
         .map_err(std::io::Error::other)?;
     info!("A2A HTTP server stopped");
     Ok(())
+}
+
+/// Bearer-token gate applied to `/a2a`. Does nothing when
+/// `state.bearer_token` is `None` (auth disabled).
+async fn bearer_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let Some(expected) = state.bearer_token.as_ref() else {
+        return next.run(req).await;
+    };
+    let submitted = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer ").map(str::trim));
+    if submitted.is_some_and(|t| t == expected.as_ref()) {
+        return next.run(req).await;
+    }
+    (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response()
 }
 
 // ---- handlers ----
@@ -115,7 +159,15 @@ async fn rpc(
                 "inputSchema": t.input_schema(),
             })).collect::<Vec<_>>()
         })),
-        "tools/call" => invoke_tool(&state, params).await,
+        "tools/call" => invoke_tool_http(&state, params).await,
+        "resources/list" => Ok(json!({
+            "resources": state.resources.iter().map(|r| json!({
+                "uri":         r.uri(),
+                "name":        r.uri(),
+                "description": r.description(),
+            })).collect::<Vec<_>>()
+        })),
+        "resources/read" => read_resource(&state, params).await,
         other => Err((ERR_METHOD_NOT_FOUND, format!("unknown method: {other}"))),
     };
 
@@ -138,7 +190,32 @@ async fn rpc(
     }
 }
 
-async fn invoke_tool(state: &AppState, params: Value) -> Result<Value, (i64, String)> {
+async fn read_resource(state: &AppState, params: Value) -> Result<Value, (i64, String)> {
+    let uri = params
+        .get("uri")
+        .and_then(Value::as_str)
+        .ok_or((ERR_INVALID_PARAMS, "missing `uri`".to_owned()))?;
+    let Some(resource) = state.resources.get(uri) else {
+        return Err((ERR_METHOD_NOT_FOUND, format!("unknown resource: {uri}")));
+    };
+    match resource.read(&state.ctx).await {
+        Ok(content) => Ok(json!({
+            "contents": [ {
+                "uri":      uri,
+                "mimeType": content.mime_type(),
+                "text":     content.text(),
+            } ],
+        })),
+        Err(e) => Err(match e {
+            ToolError::InvalidArguments(m) => (ERR_INVALID_PARAMS, m),
+            ToolError::NotFound(m) => (ERR_TOOL_NOT_FOUND, m),
+            ToolError::Forbidden(m) => (ERR_FORBIDDEN, m),
+            ToolError::Internal(m) => (ERR_INTERNAL, m),
+        }),
+    }
+}
+
+async fn invoke_tool_http(state: &AppState, params: Value) -> Result<Value, (i64, String)> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -148,10 +225,16 @@ async fn invoke_tool(state: &AppState, params: Value) -> Result<Value, (i64, Str
         .cloned()
         .unwrap_or_else(|| Value::Object(Map::default()));
 
-    let Some(tool) = state.registry.get(name) else {
-        return Err((ERR_METHOD_NOT_FOUND, format!("unknown tool: {name}")));
-    };
-    match tool.call(args, &state.ctx).await {
+    match invoke_audited(
+        &state.registry,
+        &state.rate_limiter,
+        &state.ctx,
+        ACTOR,
+        name,
+        args,
+    )
+    .await
+    {
         Ok(output) => Ok(json!({ "output": output, "isError": false })),
         Err(e) => match e {
             ToolError::InvalidArguments(m) => Err((ERR_INVALID_PARAMS, m)),

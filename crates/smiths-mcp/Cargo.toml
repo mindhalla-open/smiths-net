@@ -8,6 +8,8 @@ description  = "Control plane: Tool/Resource traits plus MCP (stdio) and A2A (HT
 
 [dependencies]
 smiths-core   = { workspace = true }
+sha2          = { workspace = true }
+hex           = { workspace = true }
 tokio         = { workspace = true }
 tokio-util    = { workspace = true }
 async-trait   = { workspace = true }
@@ -19,7 +21,9 @@ axum          = { workspace = true }
 dashmap       = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "test-util"] }
+async-trait = { workspace = true }
+reqwest     = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio       = { workspace = true, features = ["macros", "test-util"] }
 
 [lints]
 workspace = true

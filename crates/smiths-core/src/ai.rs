@@ -325,6 +325,15 @@ pub trait AiRegistry: Send + Sync {
     }
     /// Shut down every provider. Typically called on engine shutdown.
     async fn shutdown_all(&self);
+    /// Re-spawn one plugin by name, replacing the current entry. Used
+    /// by the `reload_plugin` control-plane tool. Default impl
+    /// responds "not supported" so registries built from a static
+    /// source (tests, embedded defaults) don't need to implement this.
+    async fn reload(&self, _name: &str) -> Result<(), ProviderError> {
+        Err(ProviderError(
+            "reload not supported by this registry".into(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------

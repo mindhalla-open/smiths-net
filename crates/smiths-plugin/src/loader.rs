@@ -62,7 +62,7 @@ pub async fn load_plugins(root: &Path, registry: &AiRegistry) -> Result<LoadRepo
 }
 
 #[instrument(skip(registry), fields(dir = %dir.display()))]
-async fn load_one(dir: &Path, registry: &AiRegistry) -> Result<String, Error> {
+pub(crate) async fn load_one(dir: &Path, registry: &AiRegistry) -> Result<String, Error> {
     // `plugin.toml` must exist or the directory isn't a plugin — skip
     // silently by reporting a clean NotFound at the loader boundary.
     let manifest_path = dir.join("plugin.toml");
@@ -126,6 +126,7 @@ async fn load_one(dir: &Path, registry: &AiRegistry) -> Result<String, Error> {
 
     registry.insert(PluginEntry {
         manifest,
+        dir: dir.to_path_buf(),
         sidecar,
         capabilities,
     });
