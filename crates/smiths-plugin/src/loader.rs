@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
-use smiths_core::ai::CapabilityDescriptor;
+use smiths_core::ai::parse_descriptors;
 use smiths_core::{Event, EventBus, PluginEvent};
 use smiths_wasm::WasmEngine;
 use tracing::{debug, info, instrument, warn};
@@ -28,26 +28,35 @@ pub struct LoadReport {
     pub failed: Vec<(String, String)>,
 }
 
+/// Optional dependencies threaded through the loader. All fields are
+/// optional so tests and small deployments can pass
+/// `LoaderOpts::default()`; the CLI builds a fully-populated one at
+/// boot.
+///
+/// - `bus`: when set, each loaded plugin gets a background bridge task
+///   that republishes its JSON-RPC notifications onto the engine's
+///   `EventBus` as [`Event::Plugin`] events.
+/// - `wasm_engine`: required to load `type = "wasm"` manifests.
+///   Without it, WASM plugins fail-partial with a descriptive error
+///   while sidecar plugins still load.
+#[derive(Clone, Debug, Default)]
+pub struct LoaderOpts {
+    /// See struct docs.
+    pub bus: Option<EventBus>,
+    /// See struct docs.
+    pub wasm_engine: Option<WasmEngine>,
+}
+
 /// Scan `root` for subdirectories containing `plugin.toml`, spawn each,
 /// run the handshake, and insert successful ones into `registry`.
 ///
 /// If `root` doesn't exist, returns an empty report (operators turn
 /// plugins on by creating the directory — no error).
-///
-/// When `bus` is `Some`, each loaded plugin gets a background bridge
-/// task that republishes its JSON-RPC notifications onto the bus as
-/// [`Event::Plugin`] events. Pass `None` in tests that don't care.
-///
-/// `wasm_engine` is only consulted for `type = "wasm"` manifests. When
-/// `None`, any WASM plugin encountered fails-partial with a descriptive
-/// error — sidecar plugins still load. Callers that want WASM support
-/// must construct a [`WasmEngine`] and pass it in.
-#[instrument(skip(registry, bus, wasm_engine), fields(root = %root.display()))]
+#[instrument(skip(registry, opts), fields(root = %root.display()))]
 pub async fn load_plugins(
     root: &Path,
     registry: &AiRegistry,
-    bus: Option<EventBus>,
-    wasm_engine: Option<WasmEngine>,
+    opts: LoaderOpts,
 ) -> Result<LoadReport, Error> {
     let mut report = LoadReport::default();
     if !root.exists() {
@@ -62,7 +71,7 @@ pub async fn load_plugins(
             continue;
         }
         let path = entry.path();
-        match load_one(&path, registry, bus.clone(), wasm_engine.clone()).await {
+        match load_one(&path, registry, opts.clone()).await {
             Ok(name) => {
                 info!(plugin = %name, dir = %path.display(), "plugin loaded");
                 report.loaded.push(name);
@@ -79,12 +88,11 @@ pub async fn load_plugins(
     Ok(report)
 }
 
-#[instrument(skip(registry, bus, wasm_engine), fields(dir = %dir.display()))]
+#[instrument(skip(registry, opts), fields(dir = %dir.display()))]
 pub(crate) async fn load_one(
     dir: &Path,
     registry: &AiRegistry,
-    bus: Option<EventBus>,
-    wasm_engine: Option<WasmEngine>,
+    opts: LoaderOpts,
 ) -> Result<String, Error> {
     // `plugin.toml` must exist or the directory isn't a plugin — skip
     // silently by reporting a clean NotFound at the loader boundary.
@@ -101,7 +109,7 @@ pub(crate) async fn load_one(
 
     match manifest.plugin_type {
         PluginType::Sidecar => { /* fall through to sidecar path below */ }
-        PluginType::Wasm => return load_wasm(dir, manifest, wasm_engine, registry),
+        PluginType::Wasm => return load_wasm(dir, manifest, opts.wasm_engine, registry),
         PluginType::Script => {
             return Err(Error::Load {
                 plugin: name,
@@ -122,36 +130,17 @@ pub(crate) async fn load_one(
             reason: format!("describe_capabilities failed: {e}"),
         })?;
 
-    let descriptors = parse_descriptors(raw).map_err(|reason| Error::Load {
-        plugin: name.clone(),
-        reason,
-    })?;
-
-    // Sanity-check: the descriptors must match the manifest's declared
-    // `provides` list (each provided capability has a descriptor).
-    for declared in &manifest.provides {
-        if !descriptors.iter().any(|d| &d.capability == declared) {
-            return Err(Error::Load {
-                plugin: name.clone(),
-                reason: format!("manifest claims `{declared}` but plugin didn't describe it"),
-            });
-        }
-    }
-
-    // Each descriptor's `plugin` field should match our manifest name —
-    // rewrite it defensively so downstream code can trust the binding.
-    let capabilities: Vec<CapabilityDescriptor> = descriptors
-        .into_iter()
-        .map(|mut d| {
-            d.plugin.clone_from(&name);
-            d
+    let capabilities = parse_descriptors(raw)
+        .map_err(|reason| Error::Load {
+            plugin: name.clone(),
+            reason,
         })
-        .collect();
+        .and_then(|descs| bind_and_check(descs, &name, &manifest.provides))?;
 
     // Start the notification bridge before we register — the bus
     // subscriber slot needs to be armed by the time a plugin starts
     // emitting partials.
-    if let Some(bus) = bus {
+    if let Some(bus) = opts.bus {
         spawn_notification_bridge(&sidecar, name.clone(), bus);
     }
 
@@ -191,6 +180,31 @@ fn load_wasm(
     Ok(name)
 }
 
+/// Ensure the manifest's declared `provides` list is fully covered by
+/// the descriptor set and clamp each descriptor's `plugin` field to the
+/// manifest name so downstream code can trust the binding.
+fn bind_and_check(
+    descriptors: Vec<smiths_core::ai::CapabilityDescriptor>,
+    plugin_name: &str,
+    provides: &[String],
+) -> Result<Vec<smiths_core::ai::CapabilityDescriptor>, Error> {
+    for declared in provides {
+        if !descriptors.iter().any(|d| &d.capability == declared) {
+            return Err(Error::Load {
+                plugin: plugin_name.to_owned(),
+                reason: format!("manifest claims `{declared}` but plugin didn't describe it"),
+            });
+        }
+    }
+    Ok(descriptors
+        .into_iter()
+        .map(|mut d| {
+            plugin_name.clone_into(&mut d.plugin);
+            d
+        })
+        .collect())
+}
+
 /// Subscribe to `sidecar`'s notification broadcast and forward each
 /// frame to the engine's bus as [`Event::Plugin`]. Task exits when
 /// the sidecar's notification channel closes (plugin shut down).
@@ -216,24 +230,6 @@ fn spawn_notification_bridge(sidecar: &smiths_sidecar::Sidecar, plugin: String, 
             }
         }
     });
-}
-
-/// Accept either a single descriptor object or an array of them.
-fn parse_descriptors(raw: Value) -> Result<Vec<CapabilityDescriptor>, String> {
-    let list: Vec<CapabilityDescriptor> = if raw.is_array() {
-        serde_json::from_value(raw).map_err(|e| format!("descriptor array parse: {e}"))?
-    } else {
-        let single: CapabilityDescriptor =
-            serde_json::from_value(raw).map_err(|e| format!("descriptor parse: {e}"))?;
-        vec![single]
-    };
-    if list.is_empty() {
-        return Err("plugin returned no capabilities".into());
-    }
-    for d in &list {
-        d.validate()?;
-    }
-    Ok(list)
 }
 
 #[cfg(test)]
@@ -295,7 +291,9 @@ done
         make_plugin_dir(root.path(), "ai-tts-stub", &["ai.tts"]);
 
         let reg = AiRegistry::new();
-        let report = load_plugins(root.path(), &reg, None, None).await.unwrap();
+        let report = load_plugins(root.path(), &reg, LoaderOpts::default())
+            .await
+            .unwrap();
         assert_eq!(report.loaded, vec!["ai-tts-stub"]);
         assert!(report.failed.is_empty());
         assert_eq!(reg.len(), 1);
@@ -312,9 +310,13 @@ done
     async fn missing_root_is_not_an_error() {
         let root = tempdir().unwrap();
         let reg = AiRegistry::new();
-        let report = load_plugins(&root.path().join("does-not-exist"), &reg, None, None)
-            .await
-            .unwrap();
+        let report = load_plugins(
+            &root.path().join("does-not-exist"),
+            &reg,
+            LoaderOpts::default(),
+        )
+        .await
+        .unwrap();
         assert!(report.loaded.is_empty());
         assert!(report.failed.is_empty());
     }
@@ -326,7 +328,9 @@ done
         make_plugin_dir(root.path(), "ai-asr-liar", &["ai.asr"]);
 
         let reg = AiRegistry::new();
-        let report = load_plugins(root.path(), &reg, None, None).await.unwrap();
+        let report = load_plugins(root.path(), &reg, LoaderOpts::default())
+            .await
+            .unwrap();
         assert!(report.loaded.is_empty());
         assert_eq!(report.failed.len(), 1);
         assert_eq!(reg.len(), 0);

@@ -66,14 +66,25 @@ impl AiProvider for PluginEntry {
 ///
 /// Two backends today: sidecars (subprocess + JSON-RPC stdio) and
 /// WASM providers (compiled module + describe-only MVP). Both impl
-/// `AiProvider`; the trait-level `get` / `snapshot` / `capabilities`
-/// merge them, while sidecar-specific operations (reload, streaming
-/// notification subscribers) keep their typed API via the inherent
-/// `get` method.
-#[derive(Clone, Debug, Default)]
+/// `AiProvider` and share a single `providers` map so `len`,
+/// `capabilities`, `snapshot`, and `shutdown_all` iterate uniformly.
+///
+/// A parallel `sidecars` index keeps a strongly-typed handle on
+/// sidecar-only entries — the streaming-notification bridge and
+/// `reload` need it. WASM providers don't appear in that index.
+#[derive(Clone, Default)]
 pub struct AiRegistry {
-    plugins: Arc<DashMap<String, Arc<PluginEntry>>>,
-    wasm: Arc<DashMap<String, Arc<WasmProvider>>>,
+    providers: Arc<DashMap<String, Arc<dyn AiProvider>>>,
+    sidecars: Arc<DashMap<String, Arc<PluginEntry>>>,
+}
+
+impl std::fmt::Debug for AiRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiRegistry")
+            .field("providers", &self.providers.len())
+            .field("sidecars", &self.sidecars.len())
+            .finish()
+    }
 }
 
 impl AiRegistry {
@@ -84,27 +95,33 @@ impl AiRegistry {
     }
 
     /// Register a loaded sidecar plugin. Overwrites any existing
-    /// entry with the same name.
+    /// entry with the same name. The entry is also mirrored into a
+    /// sidecar-only index so streaming + reload paths can recover
+    /// the typed `PluginEntry`.
     pub fn insert(&self, entry: PluginEntry) {
-        self.plugins
-            .insert(entry.manifest.name.clone(), Arc::new(entry));
+        let arc = Arc::new(entry);
+        let name = arc.manifest.name.clone();
+        self.providers
+            .insert(name.clone(), Arc::clone(&arc) as Arc<dyn AiProvider>);
+        self.sidecars.insert(name, arc);
     }
 
     /// Register a loaded WASM plugin.
     pub fn insert_wasm(&self, provider: Arc<WasmProvider>) {
-        self.wasm.insert(provider.name().to_owned(), provider);
+        self.providers
+            .insert(provider.name().to_owned(), provider as Arc<dyn AiProvider>);
     }
 
-    /// Number of plugins registered (sidecar + WASM).
+    /// Number of plugins registered (across all backends).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.plugins.len() + self.wasm.len()
+        self.providers.len()
     }
 
     /// `true` if no plugins are registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.plugins.is_empty() && self.wasm.is_empty()
+        self.providers.is_empty()
     }
 
     /// Get the sidecar entry for one plugin, if registered (and if
@@ -112,36 +129,32 @@ impl AiRegistry {
     /// access — subscribing to notifications, driving hot reload.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Arc<PluginEntry>> {
-        self.plugins.get(name).map(|e| Arc::clone(e.value()))
+        self.sidecars.get(name).map(|e| Arc::clone(e.value()))
     }
 
     /// Snapshot every registered sidecar plugin. WASM providers are
     /// excluded — use the trait's `snapshot` for the union.
     #[must_use]
     pub fn snapshot(&self) -> Vec<Arc<PluginEntry>> {
-        self.plugins.iter().map(|e| Arc::clone(e.value())).collect()
+        self.sidecars
+            .iter()
+            .map(|e| Arc::clone(e.value()))
+            .collect()
     }
 
     /// Flatten capability descriptors across every backend.
     #[must_use]
     pub fn capabilities(&self) -> Vec<CapabilityDescriptor> {
-        let mut out: Vec<CapabilityDescriptor> = self
-            .plugins
+        self.providers
             .iter()
-            .flat_map(|e| e.value().capabilities.clone())
-            .collect();
-        out.extend(
-            self.wasm
-                .iter()
-                .flat_map(|e| e.value().capabilities().to_vec()),
-        );
-        out
+            .flat_map(|e| e.value().capabilities().to_vec())
+            .collect()
     }
 
     /// Shut down every plugin. Typically called on engine shutdown.
     pub async fn shutdown_all(&self) {
         let handles: Vec<Sidecar> = self
-            .plugins
+            .sidecars
             .iter()
             .map(|e| e.value().sidecar.clone())
             .collect();
@@ -150,19 +163,20 @@ impl AiRegistry {
         }
         // WASM providers have no process to reap — dropping the map
         // is enough.
-        self.wasm.clear();
+        self.providers.clear();
+        self.sidecars.clear();
     }
 }
 
 #[async_trait]
 impl AiRegistryTrait for AiRegistry {
     fn get(&self, name: &str) -> Option<Arc<dyn AiProvider>> {
-        self.get(name).map(|e| e as Arc<dyn AiProvider>)
+        self.providers.get(name).map(|e| Arc::clone(e.value()))
     }
     fn snapshot(&self) -> Vec<Arc<dyn AiProvider>> {
-        self.snapshot()
-            .into_iter()
-            .map(|e| e as Arc<dyn AiProvider>)
+        self.providers
+            .iter()
+            .map(|e| Arc::clone(e.value()))
             .collect()
     }
     fn capabilities(&self) -> Vec<CapabilityDescriptor> {
@@ -185,8 +199,9 @@ impl AiRegistryTrait for AiRegistry {
         // Drop the old sidecar first so the OS releases stdio fds
         // before we spawn its replacement.
         existing.sidecar.shutdown().await;
-        self.plugins.remove(name);
-        crate::loader::load_one(&dir, self, None, None)
+        self.providers.remove(name);
+        self.sidecars.remove(name);
+        crate::loader::load_one(&dir, self, crate::loader::LoaderOpts::default())
             .await
             .map(|_| ())
             .map_err(|e| ProviderError(format!("reload `{name}`: {e}")))

@@ -36,7 +36,7 @@ pub use smiths_core::ai::{
 
 pub use dispatcher::{Dispatcher, Hook, HookReport, MemoryDispatcher};
 pub use error::Error;
-pub use loader::{LoadReport, load_plugins};
+pub use loader::{LoadReport, LoaderOpts, load_plugins};
 pub use manifest::{Manifest, PluginType};
 pub use registry::{AiRegistry, PluginEntry};
 pub use wasm_provider::WasmProvider;

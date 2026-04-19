@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use smiths_core::ai::{AiProvider, CapabilityDescriptor, ProviderError};
+use smiths_core::ai::{AiProvider, CapabilityDescriptor, ProviderError, parse_descriptors};
 use smiths_wasm::{Module, WasmEngine};
 
 use crate::manifest::Manifest;
@@ -61,11 +61,10 @@ impl WasmProvider {
         let descriptor_bytes = engine
             .call_describe(&module, &manifest.name)
             .map_err(|e| format!("describe: {e}"))?;
-        let descriptors: Vec<CapabilityDescriptor> = parse_descriptors(&descriptor_bytes)?;
+        let raw: Value = serde_json::from_slice(&descriptor_bytes)
+            .map_err(|e| format!("describe JSON parse: {e}"))?;
+        let descriptors = parse_descriptors(raw)?;
 
-        for d in &descriptors {
-            d.validate().map_err(|e| format!("descriptor: {e}"))?;
-        }
         // Declared `provides` must be covered by the descriptors —
         // same sanity check the sidecar loader does.
         for declared in &manifest.provides {
@@ -120,20 +119,4 @@ impl AiProvider for WasmProvider {
                 .into(),
         ))
     }
-}
-
-fn parse_descriptors(bytes: &[u8]) -> Result<Vec<CapabilityDescriptor>, String> {
-    let raw: Value =
-        serde_json::from_slice(bytes).map_err(|e| format!("describe JSON parse: {e}"))?;
-    let list: Vec<CapabilityDescriptor> = if raw.is_array() {
-        serde_json::from_value(raw).map_err(|e| format!("descriptor array: {e}"))?
-    } else {
-        let single: CapabilityDescriptor =
-            serde_json::from_value(raw).map_err(|e| format!("descriptor: {e}"))?;
-        vec![single]
-    };
-    if list.is_empty() {
-        return Err("plugin returned no capabilities".into());
-    }
-    Ok(list)
 }

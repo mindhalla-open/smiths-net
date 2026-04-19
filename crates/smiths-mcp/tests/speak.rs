@@ -90,9 +90,13 @@ async fn spawn_engine() -> (
         std::fs::set_permissions(&main, p).unwrap();
     }
     let _ = examples;
-    let report = smiths_plugin::load_plugins(tmp.path(), &ai_registry, None, None)
-        .await
-        .unwrap();
+    let report = smiths_plugin::load_plugins(
+        tmp.path(),
+        &ai_registry,
+        smiths_plugin::LoaderOpts::default(),
+    )
+    .await
+    .unwrap();
     assert!(
         report.loaded.iter().any(|n| n == "ai-tts-mock"),
         "ai-tts-mock failed to load: {:?}",

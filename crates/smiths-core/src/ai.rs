@@ -81,6 +81,30 @@ fn default_abi() -> String {
     "1.0".to_string()
 }
 
+/// Parse the JSON body a plugin returned from `describe_capabilities`
+/// (sidecar handshake) or the `describe()` export (WASM tier). Accepts
+/// either a single descriptor object or an array of them. Rejects an
+/// empty list and runs [`CapabilityDescriptor::validate`] on each entry.
+///
+/// Lives here (not in `smiths-plugin`) so every tier can share the same
+/// parse/validate pipeline without pulling in a plugin-host dependency.
+pub fn parse_descriptors(raw: Value) -> Result<Vec<CapabilityDescriptor>, String> {
+    let list: Vec<CapabilityDescriptor> = if raw.is_array() {
+        serde_json::from_value(raw).map_err(|e| format!("descriptor array parse: {e}"))?
+    } else {
+        let single: CapabilityDescriptor =
+            serde_json::from_value(raw).map_err(|e| format!("descriptor parse: {e}"))?;
+        vec![single]
+    };
+    if list.is_empty() {
+        return Err("plugin returned no capabilities".into());
+    }
+    for d in &list {
+        d.validate()?;
+    }
+    Ok(list)
+}
+
 impl CapabilityDescriptor {
     /// Validate common-envelope invariants. Returns a descriptive
     /// error when the plugin is confused.

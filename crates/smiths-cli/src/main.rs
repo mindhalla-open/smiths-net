@@ -112,14 +112,11 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
-    match smiths_plugin::load_plugins(
-        &config.plugins.dir,
-        &ai_registry,
-        Some(bus.clone()),
+    let loader_opts = smiths_plugin::LoaderOpts {
+        bus: Some(bus.clone()),
         wasm_engine,
-    )
-    .await
-    {
+    };
+    match smiths_plugin::load_plugins(&config.plugins.dir, &ai_registry, loader_opts).await {
         Ok(report) => {
             if !report.loaded.is_empty() {
                 info!(loaded = ?report.loaded, "plugins ready");
