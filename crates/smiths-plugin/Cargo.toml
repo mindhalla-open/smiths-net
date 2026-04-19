@@ -21,8 +21,10 @@ thiserror      = { workspace = true }
 dashmap        = { workspace = true }
 
 [dev-dependencies]
+base64   = { workspace = true }
 tokio    = { workspace = true, features = ["macros", "test-util"] }
 tempfile = { workspace = true }
+wat      = { workspace = true }
 
 [lints]
 workspace = true

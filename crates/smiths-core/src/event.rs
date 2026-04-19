@@ -9,6 +9,8 @@
 
 use std::net::SocketAddr;
 
+use serde_json::Value;
+
 use crate::media::EndpointId;
 
 /// Top-level event envelope.
@@ -19,6 +21,29 @@ pub enum Event {
     System(SystemEvent),
     /// SIP signaling events.
     Sip(SipEvent),
+    /// Plugin-originated events forwarded from sidecar notifications.
+    Plugin(PluginEvent),
+}
+
+/// Plugin → engine event stream.
+///
+/// Today one variant: a bare forwarding of the plugin's JSON-RPC
+/// notification. Specialised variants (streaming ASR partials,
+/// streaming TTS audio chunks) may land as typed events later, but
+/// the generic `Notification` path stays so unknown methods keep
+/// flowing end-to-end.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum PluginEvent {
+    /// A JSON-RPC notification the plugin emitted over stdout.
+    Notification {
+        /// Plugin name (from its manifest).
+        plugin: String,
+        /// Notification method (e.g. `"emit_partial"`).
+        method: String,
+        /// Params the plugin attached, if any.
+        params: Option<Value>,
+    },
 }
 
 /// Lifecycle signals emitted by the main runtime.

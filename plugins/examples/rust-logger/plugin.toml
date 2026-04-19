@@ -1,0 +1,7 @@
+name        = "rust-logger"
+version     = "0.1.0"
+type        = "wasm"
+entry       = "./rust_logger.wasm"
+provides    = ["ai.log"]
+abi         = "1.0"
+description = "Smoke-test WASM plugin: calls `smiths::log` from `run`, advertises one `ai.log` descriptor from `describe`."

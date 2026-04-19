@@ -37,6 +37,7 @@ DESCRIPTOR = {
             "default": "auto",
         },
         "beam_size": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+        "stream": {"type": "boolean", "default": False},
     },
     "latency_ms": {"p50": 80, "p95": 300},
     "concurrency": {"max_in_flight": 2},
@@ -60,10 +61,21 @@ def log(msg: str) -> None:
     sys.stderr.flush()
 
 
+def emit_notification(method: str, params: dict) -> None:
+    """Plugin → engine notification (JSON-RPC frame with no id)."""
+    frame = {"jsonrpc": "2.0", "method": method, "params": params}
+    sys.stdout.write(json.dumps(frame) + "\n")
+    sys.stdout.flush()
+
+
 def fake_transcribe(params: dict) -> dict:
     """Deterministic placeholder: derive 'text' from the input size
     so tests can still assert on it, but shape is identical to what a
-    real model would return."""
+    real model would return.
+
+    When `controls.stream = true`, emit a handful of `emit_partial`
+    notifications before the final response so the engine's
+    bidirectional-RPC path can be exercised end-to-end."""
     b64 = params.get("audio_base64")
     if not isinstance(b64, str):
         raise ValueError("`audio_base64` required")
@@ -81,12 +93,35 @@ def fake_transcribe(params: dict) -> dict:
     else:
         text = f"[mock ASR: ~{duration_s:.1f} s of audio]"
         confidence = 0.92
+
+    controls = params.get("controls") or {}
+    if bool(controls.get("stream")):
+        # Emit a couple of partials before the final — enough to
+        # prove the bidirectional path works without slowing tests.
+        call_id = params.get("call_id")
+        for i, fragment in enumerate(_partials_for(text)):
+            emit_notification("emit_partial", {
+                "call_id": call_id,
+                "text": fragment,
+                "confidence": round(confidence * (i + 1) / 3, 3),
+                "is_final": False,
+            })
+
     return {
         "text": text,
         "language": lang,
         "confidence": confidence,
         "duration_s": round(duration_s, 3),
     }
+
+
+def _partials_for(text: str) -> list[str]:
+    """Split `text` into two cumulative partials so streaming demos
+    have something to render."""
+    if not text:
+        return []
+    mid = max(1, len(text) // 2)
+    return [text[:mid], text]
 
 
 def main() -> int:

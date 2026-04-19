@@ -1,9 +1,11 @@
 //! Minimal smiths-net WASM plugin.
 //!
-//! Exports one function, `run`, that calls the host's `smiths::log`
-//! import with a fixed greeting. Useful as a smoke test for the
-//! wasmtime engine + host-function plumbing before richer host
-//! surface (`send_sip`, `send_rtp`, timers, state) lands.
+//! Exports two functions:
+//! - `run` — calls the host's `smiths::log` import with a fixed
+//!   greeting. Smoke test for the host-function plumbing.
+//! - `describe` — returns a packed `(ptr << 32) | len` pointing at a
+//!   static JSON `CapabilityDescriptor` in linear memory. Consumed by
+//!   `smiths-plugin`'s WASM loader tier at registration time.
 
 #![no_std]
 #![no_main]
@@ -35,6 +37,21 @@ const GREETING: &str = "rust-logger: hook fired";
 #[unsafe(no_mangle)]
 pub extern "C" fn run() {
     host_log(GREETING);
+}
+
+/// Static JSON capability descriptor. The host's WASM loader tier
+/// reads this byte range via the `describe()` export and parses it
+/// into a [`CapabilityDescriptor`] at registration time.
+static DESCRIBE_JSON: &[u8] = br#"{"capability":"ai.log","plugin":"rust-logger","abi":"1.0","description":"Smoke-test WASM plugin that just logs."}"#;
+
+/// Return the descriptor's `(ptr << 32) | len` packed into an `i64`.
+/// Contract: the bytes at `[ptr, ptr + len)` in the exported `memory`
+/// are valid UTF-8 JSON matching `CapabilityDescriptor`.
+#[unsafe(no_mangle)]
+pub extern "C" fn describe() -> i64 {
+    let ptr = DESCRIBE_JSON.as_ptr() as u32 as i64;
+    let len = DESCRIBE_JSON.len() as u32 as i64;
+    (ptr << 32) | len
 }
 
 /// Panics in a WASM guest must not unwind into host code; abort to a

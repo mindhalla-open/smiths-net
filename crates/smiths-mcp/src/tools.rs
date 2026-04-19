@@ -38,6 +38,8 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(LlmChatTool);
     reg.register(EmbedTool);
     reg.register(SpeakTool);
+    reg.register(MakeCallTool);
+    reg.register(EndCallTool);
     reg.register(ReloadPluginTool);
     reg
 }
@@ -852,6 +854,108 @@ fn fresh_seq() -> u16 {
     COUNTER.fetch_add(101, Ordering::Relaxed).wrapping_add(1000)
 }
 
+/// `make_call(target)` — place an outbound SIP INVITE to a remote URI
+/// via the engine's UAC. Returns `{call_id}` once the dialog is
+/// established (200 OK + ACK).
+pub struct MakeCallTool;
+
+#[async_trait]
+impl Tool for MakeCallTool {
+    fn name(&self) -> &'static str {
+        "make_call"
+    }
+
+    fn description(&self) -> &'static str {
+        "Place an outbound SIP INVITE to `target` (a `sip:user@host[:port]` URI) \
+         and return the Call-ID of the established dialog."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "SIP URI to dial (e.g. `sip:alice@10.0.0.1:5060`)."
+                }
+            },
+            "required": ["target"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let target = args
+            .get("target")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("target required".into()))?;
+        let originator = ctx.originator.as_ref().ok_or_else(|| {
+            ToolError::NotFound("no outbound-call originator configured; enable the SIP UAC".into())
+        })?;
+        let call_id = originator
+            .place_call(target)
+            .await
+            .map_err(map_call_error)?;
+        Ok(json!({ "call_id": call_id, "target": target }))
+    }
+}
+
+/// `end_call(call_id)` — tear down an outbound dialog previously
+/// established by `make_call`.
+pub struct EndCallTool;
+
+#[async_trait]
+impl Tool for EndCallTool {
+    fn name(&self) -> &'static str {
+        "end_call"
+    }
+
+    fn description(&self) -> &'static str {
+        "Send BYE on an outbound dialog previously created by `make_call`."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "call_id": {
+                    "type": "string",
+                    "description": "Call-ID returned from `make_call`."
+                }
+            },
+            "required": ["call_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let call_id = args
+            .get("call_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("call_id required".into()))?;
+        let originator = ctx.originator.as_ref().ok_or_else(|| {
+            ToolError::NotFound("no outbound-call originator configured; enable the SIP UAC".into())
+        })?;
+        originator.hangup(call_id).await.map_err(map_call_error)?;
+        Ok(json!({ "call_id": call_id, "status": "ended" }))
+    }
+}
+
+/// Translate a `CallError` into a `ToolError` the adapters already
+/// know how to wire.
+fn map_call_error(e: smiths_core::call::CallError) -> ToolError {
+    use smiths_core::call::CallError;
+    match e {
+        CallError::InvalidTarget(m) => ToolError::InvalidArguments(m),
+        CallError::NotFound(m) => ToolError::NotFound(m),
+        CallError::Rejected { status, reason } => {
+            ToolError::Internal(format!("peer rejected: {status} {reason}"))
+        }
+        CallError::Timeout { millis } => ToolError::Internal(format!("timeout after {millis} ms")),
+        CallError::Internal(m) => ToolError::Internal(m),
+    }
+}
+
 /// `reload_plugin` — drain a loaded plugin's sidecar, re-parse its
 /// manifest, and re-spawn. Useful when a plugin file was edited on
 /// disk without restarting the engine.
@@ -937,7 +1041,7 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 11);
+        assert_eq!(reg.len(), 13);
         for name in [
             "list_calls",
             "get_call_status",
@@ -949,10 +1053,32 @@ mod tests {
             "llm_chat",
             "embed",
             "speak",
+            "make_call",
+            "end_call",
             "reload_plugin",
         ] {
             assert!(reg.get(name).is_some(), "missing tool: {name}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn make_call_without_originator_is_not_found() {
+        let (ctx, _c) = ctx_with_state();
+        let err = MakeCallTool
+            .call(json!({"target": "sip:a@127.0.0.1"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_call_without_originator_is_not_found() {
+        let (ctx, _c) = ctx_with_state();
+        let err = EndCallTool
+            .call(json!({"call_id": "x"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

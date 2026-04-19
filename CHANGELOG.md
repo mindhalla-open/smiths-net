@@ -5,6 +5,128 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-04-18
+
+### Added — bidirectional plugin RPC (streaming notifications)
+
+- **`smiths-sidecar::PluginNotification`** — a plugin-to-engine
+  JSON-RPC notification (no `id`). The sidecar's reader now fans
+  each inbound notification frame out via a
+  `tokio::sync::broadcast::Sender<PluginNotification>` on the
+  `Sidecar`. `Sidecar::subscribe_notifications()` hands out fresh
+  `Receiver`s so any consumer (control plane, MCP tool, recording
+  hook) can observe the stream without interfering with the
+  request/response correlator.
+- **`smiths-core::Event::Plugin(PluginEvent)`** new event bus
+  variant. `PluginEvent::Notification { plugin, method, params }`
+  carries the frame across the engine seam so subsystems that don't
+  link `smiths-sidecar` can still react to plugin-initiated events.
+- **`smiths-plugin::loader` bridge** — every loaded plugin now gets
+  a background task that republishes its notifications onto the
+  `EventBus` as `Event::Plugin`. Handles
+  `broadcast::RecvError::Lagged` with a warn and keeps draining;
+  exits cleanly when the sidecar closes. `load_plugins` / `load_one`
+  grew a `bus: Option<EventBus>` parameter.
+- **`smiths-mcp` MCP notification forwarding** — the control-plane
+  MCP session now turns `PluginEvent::Notification` into
+  `notifications/plugin/{method}` JSON-RPC frames on the MCP wire
+  (`{plugin, data}` params). Agents can subscribe to streaming
+  plugin output (e.g. live ASR partials) without polling.
+- **`ai-asr-mock` example** — grew a `stream: boolean` control.
+  When `controls.stream = true`, the plugin emits two `emit_partial`
+  JSON-RPC notifications with cumulative `{call_id, text,
+  is_final}` fragments before returning the final transcript. An
+  integration test (`smiths-plugin/tests/streaming.rs`) loads the
+  mock, invokes it, and asserts the two partials flow through the
+  engine's bus in order.
+
+### Added — WASM host next layer (manifest tier + state + deadlines)
+
+- **`smiths-wasm::WasmEngine`** gained:
+  - `plugin_state(plugin)` — per-plugin persistent KV
+    (`Arc<DashMap<Vec<u8>, Vec<u8>>>`) that survives the ephemeral
+    `Store` we build per `run_entry` call.
+  - Host fns `smiths::state_set(k_ptr, k_len, v_ptr, v_len) -> i32`
+    and `smiths::state_get(k_ptr, k_len, out_ptr, out_cap) -> i32`
+    — `state_get` returns the value's full length (so the guest can
+    detect truncation) or `-1` on a miss.
+  - `run_with_deadline(module, entry, fuel, plugin, Duration)` —
+    arms a cancellable one-shot `DeadlineTimer` that calls
+    `Engine::increment_epoch` on expiry. The store's epoch deadline
+    is set to `1`, so the guest traps on the next instruction with
+    `WasmError::Timeout`. Deadline-free `run_entry` still works.
+  - `call_describe(module, plugin)` — invokes the guest's
+    `describe() -> i64` export (high 32 = ptr, low 32 = len into the
+    exported `memory`) and returns the byte range.
+- **`smiths-plugin::WasmProvider`** — new provider backend that
+  registers alongside sidecars. `load` compiles the `.wasm`, calls
+  `describe()`, parses the result as `CapabilityDescriptor(s)`,
+  sanity-checks against the manifest's `provides`, and clamps the
+  descriptor's `plugin` field to the manifest name. `invoke` stays
+  stubbed at this tier — the next host-surface slice
+  (`send_sip` / `send_rtp` / permission checks) unblocks dispatch.
+- **`AiRegistry` is now dual-backend** — stores sidecars and WASM
+  providers in parallel `DashMap`s. `len`, `is_empty`,
+  `capabilities`, `snapshot` (trait), and `shutdown_all` span both.
+  The inherent sidecar-specific `get(name) -> Arc<PluginEntry>` is
+  retained for streaming / reload consumers.
+- **`smiths-plugin::loader`** recognises `type = "wasm"` manifests
+  and dispatches to `WasmProvider::load`. Fails-partial with a
+  descriptive error when no `WasmEngine` is supplied. CLI builds
+  one engine at boot and threads it through; tests pass `None` when
+  they don't exercise the WASM path.
+- **`rust-logger` example** — now exports `describe() -> i64`
+  returning the `(ptr << 32) | len` of a static JSON
+  `CapabilityDescriptor` for `ai.log`, plus a `plugin.toml` so the
+  engine registers it as a WASM plugin. New integration test
+  (`smiths-plugin/tests/wasm_loader.rs`) stages an inline-WAT
+  `describe`-only module end-to-end through `load_plugins` and
+  asserts the capability is surfaced.
+
+## [0.7.0] - 2026-04-19
+
+### Added — UAC + outbound call control (`make_call` / `end_call`)
+
+- **`smiths-sip::UacClient`** — engine-side User Agent Client. One-shot
+  INVITE transaction with a configurable budget (default 30 s):
+  parses the target URI, allocates a media endpoint via the shared
+  `MediaFabric`, builds an SDP offer through the `SdpNegotiator`,
+  subscribes for the response branch on a new `ResponseRouter`,
+  sends the INVITE, skips 1xx, ACKs the 2xx end-to-end (fresh
+  branch), stores the dialog, publishes
+  `SipEvent::DialogCreated { call_id, media_endpoint, remote_rtp }`.
+  `hangup(call_id)` sends BYE, waits for 200, publishes
+  `SipEvent::DialogTerminated`, releases the media endpoint.
+- **`smiths-sip::ResponseRouter`** — shared branch-keyed oneshot
+  correlator. UAS forwards any response it sees; UAC subscribes
+  before each outbound request. Drops stale branches with a debug
+  log. Four unit tests cover deliver / cancel / replace / unknown.
+- **`smiths-core::call::CallOriginator` trait** — the MCP control
+  plane talks to this, not `smiths-sip` directly. `UacClient`
+  implements it; `ToolContext.originator: Option<Arc<dyn …>>` gates
+  the tools cleanly when no UAC is configured (UAS-only deployments).
+- **`SdpNegotiator` grew two methods** — `build_offer(local_ip,
+  local_rtp_port)` (UAC-side offer emission) and `parse_remote_rtp(
+  answer_body)` (UAC parses peer's RTP endpoint out of a 200 OK).
+  `smiths-sdp::Negotiator` implements both; UAC never touches the
+  SDP parse tree.
+- **`make_call(target)` + `end_call(call_id)` MCP tools** (2 new
+  built-ins, registry now 13 tools). Input schema validates the SIP
+  URI shape; output returns `{call_id, target}` / `{call_id,
+  status}`. Errors map through `CallError` → `ToolError` so rate
+  limit + audit + metrics paths work unchanged.
+- **UAS** gained `with_response_router` builder — when set, responses
+  arriving on the UAS socket are routed to the UAC by Via branch.
+  Without the router the UAS keeps the old drop-responses behaviour.
+- **CLI** stands up the UAC from the first configured UDP bind
+  (shares the transport + router with the UAS), attaches
+  `Arc<dyn CallOriginator>` to `ToolContext`. Other SIP binds stay
+  UAS-only.
+- Integration test `uac_places_call_and_hangs_up_against_fake_uas` —
+  real UAC places a call against a `FakeUas` responder, asserts
+  `DialogCreated` fires with correct `call_id` + `media_endpoint` +
+  `remote_rtp`, then `hangup` fires `DialogTerminated`.
+
 ## [0.6.0] - 2026-04-19
 
 ### Added — Engine-side `speak` + MCP over HTTP + SSE
@@ -673,6 +795,7 @@ boot-and-shutdown binary. No SIP / media / plugins yet.
 
 - `.gitignore`: added `.DS_Store` to the ignore list.
 
+[0.7.0]: https://github.com/mindhalla/smiths-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/mindhalla/smiths-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mindhalla/smiths-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mindhalla/smiths-net/compare/v0.3.0...v0.4.0

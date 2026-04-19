@@ -48,4 +48,17 @@ pub trait SdpNegotiator: Send + Sync {
         local_ip: IpAddr,
         local_rtp_port: u16,
     ) -> NegotiationOutcome;
+
+    /// Build a UAC-side SDP offer advertising `local_ip` +
+    /// `local_rtp_port`. Called by `smiths-sip::UacClient` when the
+    /// engine places an outbound INVITE. Default implementations
+    /// should advertise whatever codec set the negotiator supports;
+    /// the MVP `smiths-sdp::Negotiator` emits a PCMU-only offer.
+    fn build_offer(&self, local_ip: IpAddr, local_rtp_port: u16) -> String;
+
+    /// Parse an SDP answer (typically received in a 200 OK to our
+    /// INVITE) and return the peer's audio RTP endpoint. Returns
+    /// `None` when the body is malformed, has no audio stream, or
+    /// declares port 0.
+    fn parse_remote_rtp(&self, answer_body: &str) -> Option<SocketAddr>;
 }

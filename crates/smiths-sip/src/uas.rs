@@ -116,6 +116,10 @@ pub struct UasServer<T: Transport> {
     /// Prometheus metrics. Defaults to [`Metrics::noop`] so tests and
     /// single-server setups can ignore observability entirely.
     metrics: Arc<Metrics>,
+    /// Shared correlator for responses to locally-originated requests
+    /// (the [`crate::UacClient`]). `None` = UAS-only deployment;
+    /// responses are simply dropped (old behaviour).
+    response_router: Option<Arc<crate::ResponseRouter>>,
 }
 
 impl<T: Transport> UasServer<T> {
@@ -145,6 +149,7 @@ impl<T: Transport> UasServer<T> {
             bridges_by_dialog: Arc::new(DashMap::new()),
             registrar: None,
             metrics: Metrics::noop(),
+            response_router: None,
         })
     }
 
@@ -160,6 +165,15 @@ impl<T: Transport> UasServer<T> {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    /// Install a [`crate::ResponseRouter`] so responses arriving on
+    /// the UAS's socket get forwarded to the UAC. Without this, the
+    /// UAS drops responses (pre-UAC behaviour).
+    #[must_use]
+    pub fn with_response_router(mut self, router: Arc<crate::ResponseRouter>) -> Self {
+        self.response_router = Some(router);
         self
     }
 
@@ -206,7 +220,18 @@ impl<T: Transport> UasServer<T> {
                 self.handle_request(summary, peer).await;
             }
             rsip::SipMessage::Response(_) => {
-                debug!(%peer, "ignoring unsolicited response (no UAC state yet)");
+                if let Some(router) = self.response_router.as_ref() {
+                    if let Some(branch) = extract_via_branch(&dg.bytes) {
+                        let delivered = router.deliver(&branch, dg.bytes.clone());
+                        if !delivered {
+                            debug!(%peer, branch, "response with unknown branch; dropped");
+                        }
+                    } else {
+                        debug!(%peer, "response without Via branch; dropped");
+                    }
+                } else {
+                    debug!(%peer, "ignoring response (no UAC attached)");
+                }
             }
         }
     }
@@ -641,6 +666,28 @@ impl<T: Transport> UasServer<T> {
 /// Key for an in-dialog request (ACK, BYE, re-INVITE).
 ///
 /// Incoming request sees From as remote and To as local.
+/// Extract the first `Via` header's `branch` parameter from any raw
+/// SIP message (request or response). Returns `None` when the header
+/// or parameter is missing. Used by the response-router forwarder.
+fn extract_via_branch(raw: &Bytes) -> Option<String> {
+    let text = std::str::from_utf8(raw).ok()?;
+    for line in text.split("\r\n") {
+        if line.is_empty() {
+            break; // headers done
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("via:") || lower.starts_with("v:") {
+            let idx = lower.find(";branch=")?;
+            let after = &line[idx + ";branch=".len()..];
+            let end = after
+                .find(|c: char| c == ';' || c == ',' || c.is_whitespace())
+                .unwrap_or(after.len());
+            return Some(after[..end].to_owned());
+        }
+    }
+    None
+}
+
 fn in_dialog_key(req: &RequestSummary) -> Option<DialogKey> {
     let call_id = req.call_id.clone()?;
     let local_tag = req.to_tag.clone()?;

@@ -37,6 +37,14 @@ pub enum WasmError {
         /// Fuel budget that was set for this invocation.
         fuel: u64,
     },
+    /// Guest ran past the wall-clock deadline set by
+    /// [`crate::WasmEngine::run_with_deadline`] and tripped the
+    /// epoch interruption.
+    #[error("wasm deadline exceeded after {millis} ms")]
+    Timeout {
+        /// Deadline configured for the invocation.
+        millis: u64,
+    },
     /// `Store::set_fuel` / fuel setup failed.
     #[error("wasm fuel configuration: {0}")]
     Fuel(#[source] wasmtime::Error),

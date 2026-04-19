@@ -19,6 +19,7 @@ pub mod error;
 pub mod loader;
 pub mod manifest;
 pub mod registry;
+pub mod wasm_provider;
 
 // Host tiers owned by the plugin umbrella — this is the one documented
 // cross-sibling exception in the dependency graph.
@@ -38,3 +39,4 @@ pub use error::Error;
 pub use loader::{LoadReport, load_plugins};
 pub use manifest::{Manifest, PluginType};
 pub use registry::{AiRegistry, PluginEntry};
+pub use wasm_provider::WasmProvider;

@@ -17,7 +17,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -29,7 +29,26 @@ use crate::rpc::{RpcRequest, RpcResponse};
 /// Default RPC timeout — conservative because AI models can be slow.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Depth of the notification broadcast. Small on purpose —
+/// subscribers that fall behind lose intermediate partials, which is
+/// the right behaviour for streaming ASR / TTS (agent reconnects +
+/// resubscribes rather than serving stale frames).
+const NOTIFICATION_BUFFER: usize = 128;
+
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>>;
+
+/// Plugin-initiated notification received over stdout — JSON-RPC 2.0
+/// frame with `method` but no `id`. The [`Sidecar`] broadcasts every
+/// incoming notification through [`Sidecar::subscribe_notifications`]
+/// so higher layers (streaming MCP tools, the event bus bridge) can
+/// fan them out.
+#[derive(Debug, Clone)]
+pub struct PluginNotification {
+    /// Method name from the frame (e.g. `"emit_partial"`).
+    pub method: String,
+    /// Params the plugin attached, if any.
+    pub params: Option<serde_json::Value>,
+}
 
 /// Restart policy applied when a sidecar child dies unexpectedly.
 #[derive(Clone, Copy, Debug)]
@@ -102,6 +121,9 @@ struct Inner {
     name: String,
     next_id: AtomicU64,
     pending: Pending,
+    /// Broadcasts every incoming notification frame. Senders hold one
+    /// clone; subscribers call [`Sidecar::subscribe_notifications`].
+    notifications: broadcast::Sender<PluginNotification>,
     /// `Some` while a child is alive; `None` between crash and
     /// respawn, or permanently after retries are exhausted.
     process: Mutex<Option<ProcessState>>,
@@ -138,10 +160,12 @@ impl Sidecar {
         let plugin_dir_abs =
             std::fs::canonicalize(plugin_dir).unwrap_or_else(|_| plugin_dir.to_path_buf());
 
+        let (notif_tx, _) = broadcast::channel::<PluginNotification>(NOTIFICATION_BUFFER);
         let inner = Arc::new(Inner {
             name: name.clone(),
             next_id: AtomicU64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            notifications: notif_tx,
             process: Mutex::new(None),
             plugin_dir: plugin_dir_abs,
             entry: entry_abs,
@@ -165,6 +189,15 @@ impl Sidecar {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.inner.name
+    }
+
+    /// Subscribe to plugin-initiated notifications (JSON-RPC frames
+    /// with `method` but no `id`). Each call returns a fresh receiver;
+    /// lagging subscribers miss intermediate frames rather than
+    /// blocking the reader loop.
+    #[must_use]
+    pub fn subscribe_notifications(&self) -> broadcast::Receiver<PluginNotification> {
+        self.inner.notifications.subscribe()
     }
 
     /// Send a JSON-RPC request and await the correlated response.
@@ -274,8 +307,12 @@ async fn supervise_loop(
     let mut attempts: u32 = 0;
 
     loop {
-        let mut reader =
-            spawn_stdout_reader(stdout, Arc::clone(&inner.pending), inner.name.clone());
+        let mut reader = spawn_stdout_reader(
+            stdout,
+            Arc::clone(&inner.pending),
+            inner.notifications.clone(),
+            inner.name.clone(),
+        );
         let mut stderr_task = spawn_stderr_forwarder(stderr, inner.name.clone());
 
         // Wait for whichever ends first: graceful shutdown, reader
@@ -430,7 +467,14 @@ async fn fail_pending(pending: &Pending) {
 
 /// Background task: drain `stdout` as newline-delimited JSON-RPC
 /// frames and route each response to its pending request by id.
-fn spawn_stdout_reader(stdout: ChildStdout, pending: Pending, name: String) -> JoinHandle<()> {
+/// Plugin-initiated notifications (frames without `id`) are
+/// broadcast on `notifications` for streaming subscribers.
+fn spawn_stdout_reader(
+    stdout: ChildStdout,
+    pending: Pending,
+    notifications: broadcast::Sender<PluginNotification>,
+    name: String,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         loop {
@@ -440,7 +484,7 @@ fn spawn_stdout_reader(stdout: ChildStdout, pending: Pending, name: String) -> J
                     if trimmed.is_empty() {
                         continue;
                     }
-                    dispatch_frame(trimmed, &pending, &name).await;
+                    dispatch_frame(trimmed, &pending, &notifications, &name).await;
                 }
                 Ok(None) => {
                     debug!(plugin = %name, "sidecar stdout closed");
@@ -456,7 +500,12 @@ fn spawn_stdout_reader(stdout: ChildStdout, pending: Pending, name: String) -> J
 }
 
 /// Parse one wire frame and forward it to the correlating request.
-async fn dispatch_frame(frame: &str, pending: &Pending, name: &str) {
+async fn dispatch_frame(
+    frame: &str,
+    pending: &Pending,
+    notifications: &broadcast::Sender<PluginNotification>,
+    name: &str,
+) {
     match serde_json::from_str::<RpcResponse>(frame) {
         Ok(resp) => {
             if let Some(id) = resp.id {
@@ -466,12 +515,17 @@ async fn dispatch_frame(frame: &str, pending: &Pending, name: &str) {
                 } else {
                     debug!(plugin = %name, id, "response to unknown id");
                 }
+            } else if let Some(method) = resp.method {
+                // Plugin-initiated notification — fan out to
+                // `subscribe_notifications()` consumers. Send error
+                // just means "no subscribers right now", which is
+                // normal when no streaming tool is active.
+                let _ = notifications.send(PluginNotification {
+                    method,
+                    params: resp.params,
+                });
             } else {
-                debug!(
-                    plugin = %name,
-                    method = ?resp.method,
-                    "plugin notification (ignored in MVP)"
-                );
+                debug!(plugin = %name, "frame without id or method; dropped");
             }
         }
         Err(e) => {

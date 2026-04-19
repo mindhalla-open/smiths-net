@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
-use smiths_core::{Event, EventBus, Metrics, SipEvent};
+use smiths_core::{Event, EventBus, Metrics, PluginEvent, SipEvent};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
@@ -137,6 +137,21 @@ pub(crate) fn event_to_notification(event: &Event) -> Option<Value> {
             "jsonrpc": "2.0",
             "method": "notifications/call/terminated",
             "params": { "call_id": call_id },
+        })),
+        Event::Plugin(PluginEvent::Notification {
+            plugin,
+            method,
+            params,
+        }) => Some(json!({
+            "jsonrpc": "2.0",
+            "method":  format!("notifications/plugin/{method}"),
+            "params": {
+                "plugin": plugin,
+                // Forward the plugin's params verbatim so structured
+                // fields (call_id, text, confidence, is_final, ...)
+                // stay typed for the client.
+                "data": params.clone().unwrap_or(Value::Null),
+            },
         })),
         _ => None,
     }

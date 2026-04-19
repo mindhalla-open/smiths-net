@@ -18,4 +18,4 @@ pub mod supervisor;
 
 pub use error::Error;
 pub use rpc::{RpcRequest, RpcResponse};
-pub use supervisor::{RestartPolicy, Sidecar};
+pub use supervisor::{PluginNotification, RestartPolicy, Sidecar};

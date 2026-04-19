@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use smiths_core::Config;
 use smiths_core::ai::AiRegistry;
+use smiths_core::call::CallOriginator;
 use smiths_core::media::MediaFabric;
 use thiserror::Error;
 
@@ -37,6 +38,10 @@ pub struct ToolContext {
     /// (`speak`, future `listen`) reach in here; pure signaling /
     /// stateful tools ignore it.
     pub media: Arc<dyn MediaFabric>,
+    /// Outbound-call originator. `None` when the engine is configured
+    /// UAS-only — tools that depend on it (`make_call`, `end_call`)
+    /// return a clean `NotFound` instead of panicking.
+    pub originator: Option<Arc<dyn CallOriginator>>,
 }
 
 impl ToolContext {
@@ -53,7 +58,16 @@ impl ToolContext {
             plugins,
             config,
             media,
+            originator: None,
         }
+    }
+
+    /// Attach a [`CallOriginator`] so `make_call` / `end_call` tools
+    /// become live.
+    #[must_use]
+    pub fn with_originator(mut self, originator: Arc<dyn CallOriginator>) -> Self {
+        self.originator = Some(originator);
+        self
     }
 }
 

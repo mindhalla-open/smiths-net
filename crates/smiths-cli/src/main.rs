@@ -8,6 +8,7 @@ use anyhow::Context as _;
 use axum::{Json, Router, routing::get};
 use clap::{Parser, ValueEnum};
 use prometheus_client::registry::Registry;
+use smiths_core::call::CallOriginator;
 use smiths_core::{
     AiRegistry, Config, Event, EventBus, LogFormat, MediaFabric, Metrics, SdpNegotiator, Shutdown,
     SipTransport, SystemEvent,
@@ -15,7 +16,9 @@ use smiths_core::{
 use smiths_mcp::{ControlState, ToolContext};
 use smiths_media::UdpMediaFabric;
 use smiths_sdp::Negotiator;
-use smiths_sip::{TcpTransport, TlsTransport, Transport as _, UasServer, UdpTransport};
+use smiths_sip::{
+    ResponseRouter, TcpTransport, TlsTransport, Transport as _, UacClient, UasServer, UdpTransport,
+};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -97,7 +100,26 @@ async fn main() -> anyhow::Result<()> {
     // Load plugins from the configured directory. Failures are per-
     // plugin and logged; they don't block startup.
     let ai_registry = smiths_plugin::AiRegistry::new();
-    match smiths_plugin::load_plugins(&config.plugins.dir, &ai_registry).await {
+    // Build a shared WASM engine so `type = "wasm"` manifests can load.
+    // Failing this shouldn't block sidecar plugins — log and proceed.
+    let wasm_engine = match smiths_plugin::wasm::WasmEngine::new() {
+        Ok(e) => Some(e),
+        Err(err) => {
+            warn!(
+                ?err,
+                "wasm engine init failed; wasm plugins will be skipped"
+            );
+            None
+        }
+    };
+    match smiths_plugin::load_plugins(
+        &config.plugins.dir,
+        &ai_registry,
+        Some(bus.clone()),
+        wasm_engine,
+    )
+    .await
+    {
         Ok(report) => {
             if !report.loaded.is_empty() {
                 info!(loaded = ?report.loaded, "plugins ready");
@@ -121,12 +143,59 @@ async fn main() -> anyhow::Result<()> {
     // might reach into it) so the control-plane ToolContext and the
     // SIP subsystem see the same Arc.
     let media_fabric: Arc<dyn MediaFabric> = Arc::new(UdpMediaFabric::new());
-    let tool_ctx = ToolContext::new(
+
+    // Shared response correlator. The UAS forwards responses to it;
+    // the UAC subscribes by branch.
+    let response_router = Arc::new(ResponseRouter::new());
+
+    // ---- SIP subsystem ----
+    let mut sip_handles: Vec<JoinHandle<()>> = Vec::new();
+    let udp_enabled = config.sip.transports.contains(&SipTransport::Udp);
+    let tcp_enabled = config.sip.transports.contains(&SipTransport::Tcp);
+    let tls_enabled = config.sip.transports.contains(&SipTransport::Tls);
+    if !udp_enabled && !tcp_enabled && !tls_enabled {
+        warn!("no SIP transports configured; signaling disabled");
+    }
+    if tls_enabled && (config.sip.tls_cert_path.is_none() || config.sip.tls_key_path.is_none()) {
+        warn!(
+            "sip.transports includes `tls` but tls_cert_path/tls_key_path are unset; disabling TLS"
+        );
+    }
+
+    // Build the UAC from the first configured UDP bind. The UAC shares
+    // that bind's UdpTransport + ResponseRouter with the UAS, so
+    // outbound INVITEs / BYEs get their responses on the same socket.
+    let mut originator: Option<Arc<dyn CallOriginator>> = None;
+    if udp_enabled && let Some(bind) = config.sip.bind.first() {
+        let addr = bind.socket_addr();
+        match spawn_sip_udp(
+            addr,
+            bus.clone(),
+            shutdown.token(),
+            Arc::clone(&media_fabric),
+            Arc::clone(&metrics),
+            Arc::clone(&response_router),
+            /* build_uac */ true,
+        )
+        .await
+        {
+            Ok(SpawnedSipUdp { handles, uac }) => {
+                sip_handles.extend(handles);
+                originator = uac.map(|u| u as Arc<dyn CallOriginator>);
+            }
+            Err(e) => warn!(%bind, ?e, "failed to start SIP/UDP on first bind; continuing"),
+        }
+    }
+
+    let mut tool_ctx = ToolContext::new(
         control_state,
         ai_registry_dyn,
         config_snapshot,
         Arc::clone(&media_fabric),
     );
+    if let Some(o) = originator.clone() {
+        tool_ctx = tool_ctx.with_originator(o);
+    }
 
     // MCP stdio is now additive: it runs alongside SIP / health / A2A
     // rather than replacing them, so agents can receive push
@@ -155,32 +224,24 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&metrics_registry),
     ));
 
-    // ---- SIP subsystem ----
-    let mut sip_handles: Vec<JoinHandle<()>> = Vec::new();
-    let udp_enabled = config.sip.transports.contains(&SipTransport::Udp);
-    let tcp_enabled = config.sip.transports.contains(&SipTransport::Tcp);
-    let tls_enabled = config.sip.transports.contains(&SipTransport::Tls);
-    if !udp_enabled && !tcp_enabled && !tls_enabled {
-        warn!("no SIP transports configured; signaling disabled");
-    }
-    if tls_enabled && (config.sip.tls_cert_path.is_none() || config.sip.tls_key_path.is_none()) {
-        warn!(
-            "sip.transports includes `tls` but tls_cert_path/tls_key_path are unset; disabling TLS"
-        );
-    }
-    for bind in &config.sip.bind {
+    // Additional SIP binds. The first UDP bind (when UDP is enabled)
+    // was already consumed above to stand up the UAC; other binds
+    // come online here as UAS-only listeners.
+    for (idx, bind) in config.sip.bind.iter().enumerate() {
         let addr = bind.socket_addr();
-        if udp_enabled {
+        if udp_enabled && !(idx == 0 && originator.is_some()) {
             match spawn_sip_udp(
                 addr,
                 bus.clone(),
                 shutdown.token(),
                 Arc::clone(&media_fabric),
                 Arc::clone(&metrics),
+                Arc::clone(&response_router),
+                /* build_uac */ false,
             )
             .await
             {
-                Ok(handles) => sip_handles.extend(handles),
+                Ok(SpawnedSipUdp { handles, .. }) => sip_handles.extend(handles),
                 Err(e) => warn!(%bind, ?e, "failed to start SIP/UDP on bind; continuing"),
             }
         }
@@ -311,13 +372,23 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+struct SpawnedSipUdp {
+    handles: Vec<JoinHandle<()>>,
+    /// Populated only on the bind we designate as the outbound-call
+    /// origin. `None` for every other UDP listener.
+    uac: Option<Arc<UacClient<UdpTransport>>>,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn spawn_sip_udp(
     bind: SocketAddr,
     bus: EventBus,
     cancel: CancellationToken,
     media_fabric: Arc<dyn MediaFabric>,
     metrics: Arc<Metrics>,
-) -> anyhow::Result<Vec<JoinHandle<()>>> {
+    router: Arc<ResponseRouter>,
+    build_uac: bool,
+) -> anyhow::Result<SpawnedSipUdp> {
     let transport = UdpTransport::bind(bind)
         .await
         .with_context(|| format!("binding UDP on {bind}"))?;
@@ -331,12 +402,38 @@ async fn spawn_sip_udp(
     // `o=` / `c=`. A single-bind deployment has one negotiator; a
     // multi-bind deployment has one per listener.
     let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(local.ip()));
-    let server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
-        .with_context(|| format!("building UAS on {local}"))?
-        .with_metrics(metrics);
+    let server = UasServer::new(
+        Arc::clone(&transport),
+        bus.clone(),
+        Arc::clone(&media_fabric),
+        Arc::clone(&negotiator),
+    )
+    .with_context(|| format!("building UAS on {local}"))?
+    .with_metrics(Arc::clone(&metrics))
+    .with_response_router(Arc::clone(&router));
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP UDP listening");
-    Ok(vec![reader, server_handle])
+
+    let uac = if build_uac {
+        let uac = Arc::new(UacClient::new(
+            Arc::clone(&transport),
+            bus,
+            media_fabric,
+            negotiator,
+            router,
+            local,
+            metrics,
+        ));
+        info!(%local, "SIP UDP UAC ready");
+        Some(uac)
+    } else {
+        None
+    };
+
+    Ok(SpawnedSipUdp {
+        handles: vec![reader, server_handle],
+        uac,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

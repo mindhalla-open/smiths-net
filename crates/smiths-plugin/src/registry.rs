@@ -19,6 +19,7 @@ use smiths_core::ai::{
 use smiths_sidecar::Sidecar;
 
 use crate::manifest::Manifest;
+use crate::wasm_provider::WasmProvider;
 
 /// One registered plugin — its manifest, live sidecar handle, and the
 /// capabilities it advertised at load.
@@ -62,9 +63,17 @@ impl AiProvider for PluginEntry {
 }
 
 /// Plugin registry. Cheap to clone.
+///
+/// Two backends today: sidecars (subprocess + JSON-RPC stdio) and
+/// WASM providers (compiled module + describe-only MVP). Both impl
+/// `AiProvider`; the trait-level `get` / `snapshot` / `capabilities`
+/// merge them, while sidecar-specific operations (reload, streaming
+/// notification subscribers) keep their typed API via the inherent
+/// `get` method.
 #[derive(Clone, Debug, Default)]
 pub struct AiRegistry {
     plugins: Arc<DashMap<String, Arc<PluginEntry>>>,
+    wasm: Arc<DashMap<String, Arc<WasmProvider>>>,
 }
 
 impl AiRegistry {
@@ -74,44 +83,59 @@ impl AiRegistry {
         Self::default()
     }
 
-    /// Register a loaded plugin. Overwrites any existing entry with
-    /// the same name.
+    /// Register a loaded sidecar plugin. Overwrites any existing
+    /// entry with the same name.
     pub fn insert(&self, entry: PluginEntry) {
         self.plugins
             .insert(entry.manifest.name.clone(), Arc::new(entry));
     }
 
-    /// Number of plugins registered.
+    /// Register a loaded WASM plugin.
+    pub fn insert_wasm(&self, provider: Arc<WasmProvider>) {
+        self.wasm.insert(provider.name().to_owned(), provider);
+    }
+
+    /// Number of plugins registered (sidecar + WASM).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.plugins.len()
+        self.plugins.len() + self.wasm.len()
     }
 
     /// `true` if no plugins are registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.plugins.is_empty()
+        self.plugins.is_empty() && self.wasm.is_empty()
     }
 
-    /// Get the entry for one plugin, if registered.
+    /// Get the sidecar entry for one plugin, if registered (and if
+    /// sidecar-backed). Used by consumers that need raw sidecar
+    /// access — subscribing to notifications, driving hot reload.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Arc<PluginEntry>> {
         self.plugins.get(name).map(|e| Arc::clone(e.value()))
     }
 
-    /// Snapshot every registered plugin's entry.
+    /// Snapshot every registered sidecar plugin. WASM providers are
+    /// excluded — use the trait's `snapshot` for the union.
     #[must_use]
     pub fn snapshot(&self) -> Vec<Arc<PluginEntry>> {
         self.plugins.iter().map(|e| Arc::clone(e.value())).collect()
     }
 
-    /// Flatten capability descriptors across every plugin.
+    /// Flatten capability descriptors across every backend.
     #[must_use]
     pub fn capabilities(&self) -> Vec<CapabilityDescriptor> {
-        self.snapshot()
-            .into_iter()
-            .flat_map(|p| p.capabilities.clone())
-            .collect()
+        let mut out: Vec<CapabilityDescriptor> = self
+            .plugins
+            .iter()
+            .flat_map(|e| e.value().capabilities.clone())
+            .collect();
+        out.extend(
+            self.wasm
+                .iter()
+                .flat_map(|e| e.value().capabilities().to_vec()),
+        );
+        out
     }
 
     /// Shut down every plugin. Typically called on engine shutdown.
@@ -124,6 +148,9 @@ impl AiRegistry {
         for sc in handles {
             sc.shutdown().await;
         }
+        // WASM providers have no process to reap — dropping the map
+        // is enough.
+        self.wasm.clear();
     }
 }
 
@@ -159,7 +186,7 @@ impl AiRegistryTrait for AiRegistry {
         // before we spawn its replacement.
         existing.sidecar.shutdown().await;
         self.plugins.remove(name);
-        crate::loader::load_one(&dir, self)
+        crate::loader::load_one(&dir, self, None, None)
             .await
             .map(|_| ())
             .map_err(|e| ProviderError(format!("reload `{name}`: {e}")))

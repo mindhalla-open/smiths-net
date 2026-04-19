@@ -16,4 +16,8 @@ pub mod host;
 
 pub use engine::{DEFAULT_FUEL, WasmEngine};
 pub use error::WasmError;
-pub use host::HostState;
+pub use host::{HostState, PluginState};
+
+// Re-export so downstream crates (`smiths-plugin`) don't need to pull
+// `wasmtime` into their dep graph just to carry a `Module`.
+pub use wasmtime::Module;

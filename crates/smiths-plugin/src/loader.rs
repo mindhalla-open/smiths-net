@@ -6,14 +6,18 @@
 //! a clean summary and operators know exactly which plugin misbehaved.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::Value;
 use smiths_core::ai::CapabilityDescriptor;
-use tracing::{info, instrument, warn};
+use smiths_core::{Event, EventBus, PluginEvent};
+use smiths_wasm::WasmEngine;
+use tracing::{debug, info, instrument, warn};
 
 use crate::error::Error;
 use crate::manifest::{Manifest, PluginType};
 use crate::registry::{AiRegistry, PluginEntry};
+use crate::wasm_provider::WasmProvider;
 
 /// Summary of one plugin-load pass.
 #[derive(Debug, Default)]
@@ -29,8 +33,22 @@ pub struct LoadReport {
 ///
 /// If `root` doesn't exist, returns an empty report (operators turn
 /// plugins on by creating the directory — no error).
-#[instrument(skip(registry), fields(root = %root.display()))]
-pub async fn load_plugins(root: &Path, registry: &AiRegistry) -> Result<LoadReport, Error> {
+///
+/// When `bus` is `Some`, each loaded plugin gets a background bridge
+/// task that republishes its JSON-RPC notifications onto the bus as
+/// [`Event::Plugin`] events. Pass `None` in tests that don't care.
+///
+/// `wasm_engine` is only consulted for `type = "wasm"` manifests. When
+/// `None`, any WASM plugin encountered fails-partial with a descriptive
+/// error — sidecar plugins still load. Callers that want WASM support
+/// must construct a [`WasmEngine`] and pass it in.
+#[instrument(skip(registry, bus, wasm_engine), fields(root = %root.display()))]
+pub async fn load_plugins(
+    root: &Path,
+    registry: &AiRegistry,
+    bus: Option<EventBus>,
+    wasm_engine: Option<WasmEngine>,
+) -> Result<LoadReport, Error> {
     let mut report = LoadReport::default();
     if !root.exists() {
         info!(dir = %root.display(), "plugins dir missing; skipping load");
@@ -44,7 +62,7 @@ pub async fn load_plugins(root: &Path, registry: &AiRegistry) -> Result<LoadRepo
             continue;
         }
         let path = entry.path();
-        match load_one(&path, registry).await {
+        match load_one(&path, registry, bus.clone(), wasm_engine.clone()).await {
             Ok(name) => {
                 info!(plugin = %name, dir = %path.display(), "plugin loaded");
                 report.loaded.push(name);
@@ -61,8 +79,13 @@ pub async fn load_plugins(root: &Path, registry: &AiRegistry) -> Result<LoadRepo
     Ok(report)
 }
 
-#[instrument(skip(registry), fields(dir = %dir.display()))]
-pub(crate) async fn load_one(dir: &Path, registry: &AiRegistry) -> Result<String, Error> {
+#[instrument(skip(registry, bus, wasm_engine), fields(dir = %dir.display()))]
+pub(crate) async fn load_one(
+    dir: &Path,
+    registry: &AiRegistry,
+    bus: Option<EventBus>,
+    wasm_engine: Option<WasmEngine>,
+) -> Result<String, Error> {
     // `plugin.toml` must exist or the directory isn't a plugin — skip
     // silently by reporting a clean NotFound at the loader boundary.
     let manifest_path = dir.join("plugin.toml");
@@ -76,14 +99,15 @@ pub(crate) async fn load_one(dir: &Path, registry: &AiRegistry) -> Result<String
     let manifest = Manifest::from_dir(dir)?;
     let name = manifest.name.clone();
 
-    if manifest.plugin_type != PluginType::Sidecar {
-        return Err(Error::Load {
-            plugin: name,
-            reason: format!(
-                "plugin type `{:?}` not yet supported (sidecar only)",
-                manifest.plugin_type
-            ),
-        });
+    match manifest.plugin_type {
+        PluginType::Sidecar => { /* fall through to sidecar path below */ }
+        PluginType::Wasm => return load_wasm(dir, manifest, wasm_engine, registry),
+        PluginType::Script => {
+            return Err(Error::Load {
+                plugin: name,
+                reason: "plugin type `Script` not yet supported".into(),
+            });
+        }
     }
 
     // Spawn the subprocess.
@@ -124,6 +148,13 @@ pub(crate) async fn load_one(dir: &Path, registry: &AiRegistry) -> Result<String
         })
         .collect();
 
+    // Start the notification bridge before we register — the bus
+    // subscriber slot needs to be armed by the time a plugin starts
+    // emitting partials.
+    if let Some(bus) = bus {
+        spawn_notification_bridge(&sidecar, name.clone(), bus);
+    }
+
     registry.insert(PluginEntry {
         manifest,
         dir: dir.to_path_buf(),
@@ -131,6 +162,60 @@ pub(crate) async fn load_one(dir: &Path, registry: &AiRegistry) -> Result<String
         capabilities,
     });
     Ok(name)
+}
+
+/// Load a `type = "wasm"` manifest: compile the module, run the
+/// guest's `describe()` export, and register the resulting provider.
+/// Synchronous — compilation happens on the caller's thread (wasmtime
+/// doesn't have async compile APIs here and the cost is comparable to
+/// spawning a subprocess).
+fn load_wasm(
+    dir: &Path,
+    manifest: Manifest,
+    wasm_engine: Option<WasmEngine>,
+    registry: &AiRegistry,
+) -> Result<String, Error> {
+    let name = manifest.name.clone();
+    let Some(engine) = wasm_engine else {
+        return Err(Error::Load {
+            plugin: name,
+            reason: "WASM plugin encountered but loader was not given a WasmEngine".into(),
+        });
+    };
+    let provider =
+        WasmProvider::load(engine, manifest, dir.to_path_buf()).map_err(|reason| Error::Load {
+            plugin: name.clone(),
+            reason,
+        })?;
+    registry.insert_wasm(Arc::new(provider));
+    Ok(name)
+}
+
+/// Subscribe to `sidecar`'s notification broadcast and forward each
+/// frame to the engine's bus as [`Event::Plugin`]. Task exits when
+/// the sidecar's notification channel closes (plugin shut down).
+fn spawn_notification_bridge(sidecar: &smiths_sidecar::Sidecar, plugin: String, bus: EventBus) {
+    let mut rx = sidecar.subscribe_notifications();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(notif) => {
+                    let _ = bus.publish(Event::Plugin(PluginEvent::Notification {
+                        plugin: plugin.clone(),
+                        method: notif.method,
+                        params: notif.params,
+                    }));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(plugin = %plugin, lagged = n, "plugin notification bridge lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    debug!(plugin = %plugin, "plugin notification bridge exiting");
+                    return;
+                }
+            }
+        }
+    });
 }
 
 /// Accept either a single descriptor object or an array of them.
@@ -210,7 +295,7 @@ done
         make_plugin_dir(root.path(), "ai-tts-stub", &["ai.tts"]);
 
         let reg = AiRegistry::new();
-        let report = load_plugins(root.path(), &reg).await.unwrap();
+        let report = load_plugins(root.path(), &reg, None, None).await.unwrap();
         assert_eq!(report.loaded, vec!["ai-tts-stub"]);
         assert!(report.failed.is_empty());
         assert_eq!(reg.len(), 1);
@@ -227,7 +312,7 @@ done
     async fn missing_root_is_not_an_error() {
         let root = tempdir().unwrap();
         let reg = AiRegistry::new();
-        let report = load_plugins(&root.path().join("does-not-exist"), &reg)
+        let report = load_plugins(&root.path().join("does-not-exist"), &reg, None, None)
             .await
             .unwrap();
         assert!(report.loaded.is_empty());
@@ -241,7 +326,7 @@ done
         make_plugin_dir(root.path(), "ai-asr-liar", &["ai.asr"]);
 
         let reg = AiRegistry::new();
-        let report = load_plugins(root.path(), &reg).await.unwrap();
+        let report = load_plugins(root.path(), &reg, None, None).await.unwrap();
         assert!(report.loaded.is_empty());
         assert_eq!(report.failed.len(), 1);
         assert_eq!(reg.len(), 0);

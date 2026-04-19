@@ -90,7 +90,7 @@ async fn spawn_engine() -> (
         std::fs::set_permissions(&main, p).unwrap();
     }
     let _ = examples;
-    let report = smiths_plugin::load_plugins(tmp.path(), &ai_registry)
+    let report = smiths_plugin::load_plugins(tmp.path(), &ai_registry, None, None)
         .await
         .unwrap();
     assert!(

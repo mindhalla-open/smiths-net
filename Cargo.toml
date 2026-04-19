@@ -6,7 +6,7 @@ exclude  = ["fuzz"]
 [workspace.package]
 edition      = "2024"
 rust-version = "1.85"
-version      = "0.6.0"
+version      = "0.8.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
@@ -67,7 +67,7 @@ rustls-pemfile = "2"
 rcgen          = "0.14"
 
 # Metrics
-prometheus-client = "0.23"
+prometheus-client = "0.24.1"
 
 # audio helpers
 base64 = "0.22"
