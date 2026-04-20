@@ -5,6 +5,233 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-04-19
+
+### Added — Transaction FSM slice 5 (final)
+
+Closes RFC 3261 §17 as a library: all four transaction FSMs + the
+dialog-layer FSM are now in place, and the `TransactionDriver`
+hosts both client and server FSMs.
+
+- **`smiths-sip::txn::ServerNonInviteTxn`** — RFC 3261 §17.2.2.
+  - States: `Trying → Proceeding → Completed → Terminated`.
+  - Timer J (`64 · T1 = 32 s` absorb-retransmits window); armed on
+    entering Completed.
+  - Request retransmits in Proceeding / Completed replay the
+    cached last response; in Trying they drop silently.
+  - 10 unit tests.
+- **`smiths-sip::txn::DialogFsm`** — RFC 3261 §12 dialog FSM.
+  - States: `Early → Confirmed → Terminated`.
+  - Events: `AckReceived`, `ByeCompleted`, `Cancelled`, `Error`.
+  - Illegal transitions surface as `DialogTransitionError`
+    rather than silent absorption — dialogs are long-lived and
+    stray events usually mean an application-layer bug.
+  - `to_core_state()` projects to the serializable
+    `smiths_core::DialogState` (returns `None` when terminated —
+    dead dialogs don't appear in the HA snapshot).
+  - 10 unit tests.
+- **`TransactionDriver::start_server`** — symmetric to
+  `start_client`. Registers a server FSM and returns a `TuEvent`
+  receiver the TU drains for `Terminated`.
+- **`TransactionDriver::send_response`** — TU pushes a built
+  response through the FSM; the driver emits `SendToPeer` and
+  arms the appropriate retransmit-absorb timer.
+- **`TransactionDriver::deliver_request`** — routes inbound
+  request retransmits into the server FSM, which replays the
+  cached response per §17.2.1 / §17.2.2.
+- Two new driver integration tests: server registration + peer
+  send, and request-retransmit replay.
+
+### Status — RFC 3261 §17 transaction layer
+
+All four FSMs written, tested, and hosted by the async driver:
+
+- Client non-INVITE (§17.1.2) — migrated (`UacClient::hangup`).
+- Client INVITE (§17.1.1) — migrated (`UacClient::place_call`).
+- Server INVITE (§17.2.1) — library + driver API, UAS wiring
+  deferred.
+- Server non-INVITE (§17.2.2) — library + driver API, UAS
+  wiring deferred.
+- Dialog FSM (§12) — library, ready for the dialog-layer glue
+  slice that ties transactions to call lifecycle.
+
+The existing UAS dedupe DashMap keeps working (deadlock fix
+landed in v0.13.1). Replacing it with server FSM entries is
+cleanup rather than a correctness requirement, so it's tracked
+as an optional follow-on rather than a roadmap blocker.
+
+## [0.18.0] - 2026-04-20
+
+### Added — Transaction FSM slices 3 + 4
+
+Both INVITE-side transaction FSMs (RFC 3261 §17.1.1 + §17.2.1). The
+UAC `place_call` path migrates onto the client INVITE FSM; server
+INVITE FSM lands as a library (UAS wiring = slice 5).
+
+- **`smiths-sip::txn::ClientInviteTxn`** — RFC 3261 §17.1.1.
+  - States: `Calling → Proceeding → Completed → Terminated`.
+  - Timer A (retransmit INVITE, T1 doubling, no RFC cap — stops on
+    1xx or timer B).
+  - Timer B (`64 · T1 = 32 s` transaction timeout).
+  - Timer D (`32 s` wait for non-2xx retransmits in Completed).
+  - **2xx bypass**: 2xx final drops straight to Terminated; the TU
+    owns end-to-end ACK per §13.3.1.4.
+  - **Non-2xx ACK is the FSM's job** per §17.1.1.3 — every
+    3xx-6xx final (and retransmits) gets an auto-generated ACK.
+  - 12 unit tests across every state / timer / response path.
+- **`smiths-sip::txn::ack::build_non_ok_ack`** — byte-level ACK
+  builder. Preserves INVITE's Via branch (§17.1.1.3), copies From /
+  Call-ID / Request-URI / Max-Forwards / Route headers; takes `To`
+  (with server tag) from the response. 4 unit tests.
+- **`smiths-sip::txn::ServerInviteTxn`** — RFC 3261 §17.2.1.
+  - States: `Proceeding → Completed → Confirmed → Terminated`.
+  - Timer G (retransmit non-2xx final, T1 doubling up to T2).
+  - Timer H (`64 · T1 = 32 s` wait for ACK after non-2xx).
+  - Timer I (`T4 = 5 s` absorb ACK retransmits in Confirmed).
+  - **2xx bypass**: TU owns 2xx retransmit timers per §13.3.1.4.
+  - INVITE retransmits replay the last response (cached in the
+    FSM; replaces the UAS's current `dedupe` cache once the UAS
+    migration lands in slice 5).
+  - 13 unit tests.
+- **`TransactionEvent::SendResponseFromTu`** — new event variant
+  for server FSMs; the TU (dialog layer) asks the transaction
+  layer to emit a response (1xx / 2xx / non-2xx), and the FSM
+  decides whether to cache + retransmit.
+
+### Changed — `UacClient::place_call` migrated through the driver
+
+Previously: one-shot `transport.send(invite)` + subscribe router +
+`wait_for_final` (no retransmit at all; on UDP loss the whole 30 s
+budget burned through silently).
+
+Now: register a `ClientInviteTxn` with the driver, drain
+`TuEvent` stream until a final response or the deadline. Behavioural
+upgrades:
+
+- **Timer-A retransmits** at T1 / 2·T1 / 4·T1 / … until the peer
+  replies or the overall deadline fires.
+- **Automatic ACK for 3xx-6xx** handled by the FSM (no code in UAC).
+- `wait_for_final` + `parse_status` helpers in `uac.rs` removed as
+  dead code; the `router` field on `UacClient` removed (driver
+  owns it now — constructor signature unchanged, the passed
+  `Arc<ResponseRouter>` is moved into the driver).
+- Existing `uac_places_call_and_hangs_up_against_fake_uas`
+  integration test passes through the migrated path unchanged.
+
+### Deferred to slice 5
+
+- **UAS server-INVITE migration** — replacing the `dedupe` cache +
+  in-UAS retransmit dedupe path with per-transaction
+  `ServerInviteTxn` entries managed by a server-side driver.
+- **Server non-INVITE FSM** (§17.2.2, timer J) — tiny, ~200 LOC.
+- **Dialog FSM driver** (Idle → Early → Confirmed → Terminated)
+  on top.
+- UAC `place_call` is still the one callsite that manually builds
+  the 2xx ACK — candidate for a dialog-layer helper.
+
+## [0.17.0] - 2026-04-20
+
+### Added — async `TransactionDriver` + first migration (UAC BYE)
+
+Second slice of the RFC 3261 §17 migration. The pure FSM built in
+v0.16.0 now has an async runtime + its first real call-site in the
+engine.
+
+- **`smiths-sip::txn::TransactionDriver<T: Transport>`** — hosts
+  live FSMs, runs their `SendToPeer` / `ArmTimer` / `CancelTimer` /
+  `DeliverResponseToTu` / `Terminated` actions. Generic over
+  `Transport` to match UAC's existing shape (AFIT `Transport` isn't
+  dyn-compatible). Cheap to clone.
+- **Timer tasks** — each armed timer is a `tokio::spawn` with an
+  `AbortHandle` stored on the txn entry. `CancelTimer` aborts it;
+  `Terminated` aborts every remaining timer plus the response
+  listener. A per-txn `CancellationToken` races the sleep so an
+  aborted timer task drops even if it's mid-sleep.
+- **Response routing** — driver spawns one listener task per txn
+  that subscribes to [`ResponseRouter`] by branch, re-feeds each
+  arriving response into the FSM, and re-subscribes for the next
+  one (the router's oneshot is single-shot, same pattern as the
+  old `wait_for_final`). Exits on `Terminated`.
+- **`TuEvent`** — the Transaction User sees an unbounded MPSC
+  stream of responses plus one final `Terminated` marker.
+- **Two end-to-end integration tests** in `driver::tests` using
+  real UDP sockets: request-send → final-response round-trip; and
+  timer-E actually retransmits on the wire after T1=500 ms when no
+  response arrives.
+- **`UacClient::hangup` migrated** — the BYE path now registers a
+  `ClientNonInviteTxn` with the driver instead of doing a one-shot
+  `transport.send` + `router.subscribe` + `wait_for_final`. **Net
+  behavioural win:** if the BYE's first send is lost on UDP, the
+  FSM retransmits at T1, 2·T1, 4·T1, up to T2=4 s, capped by the
+  30 s overall budget — the old path would silently burn through
+  the whole budget on a single lost packet.
+- Public signature of `hangup` unchanged; existing
+  `uac_places_call_and_hangs_up_against_fake_uas` integration test
+  passes through the migrated path unchanged.
+
+### Deferred to FSM slice 3+
+
+- **Client INVITE FSM** (§17.1.1, timers A/B/D, `Calling` state).
+  Needed to migrate `UacClient::place_call` / `wait_for_final`.
+- Server FSMs + dialog driver (still on the roadmap — slices 4/5).
+- `ResponseRouter` simplification — once client FSMs handle their
+  own retransmit + final-response correlation, the router's
+  per-branch oneshot pattern can collapse into a simple
+  `DashMap<String, Sender<Bytes>>` without the re-subscribe loop.
+
+## [0.16.0] - 2026-04-20
+
+### Added — RFC 3261 §17 transaction layer: framework + client non-INVITE
+
+First slice of a multi-session migration off the ad-hoc UAC retransmit
+path. **Additive only** — the new FSM module lives alongside `uas.rs`
+/ `uac.rs` without touching them; no user-visible behavior change.
+
+- **`smiths-sip::txn` module** — pure-synchronous FSM framework:
+  - `TransactionState` / `Role` / `TransactionKey` — the lookup
+    vocabulary the future driver indexes on.
+  - `TimerId` — every RFC 3261 §17.1.1.1 timer (A–K) named by the
+    letter that matches the spec, so FSM code reads 1:1 with the RFC.
+  - `TransactionEvent` — network-in events (`StartClient`,
+    `ResponseReceived`, `RequestReceived`, `TimerFired`).
+  - `TransactionAction` — network-out actions (`SendToPeer`,
+    `DeliverResponseToTu`, `ArmTimer`, `CancelTimer`, `Terminated`).
+  - `Transaction` trait — the `on_event(ev) → Vec<Action>` shape
+    every FSM flavor implements.
+- **`smiths-sip::txn::timers`** — `T1` (500 ms), `T2` (4 s), `T4`
+  (5 s), `TIMEOUT_64T1` (32 s) constants; `doubling_backoff(attempt,
+  cap)` helper shared across FSMs.
+- **`ClientNonInviteTxn` (RFC 3261 §17.1.2)** — smallest of the four
+  FSMs, covers outbound BYE / OPTIONS / REGISTER / CANCEL once the
+  driver wires it next session:
+  - States: `Trying → Proceeding → Completed → Terminated`.
+  - Timer E (retransmit, `T1` then doubles up to `T2`).
+  - Timer F (transaction timeout, `64·T1 = 32 s`).
+  - Timer K (wait for duplicate responses, `T4 = 5 s`).
+  - Duplicate finals in Completed are silently consumed.
+  - Late events in Terminated are absorbed (real SIP stacks race
+    against their own timer cancellations all the time).
+- **14 unit tests** cover every state transition + every timer path
+  (initial send, E retransmit doubling, Trying→Proceeding on 1xx,
+  Proceeding loop, Trying→Completed and Proceeding→Completed on
+  final, duplicate-final silence, K-terminates, F-times-out in both
+  Trying and Proceeding, post-Terminated events are no-ops, key
+  round-trips).
+
+### Deferred (FSM slice 2+)
+
+- **`TransactionDriver`** — async wrapper that owns timers +
+  transaction table. Needed to integrate FSMs with the live UAC.
+- **`UacClient` BYE migration** — first call-site swap onto the new
+  FSM once the driver lands.
+- **Client INVITE FSM** (§17.1.1, timers A/B/D, includes `Calling`
+  state).
+- **Server INVITE FSM** (§17.2.1, timers G/H/I, ACK-driven
+  `Confirmed` state).
+- **Server non-INVITE FSM** (§17.2.2, timer J).
+- **Dialog FSM driver** (Idle → Early → Confirmed → Terminated) on
+  top of the transaction FSMs.
+
 ## [0.15.0] - 2026-04-20
 
 ### Added — SRTP (SDES)

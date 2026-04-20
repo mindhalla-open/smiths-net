@@ -12,6 +12,7 @@ pub mod error;
 pub mod rate_limit;
 pub mod response_router;
 pub mod transport;
+pub mod txn;
 pub mod uac;
 pub mod uas;
 
@@ -19,5 +20,9 @@ pub use error::Error;
 pub use rate_limit::SipRateLimiter;
 pub use response_router::ResponseRouter;
 pub use transport::{Datagram, Transport, tcp::TcpTransport, tls::TlsTransport, udp::UdpTransport};
+pub use txn::{
+    ClientNonInviteTxn, Role, TransactionAction, TransactionDriver, TransactionEvent,
+    TransactionState, TuEvent,
+};
 pub use uac::{UacClient, UacError};
 pub use uas::UasServer;
