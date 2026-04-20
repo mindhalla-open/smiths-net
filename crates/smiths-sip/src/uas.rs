@@ -674,12 +674,20 @@ impl<T: Transport> UasServer<T> {
         ));
 
         if let Some(branch) = req.branch.as_ref() {
-            if self.dedupe.len() >= DEDUPE_CAPACITY
-                && let Some(entry) = self.dedupe.iter().next()
-            {
-                let k = entry.key().clone();
-                drop(entry);
-                self.dedupe.remove(&k);
+            if self.dedupe.len() >= DEDUPE_CAPACITY {
+                // Evict one entry. We scope the `iter()` tightly so the
+                // Iter (which holds a shard read-guard) is dropped
+                // *before* we call `remove()` on the same shard —
+                // otherwise the `remove` deadlocks on its own read
+                // guard. An earlier version relied on `drop(entry)` +
+                // temporary-lifetime rules, but `if let` extends the
+                // `iter()` rvalue's lifetime through the full scope,
+                // which kept the guard alive and wedged the UAS
+                // permanently once DEDUPE_CAPACITY was hit under load.
+                let evict_key = self.dedupe.iter().next().map(|e| e.key().clone());
+                if let Some(k) = evict_key {
+                    self.dedupe.remove(&k);
+                }
             }
             self.dedupe.insert(branch.clone(), bytes.clone());
         }

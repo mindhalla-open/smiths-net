@@ -5,6 +5,42 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.1] - 2026-04-20
+
+### Fixed — UAS dedupe-eviction deadlock
+
+- **The bug:** `UasServer::respond` evicted a cache entry via
+  `self.dedupe.iter().next()` + `remove(&k)`. Rust's `if let`
+  lifetime rules extend the `iter()` rvalue temporary through the
+  full scope, so the `Iter` (holding a `DashMap` shard read guard)
+  was still alive when `remove` took a write lock on the same
+  shard. The UAS wedged permanently once `DEDUPE_CAPACITY` (4096)
+  was hit under load — no further SIP datagrams got dispatched
+  even though the process, health endpoint, and metrics all looked
+  healthy.
+- **The fix:** extract the eviction key in a self-contained
+  expression (`self.dedupe.iter().next().map(|e| e.key().clone())`)
+  so the `Iter` is dropped before `remove`. The hot path stays
+  single-threaded (UAS serializes `handle_datagram`); the bug
+  surfaced because macOS's loopback buffered 4096+ datagrams fast
+  enough to push us past the threshold.
+- **Regression test:** `crates/smiths-sip/tests/dedupe_eviction.rs`
+  sends 4200 unique OPTIONS requests and asserts at least 4100 get
+  200 OK back. Pre-fix this hung after ~4096. Post-fix all 4200
+  land. Takes ~10 s on dev hardware.
+- **Validated via sipp** on loopback: 50,000 REGISTERs at
+  ~10,000 cps, 100% success, 0 retransmits, 0 failed. Prior to
+  the fix the engine froze after ~4096 REGISTERs regardless of
+  arrival rate.
+
+### Added
+
+- **`scenarios/sipp/register_noauth.xml`** — blind-200 variant of
+  the REGISTER scenario for running throughput smokes against the
+  default (no-credential-store) engine. The existing
+  `register.xml` still drives the auth round-trip; use this one
+  when seeding the credential store is not on the table.
+
 ## [0.13.0] - 2026-04-20
 
 ### Added — graceful drain
