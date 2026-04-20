@@ -125,6 +125,9 @@ pub struct UasServer<T: Transport> {
     /// route traffic elsewhere while live dialogs finish naturally.
     /// `None` = drain disabled (tests, single-shot deployments).
     drain: Option<smiths_core::Drain>,
+    /// Per-source-IP token bucket. Always present — when config
+    /// disables rate limiting it's a cheap always-allow.
+    rate_limit: crate::rate_limit::SipRateLimiter,
 }
 
 impl<T: Transport> UasServer<T> {
@@ -156,6 +159,7 @@ impl<T: Transport> UasServer<T> {
             metrics: Metrics::noop(),
             response_router: None,
             drain: None,
+            rate_limit: crate::rate_limit::SipRateLimiter::disabled(),
         })
     }
 
@@ -193,6 +197,15 @@ impl<T: Transport> UasServer<T> {
         self
     }
 
+    /// Attach a per-source-IP rate limiter. Without this, the UAS
+    /// runs with an always-allow limiter (zero overhead) — the CLI
+    /// wires a real one from `config.sip.rate_limit`.
+    #[must_use]
+    pub fn with_rate_limit(mut self, rate_limit: crate::rate_limit::SipRateLimiter) -> Self {
+        self.rate_limit = rate_limit;
+        self
+    }
+
     /// Run the UAS event loop. Exits when `cancel` fires or `rx` closes.
     #[instrument(skip_all)]
     pub async fn run(self, mut rx: mpsc::Receiver<Datagram>, cancel: CancellationToken) {
@@ -218,6 +231,13 @@ impl<T: Transport> UasServer<T> {
 
     async fn handle_datagram(&self, dg: Datagram) {
         let peer = dg.peer;
+        // Rate-limit *before* parsing: reject hostile bursts without
+        // burning the rsip parser on them. Disabled limiter is a
+        // single-atomic no-op.
+        if !self.rate_limit.allow(peer.ip()) {
+            debug!(%peer, "SIP datagram dropped by rate limiter");
+            return;
+        }
         let parse = match rsip::SipMessage::try_from(dg.bytes.as_ref()) {
             Ok(msg) => msg,
             Err(e) => {
@@ -716,6 +736,25 @@ impl<T: Transport> UasServer<T> {
 /// Extract the first `Via` header's `branch` parameter from any raw
 /// SIP message (request or response). Returns `None` when the header
 /// or parameter is missing. Used by the response-router forwarder.
+/// Fuzz-only hooks. Exposed so `smiths-fuzz` can drive our hand-rolled
+/// parsers directly without booting a full UAS. Not part of the
+/// stable API — internal to the workspace.
+#[doc(hidden)]
+pub mod __fuzz {
+    use bytes::Bytes;
+
+    /// Run `summarize_request` on arbitrary bytes. Panics/UB/OOB are
+    /// the bugs the fuzzer hunts for.
+    pub fn summarize_request(raw: &[u8]) {
+        let _ = super::summarize_request(&Bytes::copy_from_slice(raw));
+    }
+
+    /// Run `extract_via_branch` on arbitrary bytes.
+    pub fn extract_via_branch(raw: &[u8]) {
+        let _ = super::extract_via_branch(&Bytes::copy_from_slice(raw));
+    }
+}
+
 fn extract_via_branch(raw: &Bytes) -> Option<String> {
     let text = std::str::from_utf8(raw).ok()?;
     for line in text.split("\r\n") {

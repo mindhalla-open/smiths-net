@@ -90,6 +90,11 @@ async fn main() -> anyhow::Result<()> {
     // before the cancel token fires.
     let drain = smiths_core::Drain::new();
 
+    // Per-source-IP rate limiter for SIP ingress. Shared across all
+    // listeners (UDP / TCP / TLS) so a single noisy peer can't bypass
+    // the limit by hopping transports.
+    let sip_rate_limit = smiths_sip::SipRateLimiter::new(config.sip.rate_limit);
+
     // One Prometheus registry, shared between the /metrics endpoint
     // and every subsystem that increments counters.
     let metrics_registry = Arc::new(Mutex::new(Registry::default()));
@@ -192,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&metrics),
             Arc::clone(&response_router),
             drain.clone(),
+            sip_rate_limit.clone(),
             /* build_uac */ true,
         )
         .await
@@ -249,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(&metrics),
                 Arc::clone(&response_router),
                 drain.clone(),
+                sip_rate_limit.clone(),
                 /* build_uac */ false,
             )
             .await
@@ -266,6 +273,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(&media_fabric),
                 Arc::clone(&metrics),
                 drain.clone(),
+                sip_rate_limit.clone(),
             )
             .await
             {
@@ -286,6 +294,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(&media_fabric),
                 Arc::clone(&metrics),
                 drain.clone(),
+                sip_rate_limit.clone(),
             )
             .await
             {
@@ -438,6 +447,7 @@ async fn spawn_sip_udp(
     metrics: Arc<Metrics>,
     router: Arc<ResponseRouter>,
     drain: smiths_core::Drain,
+    rate_limit: smiths_sip::SipRateLimiter,
     build_uac: bool,
 ) -> anyhow::Result<SpawnedSipUdp> {
     let transport = UdpTransport::bind(bind)
@@ -462,7 +472,8 @@ async fn spawn_sip_udp(
     .with_context(|| format!("building UAS on {local}"))?
     .with_metrics(Arc::clone(&metrics))
     .with_response_router(Arc::clone(&router))
-    .with_drain(drain.clone());
+    .with_drain(drain.clone())
+    .with_rate_limit(rate_limit.clone());
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP UDP listening");
 
@@ -498,6 +509,7 @@ async fn spawn_sip_tls(
     media_fabric: Arc<dyn MediaFabric>,
     metrics: Arc<Metrics>,
     drain: smiths_core::Drain,
+    rate_limit: smiths_sip::SipRateLimiter,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let transport = TlsTransport::bind(bind, cert, key)
         .await
@@ -512,12 +524,14 @@ async fn spawn_sip_tls(
     let server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
         .with_context(|| format!("building UAS on {local}"))?
         .with_metrics(metrics)
-        .with_drain(drain);
+        .with_drain(drain)
+        .with_rate_limit(rate_limit);
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP TLS listening");
     Ok(vec![reader, server_handle])
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_sip_tcp(
     bind: SocketAddr,
     bus: EventBus,
@@ -525,6 +539,7 @@ async fn spawn_sip_tcp(
     media_fabric: Arc<dyn MediaFabric>,
     metrics: Arc<Metrics>,
     drain: smiths_core::Drain,
+    rate_limit: smiths_sip::SipRateLimiter,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let transport = TcpTransport::bind(bind)
         .await
@@ -539,7 +554,8 @@ async fn spawn_sip_tcp(
     let server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
         .with_context(|| format!("building UAS on {local}"))?
         .with_metrics(metrics)
-        .with_drain(drain);
+        .with_drain(drain)
+        .with_rate_limit(rate_limit);
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP TCP listening");
     Ok(vec![reader, server_handle])

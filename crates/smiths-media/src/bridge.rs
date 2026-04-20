@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::rtcp::{build_sr, ntp_now};
+use crate::rtcp::{ReportBlock, build_sr, build_sr_with_rb, ntp_now, parse_rr};
 use crate::rtp_stats::StreamStats;
 
 /// One leg of a bridged call.
@@ -160,8 +160,18 @@ impl Bridge {
                     rtcp_b.clone(),
                     ssrc_toward_b,
                     stats_a_to_b.clone(),
+                    // RR block inside SR reports on what we've
+                    // RECEIVED from peer B (the b->a stream).
+                    stats_b_to_a.clone(),
                     interval,
                     cfg.metrics.clone(),
+                    cancel.clone(),
+                    "a->b",
+                ));
+                // Listen on the RTCP socket for peer B's own RRs so
+                // we observe its view of our outbound.
+                tasks.push(spawn_rr_listener(
+                    Arc::clone(&rtcp_b.socket),
                     cancel.clone(),
                     "a->b",
                 ));
@@ -171,8 +181,14 @@ impl Bridge {
                     rtcp_a.clone(),
                     ssrc_toward_a,
                     stats_b_to_a.clone(),
+                    stats_a_to_b.clone(),
                     interval,
                     cfg.metrics.clone(),
+                    cancel.clone(),
+                    "b->a",
+                ));
+                tasks.push(spawn_rr_listener(
+                    Arc::clone(&rtcp_a.socket),
                     cancel.clone(),
                     "b->a",
                 ));
@@ -284,12 +300,19 @@ fn spawn_rewriting_forward(
     })
 }
 
-/// Fire an RTCP Sender Report to `rtcp.peer` on each tick, carrying
-/// the current snapshot of `stats`. Runs until `cancel` fires.
+/// Fire an RTCP Sender Report on each tick.
+///
+/// The SR body reports on our **outbound** stream (`sender_stats`);
+/// the embedded RR block reports on the **inbound** stream we're
+/// receiving from this peer (`receiver_stats`). If the inbound stream
+/// hasn't seen any packets yet we fall back to a bare SR — RFC 3550
+/// allows RC=0 when the receiver has nothing to report.
+#[allow(clippy::too_many_arguments)] // All args map 1:1 to emitter state.
 fn spawn_sr_emitter(
     rtcp: RtcpLeg,
     sender_ssrc: u32,
-    stats: StreamStats,
+    sender_stats: StreamStats,
+    receiver_stats: StreamStats,
     interval: Duration,
     metrics: Option<Arc<Metrics>>,
     cancel: CancellationToken,
@@ -297,8 +320,6 @@ fn spawn_sr_emitter(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
-        // Skip the immediate first tick — let the forwarder observe at
-        // least a few packets so the SR carries meaningful counts.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
         loop {
@@ -306,15 +327,44 @@ fn spawn_sr_emitter(
                 biased;
                 () = cancel.cancelled() => break,
                 _ = ticker.tick() => {
-                    let snap = stats.snapshot();
-                    let pkt = build_sr(
-                        sender_ssrc,
-                        ntp_now(),
-                        snap.last_rtp_ts,
-                        u32::try_from(snap.packets).unwrap_or(u32::MAX),
-                        u32::try_from(snap.octets).unwrap_or(u32::MAX),
-                    );
-                    if let Err(e) = rtcp.socket.send_to(&pkt, rtcp.peer).await {
+                    let send_snap = sender_stats.snapshot();
+                    let recv_snap = receiver_stats.snapshot();
+                    let pkt_bytes = if recv_snap.packets == 0 {
+                        // No inbound yet — emit bare SR (RC=0).
+                        build_sr(
+                            sender_ssrc,
+                            ntp_now(),
+                            send_snap.last_rtp_ts,
+                            u32::try_from(send_snap.packets).unwrap_or(u32::MAX),
+                            u32::try_from(send_snap.octets).unwrap_or(u32::MAX),
+                        ).to_vec()
+                    } else {
+                        let rb = ReportBlock {
+                            ssrc: recv_snap.last_ssrc,
+                            // Fraction / cumulative loss aren't tracked
+                            // yet (no expected-vs-received gap
+                            // detection); fill with 0 for now and
+                            // tighten when the FSM slice lands.
+                            fraction_lost: 0,
+                            cumulative_lost: 0,
+                            extended_highest_seq: recv_snap.max_seq,
+                            jitter: recv_snap.jitter,
+                            // last_sr / DLSR require tracking incoming
+                            // SRs; RR listener (spawn_rr_listener) is
+                            // where those will wire up.
+                            last_sr: 0,
+                            delay_since_last_sr: 0,
+                        };
+                        build_sr_with_rb(
+                            sender_ssrc,
+                            ntp_now(),
+                            send_snap.last_rtp_ts,
+                            u32::try_from(send_snap.packets).unwrap_or(u32::MAX),
+                            u32::try_from(send_snap.octets).unwrap_or(u32::MAX),
+                            &rb,
+                        ).to_vec()
+                    };
+                    if let Err(e) = rtcp.socket.send_to(&pkt_bytes, rtcp.peer).await {
                         warn!(dir, ?e, "RTCP SR send failed");
                     } else if let Some(m) = &metrics {
                         m.rtcp_sr_sent.inc();
@@ -323,6 +373,46 @@ fn spawn_sr_emitter(
             }
         }
         debug!(dir, "bridge RTCP emitter stopped");
+    })
+}
+
+/// Listen for RTCP RR packets from the peer. Parses, logs a debug
+/// line, and drops — hooking RR feedback into `StreamStats` (loss %,
+/// DLSR tracking) is follow-on work that needs the cumulative-lost
+/// counter wired on the emitter side first.
+fn spawn_rr_listener(
+    socket: Arc<tokio::net::UdpSocket>,
+    cancel: CancellationToken,
+    dir: &'static str,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 1500];
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => break,
+                res = socket.recv_from(&mut buf) => match res {
+                    Ok((n, _src)) => {
+                        if let Some((sender, blocks)) = parse_rr(&buf[..n]) {
+                            for rb in &blocks {
+                                debug!(
+                                    dir, sender, ssrc = rb.ssrc,
+                                    fraction_lost = rb.fraction_lost,
+                                    cumulative_lost = rb.cumulative_lost,
+                                    jitter = rb.jitter,
+                                    "peer RR received"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(dir, ?e, "RTCP recv failed; stopping listener");
+                        break;
+                    }
+                }
+            }
+        }
+        debug!(dir, "bridge RTCP listener stopped");
     })
 }
 

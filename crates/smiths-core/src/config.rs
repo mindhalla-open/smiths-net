@@ -79,6 +79,25 @@ pub struct SipConfig {
     /// Required when `transports` contains `tls`. Ignored otherwise.
     pub tls_cert_path: Option<std::path::PathBuf>,
     pub tls_key_path: Option<std::path::PathBuf>,
+    /// Per-source-IP rate limit on inbound SIP datagrams.
+    pub rate_limit: SipRateLimit,
+}
+
+/// Token-bucket rate limit applied per source IP at UAS ingress.
+///
+/// `per_sec == 0` disables the limiter entirely (default, dev-friendly).
+/// `per_sec > 0` rate-limits new datagrams to the configured rate with
+/// a bucket depth of `burst` (falling back to `per_sec` when `burst == 0`).
+/// Datagrams from over-limit sources are dropped silently — this is
+/// anti-flood, not a protocol-level response, so we don't burn a
+/// `503 Service Unavailable` generation on every dropped packet.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SipRateLimit {
+    /// Sustained datagrams/sec allowed per source IP. `0` disables.
+    pub per_sec: u32,
+    /// Maximum bucket depth. `0` falls back to `per_sec`.
+    pub burst: u32,
 }
 
 impl Default for SipConfig {
@@ -92,6 +111,7 @@ impl Default for SipConfig {
             drain_timeout_secs: 10,
             tls_cert_path: None,
             tls_key_path: None,
+            rate_limit: SipRateLimit::default(),
         }
     }
 }

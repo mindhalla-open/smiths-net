@@ -28,7 +28,7 @@ pub use call::{CallError, CallLookup, CallOriginator, DialogKey, DialogRecord, D
 pub use codec::{linear_to_ulaw, pcm16_to_pcmu, pcmu_to_pcm16, ulaw_to_linear};
 pub use config::{
     A2aConfig, BindSpec, BindSpecError, Config, CoreConfig, LogFormat, McpConfig,
-    ObservabilityConfig, PluginsConfig, RateLimitConfig, SipConfig, SipTransport,
+    ObservabilityConfig, PluginsConfig, RateLimitConfig, SipConfig, SipRateLimit, SipTransport,
 };
 pub use drain::Drain;
 pub use error::Error;

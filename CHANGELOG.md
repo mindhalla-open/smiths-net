@@ -5,6 +5,67 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-04-20
+
+### Validated — fuzz harness run
+
+- Ran `cargo +nightly fuzz run sip_parser` for ~4 minutes
+  (**5.2M runs**) with a seeded corpus covering OPTIONS, INVITE,
+  REGISTER-with-auth, and responses. **Zero crashes, zero panics,
+  zero OOMs** across three parse layers:
+  1. `rsip::SipMessage::try_from` (third-party gate)
+  2. `summarize_request` (our hand-rolled request-summary parser)
+  3. `extract_via_branch` (response-router branch extractor)
+- Exposed the latter two via a `#[doc(hidden)] pub mod __fuzz`
+  inside `smiths-sip::uas` so the fuzz target can drive them
+  directly without booting a UAS.
+- Seeded `fuzz/corpus/sip_parser/` with four realistic inputs —
+  future fuzz runs start from meaningful mutations, not `[]`.
+
+### Added — per-source-IP SIP rate limiting
+
+- **`smiths-sip::rate_limit::SipRateLimiter`** — token bucket per
+  source IP. `SipRateLimit { per_sec, burst }` config tuple lands
+  on `SipConfig` (disabled by default; `per_sec == 0`). Over-limit
+  datagrams are silently dropped *before* the rsip parser runs,
+  keeping the hot path short during a flood.
+- **`UasServer::with_rate_limit(...)`** — builder. UAS checks the
+  limiter in `handle_datagram`, before parse, before any state
+  touch. Per-IP buckets in a `DashMap`; disabled case is a single
+  atomic compare so the hot path stays cheap.
+- CLI wires one shared limiter across all transports (UDP, TCP,
+  TLS) so a hostile peer can't bypass the limit by hopping
+  transports. `SMITHS__SIP__RATE_LIMIT__PER_SEC=50` enables.
+- Two integration tests: caps-at-burst, and
+  per_sec=0-lets-everything-through.
+
+### Added — RTCP Receiver Reports (embedded + listener)
+
+- **`smiths-media::rtcp::build_sr_with_rb` / `build_rr` /
+  `parse_rr` / `ReportBlock`** — RFC 3550 §6.4 wire layout for
+  Report Blocks. 24-byte RB carries `ssrc` / `fraction_lost` /
+  24-bit signed `cumulative_lost` / `extended_highest_seq` /
+  `jitter` / `last_sr` / `delay_since_last_sr`. 4 round-trip /
+  validation tests cover the happy path, wrong PT, lying RC.
+- **Bridge emitter now embeds a Report Block** in each outgoing SR
+  describing what the engine *received* from the peer of the
+  current direction. When no inbound packets have been observed
+  yet (fresh bridge), the emitter still emits a bare SR (`RC=0`)
+  rather than burning cycles building an empty RB.
+- **`spawn_rr_listener`** — per-direction RTCP listener that reads
+  incoming RR packets, parses them, logs the peer's loss / jitter
+  numbers at debug level. Hooking the values back into
+  `StreamStats` (for `last_sr` / DLSR) is deferred — needs the
+  cumulative-lost counter wired on the emitter side first.
+
+### Bug-check notes
+
+- Fuzz found nothing new after the v0.13.1 dedupe-eviction fix.
+- Rate limiter defense protects against the saturation scenario
+  observed during the sipp perf run (2000 cps burst → OS socket
+  buffer overflow). With a 50 rps / 100 burst limit the attacker
+  gets 100 datagrams, then silence.
+
 ## [0.13.1] - 2026-04-20
 
 ### Fixed — UAS dedupe-eviction deadlock
