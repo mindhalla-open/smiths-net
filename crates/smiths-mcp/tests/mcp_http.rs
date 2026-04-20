@@ -34,10 +34,8 @@ impl MediaFabric for NullMedia {
     }
     async fn bridge(
         &self,
-        _: EndpointId,
-        _: std::net::SocketAddr,
-        _: EndpointId,
-        _: std::net::SocketAddr,
+        _: smiths_core::BridgeLeg,
+        _: smiths_core::BridgeLeg,
     ) -> Result<BridgeId, MediaError> {
         Err(MediaError::PortExhausted("null".into()))
     }

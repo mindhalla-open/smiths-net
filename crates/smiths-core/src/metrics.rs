@@ -86,6 +86,15 @@ pub struct Metrics {
     pub dialogs_active: Gauge,
     /// Number of active UDP bridges the media fabric is running.
     pub bridges_active: Gauge,
+    /// Server-side SIP transactions currently held by the
+    /// `TransactionDriver`. Each inbound non-ACK request registers
+    /// one FSM entry that lives until its method-appropriate absorb
+    /// timer fires (J for non-INVITE, I/H/`2xx-bypass` for INVITE).
+    /// Under normal load this approximates "active server
+    /// transactions"; under adversarial traffic it's the closest
+    /// signal we have to "dedupe table pressure" now that the
+    /// LRU-capped `DashMap` is gone.
+    pub sip_server_txns_active: Gauge,
     /// RTP packets the bridge forwarded (post-SSRC-rewrite), keyed
     /// by direction.
     pub rtp_packets_forwarded: Family<RtpDirLabel, Counter>,
@@ -114,6 +123,7 @@ impl Metrics {
         let sip_parse_errors = Counter::default();
         let dialogs_active = Gauge::default();
         let bridges_active = Gauge::default();
+        let sip_server_txns_active = Gauge::default();
         let rtp_packets_forwarded = Family::<RtpDirLabel, Counter>::default();
         let rtcp_sr_sent = Counter::default();
         let tool_invocations = Family::<ToolOutcomeLabel, Counter>::default();
@@ -144,6 +154,13 @@ impl Metrics {
             "media_bridges_active",
             "Currently-live media bridges",
             bridges_active.clone(),
+        );
+        registry.register(
+            "sip_server_txns_active",
+            "Server-side SIP transaction FSM entries currently held by \
+             the driver (per-branch, live until the method-appropriate \
+             absorb timer fires).",
+            sip_server_txns_active.clone(),
         );
         registry.register(
             "rtp_packets_forwarded",
@@ -187,6 +204,7 @@ impl Metrics {
             sip_parse_errors,
             dialogs_active,
             bridges_active,
+            sip_server_txns_active,
             rtp_packets_forwarded,
             rtcp_sr_sent,
             tool_invocations,

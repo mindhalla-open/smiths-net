@@ -20,6 +20,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::sdp::SrtpKeys;
+
 /// Opaque handle to an engine-allocated media endpoint.
 ///
 /// Issued by [`MediaFabric::allocate`]; retained by the Call FSM / UAS
@@ -213,6 +215,45 @@ pub trait SrtpTransform: Send + Sync {
     fn unprotect_rtp(&self, ciphertext: &[u8]) -> Result<Vec<u8>, SrtpError>;
 }
 
+/// One side of a bridge request.
+///
+/// Split out from the previous 4-arg `bridge(a, peer_a, b, peer_b)`
+/// signature so the two newly optional pieces — per-leg SRTP keying
+/// material today, per-leg codec transcoding later — can be added
+/// without inflating the argument list.
+#[derive(Clone, Debug)]
+pub struct BridgeLeg {
+    /// Local endpoint (previously allocated via [`MediaFabric::allocate`]).
+    pub endpoint: EndpointId,
+    /// Address of the remote peer for this leg (RTP). Derived from the
+    /// offer/answer exchange.
+    pub peer: SocketAddr,
+    /// SRTP keys to apply on this leg. `None` = plain RTP passthrough.
+    pub srtp: Option<SrtpKeys>,
+}
+
+impl BridgeLeg {
+    /// Construct a plain-RTP leg (no SRTP).
+    #[must_use]
+    pub const fn plain(endpoint: EndpointId, peer: SocketAddr) -> Self {
+        Self {
+            endpoint,
+            peer,
+            srtp: None,
+        }
+    }
+
+    /// Construct an SRTP-protected leg.
+    #[must_use]
+    pub const fn with_srtp(endpoint: EndpointId, peer: SocketAddr, srtp: SrtpKeys) -> Self {
+        Self {
+            endpoint,
+            peer,
+            srtp: Some(srtp),
+        }
+    }
+}
+
 /// Errors surfaced by [`MediaFabric`] operations.
 #[derive(Debug, Error)]
 pub enum MediaError {
@@ -246,16 +287,15 @@ pub trait MediaFabric: Send + Sync {
     /// [`EndpointId`] wrapped in an [`MediaEndpoint`] capability.
     async fn allocate(&self, bind_ip: IpAddr) -> Result<Arc<dyn MediaEndpoint>, MediaError>;
 
-    /// Start forwarding bytes between two endpoints. Each endpoint's
-    /// `peer_*` is the remote RTP address learned from SDP. Returns a
-    /// [`BridgeId`]; drop via [`MediaFabric::release_bridge`].
-    async fn bridge(
-        &self,
-        a: EndpointId,
-        peer_a: SocketAddr,
-        b: EndpointId,
-        peer_b: SocketAddr,
-    ) -> Result<BridgeId, MediaError>;
+    /// Start forwarding bytes between two endpoints. Each [`BridgeLeg`]
+    /// carries the local endpoint, the remote RTP address learned from
+    /// SDP, and optional SRTP keying material. Returns a [`BridgeId`];
+    /// drop via [`MediaFabric::release_bridge`].
+    ///
+    /// Passing `srtp = Some(_)` on one leg and `None` on the other is
+    /// legal — the fabric encrypts/decrypts only where keys are
+    /// present (useful for half-SRTP gateway scenarios).
+    async fn bridge(&self, a: BridgeLeg, b: BridgeLeg) -> Result<BridgeId, MediaError>;
 
     /// Stop a bridge and drop its forwarder tasks. No-op if `id` is
     /// unknown (e.g. already released by the paired side).

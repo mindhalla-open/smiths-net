@@ -29,3 +29,38 @@ transports = ["udp"]
 # Grace period (seconds) to finish in-flight transactions on shutdown.
 drain_timeout_secs = 10
 
+[plugins]
+# Directory the loader scans at startup. Each subdirectory with a
+# `plugin.toml` becomes one sidecar or WASM plugin. Defaults to
+# "plugins" (relative to cwd).
+dir = "plugins"
+
+# Sidecar sandbox (v0.23.0). Every field is optional; omit or set to
+# the default to leave that knob at "inherit". All are applied in the
+# forked child right before `execve`, so limits are enforced by the
+# kernel from the plugin's first instruction onward.
+#
+# Prod deployments should enable these; dev / tests can leave them
+# empty (the default).
+#
+# Seccomp-BPF filtering and user-namespace isolation are tracked as a
+# separate follow-on slice — out of scope for this section.
+[plugins.sandbox]
+# RLIMIT_NOFILE — max open file descriptors.
+# max_fds = 256
+
+# RLIMIT_AS in bytes — virtual-memory ceiling (best portable memory cap).
+# max_memory_bytes = 536870912    # 512 MiB
+
+# RLIMIT_CPU in seconds — kernel SIGXCPUs the child on overrun.
+# max_cpu_seconds = 60
+
+# RLIMIT_NPROC — additional processes the plugin can spawn.
+# Set to 0 to forbid fork()/exec() from the plugin entirely.
+# max_processes = 0
+
+# Linux only: prctl(PR_SET_NO_NEW_PRIVS, 1) — blocks privilege
+# escalation via setuid binaries / file capabilities. Silently
+# skipped on macOS / BSD.
+# no_new_privs = true
+

@@ -5,6 +5,291 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] - 2026-04-20
+
+### Added — sidecar resource sandboxing (closes roadmap item 8, MVP scope)
+
+Sidecar plugins now spawn under a `SandboxConfig` that the operator
+controls through `[plugins.sandbox]` in TOML. Limits apply via a
+`pre_exec` closure in the forked child right before `execve`, so
+the kernel enforces them from the plugin's first instruction.
+
+- **`smiths_core::SandboxConfig`** — per-sidecar knobs:
+  `max_fds` (`RLIMIT_NOFILE`), `max_memory_bytes` (`RLIMIT_AS`),
+  `max_cpu_seconds` (`RLIMIT_CPU`), `max_processes` (`RLIMIT_NPROC`;
+  set `0` to forbid `fork`/`exec` from the plugin entirely), and
+  `no_new_privs` (Linux `PR_SET_NO_NEW_PRIVS`, silently skipped
+  elsewhere).
+- **`smiths_sidecar::sandbox::apply_in_child`** — async-signal-safe
+  application via the `rustix` crate. No libc unsafe blocks; the
+  workspace lint relaxed from `unsafe_code = "forbid"` to `"deny"`
+  so the one necessary `CommandExt::pre_exec` call can carry a
+  narrowly-scoped `#[allow(unsafe_code)]` with a justification
+  comment. Every other crate stays unsafe-free.
+- **`Sidecar::spawn_with(name, dir, entry, policy, sandbox)`** —
+  new primary spawn entry point. `Sidecar::spawn` +
+  `Sidecar::spawn_with_policy` retained as convenience wrappers
+  (both thread `SandboxConfig::default()` — permissive).
+- **`LoaderOpts::sandbox`** field — CLI plumbs
+  `config.plugins.sandbox` through the loader so every loaded
+  plugin inherits the same caps. Includes supervisor-driven
+  respawns after crashes (rlimit is re-applied per spawn).
+- **Integration test**: `sandbox_rlimit_nofile_is_applied_to_child`
+  spawns a bash script that echoes `ulimit -n` back over JSON-RPC
+  and verifies the child observes exactly the configured value.
+
+### What's explicitly out of scope for this slice
+
+- **seccomp-BPF syscall filtering** — its correctness is bound to
+  the plugin's runtime (tokio, Python, etc.), so it needs its own
+  curation pass and config surface. Tracked as a separate slice.
+- **User-namespace isolation / cgroups** — same story, significantly
+  bigger, deserves its own plan.
+- **macOS `sandbox-exec`** — deprecated Apple API; not worth wiring
+  given the current dev-primary role of macOS.
+
+This satisfies roadmap item 8 (MVP sandboxing — FD / memory / CPU /
+process caps + privilege-escalation gate); hardened-seccomp +
+namespaces move to the "hardening follow-on" list.
+
+### Changed
+
+- Workspace lint `unsafe_code = "forbid"` → `"deny"`. The sole
+  narrow exception is documented at the `pre_exec` call site in
+  `smiths-sidecar::supervisor`.
+- `examples/config.toml` gained a documented `[plugins.sandbox]`
+  section with every knob commented out at conservative defaults
+  so operators can uncomment and deploy.
+
+## [0.22.0] - 2026-04-20
+
+### Changed — UAS INVITE path migrated onto the server transaction FSM
+
+Closes the UAS FSM migration started in v0.21.0. Every inbound
+request the UAS responds to — INVITE included — now lives as a
+`ServerInviteTxn` or `ServerNonInviteTxn` entry in the driver.
+Retransmit replay, G/H/I timer arming, ACK-for-non-2xx transitions,
+and 2xx bypass are all FSM-driven. The legacy `dedupe` `DashMap` is
+gone as a general-purpose cache.
+
+- **`ServerInviteTxn` + ACK correlation**: INVITE registers a server
+  FSM on arrival; the handler's `send_provisional` (100 Trying) and
+  `respond` (2xx / 401 / 488 / …) both route through
+  `driver.send_response(...)`. Non-2xx transitions the FSM to
+  Completed (G + H armed). The ACK for a non-2xx carries the
+  INVITE's branch per §17.1.1.3 — `handle_ack` now delivers it to
+  the INVITE FSM for the Completed → Confirmed transition + timer I.
+- **`invite_2xx_cache`** (narrow replacement for `dedupe`): RFC 3261
+  §13.3.1.4 gives the Transaction User ownership of 2xx retransmit
+  so the FSM bypasses straight to Terminated on 2xx send. Until the
+  UAS grows a per-dialog 2xx retransmit loop, a small branch-keyed
+  cache parks the 2xx bytes for simple peer-retry replay. Keeps the
+  4096-entry LRU cap + shard-scoped eviction (v0.13.1 pattern).
+- Existing integration tests (`invite_retransmit_replays_same_200`,
+  `invite_401_cancel`, `invite_establishes_dialog_ack_then_bye`,
+  `dedupe_eviction.rs`) all pass unchanged through the new path —
+  that is the regression contract for the migration.
+
+### Added — `sip_server_txns_active` Prometheus gauge
+
+`TransactionDriver::with_metrics` wires an `Arc<Metrics>` handle
+into the driver; `start_server` / terminate keep the
+`sip_server_txns_active` gauge in sync. The UAS's `with_metrics`
+builder now rebuilds the driver with the shared handle so
+operators see live FSM entry counts on `/metrics` — replaces the
+visibility the old LRU-capped `dedupe` table provided, now that
+the FSM table has no cap. New unit test
+`metrics_gauge_tracks_server_txn_lifecycle` covers the inc/dec.
+
+### Added — `clippy::unwrap_used` on smiths-core + smiths-sdp
+
+Both crates have zero production-code unwraps / expects (every use
+is inside `#[cfg(test)]` mods). Promoted via crate-level
+`#![warn(clippy::unwrap_used, clippy::expect_used)]` +
+`#![cfg_attr(test, allow(...))]` in each `lib.rs` — Cargo 1.74+
+doesn't permit mixing `[lints] workspace = true` with
+`[lints.clippy]` overrides, so the crate-level-attr pattern is
+the idiomatic per-package route.
+
+### Added — `sdes_crypto` fuzz target
+
+New `fuzz/fuzz_targets/sdes_crypto.rs` drives `SdesCrypto::parse`
++ `SessionDescription::parse` with adversarial bytes. Matches the
+existing `sip_parser` target's shape. Run via
+`cargo +nightly fuzz run sdes_crypto`.
+
+## [0.21.0] - 2026-04-20
+
+### Changed — UAS non-INVITE path migrated onto the server transaction FSM
+
+Every non-INVITE request the UAS actually responds to — OPTIONS,
+BYE, REGISTER, CANCEL, unknown-method 405s — now registers a
+`ServerNonInviteTxn` in the shared `TransactionDriver` on first
+arrival. Response bytes flow through `driver.send_response(...)`;
+the FSM caches the last response in its `last_response` field and
+arms timer J. Retransmits of the same request route to
+`driver.deliver_request(...)`, which replays the cached response
+via the FSM.
+
+- **Replaces the legacy `dedupe` `DashMap` path for non-INVITE**,
+  keeping the deadlock-fix semantics (v0.13.1) but eliminating the
+  need for a capacity-bound LRU scan entirely — the FSM's timer J
+  is wall-clock-driven (`64 · T1 = 32 s`).
+- **INVITE + ACK still use `dedupe`**. INVITE's server FSM needs
+  ACK correlation + G/H/I retransmit timers, which is its own
+  slice. ACK never elicits a response, so neither path matters.
+- `UasServer` gained a `txn_driver: TransactionDriver<T>` field
+  constructed alongside the existing transport. Same transport is
+  shared with the UAC's driver; the server driver maintains its
+  own transaction table keyed by `(branch, method, Server)`.
+- Existing integration tests (`retransmission_replays_cached_response`,
+  all REGISTER / BYE / OPTIONS / auth scenarios) pass unchanged
+  through the new path — that is the regression test.
+- New helper `is_fsm_candidate(method)` keeps the split explicit at
+  every call site so the follow-on INVITE migration is a one-line
+  change.
+
+### Added — MCP stdio binary smoke test
+
+`crates/smiths-cli/tests/mcp_stdio.rs` — spawns the real
+`smiths-net` binary with `--mcp stdio`, drives JSON-RPC over stdin,
+verifies:
+
+- `initialize` returns our server name + protocol version + the
+  tools / resources capability block.
+- `tools/list` enumerates the canonical in-box tool set.
+- `tools/call health` returns `{"status":"ok"}` with a numeric
+  `uptime_secs`.
+- Closing stdin triggers a clean exit (CLI honors stdin-EOF).
+
+Closes the last Phase 5 pending item (`docs/plans/todo.md`).
+
+### Added — workspace lint tightening (phase-6 hardening, first slice)
+
+Five prospective `clippy::...` lints promoted to `warn` at the
+workspace level. Zero current fires, so this is pure forward
+protection — future PRs that sneak in debug artifacts get caught
+by CI:
+
+- `clippy::dbg_macro`
+- `clippy::print_stdout`
+- `clippy::print_stderr`
+- `clippy::todo`
+- `clippy::unimplemented` (test fakes in
+  `crates/smiths-wasm/tests/engine.rs` get a crate-local
+  `#![allow(...)]` — that's the idiomatic "shouldn't be hit"
+  marker in test doubles.)
+
+`clippy::unwrap_used` / `missing_docs` from the original Phase 6
+plan are deferred — each needs a dedicated slice to avoid a
+262-fire cliff across src/ + integration tests.
+
+### Maintenance
+
+- `rand` dep bumped `0.9 → 0.10.1` (workspace-transitively; the
+  one direct use in `smiths-sdp::negotiate::fresh_sdes_key`
+  migrated from `RngCore::fill_bytes` to `Rng::fill_bytes` per the
+  new trait split).
+- `wasmtime` bumped `43 → 44.0.0`.
+
+## [0.20.0] - 2026-04-20
+
+### Added — SDES negotiator wiring end-to-end
+
+SRTP SDES (`AES_CM_128_HMAC_SHA1_80`) now flows end-to-end through
+the SDP offer/answer exchange. Before this release, the SRTP
+transforms existed in `smiths-media` but bridges had to be
+instantiated with manually-injected key material; from now on, a UAS
+that receives an `RTP/SAVP` INVITE with `a=crypto:` responds with a
+matching `a=crypto:` line carrying an engine-generated key, and the
+media fabric wires per-direction transforms on the resulting bridge
+automatically.
+
+- **`smiths-core::sdp::SrtpKeys`** — new struct carrying the peer's
+  advertised key + the engine's chosen answer key + the cipher suite.
+  `NegotiationOutcome::Accepted` gained an `srtp: Option<SrtpKeys>`
+  field. `Debug` is hand-written to redact key bytes (log-safe).
+- **`smiths-core::media::BridgeLeg`** — new spec struct used by
+  `MediaFabric::bridge`. Replaces the prior 4-arg
+  `bridge(a, peer_a, b, peer_b)` signature with
+  `bridge(a: BridgeLeg, b: BridgeLeg)` where each leg optionally
+  carries SRTP keys. Constructors `BridgeLeg::plain` +
+  `BridgeLeg::with_srtp`.
+- **`smiths-sdp::MediaDescription::crypto`** — parses + serializes
+  `a=crypto:` lines. `a=crypto:` parse errors on one line are soft
+  (logged + skipped), so a single bad line doesn't kill the whole
+  SDP document.
+- **`smiths-sdp::Negotiator::answer`** — detects `RTP/SAVP` + any
+  supported `a=crypto:`, generates an engine key via
+  `fresh_sdes_key()` (CSPRNG), emits the matching answer line, and
+  returns `NegotiationResult::Answer { sdp, srtp }`. `RTP/SAVP`
+  without acceptable crypto → `Mismatch` (RFC 4568 §5.1.2 no
+  plaintext downgrade).
+- **`smiths-sip::uas`** — threads `SrtpKeys` from the negotiator
+  outcome into `PendingLeg`, then into the `BridgeLeg` spec passed
+  to `MediaFabric::bridge` on rendezvous pairing. Plain-RTP calls
+  keep their prior zero-crypto path.
+- **`smiths-media::UdpMediaFabric::bridge`** — materializes each
+  leg's `SrtpKeys` into `AesCmHmacSha1_80Transform` instances and
+  attaches them to `LegSrtp` on the bridge.
+- New workspace dep `rand = "0.9"` (direct use: engine-side SDES key
+  generation only).
+
+### Added — `codec_mismatch` integration coverage (`tests/codec_mismatch.rs`)
+
+Four richer SDP-offer shapes the UAS must reject with 488:
+- Multiple unknown codecs at three different clock rates in one
+  offer (guards against a regression where the first PT number
+  matched regardless of codec name).
+- Video-only offer (engine is audio-only).
+- `RTP/SAVP` with a supported codec but **no** `a=crypto:` line
+  (RFC 4568 §5.1.2 — must not downgrade to plaintext).
+- `RTP/SAVP` with `a=crypto:` advertising a suite we don't support
+  (`AES_256_GCM`).
+
+All four also confirm `100 Trying` still fires before the 488, so
+provisional behavior doesn't regress under the negotiator refactor.
+
+### Added — SRTP end-to-end integration test (`tests/sdp_srtp.rs`)
+
+Two fake UAs rendezvous on a `sip:<key>@engine` with `RTP/SAVP` +
+`a=crypto:`. The engine answers each with an engine-chosen crypto
+line, pairs the legs, and wires SRTP transforms. UA-A encrypts an
+RTP packet with its offer key; UA-B receives ciphertext and decrypts
+it with the key the engine advertised in UA-B's 200 OK. Confirms:
+
+- Engine never echoes either UA's offer key as its own answer key
+  (no leaked peer secret).
+- Bridge SSRC rewrite still fires on the SRTP path.
+- End-to-end payload round-trip.
+
+### Changed — `MediaFabric::bridge` trait signature
+
+Moved from `bridge(a, peer_a, b, peer_b)` to
+`bridge(a: BridgeLeg, b: BridgeLeg)`. Every in-tree caller migrated;
+external trait implementers need to update their `bridge` signature
+and import `smiths_core::BridgeLeg`.
+
+### Docs
+
+- `docs/architecture/03-mcp-and-ops.md` — rewritten MCP section to
+  reflect the actual three-transport surface (stdio, HTTP, SSE) +
+  the A2A HTTP adapter, the shipped tool + resource sets, SSE
+  notification stream, and bearer/rate-limit/audit posture. Closes
+  the Phase 5 pending item.
+
+### Roadmap tidy-up
+
+Two items in `.vscode/prod-readiness-roadmap.md` were already done
+but still listed as pending:
+
+- **Loss-% tracking on the sender side** — v0.15.0 landed
+  `StreamStats` cumulative-loss tracking; RR blocks now carry real
+  numbers.
+- **sipp perf validation** — v0.13.0 ran it; found + fixed the
+  dedupe-eviction deadlock (v0.13.1); the engine now sustains
+  ~10 k cps REGISTER on loopback.
+
 ## [0.19.0] - 2026-04-19
 
 ### Added — Transaction FSM slice 5 (final)

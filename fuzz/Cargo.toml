@@ -11,11 +11,20 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 rsip          = "0.4"
+smiths-sdp    = { path = "../crates/smiths-sdp" }
 smiths-sip    = { path = "../crates/smiths-sip" }
 
 [[bin]]
 name              = "sip_parser"
 path              = "fuzz_targets/sip_parser.rs"
+test              = false
+doc               = false
+bench             = false
+doctest           = false
+
+[[bin]]
+name              = "sdes_crypto"
+path              = "fuzz_targets/sdes_crypto.rs"
 test              = false
 doc               = false
 bench             = false

@@ -6,11 +6,18 @@ exclude  = ["fuzz"]
 [workspace.package]
 edition      = "2024"
 rust-version = "1.85"
-version      = "0.19.0"
+version      = "0.23.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
-unsafe_code      = "forbid"
+# `deny` (not `forbid`) so legitimate uses of `unsafe {}` can carry a
+# crate-local `#[allow(unsafe_code)]` with a justification comment.
+# Today the only such callsite is `smiths-sidecar`'s sandbox-attach
+# path, which must invoke `CommandExt::pre_exec` (an `unsafe fn` in
+# std with no safe alternative short of shipping a second binary).
+# Every other crate is still unsafe-free by policy — the lint fires
+# at `warn`+`deny` unless a file explicitly allows.
+unsafe_code      = "deny"
 unreachable_pub  = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
 
@@ -20,6 +27,17 @@ multiple_crate_versions = "allow"
 module_name_repetitions = "allow"
 missing_errors_doc      = "allow"
 missing_panics_doc      = "allow"
+
+# --- Prospective hardening (v0.21.0) ---
+# Zero current fires workspace-wide — enforce going forward so stray
+# debug prints, `todo!`s, or `dbg!` macros can't land unnoticed.
+# `unwrap_used` / `missing_docs` are the big-ticket items from the
+# Phase 6 hardening list; they're tracked for a dedicated slice.
+dbg_macro     = "warn"
+print_stdout  = "warn"
+print_stderr  = "warn"
+todo          = "warn"
+unimplemented = "warn"
 
 [workspace.dependencies]
 # async runtime
@@ -57,7 +75,7 @@ sha2    = "0.11.0"
 hex     = "0.4"
 
 # WASM host
-wasmtime = { version = "43", default-features = false, features = ["cranelift", "runtime"] }
+wasmtime = { version = "44.0.0", default-features = false, features = ["cranelift", "runtime"] }
 wat      = "1"
 
 # Wire schema (prost without build.rs — derives only)
@@ -70,6 +88,14 @@ notify = "8.2.0"
 # SRTP (built-in, not a plugin — per-packet crypto on the bridge hot
 # path). Pure Rust, no libsrtp FFI, MIT/Apache-2.0.
 webrtc-srtp = "0.17"
+
+# CSPRNG — engine-side SDES key generation.
+rand = "0.10.1"
+
+# POSIX syscall wrappers used in sidecar sandboxing (`setrlimit`,
+# Linux `prctl(PR_SET_NO_NEW_PRIVS)`). Pure-Rust wrappers so we
+# keep `unsafe_code = "forbid"` at the workspace level.
+rustix = { version = "1.1", features = ["process", "thread"] }
 
 # TLS
 rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

@@ -32,11 +32,14 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use smiths_core::Metrics;
+
 use crate::response_router::ResponseRouter;
 use crate::transport::Transport;
 
 use super::{
-    TimerId, Transaction, TransactionAction, TransactionEvent, TransactionKey, TransactionState,
+    Role, TimerId, Transaction, TransactionAction, TransactionEvent, TransactionKey,
+    TransactionState,
 };
 
 /// Event delivered from a transaction to its Transaction User.
@@ -85,6 +88,12 @@ struct Inner<T: Transport> {
     transport: Arc<T>,
     router: Arc<ResponseRouter>,
     txns: DashMap<TransactionKey, Arc<TxnEntry>>,
+    /// Optional metrics handle. When present, the driver increments
+    /// `sip_server_txns_active` on server-FSM registration and
+    /// decrements it on termination. Client-side FSMs aren't
+    /// counted — they live for the call's own timeout window and
+    /// aren't a pressure signal.
+    metrics: Option<Arc<Metrics>>,
 }
 
 /// One live transaction's runtime state. The FSM itself lives behind
@@ -108,6 +117,15 @@ struct TxnEntry {
     /// Per-txn cancellation — flipped on Terminated so any in-flight
     /// timer tasks bow out before calling back into the driver.
     cancel: CancellationToken,
+    /// Serializes per-txn wire sends. Each `spawn_send` task acquires
+    /// this before calling `transport.send`, so two FSM actions fired
+    /// in rapid succession (e.g. 100 Trying followed by 200 OK on the
+    /// same INVITE) reach the peer in the order the FSM emitted them.
+    /// Without this, both sends were fire-and-forget tokio tasks on
+    /// the multi-thread runtime and could race to the socket —
+    /// `drain.rs`'s `non_draining_uas_still_accepts_invite` caught
+    /// that regression before users would.
+    send_serialize: tokio::sync::Mutex<()>,
 }
 
 impl<T: Transport> TransactionDriver<T> {
@@ -121,8 +139,23 @@ impl<T: Transport> TransactionDriver<T> {
                 transport,
                 router,
                 txns: DashMap::new(),
+                metrics: None,
             }),
         }
+    }
+
+    /// Builder: attach a metrics handle. With this set, the driver
+    /// maintains the `sip_server_txns_active` gauge across
+    /// [`Self::start_server`] / terminate. Without it (tests), the
+    /// driver runs silently.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        // Cheap: `self.inner` is `Arc`-backed, but we only mutate at
+        // construction time so the `Arc::get_mut` is guaranteed.
+        Arc::get_mut(&mut self.inner)
+            .expect("with_metrics must be called before the driver is shared")
+            .metrics = Some(metrics);
+        self
     }
 
     /// Number of currently-live transactions — diagnostic / tests.
@@ -155,6 +188,7 @@ impl<T: Transport> TransactionDriver<T> {
             tu_tx,
             listener: Mutex::new(None),
             cancel: CancellationToken::new(),
+            send_serialize: tokio::sync::Mutex::new(()),
         });
         self.inner.txns.insert(key.clone(), Arc::clone(&entry));
 
@@ -218,8 +252,12 @@ impl<T: Transport> TransactionDriver<T> {
             tu_tx,
             listener: Mutex::new(None),
             cancel: CancellationToken::new(),
+            send_serialize: tokio::sync::Mutex::new(()),
         });
         self.inner.txns.insert(key, Arc::clone(&entry));
+        if let Some(m) = &self.inner.metrics {
+            m.sip_server_txns_active.inc();
+        }
         tu_rx
     }
 
@@ -305,7 +343,7 @@ impl<T: Transport> TransactionDriver<T> {
         for action in actions {
             match action {
                 TransactionAction::SendToPeer(bytes) => {
-                    self.spawn_send(bytes, entry.peer);
+                    self.spawn_send(entry, bytes);
                 }
                 TransactionAction::DeliverResponseToTu { status, bytes } => {
                     let _ = entry.tu_tx.send(TuEvent::Response { status, bytes });
@@ -323,9 +361,18 @@ impl<T: Transport> TransactionDriver<T> {
         }
     }
 
-    fn spawn_send(&self, bytes: Bytes, peer: SocketAddr) {
+    /// Spawn a per-txn send task. Every send on the same transaction
+    /// acquires the entry's `send_serialize` mutex first, so two FSM
+    /// actions fired back-to-back (e.g. 100 Trying + 200 OK on the
+    /// same INVITE) reach the wire in FSM-emit order. Tokio's
+    /// `Mutex` is FIFO so the queued ordering is preserved even on
+    /// multi-thread runtimes.
+    fn spawn_send(&self, entry: &Arc<TxnEntry>, bytes: Bytes) {
         let transport = Arc::clone(&self.inner.transport);
+        let entry = Arc::clone(entry);
+        let peer = entry.peer;
         tokio::spawn(async move {
+            let _guard = entry.send_serialize.lock().await;
             if let Err(e) = transport.send(bytes, peer).await {
                 warn!(%peer, ?e, "transaction driver: transport send failed");
             }
@@ -393,7 +440,17 @@ impl<T: Transport> TransactionDriver<T> {
         if let Some(h) = entry.listener.lock().expect("listener mutex").take() {
             h.abort();
         }
-        self.inner.txns.remove(key);
+        let removed = self.inner.txns.remove(key).is_some();
+        // Only decrement for server-side entries (see `with_metrics`
+        // rationale) and only when the remove actually landed — a
+        // double-terminate from two racing action batches could
+        // otherwise send the gauge negative.
+        if removed
+            && key.role == Role::Server
+            && let Some(m) = &self.inner.metrics
+        {
+            m.sip_server_txns_active.dec();
+        }
         let _ = entry.tu_tx.send(TuEvent::Terminated);
     }
 
@@ -613,6 +670,49 @@ mod tests {
                 .expect("replay never arrived")
                 .unwrap();
         assert!(buf[..n].starts_with(b"SIP/2.0 404"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metrics_gauge_tracks_server_txn_lifecycle() {
+        use crate::txn::ServerNonInviteTxn;
+
+        let (engine_transport, _engine_addr) = bound_udp().await;
+        let (_peer_sock, peer_addr) = bound_peer().await;
+
+        // Noop `Metrics` has a real `sip_server_txns_active` gauge —
+        // it just isn't registered on the engine's `/metrics`
+        // registry. Tests inspect the handle directly.
+        let metrics = Metrics::noop();
+        let router = Arc::new(ResponseRouter::new());
+        let driver = TransactionDriver::new(engine_transport.clone(), Arc::clone(&router))
+            .with_metrics(Arc::clone(&metrics));
+
+        assert_eq!(metrics.sip_server_txns_active.get(), 0);
+
+        let branch = "z9hG4bK-metric-1".to_string();
+        let txn = ServerNonInviteTxn::new(branch.clone(), "OPTIONS");
+        let key = txn.key().clone();
+        let _tu_rx = driver.start_server(Box::new(txn), peer_addr);
+
+        assert_eq!(
+            metrics.sip_server_txns_active.get(),
+            1,
+            "start_server must inc the gauge"
+        );
+
+        // Drive the FSM to Terminated: send a final, then fire timer J.
+        driver.send_response(&key, 200, Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"));
+        driver.fire_timer(&key, TimerId::J);
+
+        assert!(
+            !driver.is_alive(&key),
+            "FSM should be terminated after timer J"
+        );
+        assert_eq!(
+            metrics.sip_server_txns_active.get(),
+            0,
+            "terminate must dec the gauge"
+        );
     }
 
     #[test]

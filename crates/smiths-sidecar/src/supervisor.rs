@@ -14,8 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use smiths_core::Metrics;
 use smiths_core::metrics::PluginLabel;
+use smiths_core::{Metrics, SandboxConfig};
+
+use crate::sandbox;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -132,6 +134,10 @@ struct Inner {
     plugin_dir: PathBuf,
     entry: PathBuf,
     policy: RestartPolicy,
+    /// Resource-limit sandbox applied on every spawn (including
+    /// respawns). Default = permissive, so tests and single-shot
+    /// sidecars see no change.
+    sandbox: SandboxConfig,
     /// Flipped by `shutdown` so the supervisor stops respawning.
     shutdown: CancellationToken,
     /// Supervisor task handle. Owned so `shutdown` can `await` it.
@@ -154,23 +160,45 @@ impl std::fmt::Debug for Inner {
 }
 
 impl Sidecar {
-    /// Spawn with the default [`RestartPolicy`].
+    /// Spawn with the default [`RestartPolicy`] and no sandbox.
     pub async fn spawn(
         name: impl Into<String>,
         plugin_dir: &Path,
         entry: &Path,
     ) -> Result<Self, Error> {
-        Self::spawn_with_policy(name, plugin_dir, entry, RestartPolicy::default()).await
+        Self::spawn_with(
+            name,
+            plugin_dir,
+            entry,
+            RestartPolicy::default(),
+            SandboxConfig::default(),
+        )
+        .await
     }
 
-    /// Spawn with an explicit restart policy. `RestartPolicy::no_restart()`
-    /// is the suicide-on-crash behaviour used by the original tests.
-    #[instrument(skip_all, fields(dir = %plugin_dir.display(), entry = %entry.display()))]
+    /// Spawn with an explicit restart policy and the default (empty)
+    /// sandbox. Kept for backward compatibility with callers that
+    /// don't care about resource caps.
     pub async fn spawn_with_policy(
         name: impl Into<String>,
         plugin_dir: &Path,
         entry: &Path,
         policy: RestartPolicy,
+    ) -> Result<Self, Error> {
+        Self::spawn_with(name, plugin_dir, entry, policy, SandboxConfig::default()).await
+    }
+
+    /// Spawn with an explicit restart policy + sandbox. The sandbox
+    /// applies to this spawn and every supervisor-driven respawn.
+    /// `RestartPolicy::no_restart()` + `SandboxConfig::default()` is
+    /// equivalent to the pre-sandboxing behaviour.
+    #[instrument(skip_all, fields(dir = %plugin_dir.display(), entry = %entry.display()))]
+    pub async fn spawn_with(
+        name: impl Into<String>,
+        plugin_dir: &Path,
+        entry: &Path,
+        policy: RestartPolicy,
+        sandbox: SandboxConfig,
     ) -> Result<Self, Error> {
         let name: String = name.into();
         let entry_abs = canonical_entry(plugin_dir, entry)?;
@@ -187,6 +215,7 @@ impl Sidecar {
             plugin_dir: plugin_dir_abs,
             entry: entry_abs,
             policy,
+            sandbox,
             shutdown: CancellationToken::new(),
             supervisor: Mutex::new(None),
             metrics: OnceLock::new(),
@@ -473,6 +502,27 @@ async fn spawn_once(inner: &Inner) -> Result<(Child, ChildStdin, ChildStdout, Ch
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+
+    // Unix: attach the sandbox via `pre_exec`. The closure runs in
+    // the forked child immediately before `execve` and must be
+    // async-signal-safe — every syscall goes through `rustix` (no
+    // allocator touches, no heap strings in the error path), which
+    // is why we can uphold that contract without libc unsafe code.
+    //
+    // `tokio::process::Command::pre_exec` is itself `unsafe fn` — the
+    // workspace lint is `deny`, not `forbid`, so we carry a scoped
+    // `#[allow(unsafe_code)]` here with this justification comment.
+    // The allow stays intentionally narrow: this is the only spot in
+    // the codebase that touches `unsafe`.
+    #[cfg(unix)]
+    {
+        let sandbox_cfg = inner.sandbox;
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(move || sandbox::apply_in_child(&sandbox_cfg));
+        }
+    }
+
     let mut child = cmd.spawn().map_err(|e| {
         warn!(plugin = %inner.name, entry = %inner.entry.display(), ?e, "sidecar spawn failed");
         Error::Io(e)
@@ -632,6 +682,47 @@ done
             .unwrap();
         assert_eq!(out["ok"], true);
         assert_eq!(out["method"], "describe_capabilities");
+
+        sidecar.shutdown().await;
+    }
+
+    /// Sandbox test: spawn a bash script that reports its own
+    /// `RLIMIT_NOFILE` soft cap. With `max_fds` set on the sandbox,
+    /// the pre-exec closure calls `setrlimit` so the child observes
+    /// exactly the configured value — proves the rlimit actually
+    /// flows through `pre_exec` onto the target process.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandbox_rlimit_nofile_is_applied_to_child() {
+        let dir = tempdir().unwrap();
+        let script = r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p')
+  nofile=$(ulimit -n)
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"nofile":%s}}\n' "$id" "$nofile"
+done
+"#;
+        make_script(dir.path(), "ulimit.sh", script);
+
+        let sandbox = SandboxConfig {
+            max_fds: Some(64),
+            ..SandboxConfig::default()
+        };
+        let sidecar = Sidecar::spawn_with(
+            "sandbox-nofile",
+            dir.path(),
+            Path::new("./ulimit.sh"),
+            RestartPolicy::no_restart(),
+            sandbox,
+        )
+        .await
+        .unwrap();
+
+        let out = sidecar.call("check", Value::Null).await.unwrap();
+        assert_eq!(
+            out["nofile"].as_u64(),
+            Some(64),
+            "child should see RLIMIT_NOFILE=64; got: {out}"
+        );
 
         sidecar.shutdown().await;
     }

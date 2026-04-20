@@ -27,18 +27,36 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use smiths_core::metrics::{Metrics, SipCodeLabel, SipMethodLabel};
 use smiths_core::{
-    BridgeId, DialogKey, DialogRecord, DialogState, EndpointId, Event, EventBus, MediaFabric,
-    NegotiationOutcome, SdpNegotiator, SipEvent,
+    BridgeId, BridgeLeg, DialogKey, DialogRecord, DialogState, EndpointId, Event, EventBus,
+    MediaFabric, NegotiationOutcome, SdpNegotiator, SipEvent, SrtpKeys,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
 use crate::transport::{Datagram, Transport};
+use crate::txn::{
+    Role as TxnRole, ServerInviteTxn, ServerNonInviteTxn, TransactionDriver,
+    TransactionKey as TxnKey,
+};
 
-/// Bounded cache of per-branch final responses for UDP retransmission
-/// dedupe.
-const DEDUPE_CAPACITY: usize = 4096;
+/// Bounded cache of per-branch INVITE 2xx responses for retransmit
+/// replay.
+///
+/// Every other response lives in its server-side transaction FSM's
+/// `last_response` buffer (timer G / J retransmits, FSM-arbitrated
+/// replay on request retransmission). **INVITE 2xx is the exception**:
+/// RFC 3261 §13.3.1.4 gives the Transaction User ownership of 2xx
+/// retransmission, so the FSM bypasses straight to Terminated and
+/// has nothing cached. Until we grow a proper per-dialog 2xx-retransmit
+/// timer, this small cache keeps the retransmit replay path working
+/// for simple peer retries.
+///
+/// Capacity is deliberately shallow — 4096 concurrent unacked 2xx
+/// INVITEs would already mean the TU is massively behind on ACK
+/// processing. Eviction follows the same shard-scoped pattern the
+/// original `dedupe` path pioneered (the v0.13.1 deadlock fix).
+const INVITE_2XX_CACHE_CAPACITY: usize = 4096;
 
 /// First leg of a pending rendezvous bridge, waiting for a matching
 /// second `INVITE`. Holds only tokens — the socket lives in the
@@ -48,6 +66,11 @@ struct PendingLeg {
     dialog_key: DialogKey,
     endpoint: EndpointId,
     remote_media: SocketAddr,
+    /// Negotiated SRTP keys for this leg. `None` for plain-RTP calls;
+    /// `Some(_)` when the offerer advertised `RTP/SAVP` with a
+    /// supported `a=crypto:` line. Threaded into the bridge when the
+    /// matching second INVITE lands.
+    srtp: Option<SrtpKeys>,
 }
 
 /// Parsed request summary.
@@ -85,8 +108,11 @@ struct RequestSummary {
 pub struct UasServer<T: Transport> {
     transport: Arc<T>,
     bus: EventBus,
-    /// `branch` → cached final response bytes.
-    dedupe: Arc<DashMap<String, Bytes>>,
+    /// `branch` → cached INVITE 2xx response bytes. See
+    /// [`INVITE_2XX_CACHE_CAPACITY`] for why this is narrowly scoped
+    /// to 2xx INVITE only; everything else rides the server FSM's
+    /// own `last_response` slot.
+    invite_2xx_cache: Arc<DashMap<String, Bytes>>,
     /// Active + early dialog records keyed by
     /// `(Call-ID, local-tag, remote-tag)`. [`DialogRecord`] is
     /// serializable — this is the HA snapshot surface.
@@ -128,6 +154,13 @@ pub struct UasServer<T: Transport> {
     /// Per-source-IP token bucket. Always present — when config
     /// disables rate limiting it's a cheap always-allow.
     rate_limit: crate::rate_limit::SipRateLimiter,
+    /// Async driver hosting every server-side transaction — both
+    /// INVITE (`ServerInviteTxn` with G/H/I timers, ACK correlation,
+    /// 2xx bypass) and non-INVITE (`ServerNonInviteTxn` with timer J).
+    /// Retransmit replay is FSM-driven, freeing the legacy
+    /// dedupe-DashMap path entirely. The only remaining cache is
+    /// [`Self::invite_2xx_cache`] (TU-owned 2xx replay).
+    txn_driver: TransactionDriver<T>,
 }
 
 impl<T: Transport> UasServer<T> {
@@ -144,10 +177,18 @@ impl<T: Transport> UasServer<T> {
         // Contact — fine for localhost tests; the B2BUA work in later
         // phases will compute this per outbound peer.
         let contact = format!("<sip:smiths@{local}>");
+        // Server-side txn driver. A fresh `ResponseRouter` is passed
+        // in because the driver constructor requires one — server
+        // FSMs never subscribe to it (only client FSMs do). When a
+        // shared router is injected via [`Self::with_response_router`]
+        // the UAC's driver uses it for response demux; the UAS's
+        // server-side driver stays independent.
+        let router = Arc::new(crate::ResponseRouter::new());
+        let txn_driver = TransactionDriver::new(Arc::clone(&transport), router);
         Ok(Self {
             transport,
             bus,
-            dedupe: Arc::new(DashMap::new()),
+            invite_2xx_cache: Arc::new(DashMap::new()),
             dialogs: Arc::new(DashMap::new()),
             contact,
             media_fabric,
@@ -160,6 +201,7 @@ impl<T: Transport> UasServer<T> {
             response_router: None,
             drain: None,
             rate_limit: crate::rate_limit::SipRateLimiter::disabled(),
+            txn_driver,
         })
     }
 
@@ -172,8 +214,18 @@ impl<T: Transport> UasServer<T> {
 
     /// Attach a shared metrics handle. Without this, the UAS uses a
     /// throwaway registry — safe for tests, invisible to operators.
+    /// Also rebuilds the transaction driver so its
+    /// `sip_server_txns_active` gauge increments flow into the same
+    /// registry that the `/metrics` endpoint serves.
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        // Rebuild the driver with a shared metrics handle. The driver
+        // is cheap (just a fresh Arc-backed inner + DashMap), so
+        // swapping it before any inbound traffic has registered txns
+        // is fine.
+        let router = Arc::new(crate::ResponseRouter::new());
+        self.txn_driver = TransactionDriver::new(Arc::clone(&self.transport), router)
+            .with_metrics(Arc::clone(&metrics));
         self.metrics = metrics;
         self
     }
@@ -286,18 +338,52 @@ impl<T: Transport> UasServer<T> {
             call_id: req.call_id.clone(),
         }));
 
-        // Retransmission dedupe — replay the cached FINAL response.
-        // ACK carries the same branch as the INVITE it acknowledges when
-        // the final response was non-2xx (RFC 3261 §17.1.1.3); replaying
-        // the 401/4xx on top of that ACK would loop the transaction, so
-        // the dedupe path skips ACK deliberately.
-        if req.method != "ACK"
-            && let Some(branch) = req.branch.as_deref()
-            && let Some(cached) = self.dedupe.get(branch)
-        {
-            debug!(%peer, branch, "replaying cached response");
-            let _ = self.transport.send(cached.clone(), peer).await;
-            return;
+        // Server-side transaction routing. Every method the UAS
+        // responds to — INVITE / OPTIONS / BYE / REGISTER / CANCEL /
+        // unknown-405 — lives as a `ServerInviteTxn` or
+        // `ServerNonInviteTxn` in the driver. Retransmits feed into
+        // `deliver_request` so the FSM replays its cached final
+        // response; new requests register a fresh FSM entry before
+        // the handler runs, so the subsequent [`Self::respond`] call
+        // routes through `send_response`.
+        //
+        // ACK is the exception on both sides: it never gets its own
+        // transaction (RFC 3261 §17.1.1.3 makes ACK for non-2xx part
+        // of the INVITE transaction; ACK for 2xx is end-to-end per
+        // §13.3.1.4). [`Self::handle_ack`] reaches into the INVITE
+        // FSM directly for the non-2xx → Confirmed transition.
+        if let Some(branch) = req.branch.as_deref() {
+            if req.method != "ACK" {
+                let key = server_txn_key(branch, &req.method);
+                if self.txn_driver.is_alive(&key) {
+                    // Retransmit: FSM replays its cached response.
+                    debug!(%peer, branch, method = %req.method, "retransmit → server FSM");
+                    self.txn_driver
+                        .deliver_request(&key, req.method.clone(), req.raw.clone());
+                    return;
+                }
+                // INVITE 2xx retransmit path: the FSM 2xx-bypasses
+                // to Terminated, so `is_alive` is already false above.
+                // Check the narrow TU-owned cache before spinning up
+                // a duplicate INVITE handler.
+                if req.method == "INVITE"
+                    && let Some(cached) = self.invite_2xx_cache.get(branch)
+                {
+                    debug!(%peer, branch, "replaying cached INVITE 2xx");
+                    let _ = self.transport.send(cached.clone(), peer).await;
+                    return;
+                }
+                // Fresh transaction — register before the handler
+                // runs so `respond` / `send_provisional` route through
+                // `driver.send_response`.
+                if req.method == "INVITE" {
+                    let txn = ServerInviteTxn::new(branch.to_string());
+                    let _tu_rx = self.txn_driver.start_server(Box::new(txn), peer);
+                } else {
+                    let txn = ServerNonInviteTxn::new(branch.to_string(), req.method.clone());
+                    let _tu_rx = self.txn_driver.start_server(Box::new(txn), peer);
+                }
+            }
         }
 
         match req.method.as_str() {
@@ -448,7 +534,7 @@ impl<T: Transport> UasServer<T> {
         // Allocate a media endpoint first (so we can include its port
         // in the answer), then negotiate. On any failure the endpoint
         // is released so the fabric's table doesn't grow unbounded.
-        let (endpoint, sdp_answer_body, remote_media) = if has_offer {
+        let (endpoint, sdp_answer_body, remote_media, srtp_keys) = if has_offer {
             let endpoint = match self.media_fabric.allocate(self.media_bind_ip).await {
                 Ok(ep) => ep,
                 Err(e) => {
@@ -482,7 +568,8 @@ impl<T: Transport> UasServer<T> {
                 NegotiationOutcome::Accepted {
                     answer_body,
                     remote_media,
-                } => (Some(endpoint), Some(answer_body), remote_media),
+                    srtp,
+                } => (Some(endpoint), Some(answer_body), remote_media, srtp),
                 NegotiationOutcome::Mismatch => {
                     self.media_fabric.release_endpoint(endpoint.id()).await;
                     info!(%peer, "SDP offer had no acceptable codec; 488");
@@ -507,7 +594,7 @@ impl<T: Transport> UasServer<T> {
                 }
             }
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         let local_tag = next_tag();
@@ -520,11 +607,17 @@ impl<T: Transport> UasServer<T> {
             (rendezvous.as_ref(), endpoint.as_ref(), remote_media)
         {
             if let Some((_, pending)) = self.pending_bridges.remove(key) {
-                match self
-                    .media_fabric
-                    .bridge(pending.endpoint, pending.remote_media, ep.id(), remote_rtp)
-                    .await
-                {
+                let leg_a = BridgeLeg {
+                    endpoint: pending.endpoint,
+                    peer: pending.remote_media,
+                    srtp: pending.srtp,
+                };
+                let leg_b = BridgeLeg {
+                    endpoint: ep.id(),
+                    peer: remote_rtp,
+                    srtp: srtp_keys.clone(),
+                };
+                match self.media_fabric.bridge(leg_a, leg_b).await {
                     Ok(bid) => {
                         self.bridges_by_dialog.insert(pending.dialog_key, bid);
                         self.bridges_by_dialog.insert(dialog_key.clone(), bid);
@@ -539,6 +632,7 @@ impl<T: Transport> UasServer<T> {
                         dialog_key: dialog_key.clone(),
                         endpoint: ep.id(),
                         remote_media: remote_rtp,
+                        srtp: srtp_keys.clone(),
                     },
                 );
                 info!(rendezvous = %key, "rendezvous leg parked, awaiting peer");
@@ -582,6 +676,20 @@ impl<T: Transport> UasServer<T> {
     }
 
     fn handle_ack(&self, req: &RequestSummary, peer: SocketAddr) {
+        // Transaction-layer: for a non-2xx final, ACK shares the
+        // INVITE's branch (RFC 3261 §17.1.1.3) and transitions the
+        // server INVITE FSM from Completed → Confirmed, cancelling
+        // G/H and arming I. For 2xx the FSM bypassed to Terminated
+        // on the 2xx send, so `is_alive` is already false here.
+        if let Some(branch) = req.branch.as_deref() {
+            let invite_key = server_txn_key(branch, "INVITE");
+            if self.txn_driver.is_alive(&invite_key) {
+                self.txn_driver
+                    .deliver_request(&invite_key, "ACK".into(), req.raw.clone());
+            }
+        }
+
+        // Dialog-layer: Early → Confirmed on the 2xx ACK.
         let Some(key) = in_dialog_key(req) else {
             debug!(%peer, "ACK missing dialog identifiers; dropping");
             return;
@@ -650,7 +758,10 @@ impl<T: Transport> UasServer<T> {
         }
     }
 
-    /// Send a provisional (1xx) response. Not cached for dedupe.
+    /// Send a provisional (1xx) response. Routed through the server
+    /// INVITE FSM when one is registered — the FSM caches the
+    /// provisional as `last_response` so an INVITE retransmit replays
+    /// it instead of burning the request all the way to the handler.
     async fn send_provisional(
         &self,
         req: &RequestSummary,
@@ -659,25 +770,32 @@ impl<T: Transport> UasServer<T> {
         peer: SocketAddr,
     ) {
         let bytes = Bytes::from(build_response(&req.raw, status, reason, None, &[], b""));
+        if let Some(branch) = req.branch.as_deref() {
+            let key = server_txn_key(branch, &req.method);
+            if self.txn_driver.is_alive(&key) {
+                self.txn_driver.send_response(&key, status, bytes);
+                self.emit_response_metrics(req, peer, status);
+                return;
+            }
+        }
+        // Fallback — no branch (exceptional) or no FSM. Direct send.
         if let Err(e) = self.transport.send(bytes, peer).await {
             warn!(%peer, ?e, "failed to send provisional response");
             return;
         }
-        self.metrics
-            .sip_responses
-            .get_or_create(&SipCodeLabel {
-                code: status.to_string(),
-            })
-            .inc();
-        let _ = self.bus.publish(Event::Sip(SipEvent::ResponseSent {
-            peer,
-            status,
-            call_id: req.call_id.clone(),
-        }));
+        self.emit_response_metrics(req, peer, status);
     }
 
-    /// Send a final (>= 200) response and cache it for retransmission
-    /// dedupe. `body` may be empty.
+    /// Send a final (>= 200) response through the server transaction
+    /// FSM. The driver caches the bytes in `last_response` (replayed
+    /// on request retransmits) and arms the method-appropriate
+    /// timer — G/H for INVITE non-2xx, J for every non-INVITE final.
+    ///
+    /// INVITE 2xx bypasses the FSM straight to Terminated per §17.2.1;
+    /// the TU (us) owns 2xx retransmit per §13.3.1.4. Until the UAS
+    /// grows a proper per-dialog 2xx retransmit loop, we park the
+    /// bytes in [`Self::invite_2xx_cache`] so simple peer retries
+    /// still get a reply.
     #[allow(clippy::too_many_arguments)] // a response is genuinely this many knobs
     async fn respond(
         &self,
@@ -693,29 +811,45 @@ impl<T: Transport> UasServer<T> {
             &req.raw, status, reason, local_tag, extras, body,
         ));
 
-        if let Some(branch) = req.branch.as_ref() {
-            if self.dedupe.len() >= DEDUPE_CAPACITY {
-                // Evict one entry. We scope the `iter()` tightly so the
-                // Iter (which holds a shard read-guard) is dropped
-                // *before* we call `remove()` on the same shard —
-                // otherwise the `remove` deadlocks on its own read
-                // guard. An earlier version relied on `drop(entry)` +
-                // temporary-lifetime rules, but `if let` extends the
-                // `iter()` rvalue's lifetime through the full scope,
-                // which kept the guard alive and wedged the UAS
-                // permanently once DEDUPE_CAPACITY was hit under load.
-                let evict_key = self.dedupe.iter().next().map(|e| e.key().clone());
-                if let Some(k) = evict_key {
-                    self.dedupe.remove(&k);
-                }
+        if let Some(branch) = req.branch.as_deref() {
+            // Park INVITE 2xx in the TU-owned replay cache before
+            // handing the bytes off — the FSM's 2xx bypass leaves
+            // nothing behind there.
+            if req.method == "INVITE" && (200..300).contains(&status) {
+                self.cache_invite_2xx(branch, bytes.clone());
             }
-            self.dedupe.insert(branch.clone(), bytes.clone());
+            let key = server_txn_key(branch, &req.method);
+            if self.txn_driver.is_alive(&key) {
+                self.txn_driver.send_response(&key, status, bytes);
+                self.emit_response_metrics(req, peer, status);
+                return;
+            }
         }
 
+        // Fallback — no branch header, exceptionally rare. Direct send.
         if let Err(e) = self.transport.send(bytes, peer).await {
             warn!(%peer, ?e, "failed to send response");
             return;
         }
+        self.emit_response_metrics(req, peer, status);
+    }
+
+    /// Insert `bytes` into [`Self::invite_2xx_cache`] keyed by
+    /// `branch`. Follows the shard-scoped eviction pattern from the
+    /// v0.13.1 deadlock fix: the `iter()` guard is dropped before
+    /// the paired `remove()` runs, so no shard-read+shard-write
+    /// ordering issue can wedge the map.
+    fn cache_invite_2xx(&self, branch: &str, bytes: Bytes) {
+        if self.invite_2xx_cache.len() >= INVITE_2XX_CACHE_CAPACITY {
+            let evict_key = self.invite_2xx_cache.iter().next().map(|e| e.key().clone());
+            if let Some(k) = evict_key {
+                self.invite_2xx_cache.remove(&k);
+            }
+        }
+        self.invite_2xx_cache.insert(branch.to_owned(), bytes);
+    }
+
+    fn emit_response_metrics(&self, req: &RequestSummary, peer: SocketAddr, status: u16) {
         self.metrics
             .sip_responses
             .get_or_create(&SipCodeLabel {
@@ -727,6 +861,17 @@ impl<T: Transport> UasServer<T> {
             status,
             call_id: req.call_id.clone(),
         }));
+    }
+}
+
+/// Build the server-side [`TxnKey`] for a request's (branch, method)
+/// tuple. The role is always [`TxnRole::Server`] — the UAS only
+/// reaches into the driver for its own incoming-side FSMs.
+fn server_txn_key(branch: &str, method: &str) -> TxnKey {
+    TxnKey {
+        branch: branch.to_owned(),
+        method: method.to_owned(),
+        role: TxnRole::Server,
     }
 }
 

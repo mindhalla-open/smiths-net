@@ -9,6 +9,12 @@
 //! 3. Guest spins forever: fuel runs out and the engine reports
 //!    `FuelExhausted`.
 
+// Test fakes use `unimplemented!()` / `unreachable!()` in methods the
+// scenario doesn't exercise — that's the idiomatic "shouldn't be hit"
+// marker. The workspace lint forbids them in production code; this
+// crate-local allow keeps test fakes terse.
+#![allow(clippy::unimplemented)]
+
 use smiths_wasm::{WasmEngine, WasmError};
 
 const FUEL: u64 = 1_000_000;
@@ -473,10 +479,8 @@ async fn send_rtp_dispatches_through_media_fabric() {
         }
         async fn bridge(
             &self,
-            _: EndpointId,
-            _: SocketAddr,
-            _: EndpointId,
-            _: SocketAddr,
+            _: smiths_core::BridgeLeg,
+            _: smiths_core::BridgeLeg,
         ) -> Result<BridgeId, MediaError> {
             unimplemented!()
         }
@@ -567,10 +571,8 @@ async fn send_rtp_without_permission_traps() {
         }
         async fn bridge(
             &self,
-            _: EndpointId,
-            _: SocketAddr,
-            _: EndpointId,
-            _: SocketAddr,
+            _: smiths_core::BridgeLeg,
+            _: smiths_core::BridgeLeg,
         ) -> Result<BridgeId, MediaError> {
             unimplemented!()
         }

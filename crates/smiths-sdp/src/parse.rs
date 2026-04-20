@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 use crate::error::ParseError;
+use crate::srtp_attr::SdesCrypto;
 use crate::types::{
     ConnectionInfo, Direction, MediaDescription, MediaKind, Origin, RtpMap, SessionDescription,
 };
@@ -166,6 +167,7 @@ fn parse_media(value: &str, line: usize) -> Result<MediaDescription, ParseError>
         protocol,
         formats,
         rtpmap: Vec::new(),
+        crypto: Vec::new(),
         direction: Direction::default(),
         connection: None,
     })
@@ -184,6 +186,21 @@ fn apply_attribute(
         };
         let rtpmap = parse_rtpmap(rest, line)?;
         m.rtpmap.push(rtpmap);
+        return Ok(());
+    }
+    if value.starts_with("crypto:") {
+        // `SdesCrypto::parse` wants the full `a=crypto:...` form; reattach.
+        let Some(m) = cur.as_mut() else {
+            return Ok(()); // crypto outside media — ignore
+        };
+        // `a=crypto:` parse errors are soft: log and skip. A single
+        // malformed line shouldn't fail the whole SDP document; the
+        // negotiator will simply see fewer crypto options and may
+        // return Mismatch if none are acceptable.
+        match SdesCrypto::parse(&format!("a={value}")) {
+            Ok(c) => m.crypto.push(c),
+            Err(e) => tracing::debug!(line, ?e, "skipping malformed a=crypto line"),
+        }
         return Ok(());
     }
     let dir = match value {

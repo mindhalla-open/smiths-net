@@ -7,6 +7,8 @@
 use std::fmt::{self, Write as _};
 use std::net::IpAddr;
 
+use crate::srtp_attr::SdesCrypto;
+
 /// A full SDP session description.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionDescription {
@@ -55,6 +57,10 @@ pub struct MediaDescription {
     pub formats: Vec<u8>,
     /// Parsed `a=rtpmap` attributes keyed by payload type.
     pub rtpmap: Vec<RtpMap>,
+    /// Parsed `a=crypto:` lines for SDES. Empty for plain `RTP/AVP`
+    /// streams; one or more entries when the offerer proposed
+    /// `RTP/SAVP` with SDES keying.
+    pub crypto: Vec<SdesCrypto>,
     /// Media-level direction (`sendrecv` default if omitted).
     pub direction: Direction,
     /// Media-level `c=` overriding the session-level one.
@@ -219,6 +225,9 @@ impl fmt::Display for MediaDescription {
         }
         for r in &self.rtpmap {
             write!(f, "{r}")?;
+        }
+        for c in &self.crypto {
+            writeln_crlf(f, &c.to_sdp_line())?;
         }
         writeln_crlf(f, &format!("a={}", self.direction.as_str()))?;
         Ok(())

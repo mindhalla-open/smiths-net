@@ -311,14 +311,58 @@ pub struct PluginsConfig {
     /// Directory the loader scans at startup. Each subdirectory is one
     /// plugin. Missing directory → no plugins loaded, no error.
     pub dir: std::path::PathBuf,
+    /// Resource-limit sandbox applied to every sidecar subprocess.
+    /// Default is permissive (no limits, no `no_new_privs`) so tests
+    /// and dev runs aren't surprised; production deployments should
+    /// set conservative caps per the operator runbook.
+    pub sandbox: SandboxConfig,
 }
 
 impl Default for PluginsConfig {
     fn default() -> Self {
         Self {
             dir: std::path::PathBuf::from("plugins"),
+            sandbox: SandboxConfig::default(),
         }
     }
+}
+
+/// Per-sidecar sandbox knobs applied right before the child `exec`s.
+///
+/// Every field is optional — `None` means "don't touch the default
+/// (usually inherited from the engine process)". Limits that are
+/// POSIX-standard (`RLIMIT_*`) apply on Linux + macOS; Linux-only
+/// toggles (`no_new_privs`) are no-ops elsewhere with a debug log.
+///
+/// Full seccomp-BPF filtering and user-namespace isolation are NOT
+/// in this struct — they warrant their own slice and config surface
+/// because their correctness is deeply bound to the guest's syscall
+/// set (tokio + the plugin's runtime). This struct is the MVP
+/// sandboxing item 8 called for: FD / memory / CPU / process caps
+/// plus the privilege-escalation gate.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SandboxConfig {
+    /// `RLIMIT_NOFILE` soft + hard cap. Caps the number of file
+    /// descriptors the plugin can hold. Prevents FD-exhaustion
+    /// denial-of-service against the host.
+    pub max_fds: Option<u64>,
+    /// `RLIMIT_AS` cap in bytes — the process's max virtual
+    /// address space. Approximates a memory ceiling portably;
+    /// cgroups + OOM scoring are a separate story.
+    pub max_memory_bytes: Option<u64>,
+    /// `RLIMIT_CPU` soft cap in seconds. Kernel sends `SIGXCPU` when
+    /// the plugin exceeds it; by default that terminates the child.
+    pub max_cpu_seconds: Option<u64>,
+    /// `RLIMIT_NPROC` cap — how many additional processes this user
+    /// can spawn. Set `Some(0)` to forbid `fork()` / `exec()` from
+    /// the plugin entirely (it can't spawn helpers, launch shells,
+    /// etc.).
+    pub max_processes: Option<u64>,
+    /// Apply `prctl(PR_SET_NO_NEW_PRIVS, 1)` before exec. Prevents
+    /// the plugin from gaining privileges via setuid / file caps.
+    /// Linux-only; silently skipped elsewhere.
+    pub no_new_privs: bool,
 }
 
 /// Format for `tracing-subscriber` output.

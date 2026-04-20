@@ -7,17 +7,38 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use smiths_core::sdp::{NegotiationOutcome, SdpNegotiator};
+use rand::Rng as _;
+use smiths_core::SrtpSuite;
+use smiths_core::sdp::{NegotiationOutcome, SdpNegotiator, SrtpKeys};
 
+use crate::srtp_attr::SdesCrypto;
 use crate::types::{
     ConnectionInfo, MediaDescription, MediaKind, Origin, RtpMap, SessionDescription,
 };
+
+/// Generate fresh SDES key material for `suite` using the OS CSPRNG.
+///
+/// Returns `suite.key_material_len()` bytes (16 + 14 = 30 for the
+/// one suite we currently support). Every call returns fresh entropy
+/// — callers must not reuse the result across dialogs.
+#[must_use]
+pub fn fresh_sdes_key(suite: SrtpSuite) -> Vec<u8> {
+    let mut buf = vec![0u8; suite.key_material_len()];
+    rand::rng().fill_bytes(&mut buf);
+    buf
+}
 
 /// Outcome of running offer/answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NegotiationResult {
     /// Offer accepted; the engine's answer is ready to send.
-    Answer(SessionDescription),
+    Answer {
+        /// Rendered answer.
+        sdp: SessionDescription,
+        /// SRTP keying material, when the offer was `RTP/SAVP` with a
+        /// supported `a=crypto:`. `None` for plain `RTP/AVP`.
+        srtp: Option<SrtpKeys>,
+    },
     /// No codec in the offer intersected with the engine's supported
     /// list — caller should reply with `488 Not Acceptable Here`. MVP
     /// guardrail: a future `smiths-transcode` crate can branch on this
@@ -72,6 +93,15 @@ impl Negotiator {
     /// Currently only the first `m=audio` block is negotiated; other
     /// media lines (video, application) are not acknowledged — extend
     /// here once the Call FSM carries m-line lists.
+    ///
+    /// When the offer uses `RTP/SAVP` with at least one supported
+    /// `a=crypto:` suite, the engine generates a fresh key and emits
+    /// a matching `a=crypto:` line in the answer; the returned
+    /// [`NegotiationResult::Answer`] carries both halves of the SRTP
+    /// key material so the caller can wire transforms on the bridge.
+    /// Offers using `RTP/SAVP` **without** any supported crypto line
+    /// are rejected as [`NegotiationResult::Mismatch`] — this mirrors
+    /// RFC 4568 §5.1.2: a SAVP responder must not proceed unprotected.
     #[must_use]
     pub fn answer(&self, offer: &SessionDescription, local_port: u16) -> NegotiationResult {
         let Some(audio) = offer.media.iter().find(|m| m.kind == MediaKind::Audio) else {
@@ -103,31 +133,68 @@ impl Negotiator {
             return NegotiationResult::Mismatch;
         };
 
+        // --- SDES handling -------------------------------------------
+        //
+        // RFC 4568 §5.1: when the offer's transport is `RTP/SAVP`
+        // (or an `RTP/SAVP`-equivalent profile), the answer **must**
+        // be `RTP/SAVP` and **must** include an `a=crypto:` matching
+        // one of the offered tags. Transports without SAVP ignore any
+        // stray `a=crypto:` lines.
+        let is_savp = audio.protocol.eq_ignore_ascii_case("RTP/SAVP");
+        let (answer_crypto, srtp_keys) = if is_savp {
+            // First offer line whose suite we support wins. `SdesCrypto::parse`
+            // already rejects suites we don't know, so every parsed
+            // entry is already a candidate.
+            let Some(offer_crypto) = audio.crypto.first() else {
+                // SAVP without any acceptable crypto → 488 per §5.1.2.
+                return NegotiationResult::Mismatch;
+            };
+            let suite = offer_crypto.suite;
+            let local_km = fresh_sdes_key(suite);
+            let answer_line = SdesCrypto {
+                tag: offer_crypto.tag,
+                suite,
+                key_material: local_km.clone(),
+            };
+            let keys = SrtpKeys {
+                suite,
+                peer_tx_key: offer_crypto.key_material.clone(),
+                local_tx_key: local_km,
+            };
+            (vec![answer_line], Some(keys))
+        } else {
+            (Vec::new(), None)
+        };
+
         let answer_media = MediaDescription {
             kind: MediaKind::Audio,
             port: local_port,
             protocol: audio.protocol.clone(),
             formats: vec![chosen.payload_type],
             rtpmap: vec![chosen],
+            crypto: answer_crypto,
             direction: audio.direction.reverse(),
             connection: None,
         };
 
-        NegotiationResult::Answer(SessionDescription {
-            origin: Origin {
-                username: "smiths".into(),
-                // Session-id / version: use wall-clock seconds; the
-                // answerer is free to pick.
-                session_id: unix_seconds(),
-                session_version: unix_seconds(),
-                address: self.local_ip,
+        NegotiationResult::Answer {
+            sdp: SessionDescription {
+                origin: Origin {
+                    username: "smiths".into(),
+                    // Session-id / version: use wall-clock seconds; the
+                    // answerer is free to pick.
+                    session_id: unix_seconds(),
+                    session_version: unix_seconds(),
+                    address: self.local_ip,
+                },
+                session_name: "smiths-net".into(),
+                connection: Some(ConnectionInfo {
+                    address: self.local_ip,
+                }),
+                media: vec![answer_media],
             },
-            session_name: "smiths-net".into(),
-            connection: Some(ConnectionInfo {
-                address: self.local_ip,
-            }),
-            media: vec![answer_media],
-        })
+            srtp: srtp_keys,
+        }
     }
 }
 
@@ -148,9 +215,10 @@ impl SdpNegotiator for Negotiator {
         let mut scoped = self.clone();
         scoped.local_ip = local_ip;
         match scoped.answer(&offer, local_rtp_port) {
-            NegotiationResult::Answer(sdp) => NegotiationOutcome::Accepted {
+            NegotiationResult::Answer { sdp, srtp } => NegotiationOutcome::Accepted {
                 answer_body: sdp.to_string(),
                 remote_media,
+                srtp,
             },
             NegotiationResult::Mismatch => NegotiationOutcome::Mismatch,
         }
@@ -174,6 +242,7 @@ impl SdpNegotiator for Negotiator {
                 protocol: "RTP/AVP".into(),
                 formats,
                 rtpmap: rtpmaps,
+                crypto: Vec::new(),
                 direction: crate::Direction::SendRecv,
                 connection: None,
             }],
@@ -231,10 +300,30 @@ mod tests {
                 protocol: "RTP/AVP".into(),
                 formats,
                 rtpmap: rtpmaps,
+                crypto: Vec::new(),
                 direction: Direction::SendRecv,
                 connection: None,
             }],
         }
+    }
+
+    fn savp_offer_with_crypto(tag: u32) -> SessionDescription {
+        let mut offer = offer_with(
+            vec![0],
+            vec![RtpMap {
+                payload_type: 0,
+                codec: "PCMU".into(),
+                clock_rate: 8_000,
+                channels: None,
+            }],
+        );
+        offer.media[0].protocol = "RTP/SAVP".into();
+        offer.media[0].crypto = vec![SdesCrypto {
+            tag,
+            suite: SrtpSuite::AesCm128HmacSha1_80,
+            key_material: (0..30u8).collect(),
+        }];
+        offer
     }
 
     #[test]
@@ -263,7 +352,7 @@ mod tests {
                 },
             ],
         );
-        let NegotiationResult::Answer(answer) = neg.answer(&offer, 16_384) else {
+        let NegotiationResult::Answer { sdp: answer, srtp } = neg.answer(&offer, 16_384) else {
             panic!("expected Answer");
         };
         assert_eq!(answer.media.len(), 1);
@@ -271,6 +360,8 @@ mod tests {
         assert_eq!(answer.media[0].port, 16_384);
         // Offer was sendrecv → answer is sendrecv.
         assert_eq!(answer.media[0].direction, Direction::SendRecv);
+        // Plain RTP/AVP: no SRTP.
+        assert!(srtp.is_none());
     }
 
     #[test]
@@ -278,7 +369,7 @@ mod tests {
         let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
         // Old-style offer: just `m=audio ... 0` with no rtpmap.
         let offer = offer_with(vec![0], vec![]);
-        let NegotiationResult::Answer(answer) = neg.answer(&offer, 16_384) else {
+        let NegotiationResult::Answer { sdp: answer, .. } = neg.answer(&offer, 16_384) else {
             panic!("expected Answer");
         };
         assert_eq!(answer.media[0].formats, vec![0]);
@@ -297,10 +388,76 @@ mod tests {
             }],
         );
         offer.media[0].direction = Direction::SendOnly;
-        let NegotiationResult::Answer(answer) = neg.answer(&offer, 1_234) else {
+        let NegotiationResult::Answer { sdp: answer, .. } = neg.answer(&offer, 1_234) else {
             panic!();
         };
         assert_eq!(answer.media[0].direction, Direction::RecvOnly);
+    }
+
+    #[test]
+    fn savp_offer_gets_savp_answer_with_matching_crypto_tag() {
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let offer = savp_offer_with_crypto(42);
+        let NegotiationResult::Answer { sdp: answer, srtp } = neg.answer(&offer, 16_384) else {
+            panic!("expected Answer");
+        };
+        assert_eq!(answer.media[0].protocol, "RTP/SAVP");
+        assert_eq!(answer.media[0].crypto.len(), 1);
+        assert_eq!(answer.media[0].crypto[0].tag, 42);
+        assert_eq!(
+            answer.media[0].crypto[0].suite,
+            SrtpSuite::AesCm128HmacSha1_80
+        );
+        assert_eq!(
+            answer.media[0].crypto[0].key_material.len(),
+            SrtpSuite::AesCm128HmacSha1_80.key_material_len()
+        );
+
+        let keys = srtp.expect("SAVP offer must yield srtp keys");
+        assert_eq!(keys.suite, SrtpSuite::AesCm128HmacSha1_80);
+        // Peer key in the offer was 0..30; engine's local key is fresh random.
+        assert_eq!(keys.peer_tx_key, (0..30u8).collect::<Vec<u8>>());
+        assert_eq!(
+            keys.local_tx_key.len(),
+            SrtpSuite::AesCm128HmacSha1_80.key_material_len()
+        );
+        assert_ne!(
+            keys.local_tx_key, keys.peer_tx_key,
+            "engine must not echo the peer's key"
+        );
+    }
+
+    #[test]
+    fn savp_offer_without_crypto_is_mismatch() {
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let mut offer = savp_offer_with_crypto(1);
+        offer.media[0].crypto.clear();
+        assert_eq!(neg.answer(&offer, 16_384), NegotiationResult::Mismatch);
+    }
+
+    #[test]
+    fn answer_body_serializes_crypto_line() {
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let offer = savp_offer_with_crypto(7);
+        let NegotiationResult::Answer { sdp: answer, .. } = neg.answer(&offer, 16_384) else {
+            panic!();
+        };
+        let body = answer.to_string();
+        assert!(body.contains("RTP/SAVP"), "answer protocol = SAVP");
+        assert!(
+            body.contains("a=crypto:7 AES_CM_128_HMAC_SHA1_80 inline:"),
+            "answer must carry engine's crypto line, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn fresh_sdes_key_has_suite_length_and_varies() {
+        let k1 = fresh_sdes_key(SrtpSuite::AesCm128HmacSha1_80);
+        let k2 = fresh_sdes_key(SrtpSuite::AesCm128HmacSha1_80);
+        assert_eq!(k1.len(), SrtpSuite::AesCm128HmacSha1_80.key_material_len());
+        assert_eq!(k2.len(), k1.len());
+        // Collision is astronomically unlikely for 30 random bytes.
+        assert_ne!(k1, k2);
     }
 
     #[test]

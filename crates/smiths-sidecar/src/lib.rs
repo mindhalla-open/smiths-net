@@ -14,6 +14,7 @@
 
 pub mod error;
 pub mod rpc;
+pub mod sandbox;
 pub mod supervisor;
 
 pub use error::Error;
