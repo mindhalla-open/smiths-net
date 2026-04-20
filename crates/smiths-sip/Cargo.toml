@@ -6,6 +6,15 @@ version      = { workspace = true }
 license      = { workspace = true }
 description  = "RFC 3261 SIP signaling: transport, parser, transactions, dialogs, auth."
 
+[features]
+# On by default so the single-binary dev experience stays "it just
+# works". Opt out with `default-features = false` on the dep line to
+# drop the SQLite / bundled-libsqlite compile cost.
+default      = ["auth-sqlite"]
+# Enables `auth::sqlite_store::SqliteAuthStore`, the embedded-SQLite
+# `CredentialStore` + `RegistrationStore` backend.
+auth-sqlite  = ["dep:rusqlite"]
+
 [dependencies]
 smiths-core    = { workspace = true }
 async-trait    = { workspace = true }
@@ -22,6 +31,7 @@ tokio-rustls   = { workspace = true }
 rustls-pemfile = { workspace = true }
 tracing        = { workspace = true }
 thiserror      = { workspace = true }
+rusqlite       = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Integration tests wire the real media + SDP implementations through

@@ -1,6 +1,6 @@
 //! Digest authentication.
 //!
-//! Two parts:
+//! Two parts (plus the v0.33.0 additions below):
 //!
 //! * **`CredentialStore`** trait + `InMemoryCredentialStore` default —
 //!   MVP guardrail for pluggable subscriber DBs (`SQLite` / Postgres /
@@ -9,6 +9,17 @@
 //!   computation, plus a stateful [`Registrar`] that issues nonces,
 //!   parses `Authorization:` headers, and verifies responses against
 //!   the credential store.
+//!
+//! Slice 2.1 (v0.33.0) added:
+//!
+//! * **`RegistrationStore`** trait — persists contact bindings learned
+//!   from successful REGISTER requests. Separate from `CredentialStore`
+//!   because the two lifetimes differ (credentials are long-lived
+//!   subscriber state; bindings are short-lived contact → expiry
+//!   entries). A single backend can impl both.
+//! * **[`sqlite_store`] module** (behind the `auth-sqlite` feature) —
+//!   `SqliteAuthStore` impl of both traits backed by an embedded
+//!   `SQLite` database, with an idempotent migration runner.
 
 // Slice 1.7: the `expect()` call sites in this module are all on
 // `RwLock` guards protecting in-memory auth state. A poisoned lock
@@ -97,6 +108,140 @@ impl CredentialStore for InMemoryCredentialStore {
             .cloned()
     }
 }
+
+/// A registered contact binding: the address-of-record (AOR), the
+/// contact URI the UA wants inbound calls routed to, and the wall-
+/// clock timestamp at which the binding expires.
+///
+/// Stored by any implementor of [`RegistrationStore`]; returned to
+/// MCP callers via the `sip://registrations` resource.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Binding {
+    /// Full address-of-record. Canonical form: `sip:user@realm` — the
+    /// registrar normalizes before calling into the store.
+    pub aor: String,
+    /// Contact URI the UA registered. Opaque — the engine doesn't
+    /// parse it beyond what it needs to route.
+    pub contact: String,
+    /// Unix-seconds deadline after which the binding is stale and
+    /// eligible for GC. `0` is treated as "explicit unregister" per
+    /// RFC 3261 §10.3.
+    pub expires_at_unix: i64,
+}
+
+/// Errors surfaced by [`RegistrationStore`] implementations.
+///
+/// Generic over backend: the `SQLite` store wraps `rusqlite::Error`, a
+/// future HTTP store would wrap an HTTP error, etc.
+#[derive(Debug, thiserror::Error)]
+pub enum RegistrationError {
+    /// Underlying backend rejected the operation.
+    #[error("registration store backend: {0}")]
+    Backend(String),
+    /// The AOR was not known to the store. Non-fatal on `lookup` —
+    /// callers treat it as "no bindings" — and surfaced verbatim on
+    /// `unbind` so callers can decide whether a missing AOR is an
+    /// error or an idempotent no-op.
+    #[error("unknown AOR: {0}")]
+    UnknownAor(String),
+}
+
+/// Persistence surface for registered contact bindings.
+///
+/// Separate from [`CredentialStore`] because the two have different
+/// lifetimes: credentials change when an operator provisions a new
+/// subscriber; bindings change whenever a UA re-registers. A single
+/// backend (the `SQLite` store, a sidecar plugin, etc.) can impl both.
+///
+/// Implementors must be `Send + Sync + 'static` because the
+/// registrar runs under tokio's multi-thread scheduler.
+pub trait RegistrationStore: Send + Sync + 'static {
+    /// Upsert a binding. An existing `(aor, contact)` pair has its
+    /// expiry refreshed; a new pair lands as a fresh row. Returns the
+    /// canonical stored form so callers don't need a separate lookup
+    /// to echo it back in the REGISTER 200 OK.
+    fn bind(&self, binding: &Binding) -> Result<Binding, RegistrationError>;
+
+    /// Remove a specific `(aor, contact)` binding. Idempotent —
+    /// absent bindings surface as `Err(UnknownAor)` so the caller can
+    /// decide whether that's a problem for its flow.
+    fn unbind(&self, aor: &str, contact: &str) -> Result<(), RegistrationError>;
+
+    /// Return every live binding for `aor`. An AOR with no bindings
+    /// (or an unknown AOR) returns `Ok(Vec::new())` — lookups don't
+    /// raise for missing entries.
+    fn lookup_bindings(&self, aor: &str) -> Result<Vec<Binding>, RegistrationError>;
+
+    /// Full snapshot: every live binding in the store. Used by the
+    /// `sip://registrations` MCP resource. Implementors are expected
+    /// to filter expired rows before returning (or schedule a GC so
+    /// the caller sees only live entries).
+    fn snapshot(&self) -> Result<Vec<Binding>, RegistrationError>;
+}
+
+/// In-memory [`RegistrationStore`] mirror of [`InMemoryCredentialStore`].
+/// Kept tiny — production deployments use the `SQLite` backend; this is
+/// for tests and dev setups that don't want to touch the filesystem.
+#[derive(Default)]
+pub struct InMemoryRegistrationStore {
+    // Keyed by (aor, contact) so same-AOR re-registrations upsert cleanly.
+    entries: RwLock<HashMap<(String, String), Binding>>,
+}
+
+impl InMemoryRegistrationStore {
+    /// Build an empty in-memory registration store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl RegistrationStore for InMemoryRegistrationStore {
+    fn bind(&self, binding: &Binding) -> Result<Binding, RegistrationError> {
+        let key = (binding.aor.clone(), binding.contact.clone());
+        let mut guard = self.entries.write().expect("registration store poisoned");
+        guard.insert(key, binding.clone());
+        Ok(binding.clone())
+    }
+
+    fn unbind(&self, aor: &str, contact: &str) -> Result<(), RegistrationError> {
+        let key = (aor.to_owned(), contact.to_owned());
+        let mut guard = self.entries.write().expect("registration store poisoned");
+        if guard.remove(&key).is_none() {
+            return Err(RegistrationError::UnknownAor(aor.to_owned()));
+        }
+        Ok(())
+    }
+
+    fn lookup_bindings(&self, aor: &str) -> Result<Vec<Binding>, RegistrationError> {
+        let now = unix_now_secs();
+        let guard = self.entries.read().expect("registration store poisoned");
+        Ok(guard
+            .iter()
+            .filter(|(k, v)| k.0 == aor && v.expires_at_unix > now)
+            .map(|(_, v)| v.clone())
+            .collect())
+    }
+
+    fn snapshot(&self) -> Result<Vec<Binding>, RegistrationError> {
+        let now = unix_now_secs();
+        let guard = self.entries.read().expect("registration store poisoned");
+        Ok(guard
+            .values()
+            .filter(|b| b.expires_at_unix > now)
+            .cloned()
+            .collect())
+    }
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+#[cfg(feature = "auth-sqlite")]
+pub mod sqlite_store;
 
 #[cfg(test)]
 mod tests {

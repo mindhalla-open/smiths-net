@@ -90,6 +90,16 @@ struct RequestSummary {
     /// Normalized `Content-Type` header value, lowercased without
     /// trailing whitespace or parameters.
     content_type: Option<String>,
+    /// Raw `Contact:` header value (everything after the colon).
+    /// Parsed by the REGISTER path to extract the contact URI.
+    /// `None` on requests that omit Contact entirely — common on
+    /// OPTIONS + BYE where the header isn't mandatory.
+    contact: Option<String>,
+    /// Parsed `Expires:` header (RFC 3261 §20.19). For REGISTER the
+    /// expiration is also carryable on each `Contact:` param via
+    /// `;expires=N`; we honour the top-level header as the default
+    /// and let the registrar override per-contact.
+    expires: Option<u32>,
     /// Message body as UTF-8 (SDP is ASCII).
     body: Option<String>,
     /// Raw request bytes; the response builder copies header lines
@@ -142,6 +152,13 @@ pub struct UasServer<T: Transport> {
     /// `None` = auth disabled, registrar accepts any REGISTER blindly
     /// (dev convenience; never do that in prod).
     registrar: Option<crate::auth::digest::Registrar>,
+    /// Contact-binding persistence for registered UAs (slice 2.1).
+    /// `None` = in-memory REGISTER handling only (every successful
+    /// REGISTER is 200 OK but the binding isn't persisted anywhere).
+    /// Production deployments wire a `SqliteAuthStore` (or equivalent)
+    /// here via [`Self::with_registration_store`] so `sip://
+    /// registrations` has something to read.
+    registration_store: Option<Arc<dyn crate::auth::RegistrationStore>>,
     /// Prometheus metrics. Defaults to [`Metrics::noop`] so tests and
     /// single-server setups can ignore observability entirely.
     metrics: Arc<Metrics>,
@@ -200,6 +217,7 @@ impl<T: Transport> UasServer<T> {
             pending_bridges: Arc::new(DashMap::new()),
             bridges_by_dialog: Arc::new(DashMap::new()),
             registrar: None,
+            registration_store: None,
             metrics: Metrics::noop(),
             response_router: None,
             drain: None,
@@ -212,6 +230,20 @@ impl<T: Transport> UasServer<T> {
     #[must_use]
     pub fn with_registrar(mut self, registrar: crate::auth::digest::Registrar) -> Self {
         self.registrar = Some(registrar);
+        self
+    }
+
+    /// Attach a [`crate::auth::RegistrationStore`] so successful
+    /// REGISTER requests persist their `Contact:` bindings. Without
+    /// one, REGISTER still authenticates + returns `200 OK` but
+    /// nothing survives past the response — in-memory deployments
+    /// where no MCP caller needs to inspect bindings.
+    #[must_use]
+    pub fn with_registration_store(
+        mut self,
+        store: Arc<dyn crate::auth::RegistrationStore>,
+    ) -> Self {
+        self.registration_store = Some(store);
         self
     }
 
@@ -437,6 +469,7 @@ impl<T: Transport> UasServer<T> {
             Some(auth) => match reg.authenticate("REGISTER", ruri, auth) {
                 Ok(user) => {
                     info!(%user, %peer, "REGISTER authenticated");
+                    self.persist_register_binding(req, reg.realm(), &user);
                     self.respond(req, 200, "OK", Some(&next_tag()), &[], b"", peer)
                         .await;
                 }
@@ -449,6 +482,52 @@ impl<T: Transport> UasServer<T> {
                         .await;
                 }
             },
+        }
+    }
+
+    /// Persist the `Contact:` → expiry binding a successful REGISTER
+    /// just established. Silent no-op when no
+    /// [`crate::auth::RegistrationStore`] is attached; the auth flow
+    /// has already decided the request is legitimate by this point.
+    ///
+    /// Slice 2.1 (v0.33.0): the parse is permissive — anything inside
+    /// the first `<...>` on the Contact line is the URI; otherwise we
+    /// take the first whitespace-delimited token. Full RFC 3261 §25.1
+    /// multi-contact + `expires=` parameters are follow-on work; they
+    /// matter for forking proxies more than for a registrar that only
+    /// binds one AOR at a time.
+    fn persist_register_binding(&self, req: &RequestSummary, realm: &str, username: &str) {
+        let Some(store) = self.registration_store.as_ref() else {
+            return;
+        };
+        let Some(contact_hdr) = req.contact.as_deref() else {
+            debug!("REGISTER missing Contact header; skipping bind");
+            return;
+        };
+        let Some(contact_uri) = first_contact_uri(contact_hdr) else {
+            debug!(contact = contact_hdr, "could not parse Contact URI; skipping bind");
+            return;
+        };
+        let aor = format!("sip:{username}@{realm}");
+        // Expires: 0 means "unregister THIS contact" per RFC 3261
+        // §10.3.7. Unbind and bow out.
+        let ttl = req.expires.unwrap_or(3600);
+        if ttl == 0 {
+            match store.unbind(&aor, &contact_uri) {
+                Ok(()) => debug!(%aor, contact = %contact_uri, "REGISTER unbind"),
+                Err(e) => debug!(%aor, ?e, "REGISTER unbind failed"),
+            }
+            return;
+        }
+        let expires_at_unix = current_unix_secs().saturating_add(i64::from(ttl));
+        let binding = crate::auth::Binding {
+            aor,
+            contact: contact_uri,
+            expires_at_unix,
+        };
+        match store.bind(&binding) {
+            Ok(_) => debug!(aor = %binding.aor, "REGISTER binding persisted"),
+            Err(e) => warn!(aor = %binding.aor, ?e, "REGISTER binding persist failed"),
         }
     }
 
@@ -1086,6 +1165,8 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
     let mut to_tag = None;
     let mut content_type: Option<String> = None;
     let mut authorization: Option<String> = None;
+    let mut contact: Option<String> = None;
+    let mut expires: Option<u32> = None;
 
     for line in lines {
         if line.is_empty() {
@@ -1125,6 +1206,18 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
             if !v.is_empty() {
                 authorization = Some(v.to_owned());
             }
+        } else if contact.is_none()
+            && (lower.starts_with("contact:") || lower.starts_with("m:"))
+        {
+            let v = line.split_once(':').map_or("", |(_, v)| v).trim();
+            if !v.is_empty() {
+                contact = Some(v.to_owned());
+            }
+        } else if expires.is_none() && lower.starts_with("expires:") {
+            let v = line.split_once(':').map_or("", |(_, v)| v).trim();
+            if let Ok(n) = v.parse::<u32>() {
+                expires = Some(n);
+            }
         }
     }
 
@@ -1138,8 +1231,90 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
         request_uri,
         authorization,
         content_type,
+        contact,
+        expires,
         body: (!body.is_empty()).then(|| body.to_owned()),
         raw: raw.clone(),
+    }
+}
+
+/// Current wall-clock seconds, clamped on overflow. Pure; pulled out
+/// so tests can swap it for a deterministic source if ever needed.
+fn current_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Extract the first contact URI from a `Contact:` header value.
+///
+/// Prefers the form `"display" <sip:...>` (the URI is the first
+/// angle-bracketed token). Falls back to the first whitespace-/
+/// comma-delimited token, stripping trailing parameters.
+///
+/// Deliberately permissive — slice 2.1 binds one URI per AOR; a
+/// follow-on slice gets to parse multiple contacts + `;expires=N`
+/// per-contact params per RFC 3261 §25.1.
+fn first_contact_uri(header: &str) -> Option<String> {
+    let trimmed = header.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        return None;
+    }
+    if let Some(start) = trimmed.find('<') {
+        let after = &trimmed[start + 1..];
+        if let Some(end) = after.find('>') {
+            let inner = &after[..end];
+            if !inner.is_empty() {
+                return Some(inner.to_owned());
+            }
+        }
+    }
+    let first = trimmed
+        .split([',', ' ', '\t'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+    // Strip any ;param=value trailer.
+    let uri = first.split(';').next().unwrap_or(first).trim();
+    (!uri.is_empty()).then(|| uri.to_owned())
+}
+
+#[cfg(test)]
+mod contact_parse_tests {
+    use super::first_contact_uri;
+
+    #[test]
+    fn angle_bracketed_form() {
+        assert_eq!(
+            first_contact_uri("\"Alice\" <sip:alice@pc.example>;expires=3600"),
+            Some("sip:alice@pc.example".into())
+        );
+    }
+
+    #[test]
+    fn bare_uri_with_params() {
+        assert_eq!(
+            first_contact_uri("sip:bob@pc.example;expires=60"),
+            Some("sip:bob@pc.example".into())
+        );
+    }
+
+    #[test]
+    fn multiple_contacts_take_first() {
+        assert_eq!(
+            first_contact_uri("<sip:a@x>, <sip:b@y>"),
+            Some("sip:a@x".into())
+        );
+    }
+
+    #[test]
+    fn wildcard_is_none() {
+        assert_eq!(first_contact_uri("*"), None);
+    }
+
+    #[test]
+    fn empty_is_none() {
+        assert_eq!(first_contact_uri("   "), None);
     }
 }
 

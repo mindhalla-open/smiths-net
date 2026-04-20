@@ -6,7 +6,7 @@ exclude  = ["fuzz"]
 [workspace.package]
 edition      = "2024"
 rust-version = "1.85"
-version      = "0.32.0"
+version      = "0.33.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
@@ -124,6 +124,12 @@ futures      = "0.3"
 
 # test helpers
 tempfile = "3"
+
+# Embedded SQLite for the subscriber DB (P8 / slice 2.1). `bundled`
+# compiles sqlite3.c alongside us so operators don't need a system
+# libsqlite3; adds ~1 MB to the binary, which is cheap compared to
+# the operational wins of a single-binary distribution.
+rusqlite = { version = "0.39.0", features = ["bundled"] }
 
 # internal crates
 smiths-core    = { path = "crates/smiths-core" }

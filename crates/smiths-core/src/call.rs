@@ -124,6 +124,38 @@ pub enum CallError {
     Internal(String),
 }
 
+/// Read-only snapshot of one SIP registration binding. Populated by
+/// `smiths-sip`'s auth stores and surfaced through MCP's
+/// `sip://registrations` resource. Kept in `smiths-core` so the MCP
+/// crate doesn't need to pull in the SIP crate just to inspect live
+/// registrations.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RegistrationSnapshot {
+    /// Address-of-record (`sip:user@realm`).
+    pub aor: String,
+    /// Contact URI the UA registered.
+    pub contact: String,
+    /// Unix seconds at which this binding expires.
+    pub expires_at_unix: i64,
+}
+
+/// Read-only observability surface over a subscriber-DB's live
+/// registrations. Implemented by `smiths-sip::auth::sqlite_store::
+/// SqliteAuthStore` (and future backends). The MCP control plane
+/// uses it to render `sip://registrations` without taking a
+/// cross-crate dep on the SIP auth module.
+///
+/// Intentionally one method — snapshots — so third-party stores
+/// (HTTP webhook, sidecar plugin) can expose "what's registered
+/// right now?" for ops without first mirroring the whole
+/// `RegistrationStore` mutation surface.
+pub trait RegistrationView: Send + Sync + 'static {
+    /// Every live (non-expired) binding the store knows about.
+    /// Implementations should filter out already-expired rows
+    /// before returning.
+    fn snapshot(&self) -> Vec<RegistrationSnapshot>;
+}
+
 /// Originator surface consumed by the MCP `make_call` / `end_call`
 /// tools. Implemented by `smiths-sip::UacClient`; the trait seam
 /// keeps `smiths-mcp` free of any direct dependency on the SIP crate.

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use smiths_core::Config;
 use smiths_core::ai::AiRegistry;
-use smiths_core::call::CallOriginator;
+use smiths_core::call::{CallOriginator, RegistrationView};
 use smiths_core::media::MediaFabric;
 use thiserror::Error;
 
@@ -42,6 +42,11 @@ pub struct ToolContext {
     /// UAS-only — tools that depend on it (`make_call`, `end_call`)
     /// return a clean `NotFound` instead of panicking.
     pub originator: Option<Arc<dyn CallOriginator>>,
+    /// Read-only view over the subscriber DB's live registrations
+    /// (slice 2.1). `None` when no backend is wired (e.g.
+    /// `[auth] backend = "none"`); `sip://registrations` returns an
+    /// empty snapshot in that case rather than 404-ing.
+    pub registrations: Option<Arc<dyn RegistrationView>>,
 }
 
 impl ToolContext {
@@ -59,6 +64,7 @@ impl ToolContext {
             config,
             media,
             originator: None,
+            registrations: None,
         }
     }
 
@@ -67,6 +73,20 @@ impl ToolContext {
     #[must_use]
     pub fn with_originator(mut self, originator: Arc<dyn CallOriginator>) -> Self {
         self.originator = Some(originator);
+        self
+    }
+
+    /// Attach a [`RegistrationView`] so the `sip://registrations`
+    /// resource can render live subscriber bindings. Without it the
+    /// resource returns an empty snapshot — callers can still
+    /// differentiate "registrar disabled" from "registered but idle"
+    /// by checking `[auth] backend` in `config://current`.
+    #[must_use]
+    pub fn with_registrations(
+        mut self,
+        view: Arc<dyn RegistrationView>,
+    ) -> Self {
+        self.registrations = Some(view);
         self
     }
 }

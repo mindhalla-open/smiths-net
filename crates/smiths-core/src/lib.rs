@@ -40,12 +40,15 @@ pub use ai::{
     ValidationError, validate_controls,
 };
 pub use bus::EventBus;
-pub use call::{CallError, CallLookup, CallOriginator, DialogKey, DialogRecord, DialogState};
+pub use call::{
+    CallError, CallLookup, CallOriginator, DialogKey, DialogRecord, DialogState,
+    RegistrationSnapshot, RegistrationView,
+};
 pub use codec::{linear_to_ulaw, pcm16_to_pcmu, pcmu_to_pcm16, ulaw_to_linear};
 pub use config::{
-    A2aConfig, BindSpec, BindSpecError, Config, CoreConfig, LogFormat, McpConfig,
-    ObservabilityConfig, PluginsConfig, RateLimitConfig, SandboxConfig, SeccompPolicy, SipConfig,
-    SipRateLimit, SipTransport,
+    A2aConfig, AuthBackend, AuthConfig, BindSpec, BindSpecError, Config, CoreConfig, LogFormat,
+    McpConfig, ObservabilityConfig, PluginsConfig, RateLimitConfig, SandboxConfig, SeccompPolicy,
+    SipConfig, SipRateLimit, SipTransport, SqliteAuthConfig,
 };
 pub use drain::Drain;
 pub use dtls::{DtlsCertError, SelfSignedCert};

@@ -5,6 +5,59 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0] - 2026-04-21
+
+Slice 2.1 — SQLite subscriber DB (P8, first half). Unblocks
+production REGISTER with persisted credentials + contact bindings.
+
+### Added
+
+- **`smiths-sip::auth::sqlite_store::SqliteAuthStore`** — embedded
+  `SQLite` backend (via `rusqlite` with `bundled` — no system
+  libsqlite3 required). Implements both `CredentialStore` (for
+  digest auth) and the new `RegistrationStore` trait (for Contact
+  bindings). Single impl, two trait objects — callers
+  `Arc::clone` the store into both seats.
+- **3-table v1 schema**: `realms`, `users` (FK → realms, unique
+  `(realm_id, username)`), `contacts` (unique `(aor, contact)`).
+  Indexes on `contacts.aor` + `contacts.expires_at_unix` for the
+  hot paths.
+- **`MigrationRunner`** — idempotent. Opening an empty DB installs
+  v1; reopening a populated DB is a no-op; opening a DB newer than
+  this binary understands fails fast with
+  `SchemaTooNew { found, max_supported }`. Each step logs at
+  `info!` when applied.
+- **`auth::RegistrationStore` trait + `Binding` DTO** — pluggable
+  persistence surface for per-AOR contact bindings. In-memory
+  default (`InMemoryRegistrationStore`) plus the SQLite impl
+  above. Expired rows are filtered out of `snapshot()` /
+  `lookup_bindings()`; `gc_expired()` hard-deletes them.
+- **`[auth]` config section** — `backend = "none" | "sqlite"` (new
+  default `"none"` keeps pre-v0.33.0 behavior), `realm`, plus
+  `[auth.sqlite] path` when `backend = "sqlite"`.
+- **UAS REGISTER Contact persistence** — `handle_register` parses
+  `Contact:` + `Expires:`, computes the AOR as `sip:user@realm`,
+  and calls `RegistrationStore::bind` on success. `Expires: 0`
+  unbinds per RFC 3261 §10.3.7. Silent no-op when no store is
+  wired.
+- **`smiths_core::RegistrationView` + `RegistrationSnapshot`** —
+  read-only observability trait; surfaced to the MCP control
+  plane without a cross-crate dep on `smiths-sip`.
+- **`sip://registrations` MCP resource** — serialises every live
+  binding as `{count, bindings: [...]}`. Empty snapshot when no
+  backend is wired; operators distinguish "disabled" from "idle"
+  via `config://current`.
+- **Integration test** (`tests/register_sqlite.rs`) — full
+  challenge → authenticate → bind → unbind flow against a tempfile
+  DB. Asserts the contact lands in the contacts table after 200
+  OK, and that `Expires: 0` removes it.
+
+### Changed
+
+- `auth.rs` is now `auth/mod.rs`; new `sqlite_store` submodule
+  gated behind the `auth-sqlite` feature (on by default for
+  `smiths-sip`).
+
 ## [0.32.0] - 2026-04-20
 
 Closes **prod-readiness Phase 6** — full e2e + perf validation.

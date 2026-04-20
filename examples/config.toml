@@ -29,6 +29,18 @@ transports = ["udp"]
 # Grace period (seconds) to finish in-flight transactions on shutdown.
 drain_timeout_secs = 10
 
+# Subscriber DB + digest-auth realm (P8 / slice 2.1).
+# `backend = "none"` (default) keeps pre-v0.33.0 behaviour — REGISTER
+# blindly 200s. `backend = "sqlite"` enables the embedded SQLite
+# store; provision users out-of-band via `SqliteAuthStore::upsert_user`
+# (CLI subcommand lands in a follow-on slice).
+[auth]
+backend = "none"
+realm   = "smiths.local"
+
+# [auth.sqlite]
+# path = "/var/lib/smiths-net/auth.db"
+
 [plugins]
 # Directory the loader scans at startup. Each subdirectory with a
 # `plugin.toml` becomes one sidecar or WASM plugin. Defaults to

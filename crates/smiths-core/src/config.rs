@@ -33,6 +33,77 @@ pub struct Config {
     pub a2a: A2aConfig,
     /// Plugin loader settings.
     pub plugins: PluginsConfig,
+    /// Auth / subscriber-DB configuration (P8, slice 2.1).
+    pub auth: AuthConfig,
+}
+
+/// `[auth]` TOML block — subscriber-DB backend selection and realm.
+///
+/// ```toml
+/// [auth]
+/// backend = "sqlite"        # "none" | "sqlite"
+/// realm   = "smiths.local"
+///
+/// [auth.sqlite]
+/// path = "/var/lib/smiths-net/auth.db"
+/// ```
+///
+/// `backend = "none"` (the default today) keeps the pre-v0.33.0 dev
+/// behaviour: REGISTER is accepted blindly, INVITE isn't challenged.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Which subscriber-DB implementation to wire up.
+    pub backend: AuthBackend,
+    /// Digest-auth realm the engine advertises in `WWW-Authenticate`.
+    /// Must match the realm stored against each account; mismatched
+    /// realms surface to UAs as `401 Unauthorized` with the engine's
+    /// value.
+    pub realm: String,
+    /// SQLite-specific settings. Ignored when `backend != "sqlite"`.
+    pub sqlite: SqliteAuthConfig,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            backend: AuthBackend::None,
+            realm: "smiths.local".to_owned(),
+            sqlite: SqliteAuthConfig::default(),
+        }
+    }
+}
+
+/// Subscriber-DB backend selector. Extend by adding a variant +
+/// wiring the corresponding `smiths-sip::auth::*_store` impl.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthBackend {
+    /// No credential store: REGISTER + INVITE accepted without auth.
+    /// Same as pre-v0.33.0 behaviour. Default so existing
+    /// `config.toml` files keep working.
+    #[default]
+    None,
+    /// Embedded `SQLite` store. Path configured via
+    /// [`AuthConfig::sqlite`].
+    Sqlite,
+}
+
+/// `[auth.sqlite]` settings.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SqliteAuthConfig {
+    /// Filesystem path to the `SQLite` database. Opened with
+    /// auto-create; the enclosing directory must already exist.
+    pub path: std::path::PathBuf,
+}
+
+impl Default for SqliteAuthConfig {
+    fn default() -> Self {
+        Self {
+            path: std::path::PathBuf::from("smiths-auth.db"),
+        }
+    }
 }
 
 /// Core runtime tuning.
