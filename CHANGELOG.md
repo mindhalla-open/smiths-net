@@ -5,6 +5,56 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.0] - 2026-04-21
+
+Slice 2.2 — HTTP webhook subscriber-DB backend (P8, second half).
+Operators with existing IAM / HR systems can now delegate
+credential lookup to an HTTPS endpoint without exposing plaintext
+passwords to the engine.
+
+### Added
+
+- **`smiths-sip::auth::http_store::HttpAuthStore`** —
+  `CredentialStore` impl that `POST`s `{realm, username, algorithm}`
+  to an operator-provided webhook and expects
+  `{"status":"accept","ha1":"<hex>"}` or `{"status":"deny"}` back.
+  Built on `reqwest` with `rustls-tls` so musl static builds stay
+  self-contained. Behind the `auth-http` feature (on by default).
+- **Pre-computed HA1 path** — `Credentials` gained an optional
+  `ha1` field + `from_ha1` constructor. The registrar uses it when
+  set, skipping the on-demand hash; plaintext passwords never cross
+  the webhook boundary.
+- **Circuit breaker** — per-store state with Closed / Open /
+  HalfOpen semantics. After `breaker_threshold` consecutive
+  failures (default 5) the breaker trips Open; after
+  `breaker_cooldown_secs` (default 30) one probe is allowed; a
+  successful probe closes it. Open-state behaviour selectable via
+  `FailureMode::FailClosed` (default, safe) vs `FailOpen`
+  (UnknownUser-equivalent, dev only).
+- **Bearer auth** — `Authorization: Bearer <token>` on every
+  webhook request so the backend can authenticate the engine.
+  Config: `[auth.http] bearer_token`.
+- **`[auth.http]` config section** — `endpoint`, `timeout_ms`,
+  `retries`, `bearer_token`, `breaker_threshold`,
+  `breaker_cooldown_secs`, `failure_mode`. `[auth] backend` grew a
+  `"http"` variant.
+- **Integration test** (`tests/register_http.rs`) — 5 scenarios
+  against an in-process `axum` mock: accept / deny / breaker trip
+  (asserts the wire isn't hit while Open) / bearer token plumbed
+  correctly / missing bearer surfaces as deny.
+- **Async entry point** — `HttpAuthStore::authenticate()` is
+  awaitable directly for callers that already live in async code;
+  the sync `CredentialStore::lookup` bridge uses
+  `tokio::task::block_in_place` + `Handle::block_on` (requires a
+  multi-thread runtime, which is our default).
+
+### Changed
+
+- `Credentials` has a new required field (`ha1: Option<String>`);
+  every construction site migrated to `Credentials::new(...)` or
+  `::from_ha1(...)`. Existing behaviour is unchanged when `ha1` is
+  `None`.
+
 ## [0.33.0] - 2026-04-21
 
 Slice 2.1 — SQLite subscriber DB (P8, first half). Unblocks

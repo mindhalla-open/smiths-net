@@ -293,6 +293,7 @@ impl CredentialStore for SqliteAuthStore {
                     username: row.get(0)?,
                     realm: row.get(1)?,
                     password: row.get(2)?,
+                    ha1: None,
                 })
             },
         )
@@ -407,11 +408,7 @@ mod tests {
     use super::*;
 
     fn test_creds(user: &str) -> Credentials {
-        Credentials {
-            username: user.to_owned(),
-            realm: "smiths.local".to_owned(),
-            password: "hunter2".to_owned(),
-        }
+        Credentials::new(user, "smiths.local", "hunter2")
     }
 
     fn binding(aor: &str, contact: &str, ttl_from_now: i64) -> Binding {

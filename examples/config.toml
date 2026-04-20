@@ -35,11 +35,26 @@ drain_timeout_secs = 10
 # store; provision users out-of-band via `SqliteAuthStore::upsert_user`
 # (CLI subcommand lands in a follow-on slice).
 [auth]
-backend = "none"
+backend = "none"          # "none" | "sqlite" | "http"
 realm   = "smiths.local"
 
 # [auth.sqlite]
 # path = "/var/lib/smiths-net/auth.db"
+
+# HTTP webhook backend (P8 / slice 2.2). The engine posts
+# `{"realm","username","algorithm"}` to `endpoint`; the webhook
+# returns `{"status":"accept","ha1":"<hex>"}` or `{"status":"deny"}`.
+# `failure_mode = "fail_closed"` (default) denies every lookup while
+# the circuit breaker is open; `"fail_open"` returns UnknownUser
+# instead (suitable only when auth is optional).
+# [auth.http]
+# endpoint              = "https://iam.example.com/sip-auth"
+# timeout_ms            = 2000
+# retries               = 1
+# bearer_token          = "s3cret-engine-token"
+# breaker_threshold     = 5
+# breaker_cooldown_secs = 30
+# failure_mode          = "fail_closed"
 
 [plugins]
 # Directory the loader scans at startup. Each subdirectory with a

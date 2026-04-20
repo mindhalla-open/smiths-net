@@ -46,9 +46,9 @@ pub use call::{
 };
 pub use codec::{linear_to_ulaw, pcm16_to_pcmu, pcmu_to_pcm16, ulaw_to_linear};
 pub use config::{
-    A2aConfig, AuthBackend, AuthConfig, BindSpec, BindSpecError, Config, CoreConfig, LogFormat,
-    McpConfig, ObservabilityConfig, PluginsConfig, RateLimitConfig, SandboxConfig, SeccompPolicy,
-    SipConfig, SipRateLimit, SipTransport, SqliteAuthConfig,
+    A2aConfig, AuthBackend, AuthConfig, BindSpec, BindSpecError, Config, CoreConfig, HttpAuthConfig,
+    HttpFailureMode, LogFormat, McpConfig, ObservabilityConfig, PluginsConfig, RateLimitConfig,
+    SandboxConfig, SeccompPolicy, SipConfig, SipRateLimit, SipTransport, SqliteAuthConfig,
 };
 pub use drain::Drain;
 pub use dtls::{DtlsCertError, SelfSignedCert};

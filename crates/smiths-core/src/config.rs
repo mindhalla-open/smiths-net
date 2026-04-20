@@ -62,6 +62,8 @@ pub struct AuthConfig {
     pub realm: String,
     /// SQLite-specific settings. Ignored when `backend != "sqlite"`.
     pub sqlite: SqliteAuthConfig,
+    /// HTTP-webhook settings. Ignored when `backend != "http"`.
+    pub http: HttpAuthConfig,
 }
 
 impl Default for AuthConfig {
@@ -70,6 +72,7 @@ impl Default for AuthConfig {
             backend: AuthBackend::None,
             realm: "smiths.local".to_owned(),
             sqlite: SqliteAuthConfig::default(),
+            http: HttpAuthConfig::default(),
         }
     }
 }
@@ -87,6 +90,10 @@ pub enum AuthBackend {
     /// Embedded `SQLite` store. Path configured via
     /// [`AuthConfig::sqlite`].
     Sqlite,
+    /// HTTP webhook — engine posts a challenge to the operator's
+    /// endpoint and expects a pre-computed HA1 or deny verdict back.
+    /// Config in [`AuthConfig::http`].
+    Http,
 }
 
 /// `[auth.sqlite]` settings.
@@ -104,6 +111,64 @@ impl Default for SqliteAuthConfig {
             path: std::path::PathBuf::from("smiths-auth.db"),
         }
     }
+}
+
+/// `[auth.http]` settings — webhook endpoint + breaker tuning.
+///
+/// Mirror of `smiths-sip::auth::http_store::HttpAuthConfig`. Kept in
+/// `smiths-core` so operators configure auth without the CLI having
+/// to reach sideways into `smiths-sip`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpAuthConfig {
+    /// Full endpoint URL the engine POSTs challenges to. Required
+    /// when `backend = "http"`; empty on `"none"` / `"sqlite"`.
+    pub endpoint: String,
+    /// Per-request timeout, milliseconds. Default 2000.
+    pub timeout_ms: u64,
+    /// Retry count per lookup (on top of the first attempt).
+    /// Default 1.
+    pub retries: u8,
+    /// `Authorization: Bearer <token>` sent with every webhook
+    /// request, so the backend can authenticate the engine itself.
+    /// `None` = no bearer.
+    pub bearer_token: Option<String>,
+    /// Consecutive failures before the circuit breaker trips Open.
+    /// Default 5.
+    pub breaker_threshold: u32,
+    /// Cooldown (seconds) after the breaker trips Open before the
+    /// next probe is attempted. Default 30.
+    pub breaker_cooldown_secs: u64,
+    /// What to do while the breaker is Open. `"fail_closed"`
+    /// (default) treats every lookup as deny; `"fail_open"` returns
+    /// `UnknownUser` without touching the breaker — only appropriate
+    /// when auth is optional.
+    pub failure_mode: HttpFailureMode,
+}
+
+impl Default for HttpAuthConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            timeout_ms: 2_000,
+            retries: 1,
+            bearer_token: None,
+            breaker_threshold: 5,
+            breaker_cooldown_secs: 30,
+            failure_mode: HttpFailureMode::FailClosed,
+        }
+    }
+}
+
+/// Wire form of `smiths-sip::auth::http_store::FailureMode`.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpFailureMode {
+    /// Every lookup returns deny while the breaker is Open. Default.
+    #[default]
+    FailClosed,
+    /// Every lookup returns `UnknownUser` (no breaker increment).
+    FailOpen,
 }
 
 /// Core runtime tuning.

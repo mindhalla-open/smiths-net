@@ -36,11 +36,7 @@ async fn spawn_uas_with_registrar() -> SocketAddr {
     let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(local.ip()));
 
     let store = Arc::new(InMemoryCredentialStore::new());
-    store.insert(Credentials {
-        username: "alice".into(),
-        realm: "smiths.test".into(),
-        password: "s3cret".into(),
-    });
+    store.insert(Credentials::new("alice", "smiths.test", "s3cret"));
     let registrar = Registrar::new("smiths.test", store);
 
     let server = UasServer::new(Arc::clone(&transport), bus, fabric, negotiator)

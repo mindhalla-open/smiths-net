@@ -6,7 +6,7 @@ exclude  = ["fuzz"]
 [workspace.package]
 edition      = "2024"
 rust-version = "1.85"
-version      = "0.33.0"
+version      = "0.34.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
@@ -130,6 +130,13 @@ tempfile = "3"
 # libsqlite3; adds ~1 MB to the binary, which is cheap compared to
 # the operational wins of a single-binary distribution.
 rusqlite = { version = "0.39.0", features = ["bundled"] }
+
+# HTTP client for the webhook `CredentialStore` (P8 / slice 2.2).
+# `rustls-tls` avoids a system OpenSSL dep so musl builds stay
+# self-contained. `json` flips on `serde_json` helpers so the
+# request/response DTOs round-trip ergonomically. No default
+# features — we don't need cookies / gzip / multipart.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # internal crates
 smiths-core    = { path = "crates/smiths-core" }

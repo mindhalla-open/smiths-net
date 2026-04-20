@@ -33,14 +33,65 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 /// A set of credentials for one account.
+///
+/// Two shapes are supported:
+///
+/// - **Plaintext**: `password` is populated, `ha1` is `None`. The
+///   registrar hashes on every call. This is what in-memory and
+///   `SQLite` stores return.
+/// - **Pre-computed HA1** (slice 2.2): `ha1` is `Some`, `password` is
+///   typically empty. The HTTP webhook backend uses this shape so
+///   operators never have to send plaintext passwords over the wire
+///   between their IAM service and the engine.
+///
+/// The registrar uses `ha1` when present and falls back to hashing
+/// `password` otherwise. Backends that can populate both (e.g. a
+/// cache in front of a plaintext DB) are free to do so; `ha1` wins.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Credentials {
     /// SIP username (typically the URI's user part).
     pub username: String,
     /// Authentication realm.
     pub realm: String,
-    /// Plaintext password. Hashed HA1 variants land later.
+    /// Plaintext password. Ignored when `ha1` is `Some`.
     pub password: String,
+    /// Pre-computed HA1 hash (RFC 2617 / RFC 8760). Hex-encoded.
+    /// Algorithm must match whichever the registrar uses for the
+    /// request — stores that serve both MD5 and SHA-256 must check
+    /// the request's `algorithm` token before answering.
+    #[doc(alias = "H(A1)")]
+    pub ha1: Option<String>,
+}
+
+impl Credentials {
+    /// Plaintext constructor — the common case for static seeding.
+    #[must_use]
+    pub fn new(username: impl Into<String>, realm: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            realm: realm.into(),
+            password: password.into(),
+            ha1: None,
+        }
+    }
+
+    /// HA1-only constructor for backends that don't surface plaintext
+    /// passwords (IAM webhooks, LDAP bindings, HSM-backed stores).
+    /// `ha1` must be the hex-encoded digest computed with the same
+    /// algorithm the registrar will use for the request.
+    #[must_use]
+    pub fn from_ha1(
+        username: impl Into<String>,
+        realm: impl Into<String>,
+        ha1: impl Into<String>,
+    ) -> Self {
+        Self {
+            username: username.into(),
+            realm: realm.into(),
+            password: String::new(),
+            ha1: Some(ha1.into()),
+        }
+    }
 }
 
 /// Lookup interface the SIP auth path uses to resolve credentials.
@@ -243,16 +294,15 @@ fn unix_now_secs() -> i64 {
 #[cfg(feature = "auth-sqlite")]
 pub mod sqlite_store;
 
+#[cfg(feature = "auth-http")]
+pub mod http_store;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn creds(u: &str) -> Credentials {
-        Credentials {
-            username: u.to_owned(),
-            realm: "smiths.local".to_owned(),
-            password: "s3cret".to_owned(),
-        }
+        Credentials::new(u, "smiths.local", "s3cret")
     }
 
     #[test]
@@ -609,7 +659,14 @@ pub mod digest {
                 .store
                 .lookup(&self.realm, &params.username)
                 .ok_or(AuthError::UnknownUser)?;
-            let ha1 = ha1(alg, &creds.username, &creds.realm, &creds.password);
+            // HA1: pre-computed when the backend can supply it (HTTP
+            // webhook, LDAP binding — slice 2.2+) so plaintext
+            // passwords never have to cross the backend boundary.
+            // Otherwise hash on demand from the plaintext the
+            // in-memory / SQLite stores hold.
+            let ha1 = creds.ha1.clone().unwrap_or_else(|| {
+                ha1(alg, &creds.username, &creds.realm, &creds.password)
+            });
             let ha2 = ha2(alg, method, &params.uri);
 
             let expected = match (
@@ -735,11 +792,7 @@ pub mod digest {
         #[test]
         fn registrar_round_trip_md5() {
             let store = Arc::new(InMemoryCredentialStore::new());
-            store.insert(Credentials {
-                username: "alice".into(),
-                realm: "smiths.local".into(),
-                password: "s3cret".into(),
-            });
+            store.insert(Credentials::new("alice", "smiths.local", "s3cret"));
             let reg = Registrar::new("smiths.local", store.clone());
 
             // Issue challenge (we get the nonce).
@@ -765,11 +818,7 @@ pub mod digest {
         #[test]
         fn registrar_round_trip_sha256() {
             let store = Arc::new(InMemoryCredentialStore::new());
-            store.insert(Credentials {
-                username: "bob".into(),
-                realm: "smiths.local".into(),
-                password: "hunter2".into(),
-            });
+            store.insert(Credentials::new("bob", "smiths.local", "hunter2"));
             let reg = Registrar::new("smiths.local", store);
             let challenge = reg.challenge(Algorithm::Sha256, false);
             let nonce = extract_param(&challenge, "nonce").unwrap();
@@ -789,11 +838,7 @@ pub mod digest {
         #[test]
         fn registrar_bad_password_fails() {
             let store = Arc::new(InMemoryCredentialStore::new());
-            store.insert(Credentials {
-                username: "alice".into(),
-                realm: "smiths.local".into(),
-                password: "right".into(),
-            });
+            store.insert(Credentials::new("alice", "smiths.local", "right"));
             let reg = Registrar::new("smiths.local", store);
             let challenge = reg.challenge(Algorithm::Md5, false);
             let nonce = extract_param(&challenge, "nonce").unwrap();
@@ -831,11 +876,7 @@ pub mod digest {
         #[test]
         fn registrar_stale_nonce_fails() {
             let store = Arc::new(InMemoryCredentialStore::new());
-            store.insert(Credentials {
-                username: "alice".into(),
-                realm: "smiths.local".into(),
-                password: "p".into(),
-            });
+            store.insert(Credentials::new("alice", "smiths.local", "p"));
             let reg = Registrar::new("smiths.local", store);
             // Never issued this nonce.
             let h1 = ha1(Algorithm::Md5, "alice", "smiths.local", "p");

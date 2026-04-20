@@ -79,11 +79,7 @@ async fn sqlite_backed_register_persists_contact_binding() {
 
     // Operator provisions the user out-of-band.
     store
-        .upsert_user(&Credentials {
-            username: "alice".into(),
-            realm: "smiths.test".into(),
-            password: "s3cret".into(),
-        })
+        .upsert_user(&Credentials::new("alice", "smiths.test", "s3cret"))
         .unwrap();
 
     let uas_addr = spawn_uas_with_sqlite_store(store.clone()).await;

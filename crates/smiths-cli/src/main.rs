@@ -605,11 +605,7 @@ fn build_test_registrar() -> Option<smiths_sip::auth::digest::Registrar> {
                 if realm.is_none() {
                     realm = Some(r.to_owned());
                 }
-                store.insert(Credentials {
-                    username: u.to_owned(),
-                    realm: r.to_owned(),
-                    password: p.to_owned(),
-                });
+                store.insert(Credentials::new(u, r, p));
             }
             _ => {
                 warn!(
