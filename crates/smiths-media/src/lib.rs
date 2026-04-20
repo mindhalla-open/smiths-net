@@ -10,11 +10,13 @@ pub mod fabric;
 pub mod port_allocator;
 pub mod rtcp;
 pub mod rtp_stats;
+pub mod srtp;
 
 pub use bridge::{Bridge, BridgeConfig, Leg, RtcpLeg};
 pub use fabric::UdpMediaFabric;
 pub use port_allocator::{PortPair, allocate_rtp_rtcp_pair};
 pub use rtp_stats::{StreamStats, StreamStatsSnapshot};
+pub use srtp::AesCmHmacSha1_80Transform;
 
 // Codec + RTP packet types live in `smiths-core` (pure math, no
 // deps). Re-exported here so existing `smiths-media::*` paths keep

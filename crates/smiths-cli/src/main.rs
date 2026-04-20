@@ -95,6 +95,14 @@ async fn main() -> anyhow::Result<()> {
     // the limit by hopping transports.
     let sip_rate_limit = smiths_sip::SipRateLimiter::new(config.sip.rate_limit);
 
+    // Optional env-driven credential seed. `SMITHS_TEST_CREDS=
+    // user:realm:pass[,user:realm:pass...]` populates an in-memory
+    // registrar so sipp / dev traffic can exercise the digest auth
+    // round-trip. Disabled by default — production credential stores
+    // land via the CredentialStore trait (database, LDAP, …) rather
+    // than through this env knob.
+    let registrar = build_test_registrar();
+
     // One Prometheus registry, shared between the /metrics endpoint
     // and every subsystem that increments counters.
     let metrics_registry = Arc::new(Mutex::new(Registry::default()));
@@ -198,6 +206,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&response_router),
             drain.clone(),
             sip_rate_limit.clone(),
+            registrar.clone(),
             /* build_uac */ true,
         )
         .await
@@ -256,6 +265,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(&response_router),
                 drain.clone(),
                 sip_rate_limit.clone(),
+                registrar.clone(),
                 /* build_uac */ false,
             )
             .await
@@ -274,6 +284,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(&metrics),
                 drain.clone(),
                 sip_rate_limit.clone(),
+                registrar.clone(),
             )
             .await
             {
@@ -295,6 +306,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(&metrics),
                 drain.clone(),
                 sip_rate_limit.clone(),
+                registrar.clone(),
             )
             .await
             {
@@ -448,6 +460,7 @@ async fn spawn_sip_udp(
     router: Arc<ResponseRouter>,
     drain: smiths_core::Drain,
     rate_limit: smiths_sip::SipRateLimiter,
+    registrar: Option<smiths_sip::auth::digest::Registrar>,
     build_uac: bool,
 ) -> anyhow::Result<SpawnedSipUdp> {
     let transport = UdpTransport::bind(bind)
@@ -463,7 +476,7 @@ async fn spawn_sip_udp(
     // `o=` / `c=`. A single-bind deployment has one negotiator; a
     // multi-bind deployment has one per listener.
     let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(local.ip()));
-    let server = UasServer::new(
+    let mut server = UasServer::new(
         Arc::clone(&transport),
         bus.clone(),
         Arc::clone(&media_fabric),
@@ -474,6 +487,9 @@ async fn spawn_sip_udp(
     .with_response_router(Arc::clone(&router))
     .with_drain(drain.clone())
     .with_rate_limit(rate_limit.clone());
+    if let Some(reg) = registrar {
+        server = server.with_registrar(reg);
+    }
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP UDP listening");
 
@@ -510,6 +526,7 @@ async fn spawn_sip_tls(
     metrics: Arc<Metrics>,
     drain: smiths_core::Drain,
     rate_limit: smiths_sip::SipRateLimiter,
+    registrar: Option<smiths_sip::auth::digest::Registrar>,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let transport = TlsTransport::bind(bind, cert, key)
         .await
@@ -521,11 +538,14 @@ async fn spawn_sip_tls(
     let reader = transport.spawn_reader(tx, cancel.clone());
 
     let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(local.ip()));
-    let server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
+    let mut server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
         .with_context(|| format!("building UAS on {local}"))?
         .with_metrics(metrics)
         .with_drain(drain)
         .with_rate_limit(rate_limit);
+    if let Some(reg) = registrar {
+        server = server.with_registrar(reg);
+    }
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP TLS listening");
     Ok(vec![reader, server_handle])
@@ -540,6 +560,7 @@ async fn spawn_sip_tcp(
     metrics: Arc<Metrics>,
     drain: smiths_core::Drain,
     rate_limit: smiths_sip::SipRateLimiter,
+    registrar: Option<smiths_sip::auth::digest::Registrar>,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let transport = TcpTransport::bind(bind)
         .await
@@ -551,14 +572,59 @@ async fn spawn_sip_tcp(
     let reader = transport.spawn_reader(tx, cancel.clone());
 
     let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(local.ip()));
-    let server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
+    let mut server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
         .with_context(|| format!("building UAS on {local}"))?
         .with_metrics(metrics)
         .with_drain(drain)
         .with_rate_limit(rate_limit);
+    if let Some(reg) = registrar {
+        server = server.with_registrar(reg);
+    }
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP TCP listening");
     Ok(vec![reader, server_handle])
+}
+
+/// Build an `Arc<Registrar>` from `SMITHS_TEST_CREDS` if set.
+/// Format: `user:realm:pass[,user:realm:pass…]`. All credentials
+/// share the first realm — the realm is the Registrar's challenge
+/// scope, and SIP auth only validates accounts within it. Returns
+/// `None` when the env var is unset or malformed (logged).
+fn build_test_registrar() -> Option<smiths_sip::auth::digest::Registrar> {
+    use smiths_sip::auth::digest::Registrar;
+    use smiths_sip::auth::{Credentials, InMemoryCredentialStore};
+    use std::sync::Arc;
+    let raw = std::env::var("SMITHS_TEST_CREDS").ok()?;
+    let store = Arc::new(InMemoryCredentialStore::new());
+    let mut realm: Option<String> = None;
+    for entry in raw.split(',').filter(|s| !s.is_empty()) {
+        let mut parts = entry.splitn(3, ':');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(u), Some(r), Some(p)) if !u.is_empty() && !r.is_empty() => {
+                if realm.is_none() {
+                    realm = Some(r.to_owned());
+                }
+                store.insert(Credentials {
+                    username: u.to_owned(),
+                    realm: r.to_owned(),
+                    password: p.to_owned(),
+                });
+            }
+            _ => {
+                warn!(
+                    entry,
+                    "SMITHS_TEST_CREDS entry ignored (expected user:realm:pass)"
+                );
+            }
+        }
+    }
+    let realm = realm?;
+    info!(
+        realm = %realm,
+        accounts = store.len(),
+        "test credential store seeded from SMITHS_TEST_CREDS"
+    );
+    Some(Registrar::new(&realm, store))
 }
 
 fn init_tracing(level: &str, format: LogFormat, mcp_stdio: bool) -> anyhow::Result<()> {

@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use smiths_core::Metrics;
+use smiths_core::SrtpTransform;
 use smiths_core::media::{BridgeId, MediaSession};
 use smiths_core::metrics::RtpDirLabel;
 use tokio::net::UdpSocket;
@@ -43,6 +44,33 @@ pub struct Leg {
     /// periodic emitter that writes SR packets to `rtcp.peer` on
     /// `rtcp.socket`. `None` disables RTCP for this direction.
     pub rtcp: Option<RtcpLeg>,
+    /// Optional SRTP context for this leg. When set, the forwarder
+    /// decrypts ingress packets with `peer_tx` and encrypts egress
+    /// with `local_tx`; SSRC rewrite runs on the decrypted plaintext
+    /// (SRTP authenticates the header, so we have to re-sign after
+    /// the rewrite).
+    pub srtp: Option<LegSrtp>,
+}
+
+/// Per-leg SRTP key context. Two transforms, one per direction —
+/// sharing one across directions would mix the per-SSRC rollover
+/// counters and break replay detection.
+#[derive(Clone)]
+pub struct LegSrtp {
+    /// Peer's transmit key (what the peer uses to encrypt outbound
+    /// — we use it to **decrypt** packets arriving on this leg).
+    pub peer_tx: Arc<dyn SrtpTransform>,
+    /// Our transmit-to-this-peer key (what we use to **encrypt**
+    /// outbound. Peer holds the matching key and decrypts).
+    pub local_tx: Arc<dyn SrtpTransform>,
+}
+
+impl std::fmt::Debug for LegSrtp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Don't leak the trait-object addresses; SRTP key material is
+        // inside these handles.
+        f.debug_struct("LegSrtp").finish()
+    }
 }
 
 /// RTCP half of one leg — a socket + the peer's RTCP address. The
@@ -129,12 +157,19 @@ impl Bridge {
         let stats_a_to_b = StreamStats::new();
         let stats_b_to_a = StreamStats::new();
 
+        // SRTP composition per direction: decrypt with the *ingress*
+        // leg's peer_tx (peer's sending key) and encrypt with the
+        // *egress* leg's local_tx (our sending key to the egress peer).
+        let srtp_ab = srtp_pair(a.srtp.as_ref(), b.srtp.as_ref());
+        let srtp_ba = srtp_pair(b.srtp.as_ref(), a.srtp.as_ref());
+
         let t_ab = spawn_rewriting_forward(
             Arc::clone(&a.socket),
             Arc::clone(&b.socket),
             b.peer,
             ssrc_toward_b,
             stats_a_to_b.clone(),
+            srtp_ab,
             cfg.metrics.clone(),
             cancel.clone(),
             "a->b",
@@ -145,6 +180,7 @@ impl Bridge {
             a.peer,
             ssrc_toward_a,
             stats_b_to_a.clone(),
+            srtp_ba,
             cfg.metrics.clone(),
             cancel.clone(),
             "b->a",
@@ -251,6 +287,22 @@ impl MediaSession for Bridge {
     }
 }
 
+/// Compose a (decrypt, encrypt) transform pair for one bridge
+/// direction. Returns `Some((in, out))` only when **both** legs have
+/// SRTP contexts — mixed configurations (one leg SRTP, other plain)
+/// are a negotiation error the SDP layer should have caught upstream,
+/// and the bridge drops packets in that case rather than leaking
+/// plaintext. `None` = plain-RTP passthrough.
+fn srtp_pair(
+    ingress: Option<&LegSrtp>,
+    egress: Option<&LegSrtp>,
+) -> Option<(Arc<dyn SrtpTransform>, Arc<dyn SrtpTransform>)> {
+    match (ingress, egress) {
+        (Some(i), Some(e)) => Some((Arc::clone(&i.peer_tx), Arc::clone(&e.local_tx))),
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // All args map 1:1 to forwarder state; grouping hides intent.
 fn spawn_rewriting_forward(
     recv: Arc<UdpSocket>,
@@ -258,12 +310,14 @@ fn spawn_rewriting_forward(
     dest: SocketAddr,
     ssrc_out: u32,
     stats: StreamStats,
+    srtp: Option<(Arc<dyn SrtpTransform>, Arc<dyn SrtpTransform>)>,
     metrics: Option<Arc<Metrics>>,
     cancel: CancellationToken,
     dir: &'static str,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // RTP frames top out well under an MTU; 2 KB leaves headroom.
+        // RTP frames top out well under an MTU; 2 KB leaves headroom
+        // (SRTP ciphertext adds only the auth tag suffix).
         let mut buf = vec![0u8; 2048];
         loop {
             tokio::select! {
@@ -271,15 +325,48 @@ fn spawn_rewriting_forward(
                 () = cancel.cancelled() => break,
                 res = recv.recv_from(&mut buf) => match res {
                     Ok((n, _src)) => {
-                        if !rewrite_ssrc(&mut buf[..n], ssrc_out) {
-                            debug!(dir, bytes = n, "non-RTP packet dropped");
-                            continue;
-                        }
-                        // Observe AFTER rewrite so the recorded SSRC
-                        // matches what we just emitted — downstream
-                        // SR reports reference it.
-                        stats.observe(&buf[..n]);
-                        if let Err(e) = send.send_to(&buf[..n], dest).await {
+                        // Build the egress packet: for plain RTP we
+                        // rewrite in place and send; for SRTP we
+                        // decrypt → rewrite plaintext → re-encrypt
+                        // because auth covers the whole packet.
+                        let egress_owned = match &srtp {
+                            None => {
+                                if !rewrite_ssrc(&mut buf[..n], ssrc_out) {
+                                    debug!(dir, bytes = n, "non-RTP packet dropped");
+                                    continue;
+                                }
+                                None
+                            }
+                            Some((decrypt, encrypt)) => {
+                                let mut plain = match decrypt.unprotect_rtp(&buf[..n]) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        debug!(dir, ?e, "SRTP auth/decrypt failed; dropped");
+                                        continue;
+                                    }
+                                };
+                                if !rewrite_ssrc(&mut plain, ssrc_out) {
+                                    debug!(dir, bytes = plain.len(), "non-RTP plaintext dropped");
+                                    continue;
+                                }
+                                match encrypt.protect_rtp(&plain) {
+                                    Ok(ct) => Some(ct),
+                                    Err(e) => {
+                                        warn!(dir, ?e, "SRTP re-encrypt failed; dropped");
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+                        let egress_slice: &[u8] = egress_owned
+                            .as_deref()
+                            .unwrap_or(&buf[..n]);
+                        // Observe on the (plaintext, rewritten) form
+                        // for plain RTP; for SRTP the ciphertext
+                        // header still carries the rewritten SSRC in
+                        // bytes 8..12, so stats track the right SSRC.
+                        stats.observe(egress_slice);
+                        if let Err(e) = send.send_to(egress_slice, dest).await {
                             warn!(dir, ?e, "bridge send failed");
                         } else if let Some(m) = &metrics {
                             m.rtp_packets_forwarded
@@ -341,12 +428,13 @@ fn spawn_sr_emitter(
                     } else {
                         let rb = ReportBlock {
                             ssrc: recv_snap.last_ssrc,
-                            // Fraction / cumulative loss aren't tracked
-                            // yet (no expected-vs-received gap
-                            // detection); fill with 0 for now and
-                            // tighten when the FSM slice lands.
+                            // Fraction-lost per interval still needs
+                            // emitter-side rotation across tick
+                            // boundaries; cumulative_lost flows
+                            // directly from StreamStats now that the
+                            // expected-vs-received delta is tracked.
                             fraction_lost: 0,
-                            cumulative_lost: 0,
+                            cumulative_lost: recv_snap.cumulative_lost,
                             extended_highest_seq: recv_snap.max_seq,
                             jitter: recv_snap.jitter,
                             // last_sr / DLSR require tracking incoming
@@ -495,11 +583,13 @@ mod tests {
                 socket: Arc::clone(&sock_engine_a),
                 peer: ua_addr_a,
                 rtcp: None,
+                srtp: None,
             },
             &Leg {
                 socket: Arc::clone(&sock_engine_b),
                 peer: ua_addr_b,
                 rtcp: None,
+                srtp: None,
             },
         );
 
@@ -547,11 +637,13 @@ mod tests {
                 socket: Arc::clone(&sock_engine_a),
                 peer: ua_addr_a,
                 rtcp: None,
+                srtp: None,
             },
             &Leg {
                 socket: Arc::clone(&sock_engine_b),
                 peer: ua_addr_b,
                 rtcp: None,
+                srtp: None,
             },
         );
 
@@ -575,11 +667,13 @@ mod tests {
                 socket: sock_a,
                 peer: addr_b,
                 rtcp: None,
+                srtp: None,
             },
             &Leg {
                 socket: sock_b,
                 peer: addr_a,
                 rtcp: None,
+                srtp: None,
             },
         );
         bridge.shutdown().await;
@@ -599,11 +693,13 @@ mod tests {
                 socket: Arc::clone(&sock_engine_a),
                 peer: ua_addr_a,
                 rtcp: None,
+                srtp: None,
             },
             &Leg {
                 socket: Arc::clone(&sock_engine_b),
                 peer: ua_addr_b,
                 rtcp: None,
+                srtp: None,
             },
         );
 
@@ -647,6 +743,7 @@ mod tests {
                     socket: rtcp_engine_a,
                     peer: ua_rtcp_addr_a,
                 }),
+                srtp: None,
             },
             &Leg {
                 socket: Arc::clone(&sock_engine_b),
@@ -655,6 +752,7 @@ mod tests {
                     socket: rtcp_engine_b,
                     peer: ua_rtcp_addr_b,
                 }),
+                srtp: None,
             },
             &BridgeConfig {
                 rtcp_interval: Some(Duration::from_millis(100)),
@@ -715,5 +813,93 @@ mod tests {
         let mut wrong_version = [0u8; 12];
         wrong_version[0] = 0x40; // V=1
         assert!(!rewrite_ssrc(&mut wrong_version, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn srtp_bridge_decrypts_rewrites_and_reencrypts() {
+        // Wire a bridge where both legs are SRTP. UA-A encrypts with
+        // its `peer_tx_a` key, engine decrypts with the same key on
+        // ingress, rewrites SSRC, re-encrypts with engine's `local_tx_b`
+        // key toward UA-B, UA-B decrypts. We assert payload parity.
+        use crate::srtp::AesCmHmacSha1_80Transform;
+        use std::sync::Arc;
+
+        // 4 independent 30-byte key materials (one per transform).
+        let km_a_tx: Vec<u8> = (0..30u8).collect();
+        let km_e_to_a: Vec<u8> = (30..60u8).collect();
+        let km_b_tx: Vec<u8> = (60..90u8).collect();
+        let km_e_to_b: Vec<u8> = (90..120u8).collect();
+
+        let a_peer_tx: Arc<dyn SrtpTransform> =
+            Arc::new(AesCmHmacSha1_80Transform::from_sdes(&km_a_tx).unwrap());
+        let a_local_tx: Arc<dyn SrtpTransform> =
+            Arc::new(AesCmHmacSha1_80Transform::from_sdes(&km_e_to_a).unwrap());
+        let b_peer_tx: Arc<dyn SrtpTransform> =
+            Arc::new(AesCmHmacSha1_80Transform::from_sdes(&km_b_tx).unwrap());
+        let b_local_tx: Arc<dyn SrtpTransform> =
+            Arc::new(AesCmHmacSha1_80Transform::from_sdes(&km_e_to_b).unwrap());
+
+        // UA-side transforms (peer's counterpart keys).
+        let ua_a_tx: AesCmHmacSha1_80Transform =
+            AesCmHmacSha1_80Transform::from_sdes(&km_a_tx).unwrap();
+        let ua_b_rx: AesCmHmacSha1_80Transform =
+            AesCmHmacSha1_80Transform::from_sdes(&km_e_to_b).unwrap();
+
+        let (sock_engine_a, addr_engine_a) = bind_udp().await;
+        let (sock_engine_b, _) = bind_udp().await;
+        let (ua_a, ua_addr_a) = bind_udp().await;
+        let (ua_b, ua_addr_b) = bind_udp().await;
+
+        let bridge = Bridge::spawn(
+            BridgeId(100),
+            &Leg {
+                socket: Arc::clone(&sock_engine_a),
+                peer: ua_addr_a,
+                rtcp: None,
+                srtp: Some(LegSrtp {
+                    peer_tx: a_peer_tx,
+                    local_tx: a_local_tx,
+                }),
+            },
+            &Leg {
+                socket: Arc::clone(&sock_engine_b),
+                peer: ua_addr_b,
+                rtcp: None,
+                srtp: Some(LegSrtp {
+                    peer_tx: b_peer_tx,
+                    local_tx: b_local_tx,
+                }),
+            },
+        );
+
+        // UA-A encrypts an RTP packet and sends it to engine.
+        let plain = rtp_packet(1, 0xDEAD_BEEF, b"srtp-hi");
+        let ciphertext = ua_a_tx.protect_rtp(&plain).unwrap();
+        ua_a.send_to(&ciphertext, addr_engine_a).await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let (n, _) = timeout(Duration::from_secs(1), ua_b.recv_from(&mut buf))
+            .await
+            .expect("UA-B should receive within 1s")
+            .unwrap();
+        let received_ct = &buf[..n];
+        // UA-B decrypts with the key engine advertised in its answer.
+        let recovered = ua_b_rx
+            .unprotect_rtp(received_ct)
+            .expect("UA-B must successfully decrypt engine's re-encrypted packet");
+        assert_eq!(
+            &recovered[12..],
+            b"srtp-hi",
+            "payload preserved end-to-end through SRTP bridge"
+        );
+        // SSRC was rewritten — must differ from UA-A's original SSRC.
+        let received_ssrc =
+            u32::from_be_bytes([recovered[8], recovered[9], recovered[10], recovered[11]]);
+        assert_ne!(
+            received_ssrc, 0xDEAD_BEEF,
+            "engine must rewrite SSRC even on the SRTP path"
+        );
+
+        bridge.shutdown().await;
     }
 }

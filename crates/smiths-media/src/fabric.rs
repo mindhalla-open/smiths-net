@@ -129,6 +129,10 @@ impl MediaFabric for UdpMediaFabric {
                 // Peer RTCP port = peer RTP port + 1 (RFC 3550 §11).
                 peer: peer_rtcp_from_rtp(peer_a),
             }),
+            // SRTP is bound by the SDP negotiator path, which passes
+            // `LegSrtp` in via a follow-on fabric method. Today the
+            // default path stays plain-RTP passthrough.
+            srtp: None,
         };
         let leg_b = Leg {
             socket: sock_b,
@@ -137,6 +141,7 @@ impl MediaFabric for UdpMediaFabric {
                 socket: rtcp_b,
                 peer: peer_rtcp_from_rtp(peer_b),
             }),
+            srtp: None,
         };
         let cfg = BridgeConfig {
             metrics: self.metrics.clone(),

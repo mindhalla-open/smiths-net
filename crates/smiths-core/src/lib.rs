@@ -35,7 +35,7 @@ pub use error::Error;
 pub use event::{Event, PluginEvent, SipEvent, SystemEvent};
 pub use media::{
     BridgeId, Endpoint, EndpointId, EndpointKind, MediaEndpoint, MediaError, MediaFabric,
-    MediaSession,
+    MediaSession, SrtpError, SrtpSuite, SrtpTransform,
 };
 pub use metrics::Metrics;
 pub use rtp::RtpPacket;

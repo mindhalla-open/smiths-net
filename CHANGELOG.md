@@ -5,6 +5,81 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-04-20
+
+### Added — SRTP (SDES)
+
+- **`smiths-core::SrtpTransform` + `SrtpSuite` + `SrtpError`** —
+  trait seam + suite enum + typed errors. `SrtpSuite` knows its own
+  key / salt lengths and SDP name. `SrtpTransform` is `&self` with
+  interior mutability so a bridge forwarder can share a transform
+  across tasks; per-direction instances keep SSRC state / rollover
+  counters isolated.
+- **`smiths-media::srtp::AesCmHmacSha1_80Transform`** —
+  `webrtc-srtp`-backed implementation. Pure Rust, MIT/Apache,
+  `AES_CM_128_HMAC_SHA1_80` suite. `from_sdes(key_material: &[u8])`
+  constructs from the 30-byte SDES master-key + salt; auth-failure
+  bytes from the backend map to `SrtpError::AuthFailed`. 4 unit
+  tests: round-trip / wrong-key-rejected / wrong-size-rejected /
+  sequential-packets.
+- **`smiths-sdp::SdesCrypto` + `SdesParseError`** — SDES
+  `a=crypto:<tag> <suite> inline:<b64>` parser / generator with 7
+  tests (canonical, `|lifetime|mki` tail, round-trip, wrong-suite,
+  short-key, truncated, not-a-crypto early bail-out).
+- **`smiths-media::Bridge` SRTP integration** — `Leg.srtp:
+  Option<LegSrtp>` carries `(peer_tx, local_tx)`. Forwarder: decrypt
+  with ingress-leg's `peer_tx` → rewrite SSRC on plaintext →
+  re-encrypt with egress-leg's `local_tx`. Re-sign happens under
+  SRTP because auth covers the header (including SSRC). Integration
+  test proves A encrypts → engine decrypts → rewrites SSRC →
+  re-encrypts → B decrypts, payload byte-identical. SDP-negotiator
+  wiring (UAS answering `a=crypto:` offers end-to-end) is the next
+  slice.
+- **`webrtc-srtp = "0.17"`** pinned as workspace dep.
+
+### Added — RTCP cumulative-loss tracking
+
+- **`StreamStats` grew `base_seq` / `cycles` / `seen_first` atomics**
+  implementing RFC 3550 §A.3 extended-max + wrap detection.
+  `snapshot().cumulative_lost` returns `expected - received` clamped
+  at 0 (reordered arrivals don't push the count negative).
+- **SR emitter now feeds real loss into Report Blocks** instead of
+  the `0` placeholder. Peer receivers finally see the engine's view
+  of the stream health.
+- 3 new unit tests: gap-counted-as-lost, no-gap-stays-zero,
+  reorder-clamps-at-zero.
+
+### Added — env-driven credential seed (`SMITHS_TEST_CREDS`)
+
+- CLI reads `SMITHS_TEST_CREDS=user:realm:pass[,user:realm:pass…]`
+  at startup, builds an in-memory `Registrar`, attaches it to
+  every UAS. Every realm stanza shares the first one. Disabled by
+  default — production credential stores land via the
+  `CredentialStore` trait (DB, LDAP, …). Unset = no registrar (dev
+  blind-200-OK path from prior versions).
+
+### Fixed — digest URI mismatch on clients that drop the user-part
+
+- Some UAs (sipp, many real-world SIP stacks) sign only the
+  host-authority in the digest `uri=` parameter even when the
+  Request-URI carries a user-part. Previously the UAS rejected
+  them with `UriMismatch` / re-challenged forever. Fix: extract
+  the `host[:port]` authority from both URIs and accept a match on
+  that, in addition to the existing exact / substring rules.
+  Found during the auth-exercised sipp prove-out (below).
+
+### Validated — sipp auth-exercised perf run
+
+- With `SMITHS_TEST_CREDS="sipp:smiths.test:s3cret"` on the engine,
+  ran `scenarios/sipp/register.xml` (the digest-authenticated
+  variant):
+  - 500 calls @ 100 cps → 100% success, 0 retrans.
+  - 5000 calls @ 1000 cps → 100% success, 0 retrans.
+  - Every call exercised the full 4-message round-trip
+    (REGISTER → 401 → REGISTER+Auth → 200).
+- Engine metrics after the 1000 cps run: 11000 REGISTER requests,
+  5500 × 401, 5500 × 200, 0 parse errors.
+
 ## [0.14.0] - 2026-04-20
 
 ### Validated — fuzz harness run

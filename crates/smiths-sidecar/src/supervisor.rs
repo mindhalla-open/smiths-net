@@ -340,10 +340,14 @@ async fn supervise_loop(
             inner.notifications.clone(),
             inner.name.clone(),
         );
-        let mut stderr_task = spawn_stderr_forwarder(stderr, inner.name.clone());
+        let stderr_task = spawn_stderr_forwarder(stderr, inner.name.clone());
 
-        // Wait for whichever ends first: graceful shutdown, reader
-        // exit (child dead), or the stderr task (child definitely dead).
+        // Wait for shutdown or for stdout EOF. Only the reader is a
+        // correctness signal — once it returns, every frame already on
+        // the wire has been dispatched. stderr is log forwarding; a
+        // child that writes nothing to stderr closes that pipe first,
+        // and waking on it would race us into aborting the reader mid-
+        // dispatch and losing the last response frame.
         tokio::select! {
             biased;
             () = inner.shutdown.cancelled() => {
@@ -354,9 +358,7 @@ async fn supervise_loop(
                 return;
             }
             _ = &mut reader => {}
-            _ = &mut stderr_task => {}
         }
-        reader.abort();
         stderr_task.abort();
 
         // Clean up this process and report pending RPCs as closed.

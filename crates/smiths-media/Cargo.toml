@@ -13,6 +13,7 @@ tokio-util  = { workspace = true }
 async-trait = { workspace = true }
 dashmap     = { workspace = true }
 tracing     = { workspace = true }
+webrtc-srtp = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "test-util"] }

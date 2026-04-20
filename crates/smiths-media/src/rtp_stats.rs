@@ -38,6 +38,16 @@ struct Inner {
     last_seq: AtomicU32,
     /// Highest seq ever seen (for loss %).
     max_seq: AtomicU32,
+    /// First sequence number we saw on this stream. Captured on the
+    /// first observed packet; used to compute `expected = max_seq -
+    /// base_seq + 1` for cumulative-lost (RFC 3550 §A.3).
+    base_seq: AtomicU32,
+    /// Number of sequence-number wraps observed (each wrap adds 65536
+    /// to the expected-packets count).
+    cycles: AtomicU32,
+    /// Set to 1 after the first observation so `base_seq` is only
+    /// written once. Relaxed load is fine — the first packet wins.
+    seen_first: AtomicU32,
     /// Last observed RTP timestamp — used as the SR's `rtp_ts` field.
     last_rtp_ts: AtomicU32,
     /// SSRC of the last observed packet.
@@ -62,7 +72,8 @@ pub struct StreamStatsSnapshot {
     pub packets: u64,
     /// Total RTP bytes observed (header + payload).
     pub octets: u64,
-    /// Highest sequence number seen.
+    /// Highest sequence number seen (base-relative; top 16 bits are
+    /// cycle count, low 16 are the RTP seq).
     pub max_seq: u32,
     /// Most recent RTP timestamp.
     pub last_rtp_ts: u32,
@@ -70,6 +81,10 @@ pub struct StreamStatsSnapshot {
     pub last_ssrc: u32,
     /// Jitter in RTP timestamp units (RFC 3550 §A.8 smoothing).
     pub jitter: u32,
+    /// Cumulative packets lost so far
+    /// (`expected − received`). Never negative in practice — if
+    /// reordered packets push received > expected we clamp at 0.
+    pub cumulative_lost: i32,
 }
 
 impl StreamStats {
@@ -92,10 +107,34 @@ impl StreamStats {
         self.inner
             .octets
             .fetch_add(packet.len() as u64, Ordering::Relaxed);
-        self.inner.last_seq.store(hdr.seq.into(), Ordering::Relaxed);
-        self.inner
-            .max_seq
-            .fetch_max(hdr.seq.into(), Ordering::Relaxed);
+
+        // Seq-wrap detection (RFC 3550 §A.3). Compare against previous
+        // 16-bit max_seq (low half). If the new seq is much lower than
+        // the old one, we likely wrapped around.
+        let seq_u32 = u32::from(hdr.seq);
+        if self.inner.seen_first.swap(1, Ordering::Relaxed) == 0 {
+            self.inner.base_seq.store(seq_u32, Ordering::Relaxed);
+            self.inner.max_seq.store(seq_u32, Ordering::Relaxed);
+        } else {
+            let prev_max = self.inner.max_seq.load(Ordering::Relaxed);
+            let prev_low_u16 = (prev_max & 0xFFFF) as u16;
+            let diff = i32::from(hdr.seq) - i32::from(prev_low_u16);
+            if diff > 0 {
+                // Forward — update max_seq (top bits = cycles).
+                let cycles = self.inner.cycles.load(Ordering::Relaxed);
+                self.inner
+                    .max_seq
+                    .store((cycles << 16) | seq_u32, Ordering::Relaxed);
+            } else if diff < -0x8000 {
+                // Large negative delta = wrap (seq 65535 → 0 is -65535).
+                let cycles = self.inner.cycles.fetch_add(1, Ordering::Relaxed) + 1;
+                self.inner
+                    .max_seq
+                    .store((cycles << 16) | seq_u32, Ordering::Relaxed);
+            }
+            // Small negative deltas = reorder within the same cycle; leave max_seq alone.
+        }
+        self.inner.last_seq.store(seq_u32, Ordering::Relaxed);
         self.inner.last_rtp_ts.store(hdr.ts, Ordering::Relaxed);
         self.inner.last_ssrc.store(hdr.ssrc, Ordering::Relaxed);
         self.update_jitter(hdr.ts);
@@ -140,16 +179,33 @@ impl StreamStats {
     }
 
     /// Snapshot every counter.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     #[must_use]
     pub fn snapshot(&self) -> StreamStatsSnapshot {
+        let packets = self.inner.packets.load(Ordering::Relaxed);
+        let max_seq = self.inner.max_seq.load(Ordering::Relaxed);
+        let base_seq = self.inner.base_seq.load(Ordering::Relaxed);
+        let seen_first = self.inner.seen_first.load(Ordering::Relaxed) == 1;
+        // RFC 3550 §A.3: expected = extended_max - base_seq + 1.
+        // Expected and lost both clamp to non-negative; reordering
+        // can push received past expected without a real loss.
+        let expected: i64 = if seen_first {
+            i64::from(max_seq)
+                .saturating_sub(i64::from(base_seq))
+                .saturating_add(1)
+        } else {
+            0
+        };
+        let cumulative_lost = expected.saturating_sub(packets as i64).max(0) as i32;
         StreamStatsSnapshot {
-            packets: self.inner.packets.load(Ordering::Relaxed),
+            packets,
             octets: self.inner.octets.load(Ordering::Relaxed),
-            max_seq: self.inner.max_seq.load(Ordering::Relaxed),
+            max_seq,
             last_rtp_ts: self.inner.last_rtp_ts.load(Ordering::Relaxed),
             last_ssrc: self.inner.last_ssrc.load(Ordering::Relaxed),
             // Shift the fixed-point jitter back to whole RTP ticks.
             jitter: self.inner.jitter_x16.load(Ordering::Relaxed) / 16,
+            cumulative_lost,
         }
     }
 }
@@ -215,6 +271,49 @@ mod tests {
         let s = StreamStats::new();
         s.observe(&rtp(1, 100, 1));
         assert_eq!(s.snapshot().jitter, 0);
+    }
+
+    #[test]
+    fn cumulative_lost_counts_gap_in_sequence() {
+        // Receive seq 10, 11, 14, 15 — two packets (12, 13) were lost.
+        // expected = 15 - 10 + 1 = 6; received = 4; lost = 2.
+        let s = StreamStats::new();
+        s.observe(&rtp(10, 0, 1));
+        s.observe(&rtp(11, 160, 1));
+        s.observe(&rtp(14, 640, 1));
+        s.observe(&rtp(15, 800, 1));
+        let snap = s.snapshot();
+        assert_eq!(snap.packets, 4);
+        assert_eq!(
+            snap.cumulative_lost, 2,
+            "two missing packets between 11 and 14 should count as lost"
+        );
+    }
+
+    #[test]
+    fn cumulative_lost_stays_zero_with_no_gap() {
+        let s = StreamStats::new();
+        for seq in 100..110 {
+            s.observe(&rtp(seq, u32::from(seq) * 160, 1));
+        }
+        let snap = s.snapshot();
+        assert_eq!(snap.packets, 10);
+        assert_eq!(snap.cumulative_lost, 0);
+    }
+
+    #[test]
+    fn cumulative_lost_clamps_at_zero_on_reorder() {
+        // Out-of-order packet shouldn't push cumulative_lost negative.
+        let s = StreamStats::new();
+        s.observe(&rtp(5, 0, 1));
+        s.observe(&rtp(6, 160, 1));
+        s.observe(&rtp(4, 80, 1)); // reordered arrival
+        let snap = s.snapshot();
+        assert_eq!(snap.packets, 3);
+        assert_eq!(
+            snap.cumulative_lost, 0,
+            "reordering must not yield negative loss"
+        );
     }
 
     #[test]
