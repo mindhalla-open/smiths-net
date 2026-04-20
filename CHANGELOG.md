@@ -5,6 +5,61 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-04-20
+
+### Added — graceful drain
+
+- **`smiths-core::Drain`** — cheaply-clonable atomic flag shared
+  across subsystems. `Drain::start()` flips to "draining";
+  `Drain::is_draining()` is a relaxed load on the hot path.
+- **`UasServer::with_drain(Drain)`** — when set, `handle_invite`
+  short-circuits to `503 Service Unavailable` (with `Retry-After: 0`)
+  before touching auth, media allocation, or dialog state. Live
+  dialogs (BYE, ACK, re-INVITE on the same dialog) flow through
+  unaffected; only fresh call setup is refused.
+- **`SMITHS_DRAIN_SECS` env var** — the CLI reads this on shutdown
+  (default 5). Flow: SIGTERM → `drain.start()` → sleep window →
+  fire the existing cancel token. Setting it to `0` reverts to
+  the pre-v0.13 instant-cancel behaviour (used by the e2e test).
+- Two integration tests in `smiths-sip/tests/drain.rs`:
+  `draining_uas_rejects_new_invite_with_503` and
+  `non_draining_uas_still_accepts_invite`.
+
+### Added — deep `/health` endpoint
+
+- **`/health` now returns structured JSON** instead of
+  `{"status":"ok"}`. Fields:
+  - `status`: `"ok"` or `"draining"`.
+  - `draining`: boolean from the shared `Drain`.
+  - `uptime_secs`: seconds since process start.
+  - `sip.binds`: list of `proto://addr` strings for every configured
+    SIP listener (`udp://`, `tcp://`, `tls://`).
+  - `plugins.loaded`: plugin names successfully registered.
+  - `plugins.failed`: `[{ dir, error }]` entries for failed loads.
+  - `dialogs_active`: live gauge read from `Metrics`.
+  - `bridges_active`: live gauge read from `Metrics`.
+- **`HealthState` / `HttpState`** — axum state types in
+  `smiths-cli/src/main.rs`. Spawned after SIP bind collection so
+  the snapshot is complete on the first request.
+
+### Changed
+
+- `smiths-cli`'s shutdown sequence now runs `drain.start()` before
+  `shutdown.trigger()`, sleeping `SMITHS_DRAIN_SECS` in between. The
+  existing system event (`ShutdownRequested`) is still published at
+  the start of drain.
+- `UasServer::new(...)`'s four builder methods now include
+  `with_drain(...)`; constructions without it (tests, single-shot
+  helpers) fall back to "never draining".
+- The full-binary e2e test now sets `SMITHS_DRAIN_SECS=0` so its
+  SIGTERM-to-exit assertion stays within its 5 s budget.
+
+### Operational / deferred
+
+- sipp perf validation remains an operator task. `scenarios/sipp/
+  register.xml` + `README.md` document the run. Needs a host with
+  sipp installed; not reproducible inside the sandbox.
+
 ## [0.12.0] - 2026-04-20
 
 ### Added — engine-wide metrics coverage

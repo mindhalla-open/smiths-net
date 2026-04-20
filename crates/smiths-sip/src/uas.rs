@@ -120,6 +120,11 @@ pub struct UasServer<T: Transport> {
     /// (the [`crate::UacClient`]). `None` = UAS-only deployment;
     /// responses are simply dropped (old behaviour).
     response_router: Option<Arc<crate::ResponseRouter>>,
+    /// Shared graceful-drain flag. When set, new `INVITE`s are
+    /// rejected with `503 Service Unavailable` so load balancers
+    /// route traffic elsewhere while live dialogs finish naturally.
+    /// `None` = drain disabled (tests, single-shot deployments).
+    drain: Option<smiths_core::Drain>,
 }
 
 impl<T: Transport> UasServer<T> {
@@ -150,6 +155,7 @@ impl<T: Transport> UasServer<T> {
             registrar: None,
             metrics: Metrics::noop(),
             response_router: None,
+            drain: None,
         })
     }
 
@@ -174,6 +180,16 @@ impl<T: Transport> UasServer<T> {
     #[must_use]
     pub fn with_response_router(mut self, router: Arc<crate::ResponseRouter>) -> Self {
         self.response_router = Some(router);
+        self
+    }
+
+    /// Attach a shared [`smiths_core::Drain`] so the UAS can refuse
+    /// new INVITEs during graceful shutdown. Without it, drain-aware
+    /// shutdown is a no-op (new dialogs keep being admitted until the
+    /// cancel token fires).
+    #[must_use]
+    pub fn with_drain(mut self, drain: smiths_core::Drain) -> Self {
+        self.drain = Some(drain);
         self
     }
 
@@ -363,6 +379,28 @@ impl<T: Transport> UasServer<T> {
     #[allow(clippy::too_many_lines)] // negotiation + bridge wiring belong together
     #[instrument(skip_all, fields(%peer, call_id = %req.call_id.as_deref().unwrap_or("-")))]
     async fn handle_invite(&self, req: &RequestSummary, peer: SocketAddr) {
+        // Graceful drain: refuse new INVITEs before touching auth /
+        // media / dialog state. Existing dialogs keep flowing through
+        // the BYE path unchanged because drain only gates fresh
+        // INVITEs. `Retry-After: 0` tells compliant peers to retry
+        // immediately against the next hop in their load-balancer set.
+        if let Some(d) = &self.drain
+            && d.is_draining()
+        {
+            debug!(%peer, "rejecting INVITE while draining");
+            self.respond(
+                req,
+                503,
+                "Service Unavailable",
+                Some(&next_tag()),
+                &[("Retry-After", "0")],
+                &[],
+                peer,
+            )
+            .await;
+            return;
+        }
+
         // When a registrar is attached, INVITE requires digest auth. We
         // challenge before emitting 100 Trying so the rejection path
         // stays tight — no media allocation, no dialog state, just the

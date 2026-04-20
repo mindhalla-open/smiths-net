@@ -10,6 +10,7 @@ pub mod bus;
 pub mod call;
 pub mod codec;
 pub mod config;
+pub mod drain;
 pub mod error;
 pub mod event;
 pub mod media;
@@ -29,6 +30,7 @@ pub use config::{
     A2aConfig, BindSpec, BindSpecError, Config, CoreConfig, LogFormat, McpConfig,
     ObservabilityConfig, PluginsConfig, RateLimitConfig, SipConfig, SipTransport,
 };
+pub use drain::Drain;
 pub use error::Error;
 pub use event::{Event, PluginEvent, SipEvent, SystemEvent};
 pub use media::{

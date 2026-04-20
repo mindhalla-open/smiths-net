@@ -122,6 +122,9 @@ async fn binary_boots_serves_sip_and_shuts_down_cleanly() {
         .arg("--config")
         .arg(&cfg)
         .env("RUST_LOG", "info")
+        // Disable the drain window so the test's SIGTERM-to-exit
+        // assertion doesn't race the default 5 s drain pause.
+        .env("SMITHS_DRAIN_SECS", "0")
         .kill_on_drop(true)
         .spawn()
         .expect("spawn binary");
