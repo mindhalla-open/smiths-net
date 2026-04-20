@@ -51,7 +51,7 @@ pub struct MediaDescription {
     pub kind: MediaKind,
     /// RTP port. `0` in an offer/answer signals a disabled stream.
     pub port: u16,
-    /// Protocol string (e.g. `RTP/AVP`, `RTP/SAVP`).
+    /// Protocol string (e.g. `RTP/AVP`, `RTP/SAVP`, `UDP/TLS/RTP/SAVP`).
     pub protocol: String,
     /// Ordered list of RTP payload types (format numbers from `m=`).
     pub formats: Vec<u8>,
@@ -65,6 +65,137 @@ pub struct MediaDescription {
     pub direction: Direction,
     /// Media-level `c=` overriding the session-level one.
     pub connection: Option<ConnectionInfo>,
+    /// Parsed `a=fingerprint:` line (RFC 8122). Present on DTLS-SRTP
+    /// and WebRTC offers; absent on plain `RTP/AVP` or SDES `RTP/SAVP`.
+    pub fingerprint: Option<Fingerprint>,
+    /// Parsed `a=setup:` line (RFC 5763 §5). Tells the peer which side
+    /// acts as DTLS client/server. Required for DTLS-SRTP interop.
+    pub setup: Option<DtlsSetup>,
+    /// ICE username fragment (`a=ice-ufrag:`, RFC 8839 §5.4).
+    pub ice_ufrag: Option<String>,
+    /// ICE password (`a=ice-pwd:`, RFC 8839 §5.4). Redacted from Debug.
+    pub ice_pwd: Option<IcePassword>,
+    /// `a=ice-options:` tokens (RFC 8839 §5.6). Each whitespace-
+    /// separated token on the offer becomes an entry; `"trickle"` is
+    /// the common one that matters for WebRTC interop.
+    pub ice_options: Vec<String>,
+    /// `a=candidate:` lines (RFC 8839 §5.1). Preserved in offer order
+    /// — the pairing algorithm cares about foundation/priority, which
+    /// both live on the typed struct.
+    pub candidates: Vec<IceCandidate>,
+    /// `true` once the peer emits `a=end-of-candidates` (trickle ICE,
+    /// RFC 8840 §4.1.1). Until the flag flips, the engine keeps the
+    /// candidate set "open" so a follow-on re-INVITE can piggyback
+    /// more candidates without triggering a re-negotiation.
+    pub end_of_candidates: bool,
+}
+
+/// Hash algorithm + colon-separated hex fingerprint bytes per RFC 8122.
+///
+/// Parsed case-insensitively for the algorithm token (`sha-256` ≈
+/// `SHA-256`); hex bytes are preserved verbatim on the wire (standard
+/// form is uppercase colon-separated pairs, e.g.
+/// `AA:BB:CC:...`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fingerprint {
+    /// Hash algorithm token — `sha-256`, `sha-1`, etc.
+    pub algorithm: String,
+    /// Fingerprint value exactly as it appeared on the wire. Keep the
+    /// colon-separated hex form so the comparison against the peer's
+    /// DTLS cert can be byte-exact.
+    pub value: String,
+}
+
+/// `a=setup:` attribute (RFC 5763 §5). Controls which DTLS role each
+/// endpoint takes during the handshake.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DtlsSetup {
+    /// `a=setup:active` — this endpoint initiates the DTLS handshake.
+    Active,
+    /// `a=setup:passive` — this endpoint awaits the DTLS `ClientHello`.
+    Passive,
+    /// `a=setup:actpass` — either role acceptable (typical offer).
+    ActPass,
+    /// `a=setup:holdconn` — reuse of existing DTLS association.
+    HoldConn,
+}
+
+impl DtlsSetup {
+    /// Parse the wire-format token. Case-insensitive per RFC.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "active" => Some(Self::Active),
+            "passive" => Some(Self::Passive),
+            "actpass" => Some(Self::ActPass),
+            "holdconn" => Some(Self::HoldConn),
+            _ => None,
+        }
+    }
+
+    /// Wire-format attribute value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Passive => "passive",
+            Self::ActPass => "actpass",
+            Self::HoldConn => "holdconn",
+        }
+    }
+
+    /// Complementary role the answerer should take, per RFC 5763 §5:
+    /// `active` ↔ `passive`; `actpass` on offer → `active` on answer
+    /// (responder picks the concrete role); `holdconn` also collapses
+    /// to `active` because re-use is a client-driven handshake.
+    #[must_use]
+    pub fn reverse(self) -> Self {
+        match self {
+            Self::Active => Self::Passive,
+            Self::Passive | Self::ActPass | Self::HoldConn => Self::Active,
+        }
+    }
+}
+
+/// ICE password, redacted in `Debug`. ICE pwd is a short-lived
+/// integrity secret per RFC 8445; the cheap wrapper prevents accidental
+/// leakage through `tracing::debug!` / `dbg!`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IcePassword(pub String);
+
+impl fmt::Debug for IcePassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "IcePassword(<redacted; {} bytes>)", self.0.len())
+    }
+}
+
+/// `a=candidate:` line (RFC 8839 §5.1). Only the fields the pairing
+/// algorithm + SDP emitter need are typed; exotic `generation` /
+/// `tcptype` / relay-specific tokens land in [`Self::raw_params`] so
+/// a round-trip never drops information.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IceCandidate {
+    /// Foundation string — opaque grouping key.
+    pub foundation: String,
+    /// Component id: 1 = RTP, 2 = RTCP (when mux isn't in play).
+    pub component: u8,
+    /// Transport token — typically `UDP`; TCP variants live in extras.
+    pub transport: String,
+    /// Priority computed per RFC 8445 §5.1.2.
+    pub priority: u32,
+    /// Candidate IP address.
+    pub address: IpAddr,
+    /// Candidate port.
+    pub port: u16,
+    /// Candidate type: `host`, `srflx`, `prflx`, `relay`.
+    pub candidate_type: String,
+    /// Optional `raddr` (related address for reflexive / relay).
+    pub related_address: Option<IpAddr>,
+    /// Optional `rport`.
+    pub related_port: Option<u16>,
+    /// Everything else (`generation 0`, `network-id 1`, `tcptype
+    /// active`) verbatim. Appended to the emitted line in order.
+    pub raw_params: Vec<(String, String)>,
 }
 
 /// `m=<kind>` — the media type token on the `m=` line.
@@ -229,7 +360,57 @@ impl fmt::Display for MediaDescription {
         for c in &self.crypto {
             writeln_crlf(f, &c.to_sdp_line())?;
         }
+        // DTLS-SRTP attrs. Emit order follows §5 examples in
+        // draft-ietf-mmusic-sdp-dtls-stuff: fingerprint, setup, then
+        // ICE attributes. Skipped entirely on plain RTP/AVP + SDES.
+        if let Some(fp) = &self.fingerprint {
+            writeln_crlf(f, &format!("a=fingerprint:{} {}", fp.algorithm, fp.value))?;
+        }
+        if let Some(setup) = self.setup {
+            writeln_crlf(f, &format!("a=setup:{}", setup.as_str()))?;
+        }
+        if let Some(ufrag) = &self.ice_ufrag {
+            writeln_crlf(f, &format!("a=ice-ufrag:{ufrag}"))?;
+        }
+        if let Some(pwd) = &self.ice_pwd {
+            writeln_crlf(f, &format!("a=ice-pwd:{}", pwd.0))?;
+        }
+        if !self.ice_options.is_empty() {
+            writeln_crlf(f, &format!("a=ice-options:{}", self.ice_options.join(" ")))?;
+        }
+        for cand in &self.candidates {
+            writeln_crlf(f, &format!("a={cand}"))?;
+        }
+        if self.end_of_candidates {
+            writeln_crlf(f, "a=end-of-candidates")?;
+        }
         writeln_crlf(f, &format!("a={}", self.direction.as_str()))?;
+        Ok(())
+    }
+}
+
+impl fmt::Display for IceCandidate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "candidate:{} {} {} {} {} {} typ {}",
+            self.foundation,
+            self.component,
+            self.transport,
+            self.priority,
+            self.address,
+            self.port,
+            self.candidate_type,
+        )?;
+        if let Some(ra) = self.related_address {
+            write!(f, " raddr {ra}")?;
+        }
+        if let Some(rp) = self.related_port {
+            write!(f, " rport {rp}")?;
+        }
+        for (k, v) in &self.raw_params {
+            write!(f, " {k} {v}")?;
+        }
         Ok(())
     }
 }

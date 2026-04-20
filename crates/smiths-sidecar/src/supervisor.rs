@@ -516,7 +516,11 @@ async fn spawn_once(inner: &Inner) -> Result<(Child, ChildStdin, ChildStdout, Ch
     // the codebase that touches `unsafe`.
     #[cfg(unix)]
     {
-        let sandbox_cfg = inner.sandbox;
+        // SandboxConfig carries a Vec for the seccomp extra-allow
+        // list (v0.29.0), so it's Clone but no longer Copy. Cloning
+        // once per respawn is cheap and keeps the `pre_exec` closure
+        // owning its snapshot.
+        let sandbox_cfg = inner.sandbox.clone();
         #[allow(unsafe_code)]
         unsafe {
             cmd.pre_exec(move || sandbox::apply_in_child(&sandbox_cfg));

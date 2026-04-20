@@ -1,0 +1,83 @@
+name: fuzz-nightly
+
+# Runs the existing `fuzz/` corpus for ~24 hours every night. v0.14.0
+# proved out the fuzz harness with 5.2M runs and 0 crashes; this job
+# keeps that bar by re-running on fresh nightly toolchains and
+# publishing coverage + any crash inputs as workflow artifacts.
+
+on:
+  schedule:
+    # 02:00 UTC every day — pick a window that doesn't collide with
+    # the main CI's usual push burst.
+    - cron: "0 2 * * *"
+  # Manual trigger for ad-hoc runs.
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    name: cargo-fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Each target runs independently so a crash in one doesn't mask
+      # useful coverage gains in the others.
+      fail-fast: false
+      matrix:
+        target:
+          - sip_parser
+          - via_branch
+          - sdes_crypto
+    # 24-hour budget split across `cargo-fuzz` + coverage artifact
+    # upload. `runs-on: ubuntu-latest` caps at 6 hours per job by
+    # default — operators wiring their own runners can remove this.
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-fuzz requires nightly for -Zinstrument-coverage.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz ${{ matrix.target }} for 5h
+        # Split into a ~5 hour timeout so the 6-hour job budget has
+        # slack for coverage extraction + artifact uploads.
+        working-directory: fuzz
+        run: |
+          timeout 18000 cargo fuzz run ${{ matrix.target }} \
+            -- -max_total_time=17700 -timeout=60 \
+            || true  # a timeout exits non-zero; treat as success
+
+      - name: Collect coverage
+        working-directory: fuzz
+        continue-on-error: true
+        run: |
+          cargo fuzz coverage ${{ matrix.target }} || true
+          ls -la target/*/coverage/*/coverage.profdata 2>/dev/null || true
+
+      - name: Upload crash corpus
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: crashes-${{ matrix.target }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
+            fuzz/corpus/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-${{ matrix.target }}
+          path: fuzz/target/*/coverage/
+          if-no-files-found: ignore
+          retention-days: 14

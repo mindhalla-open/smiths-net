@@ -18,20 +18,24 @@
 //!   `fork`/`exec` entirely).
 //! - Linux only: `prctl(PR_SET_NO_NEW_PRIVS, 1)` — block privilege
 //!   escalation via setuid binaries or file capabilities.
+//! - Linux only: seccomp-BPF allowlist (v0.29.0) — curated syscall
+//!   set plus per-plugin extras; everything else returns `EPERM`.
 //!
 //! ## What it deliberately does not do
 //!
-//! Full seccomp-BPF syscall filtering and user-namespace isolation
-//! are intentionally out of this slice. They're significantly more
-//! LOC and their correctness is tightly coupled to the plugin's
-//! runtime (tokio, Python, etc.) — easy to lock the child out of
-//! syscalls it genuinely needs. Item 8 on the roadmap (MVP sandbox)
-//! is satisfied by the rlimit + `no_new_privs` surface above; the
-//! hardened-seccomp follow-on is tracked separately.
+//! User-namespace isolation and cgroup integration are intentionally
+//! out of this slice — their correctness is tightly bound to the
+//! deployment topology (systemd vs. kubernetes vs. bare metal).
+//! Follow-on work will layer them per operator runbook need.
 
 use std::io;
 
 use smiths_core::SandboxConfig;
+#[cfg(target_os = "linux")]
+use smiths_core::SeccompPolicy;
+
+#[cfg(target_os = "linux")]
+mod seccomp_filter;
 
 /// Apply `cfg` to the current process (the forked sidecar child).
 ///
@@ -78,6 +82,31 @@ pub fn apply_in_child(cfg: &SandboxConfig) -> io::Result<()> {
         apply_no_new_privs()?;
     }
 
+    // Seccomp-BPF must land AFTER rlimit / no_new_privs — a filter
+    // denying `prctl` or `setrlimit` would otherwise break its own
+    // setup. On non-Linux targets this is a no-op.
+    apply_seccomp(cfg)?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_seccomp(cfg: &SandboxConfig) -> io::Result<()> {
+    match cfg.seccomp {
+        SeccompPolicy::Off => Ok(()),
+        SeccompPolicy::Allowlist => seccomp_filter::install_allowlist(&cfg.seccomp_extra_allow)
+            .map_err(|e| io::Error::other(format!("seccomp install: {e}"))),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps)]
+fn apply_seccomp(_cfg: &SandboxConfig) -> io::Result<()> {
+    // Seccomp is a Linux-kernel feature. BSD `pledge` / macOS
+    // `sandbox_exec` would be the comparable primitives but their
+    // semantics don't map cleanly to our allowlist shape — the
+    // config knob is silently ignored rather than surface as an
+    // error.
     Ok(())
 }
 

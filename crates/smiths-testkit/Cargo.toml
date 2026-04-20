@@ -6,6 +6,13 @@ version      = { workspace = true }
 license      = { workspace = true }
 description  = "Integration-test helpers: fake UAC/UAS, RTP, μ-law, minimal WAV, signal generators."
 
+[features]
+default = []
+# Enables `webrtc_harness`, which drives a real Chromium binary to
+# prove browser ↔ engine interop end-to-end. Off by default because
+# not every CI environment has Chrome/Chromium on the path.
+browser = ["dep:thiserror"]
+
 [dependencies]
 smiths-core  = { workspace = true }
 smiths-media = { workspace = true }
@@ -13,6 +20,7 @@ smiths-sdp   = { workspace = true }
 tokio        = { workspace = true }
 tokio-util   = { workspace = true }
 tracing      = { workspace = true }
+thiserror    = { workspace = true, optional = true }
 
 [dev-dependencies]
 smiths-sip = { workspace = true }

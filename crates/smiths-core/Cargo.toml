@@ -16,6 +16,8 @@ serde_json        = { workspace = true }
 prometheus-client = { workspace = true }
 thiserror         = { workspace = true }
 tracing           = { workspace = true }
+rcgen             = { workspace = true }
+sha2              = { workspace = true }
 
 [dev-dependencies]
 tokio   = { workspace = true, features = ["macros", "test-util"] }

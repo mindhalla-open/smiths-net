@@ -69,7 +69,9 @@ pub trait MediaEndpoint: Send + Sync {
 /// Default host-candidate endpoint. Returned by MVP UDP fabric.
 #[derive(Clone, Copy, Debug)]
 pub struct Endpoint {
+    /// Stable opaque id the fabric hands out for RTP allocations.
     pub id: EndpointId,
+    /// Bound UDP address (the "RTP port") announced in SDP.
     pub local_addr: SocketAddr,
     /// Companion RTCP port (RFC 3550 §11: RTP port is even, RTCP is
     /// RTP+1). `None` when the fabric did not allocate a paired port.

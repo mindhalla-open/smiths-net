@@ -53,6 +53,12 @@ pub struct ObservabilityConfig {
     pub log_format: LogFormat,
     /// HTTP bind address for the `/health` endpoint.
     pub health_bind: SocketAddr,
+    /// Per-call packet-capture directory. `None` disables the pcap
+    /// tap entirely. When set, each call's RTP + RTCP stream is
+    /// written to `<pcap_dir>/<call-id>.pcap`; the feature is
+    /// gated behind the `pcap` Cargo feature on `smiths-media`
+    /// because dependency size is non-trivial.
+    pub pcap_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ObservabilityConfig {
@@ -61,6 +67,7 @@ impl Default for ObservabilityConfig {
             log_level: "info".to_owned(),
             log_format: LogFormat::Json,
             health_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+            pcap_dir: None,
         }
     }
 }
@@ -75,9 +82,11 @@ pub struct SipConfig {
     pub transports: Vec<SipTransport>,
     /// Grace period to finish in-flight transactions on shutdown.
     pub drain_timeout_secs: u64,
-    /// Filesystem paths to PEM-encoded TLS server cert + private key.
+    /// Filesystem path to the PEM-encoded TLS server certificate.
     /// Required when `transports` contains `tls`. Ignored otherwise.
     pub tls_cert_path: Option<std::path::PathBuf>,
+    /// Filesystem path to the PEM-encoded TLS private key that pairs
+    /// with `tls_cert_path`.
     pub tls_key_path: Option<std::path::PathBuf>,
     /// Per-source-IP rate limit on inbound SIP datagrams.
     pub rate_limit: SipRateLimit,
@@ -340,7 +349,7 @@ impl Default for PluginsConfig {
 /// set (tokio + the plugin's runtime). This struct is the MVP
 /// sandboxing item 8 called for: FD / memory / CPU / process caps
 /// plus the privilege-escalation gate.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SandboxConfig {
     /// `RLIMIT_NOFILE` soft + hard cap. Caps the number of file
@@ -363,6 +372,36 @@ pub struct SandboxConfig {
     /// the plugin from gaining privileges via setuid / file caps.
     /// Linux-only; silently skipped elsewhere.
     pub no_new_privs: bool,
+    /// Seccomp-BPF syscall filter policy (Linux only). `Off` skips
+    /// filtering entirely; `Allowlist` installs a curated
+    /// allowlist + denies everything else with `ERRNO(EPERM)`.
+    /// Silently ignored on non-Linux targets.
+    #[serde(default)]
+    pub seccomp: SeccompPolicy,
+    /// Additional syscall names to allow **on top of** the
+    /// [`SeccompPolicy::Allowlist`] baseline. Lets operators permit
+    /// plugin-specific syscalls (`io_uring_setup`, `statx`, etc.)
+    /// without the engine re-auditing its default list. Empty by
+    /// default; ignored when `seccomp = Off`.
+    #[serde(default)]
+    pub seccomp_extra_allow: Vec<String>,
+}
+
+/// Seccomp-BPF policy selector. Tiny on-wire form so `[plugins.sandbox]
+/// seccomp = "allowlist"` reads naturally in TOML.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SeccompPolicy {
+    /// No seccomp filter. Plugins can make any syscall the kernel
+    /// permits for the running UID. Default.
+    #[default]
+    Off,
+    /// Install a curated allowlist covering tokio's runtime + the
+    /// syscalls typical Rust / Python / Node plugins need. Deny
+    /// everything else with `ERRNO(EPERM)` so failures surface as
+    /// ordinary "operation not permitted" errors rather than kernel
+    /// kills (easier to debug).
+    Allowlist,
 }
 
 /// Format for `tracing-subscriber` output.

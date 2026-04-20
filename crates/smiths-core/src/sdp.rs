@@ -68,6 +68,17 @@ pub enum NegotiationOutcome {
     },
     /// No common codec — responder should send `488 Not Acceptable Here`.
     Mismatch,
+    /// Transport profile the engine recognizes but can't terminate yet
+    /// (today: `UDP/TLS/RTP/SAVP` — DTLS-SRTP). Responder should reply
+    /// `488 Not Acceptable Here` with a `Warning: 399` header carrying
+    /// `reason` so the peer knows the call was rejected because of
+    /// transport support, not codec mismatch. Distinct variant so the
+    /// UAS doesn't have to string-sniff `Mismatch`.
+    UnsupportedTransport {
+        /// Short, operator-facing reason ("DTLS-SRTP not yet supported",
+        /// etc). Emitted into the SIP `Warning:` header verbatim.
+        reason: String,
+    },
     /// Offer body was malformed; responder should send `400 Bad Request`.
     Malformed(String),
 }

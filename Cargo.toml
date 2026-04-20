@@ -6,7 +6,7 @@ exclude  = ["fuzz"]
 [workspace.package]
 edition      = "2024"
 rust-version = "1.85"
-version      = "0.23.0"
+version      = "0.32.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
@@ -89,6 +89,15 @@ notify = "8.2.0"
 # path). Pure Rust, no libsrtp FFI, MIT/Apache-2.0.
 webrtc-srtp = "0.17"
 
+# DTLS-SRTP handshake. Pure-Rust wrapper; we seed it with our own
+# rcgen-minted cert so slice 1.2's `SelfSignedCert` is what the peer
+# sees in the fingerprint.
+# `webrtc-util` is NOT a workspace dep — smiths-dtls pins it to match
+# webrtc-dtls's transitive version inside its own Cargo.toml so the
+# KeyingMaterialExporter trait resolves to the same instance
+# webrtc-dtls implements. Do not add webrtc-util here.
+webrtc-dtls = "0.12"
+
 # CSPRNG — engine-side SDES key generation.
 rand = "0.10.1"
 
@@ -121,6 +130,8 @@ smiths-core    = { path = "crates/smiths-core" }
 smiths-proto   = { path = "crates/smiths-proto" }
 smiths-sip     = { path = "crates/smiths-sip" }
 smiths-sdp     = { path = "crates/smiths-sdp" }
+smiths-dtls    = { path = "crates/smiths-dtls" }
+smiths-ice     = { path = "crates/smiths-ice" }
 smiths-media   = { path = "crates/smiths-media" }
 smiths-plugin  = { path = "crates/smiths-plugin" }
 smiths-wasm    = { path = "crates/smiths-wasm" }

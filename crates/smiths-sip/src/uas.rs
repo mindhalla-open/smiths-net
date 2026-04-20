@@ -13,6 +13,10 @@
 //! - Every other method → `405 Method Not Allowed`.
 //! - UDP retransmission dedupe by `Via` branch: retransmits replay the
 //!   cached final response byte-for-byte.
+//! - INVITE 2xx retransmit lives as a per-dialog timer loop per
+//!   RFC 3261 §13.3.1.4 — bytes parked on the [`DialogRecord`],
+//!   driven by [`Self::spawn_invite_2xx_retransmit`], cancelled on
+//!   ACK arrival in [`Self::handle_ack`].
 //!
 //! Non-scope (follow-up passes): full RFC 3261 transaction FSMs with
 //! timers A–K, `CANCEL`, re-`INVITE`, `UPDATE`, N-party conferences,
@@ -22,6 +26,7 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -40,23 +45,18 @@ use crate::txn::{
     TransactionKey as TxnKey,
 };
 
-/// Bounded cache of per-branch INVITE 2xx responses for retransmit
-/// replay.
+/// RFC 3261 §17.1.1.2 / §13.3.1.4 base retransmit interval (500 ms).
+const T1: Duration = Duration::from_millis(500);
+/// RFC 3261 §17.1.1.2 upper bound on a single retransmit interval (4 s).
 ///
-/// Every other response lives in its server-side transaction FSM's
-/// `last_response` buffer (timer G / J retransmits, FSM-arbitrated
-/// replay on request retransmission). **INVITE 2xx is the exception**:
-/// RFC 3261 §13.3.1.4 gives the Transaction User ownership of 2xx
-/// retransmission, so the FSM bypasses straight to Terminated and
-/// has nothing cached. Until we grow a proper per-dialog 2xx-retransmit
-/// timer, this small cache keeps the retransmit replay path working
-/// for simple peer retries.
-///
-/// Capacity is deliberately shallow — 4096 concurrent unacked 2xx
-/// INVITEs would already mean the TU is massively behind on ACK
-/// processing. Eviction follows the same shard-scoped pattern the
-/// original `dedupe` path pioneered (the v0.13.1 deadlock fix).
-const INVITE_2XX_CACHE_CAPACITY: usize = 4096;
+/// §13.3.1.4 instructs the TU to double the interval starting at T1
+/// and **cap each interval at T2**; this is the cap.
+const T2: Duration = Duration::from_secs(4);
+/// RFC 3261 §13.3.1.4 total retransmit budget: 64 · T1 = 32 s. After
+/// this much wall-clock has elapsed without ACK, the UAS should
+/// terminate the dialog (via BYE) — we cancel the loop here and
+/// leave dialog termination to a follow-on.
+const INVITE_2XX_BUDGET: Duration = Duration::from_secs(32);
 
 /// First leg of a pending rendezvous bridge, waiting for a matching
 /// second `INVITE`. Holds only tokens — the socket lives in the
@@ -108,11 +108,14 @@ struct RequestSummary {
 pub struct UasServer<T: Transport> {
     transport: Arc<T>,
     bus: EventBus,
-    /// `branch` → cached INVITE 2xx response bytes. See
-    /// [`INVITE_2XX_CACHE_CAPACITY`] for why this is narrowly scoped
-    /// to 2xx INVITE only; everything else rides the server FSM's
-    /// own `last_response` slot.
-    invite_2xx_cache: Arc<DashMap<String, Bytes>>,
+    /// Per-dialog 2xx INVITE retransmit handles. The cancel token is
+    /// tripped by [`Self::handle_ack`] on Early → Confirmed and by
+    /// dialog teardown; the spawned retransmit task exits either way.
+    /// Keyed by dialog rather than branch because the 2xx ACK is
+    /// end-to-end (its own transaction) per RFC 3261 §17.1.1.3 — the
+    /// INVITE branch is no help once the FSM has 2xx-bypassed to
+    /// Terminated.
+    invite_2xx_retransmits: Arc<DashMap<DialogKey, CancellationToken>>,
     /// Active + early dialog records keyed by
     /// `(Call-ID, local-tag, remote-tag)`. [`DialogRecord`] is
     /// serializable — this is the HA snapshot surface.
@@ -158,8 +161,8 @@ pub struct UasServer<T: Transport> {
     /// INVITE (`ServerInviteTxn` with G/H/I timers, ACK correlation,
     /// 2xx bypass) and non-INVITE (`ServerNonInviteTxn` with timer J).
     /// Retransmit replay is FSM-driven, freeing the legacy
-    /// dedupe-DashMap path entirely. The only remaining cache is
-    /// [`Self::invite_2xx_cache`] (TU-owned 2xx replay).
+    /// dedupe-DashMap path entirely. INVITE 2xx bypasses the FSM and
+    /// is TU-owned (see [`Self::invite_2xx_retransmits`]).
     txn_driver: TransactionDriver<T>,
 }
 
@@ -188,7 +191,7 @@ impl<T: Transport> UasServer<T> {
         Ok(Self {
             transport,
             bus,
-            invite_2xx_cache: Arc::new(DashMap::new()),
+            invite_2xx_retransmits: Arc::new(DashMap::new()),
             dialogs: Arc::new(DashMap::new()),
             contact,
             media_fabric,
@@ -362,15 +365,17 @@ impl<T: Transport> UasServer<T> {
                         .deliver_request(&key, req.method.clone(), req.raw.clone());
                     return;
                 }
-                // INVITE 2xx retransmit path: the FSM 2xx-bypasses
-                // to Terminated, so `is_alive` is already false above.
-                // Check the narrow TU-owned cache before spinning up
-                // a duplicate INVITE handler.
-                if req.method == "INVITE"
-                    && let Some(cached) = self.invite_2xx_cache.get(branch)
-                {
-                    debug!(%peer, branch, "replaying cached INVITE 2xx");
-                    let _ = self.transport.send(cached.clone(), peer).await;
+                // INVITE retransmits arriving after the FSM has
+                // 2xx-bypassed to Terminated are dropped — the
+                // per-dialog retransmit loop owns replay cadence
+                // (RFC 3261 §13.3.1.4). Answering a peer retry here
+                // would inject an off-schedule 2xx and break the
+                // T1-doubling contract.
+                if req.method == "INVITE" && self.dialog_for_invite(&req).is_some() {
+                    debug!(
+                        %peer, branch,
+                        "INVITE retransmit for dialog with live 2xx loop; dropped (TU drives replay)"
+                    );
                     return;
                 }
                 // Fresh transaction — register before the handler
@@ -585,6 +590,27 @@ impl<T: Transport> UasServer<T> {
                     .await;
                     return;
                 }
+                NegotiationOutcome::UnsupportedTransport { reason } => {
+                    self.media_fabric.release_endpoint(endpoint.id()).await;
+                    info!(%peer, %reason, "SDP offer used an unsupported transport; 488 + Warning");
+                    // RFC 3261 §20.43: `Warning: <code> <host> "<text>"`.
+                    // Code 399 is the "miscellaneous" catch-all; the
+                    // quoted text carries the human-readable reason so
+                    // the peer sees *why* we rejected.
+                    let warning = format_warning(&reason);
+                    let warning_hdr: [(&str, &str); 1] = [("Warning", warning.as_str())];
+                    self.respond(
+                        req,
+                        488,
+                        "Not Acceptable Here",
+                        Some(&next_tag()),
+                        &warning_hdr,
+                        &[],
+                        peer,
+                    )
+                    .await;
+                    return;
+                }
                 NegotiationOutcome::Malformed(err) => {
                     self.media_fabric.release_endpoint(endpoint.id()).await;
                     warn!(%peer, %err, "malformed SDP offer");
@@ -648,6 +674,7 @@ impl<T: Transport> UasServer<T> {
             rendezvous,
             media: endpoint.as_ref().map(|ep| ep.id()),
             remote_media,
+            pending_2xx: None,
         };
         self.dialogs.insert(dialog_key, record);
         self.metrics.dialogs_active.inc();
@@ -689,7 +716,10 @@ impl<T: Transport> UasServer<T> {
             }
         }
 
-        // Dialog-layer: Early → Confirmed on the 2xx ACK.
+        // Dialog-layer: Early → Confirmed on the 2xx ACK. Cancels any
+        // in-flight §13.3.1.4 retransmit loop and clears the parked
+        // 2xx bytes off the record — both are scoped to the
+        // pre-confirmation window.
         let Some(key) = in_dialog_key(req) else {
             debug!(%peer, "ACK missing dialog identifiers; dropping");
             return;
@@ -697,11 +727,13 @@ impl<T: Transport> UasServer<T> {
         if let Some(mut entry) = self.dialogs.get_mut(&key) {
             if entry.state == DialogState::Early {
                 entry.state = DialogState::Confirmed;
+                entry.pending_2xx = None;
                 info!(call_id = %entry.call_id, "dialog confirmed");
             }
         } else {
             debug!(?key, "ACK for unknown dialog; ignoring");
         }
+        self.cancel_invite_2xx_retransmit(&key);
     }
 
     #[instrument(skip_all, fields(%peer, call_id = %req.call_id.as_deref().unwrap_or("-")))]
@@ -715,6 +747,10 @@ impl<T: Transport> UasServer<T> {
         match self.dialogs.remove(&key) {
             Some((_, record)) => {
                 self.metrics.dialogs_active.dec();
+                // BYE before ACK is exotic but legal — cancel any
+                // in-flight §13.3.1.4 retransmit so the loop doesn't
+                // keep firing after the dialog is gone.
+                self.cancel_invite_2xx_retransmit(&key);
                 // Drop an unpaired pending leg if this was it.
                 if let Some(rv) = record.rendezvous.as_ref()
                     && let Some(entry) = self.pending_bridges.get(rv)
@@ -792,10 +828,9 @@ impl<T: Transport> UasServer<T> {
     /// timer — G/H for INVITE non-2xx, J for every non-INVITE final.
     ///
     /// INVITE 2xx bypasses the FSM straight to Terminated per §17.2.1;
-    /// the TU (us) owns 2xx retransmit per §13.3.1.4. Until the UAS
-    /// grows a proper per-dialog 2xx retransmit loop, we park the
-    /// bytes in [`Self::invite_2xx_cache`] so simple peer retries
-    /// still get a reply.
+    /// the TU (us) owns 2xx retransmit per §13.3.1.4. The bytes are
+    /// parked on the [`DialogRecord`] and a per-dialog timer loop is
+    /// armed via [`Self::spawn_invite_2xx_retransmit`].
     #[allow(clippy::too_many_arguments)] // a response is genuinely this many knobs
     async fn respond(
         &self,
@@ -811,13 +846,23 @@ impl<T: Transport> UasServer<T> {
             &req.raw, status, reason, local_tag, extras, body,
         ));
 
-        if let Some(branch) = req.branch.as_deref() {
-            // Park INVITE 2xx in the TU-owned replay cache before
-            // handing the bytes off — the FSM's 2xx bypass leaves
-            // nothing behind there.
-            if req.method == "INVITE" && (200..300).contains(&status) {
-                self.cache_invite_2xx(branch, bytes.clone());
+        // Park INVITE 2xx on the dialog record and spin up the
+        // §13.3.1.4 retransmit loop. Done *before* the driver send
+        // so a racing ACK on a fast loopback can still find the
+        // retransmit handle when it cancels.
+        if req.method == "INVITE"
+            && (200..300).contains(&status)
+            && let (Some(call_id), Some(remote_tag), Some(l_tag)) =
+                (req.call_id.as_deref(), req.from_tag.as_deref(), local_tag)
+        {
+            let key: DialogKey = (call_id.to_owned(), l_tag.to_owned(), remote_tag.to_owned());
+            if let Some(mut entry) = self.dialogs.get_mut(&key) {
+                entry.pending_2xx = Some(bytes.to_vec());
             }
+            self.spawn_invite_2xx_retransmit(&key, bytes.clone(), peer);
+        }
+
+        if let Some(branch) = req.branch.as_deref() {
             let key = server_txn_key(branch, &req.method);
             if self.txn_driver.is_alive(&key) {
                 self.txn_driver.send_response(&key, status, bytes);
@@ -834,19 +879,101 @@ impl<T: Transport> UasServer<T> {
         self.emit_response_metrics(req, peer, status);
     }
 
-    /// Insert `bytes` into [`Self::invite_2xx_cache`] keyed by
-    /// `branch`. Follows the shard-scoped eviction pattern from the
-    /// v0.13.1 deadlock fix: the `iter()` guard is dropped before
-    /// the paired `remove()` runs, so no shard-read+shard-write
-    /// ordering issue can wedge the map.
-    fn cache_invite_2xx(&self, branch: &str, bytes: Bytes) {
-        if self.invite_2xx_cache.len() >= INVITE_2XX_CACHE_CAPACITY {
-            let evict_key = self.invite_2xx_cache.iter().next().map(|e| e.key().clone());
-            if let Some(k) = evict_key {
-                self.invite_2xx_cache.remove(&k);
-            }
+    /// Start the RFC 3261 §13.3.1.4 per-dialog 2xx retransmit loop.
+    /// The first retransmit fires at T1 after this call (the initial
+    /// send goes through the FSM's `SendToPeer` in [`Self::respond`]);
+    /// subsequent intervals double up to T2 and the whole loop caps
+    /// at 64·T1 total wall-clock. ACK (cancel token tripped in
+    /// [`Self::handle_ack`]) or dialog teardown bow out early.
+    ///
+    /// Each retransmit bumps `sip_invite_2xx_retransmits`. A retransmit
+    /// emitted after the first is the operator's signal that either
+    /// (a) the 2xx was lost and we're doing RFC-compliant recovery,
+    /// or (b) the peer stopped `ACK`ing and we're burning the budget.
+    fn spawn_invite_2xx_retransmit(&self, key: &DialogKey, bytes: Bytes, peer: SocketAddr) {
+        let cancel = CancellationToken::new();
+        // Replace any pre-existing handle for this dialog (re-INVITE
+        // scenarios; today we don't re-INVITE but the map should
+        // degrade sanely). Abort-on-insert, then start the new loop.
+        if let Some(old) = self
+            .invite_2xx_retransmits
+            .insert(key.clone(), cancel.clone())
+        {
+            old.cancel();
         }
-        self.invite_2xx_cache.insert(branch.to_owned(), bytes);
+        let transport = Arc::clone(&self.transport);
+        let metrics = Arc::clone(&self.metrics);
+        let retransmits = Arc::clone(&self.invite_2xx_retransmits);
+        let task_key = key.clone();
+        let task_cancel = cancel.clone();
+        tokio::spawn(async move {
+            let mut interval = T1;
+            let mut elapsed = Duration::ZERO;
+            loop {
+                tokio::select! {
+                    biased;
+                    () = task_cancel.cancelled() => {
+                        // Canceller (ACK, BYE, or a re-spawn that
+                        // replaced us) already cleared / rewrote our
+                        // map slot. Don't touch it on the way out.
+                        return;
+                    }
+                    () = tokio::time::sleep(interval) => {}
+                }
+                elapsed = elapsed.saturating_add(interval);
+                if elapsed > INVITE_2XX_BUDGET {
+                    // §13.3.1.4: after 64·T1 without ACK the TU gives
+                    // up. Dialog-level cleanup (sending BYE) is a
+                    // follow-on; today we just exit the loop.
+                    warn!(
+                        ?task_key,
+                        "INVITE 2xx retransmit budget exhausted without ACK"
+                    );
+                    break;
+                }
+                if let Err(e) = transport.send(bytes.clone(), peer).await {
+                    warn!(%peer, ?e, "INVITE 2xx retransmit failed");
+                    break;
+                }
+                metrics.sip_invite_2xx_retransmits.inc();
+                debug!(?task_key, ?interval, "INVITE 2xx retransmit fired");
+                // Double, capped at T2.
+                interval = std::cmp::min(interval.saturating_mul(2), T2);
+            }
+            // Natural exit (budget or send-error): if our token is
+            // still live, we own the map slot — take it out. If it's
+            // been cancelled mid-iteration, a replacement has already
+            // rewired the entry and we must not touch it.
+            if !task_cancel.is_cancelled() {
+                retransmits.remove(&task_key);
+            }
+        });
+    }
+
+    /// Trip the cancel token for `key`'s retransmit loop (if any) and
+    /// remove the handle. Idempotent — safe to call from both ACK
+    /// and BYE paths even when no loop is registered.
+    fn cancel_invite_2xx_retransmit(&self, key: &DialogKey) {
+        if let Some((_, token)) = self.invite_2xx_retransmits.remove(key) {
+            token.cancel();
+        }
+    }
+
+    /// Best-effort match from a retransmitted INVITE (no to-tag yet)
+    /// back to the Early dialog we already answered. Returns `None`
+    /// when no dialog is registered for `(call_id, from_tag)`, which
+    /// means the INVITE is genuinely new.
+    fn dialog_for_invite(&self, req: &RequestSummary) -> Option<DialogKey> {
+        let call_id = req.call_id.as_deref()?;
+        let remote_tag = req.from_tag.as_deref()?;
+        self.dialogs.iter().find_map(|entry| {
+            let k = entry.key();
+            if k.0 == call_id && k.2 == remote_tag {
+                Some(k.clone())
+            } else {
+                None
+            }
+        })
     }
 
     fn emit_response_metrics(&self, req: &RequestSummary, peer: SocketAddr, status: u16) {
@@ -873,6 +1000,20 @@ fn server_txn_key(branch: &str, method: &str) -> TxnKey {
         method: method.to_owned(),
         role: TxnRole::Server,
     }
+}
+
+/// Format a SIP `Warning:` header value per RFC 3261 §20.43:
+/// `<code> <warn-agent> "<text>"`. Code 399 is the miscellaneous
+/// catch-all the RFC reserves for "just carrying a text reason";
+/// `warn-agent` is our product token, and the text is quoted so
+/// spaces inside it survive the wire.
+///
+/// The reason is sanitized — we strip any embedded `"` since the
+/// `UnsupportedTransport` payload is internal-text but ends up on the
+/// wire.
+fn format_warning(reason: &str) -> String {
+    let sanitized: String = reason.chars().filter(|c| *c != '"').collect();
+    format!("399 smiths-net \"{sanitized}\"")
 }
 
 /// Key for an in-dialog request (ACK, BYE, re-INVITE).

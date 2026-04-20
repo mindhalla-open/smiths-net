@@ -9,6 +9,8 @@ pub mod fake_uac;
 pub mod fake_uas;
 pub mod signal;
 pub mod wav;
+#[cfg(feature = "browser")]
+pub mod webrtc_harness;
 
 // Codec and RTP packet types live in `smiths-media` now (production
 // code needs them for audio injection). Re-exported here so existing

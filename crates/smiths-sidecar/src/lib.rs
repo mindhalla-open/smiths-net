@@ -12,6 +12,10 @@
 //! Protobuf later is a `WireFormat` implementation swap, not a
 //! protocol change.
 
+// Slice 1.7 lint tightening.
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod error;
 pub mod rpc;
 pub mod sandbox;

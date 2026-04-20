@@ -1,0 +1,58 @@
+[Unit]
+Description=smiths-net — AI-first SIP engine
+After=network-online.target
+Wants=network-online.target
+Documentation=https://github.com/mindhalla/smiths-net
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/smiths-net --config /etc/smiths-net/config.toml
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+KillMode=mixed
+# SIGTERM trips graceful drain (503 + Retry-After: 0). `TimeoutStopSec`
+# above gives up to 15 s before systemd escalates to SIGKILL; tune
+# with `SMITHS_DRAIN_SECS` if your SLA demands longer.
+
+# -- Identity + privileges --
+User=smiths
+Group=smiths
+# CAP_NET_BIND_SERVICE lets the daemon bind to the well-known SIP
+# ports (5060 / 5061) without running as root. Everything else the
+# engine does (UDP sockets, reading config) needs no elevation.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# -- Filesystem sandbox --
+# /etc/smiths-net mounted read-only — operators roll out config
+# changes by re-deploying, not by hot-editing the live mount.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=
+# Plugin spawn paths if the engine ever writes state; keep empty for
+# the stateless MVP and uncomment if `[storage]` is enabled.
+# ReadWritePaths=/var/lib/smiths-net
+ReadOnlyPaths=/etc/smiths-net
+
+# -- Syscall sandbox --
+# Complements (not replaces) the per-plugin seccomp filter the engine
+# installs on sidecars — this one scopes the engine itself.
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# -- Networking --
+# IPv4 + IPv6 allowed; no UNIX sockets / netlink beyond what AF_INET
+# + AF_INET6 need.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

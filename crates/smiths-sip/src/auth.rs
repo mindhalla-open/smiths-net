@@ -10,6 +10,14 @@
 //!   parses `Authorization:` headers, and verifies responses against
 //!   the credential store.
 
+// Slice 1.7: the `expect()` call sites in this module are all on
+// `RwLock` guards protecting in-memory auth state. A poisoned lock
+// means another thread panicked mid-mutation; recovering would leave
+// credential tables in an ambiguous state, so propagating the panic
+// is the correct response. Per-call `#[allow]` would be noisier than
+// one module-level justification.
+#![allow(clippy::expect_used)]
+
 use std::collections::HashMap;
 use std::sync::RwLock;
 

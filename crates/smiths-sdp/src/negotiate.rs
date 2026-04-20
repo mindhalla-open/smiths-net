@@ -175,6 +175,15 @@ impl Negotiator {
             crypto: answer_crypto,
             direction: audio.direction.reverse(),
             connection: None,
+            // Engine doesn't emit DTLS-SRTP / ICE attrs yet — slice 1.3
+            // wires fingerprint + setup; 1.4 wires ICE.
+            fingerprint: None,
+            setup: None,
+            ice_ufrag: None,
+            ice_pwd: None,
+            ice_options: Vec::new(),
+            candidates: Vec::new(),
+            end_of_candidates: false,
         };
 
         NegotiationResult::Answer {
@@ -209,6 +218,20 @@ impl SdpNegotiator for Negotiator {
             Ok(o) => o,
             Err(e) => return NegotiationOutcome::Malformed(e.to_string()),
         };
+        // DTLS-SRTP gate: the WebRTC transport profile (RFC 5764 §8 —
+        // `UDP/TLS/RTP/SAVP[F]`) parses fine and we recognize the
+        // fingerprint/setup/ICE surface, but the handshake itself
+        // lands in slice 1.3. Until then, reject with a descriptive
+        // reason so peers don't see a silent 488 / 408.
+        if offer
+            .media
+            .iter()
+            .any(|m| is_dtls_srtp_profile(&m.protocol))
+        {
+            return NegotiationOutcome::UnsupportedTransport {
+                reason: "DTLS-SRTP not yet supported".into(),
+            };
+        }
         let remote_media = first_audio_endpoint(&offer);
         // Per-call override: always honor the caller's `local_ip` over
         // whatever the negotiator was seeded with.
@@ -245,6 +268,13 @@ impl SdpNegotiator for Negotiator {
                 crypto: Vec::new(),
                 direction: crate::Direction::SendRecv,
                 connection: None,
+                fingerprint: None,
+                setup: None,
+                ice_ufrag: None,
+                ice_pwd: None,
+                ice_options: Vec::new(),
+                candidates: Vec::new(),
+                end_of_candidates: false,
             }],
         };
         sdp.to_string()
@@ -267,6 +297,16 @@ fn first_audio_endpoint(sdp: &SessionDescription) -> Option<SocketAddr> {
     }
     let conn = audio.connection.as_ref().or(sdp.connection.as_ref())?;
     Some(SocketAddr::new(conn.address, audio.port))
+}
+
+/// `true` if the media profile names DTLS-SRTP (RFC 5764 §8).
+///
+/// Matches `UDP/TLS/RTP/SAVP` and `UDP/TLS/RTP/SAVPF`
+/// case-insensitively. Everything else — `RTP/AVP`, `RTP/SAVP` (SDES)
+/// — returns false and goes through normal offer/answer.
+fn is_dtls_srtp_profile(protocol: &str) -> bool {
+    let upper = protocol.to_ascii_uppercase();
+    upper == "UDP/TLS/RTP/SAVP" || upper == "UDP/TLS/RTP/SAVPF"
 }
 
 fn unix_seconds() -> u64 {
@@ -303,6 +343,13 @@ mod tests {
                 crypto: Vec::new(),
                 direction: Direction::SendRecv,
                 connection: None,
+                fingerprint: None,
+                setup: None,
+                ice_ufrag: None,
+                ice_pwd: None,
+                ice_options: Vec::new(),
+                candidates: Vec::new(),
+                end_of_candidates: false,
             }],
         }
     }

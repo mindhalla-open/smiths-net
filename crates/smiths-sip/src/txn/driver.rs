@@ -19,6 +19,14 @@
 //! [`mpsc::UnboundedReceiver<TuEvent>`] for responses + a final
 //! `Terminated` marker.
 
+// Slice 1.7: every `expect()` in this file is a mutex lock on a
+// per-txn state structure. A poisoned mutex means another thread
+// panicked mid-FSM-transition; the driver can't safely continue
+// operating on that transaction, and the idiomatic recovery is to
+// propagate the panic up. A per-call `#[allow]` would be noisier
+// than one module-level justification.
+#![allow(clippy::expect_used)]
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -117,15 +125,16 @@ struct TxnEntry {
     /// Per-txn cancellation — flipped on Terminated so any in-flight
     /// timer tasks bow out before calling back into the driver.
     cancel: CancellationToken,
-    /// Serializes per-txn wire sends. Each `spawn_send` task acquires
-    /// this before calling `transport.send`, so two FSM actions fired
+    /// FIFO queue for per-txn wire sends. A single dedicated consumer
+    /// task (spawned at entry creation) drains this channel and
+    /// `.await`s `transport.send` in order, so two FSM actions fired
     /// in rapid succession (e.g. 100 Trying followed by 200 OK on the
-    /// same INVITE) reach the peer in the order the FSM emitted them.
-    /// Without this, both sends were fire-and-forget tokio tasks on
-    /// the multi-thread runtime and could race to the socket —
-    /// `drain.rs`'s `non_draining_uas_still_accepts_invite` caught
-    /// that regression before users would.
-    send_serialize: tokio::sync::Mutex<()>,
+    /// same INVITE) reach the peer in FSM-emit order. The prior
+    /// `Mutex`-guarded spawn-per-send approach relied on spawn-order
+    /// matching lock-acquisition-order, which tokio's multi-thread
+    /// scheduler does not guarantee — the `invite.rs` and
+    /// `codec_mismatch.rs` tests caught the race under load.
+    send_tx: mpsc::UnboundedSender<Bytes>,
 }
 
 impl<T: Transport> TransactionDriver<T> {
@@ -179,6 +188,7 @@ impl<T: Transport> TransactionDriver<T> {
         peer: SocketAddr,
     ) -> mpsc::UnboundedReceiver<TuEvent> {
         let (tu_tx, tu_rx) = mpsc::unbounded_channel();
+        let (send_tx, send_rx) = mpsc::unbounded_channel::<Bytes>();
         let key = txn.key().clone();
         let branch = key.branch.clone();
         let entry = Arc::new(TxnEntry {
@@ -188,9 +198,10 @@ impl<T: Transport> TransactionDriver<T> {
             tu_tx,
             listener: Mutex::new(None),
             cancel: CancellationToken::new(),
-            send_serialize: tokio::sync::Mutex::new(()),
+            send_tx,
         });
         self.inner.txns.insert(key.clone(), Arc::clone(&entry));
+        spawn_send_loop(Arc::clone(&self.inner.transport), peer, send_rx);
 
         // Spawn the response-listener *before* StartClient so a
         // peer that replies inside a microsecond (tests!) can't race
@@ -244,6 +255,7 @@ impl<T: Transport> TransactionDriver<T> {
         peer: SocketAddr,
     ) -> mpsc::UnboundedReceiver<TuEvent> {
         let (tu_tx, tu_rx) = mpsc::unbounded_channel();
+        let (send_tx, send_rx) = mpsc::unbounded_channel::<Bytes>();
         let key = txn.key().clone();
         let entry = Arc::new(TxnEntry {
             fsm: Mutex::new(txn),
@@ -252,9 +264,10 @@ impl<T: Transport> TransactionDriver<T> {
             tu_tx,
             listener: Mutex::new(None),
             cancel: CancellationToken::new(),
-            send_serialize: tokio::sync::Mutex::new(()),
+            send_tx,
         });
         self.inner.txns.insert(key, Arc::clone(&entry));
+        spawn_send_loop(Arc::clone(&self.inner.transport), peer, send_rx);
         if let Some(m) = &self.inner.metrics {
             m.sip_server_txns_active.inc();
         }
@@ -343,7 +356,7 @@ impl<T: Transport> TransactionDriver<T> {
         for action in actions {
             match action {
                 TransactionAction::SendToPeer(bytes) => {
-                    self.spawn_send(entry, bytes);
+                    Self::spawn_send(entry, bytes);
                 }
                 TransactionAction::DeliverResponseToTu { status, bytes } => {
                     let _ = entry.tu_tx.send(TuEvent::Response { status, bytes });
@@ -361,22 +374,19 @@ impl<T: Transport> TransactionDriver<T> {
         }
     }
 
-    /// Spawn a per-txn send task. Every send on the same transaction
-    /// acquires the entry's `send_serialize` mutex first, so two FSM
-    /// actions fired back-to-back (e.g. 100 Trying + 200 OK on the
-    /// same INVITE) reach the wire in FSM-emit order. Tokio's
-    /// `Mutex` is FIFO so the queued ordering is preserved even on
-    /// multi-thread runtimes.
-    fn spawn_send(&self, entry: &Arc<TxnEntry>, bytes: Bytes) {
-        let transport = Arc::clone(&self.inner.transport);
-        let entry = Arc::clone(entry);
-        let peer = entry.peer;
-        tokio::spawn(async move {
-            let _guard = entry.send_serialize.lock().await;
-            if let Err(e) = transport.send(bytes, peer).await {
-                warn!(%peer, ?e, "transaction driver: transport send failed");
-            }
-        });
+    /// Enqueue a wire send on the txn's FIFO queue. A dedicated
+    /// consumer task (see [`spawn_send_loop`]) drains the queue and
+    /// awaits each `transport.send` in order, guaranteeing that two
+    /// FSM `SendToPeer` actions emitted back-to-back (e.g. 100 Trying
+    /// + 200 OK on the same INVITE) reach the peer in FSM-emit
+    ///   order. The prior approach spawned one task per send and
+    ///   relied on a Tokio mutex to serialize them, but that depends
+    ///   on spawn-order matching lock-acquisition-order — which the
+    ///   multi-thread scheduler does not guarantee.
+    fn spawn_send(entry: &Arc<TxnEntry>, bytes: Bytes) {
+        if entry.send_tx.send(bytes).is_err() {
+            debug!(peer = %entry.peer, "txn send queue closed; bytes dropped");
+        }
     }
 
     fn arm_timer(&self, key: &TransactionKey, entry: &Arc<TxnEntry>, id: TimerId, after: Duration) {
@@ -470,6 +480,30 @@ impl<T: Transport> TransactionDriver<T> {
             .get(key)
             .map(|e| e.value().fsm.lock().expect("fsm mutex").state())
     }
+}
+
+/// Run the per-txn wire-send loop. Drains `rx` in FIFO order and
+/// awaits each `transport.send` sequentially, so FSM-ordered
+/// `SendToPeer` actions hit the socket in the same order. The loop
+/// exits when the channel closes (the last `TxnEntry` clone dropped,
+/// which happens after `terminate` removes the `DashMap` entry and
+/// the caller frames unwind). Deliberately does **not** race a
+/// cancel token: a `Terminated` FSM action can fire immediately
+/// after the final `SendToPeer`, so short-circuiting on cancel here
+/// would drop the just-enqueued bytes and the dialog 2xx retransmit
+/// loop would then be the first thing the peer sees.
+fn spawn_send_loop<T: Transport>(
+    transport: Arc<T>,
+    peer: SocketAddr,
+    mut rx: mpsc::UnboundedReceiver<Bytes>,
+) {
+    tokio::spawn(async move {
+        while let Some(bytes) = rx.recv().await {
+            if let Err(e) = transport.send(bytes, peer).await {
+                warn!(%peer, ?e, "transaction driver: transport send failed");
+            }
+        }
+    });
 }
 
 /// Parse the numeric status code out of a response's first line.

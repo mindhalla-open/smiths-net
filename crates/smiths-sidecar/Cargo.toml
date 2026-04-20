@@ -21,6 +21,11 @@ thiserror   = { workspace = true }
 # Windows ports would need a different story (JobObjects).
 rustix = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# seccomp-BPF filter compilation. Linux-only; pulled in just for
+# the syscall-allowlist path configured via SandboxConfig::seccomp.
+seccompiler = "0.5"
+
 [dev-dependencies]
 tokio    = { workspace = true, features = ["macros", "test-util"] }
 tempfile = { workspace = true }

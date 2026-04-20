@@ -43,9 +43,13 @@ pub enum DialogState {
 /// `Serialize` for the HA snapshot path.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DialogRecord {
+    /// `Call-ID` header value — identifies the end-to-end dialog.
     pub call_id: String,
+    /// Tag this engine picked for the dialog's local leg.
     pub local_tag: String,
+    /// Tag the peer sent in the INVITE's From header.
     pub remote_tag: String,
+    /// Current dialog lifecycle state (Early / Confirmed).
     pub state: DialogState,
     /// Peer's SIP signaling address (source of the INVITE).
     pub peer_signal: SocketAddr,
@@ -57,6 +61,16 @@ pub struct DialogRecord {
     pub media: Option<EndpointId>,
     /// Peer's RTP endpoint learned from the SDP offer, if any.
     pub remote_media: Option<SocketAddr>,
+    /// Cached 2xx final-response bytes, parked here so the UAS can
+    /// drive the RFC 3261 §13.3.1.4 per-dialog retransmit loop until
+    /// ACK confirms the dialog. Cleared on Early → Confirmed. Stored
+    /// on the record (not a side table) so an HA snapshot captures
+    /// any in-flight 2xx retransmit — a failover primary can resume
+    /// the schedule without dropping the call. `None` everywhere the
+    /// dialog is already Confirmed or the call never carried an
+    /// INVITE 2xx (registrar-only dialogs, etc).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_2xx: Option<Vec<u8>>,
 }
 
 impl DialogRecord {

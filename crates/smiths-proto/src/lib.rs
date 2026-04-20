@@ -30,6 +30,12 @@
 //! Existing tags never change meaning.
 
 #![no_std]
+// Slice 1.7: match smiths-core / smiths-sdp. Every public wire
+// type carries a doc line so downstream plugin authors can read
+// the generated types without the .proto source.
+#![warn(missing_docs)]
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 extern crate alloc;
 

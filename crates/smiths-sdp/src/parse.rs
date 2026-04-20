@@ -9,7 +9,8 @@ use std::str::FromStr;
 use crate::error::ParseError;
 use crate::srtp_attr::SdesCrypto;
 use crate::types::{
-    ConnectionInfo, Direction, MediaDescription, MediaKind, Origin, RtpMap, SessionDescription,
+    ConnectionInfo, Direction, DtlsSetup, Fingerprint, IceCandidate, IcePassword, MediaDescription,
+    MediaKind, Origin, RtpMap, SessionDescription,
 };
 
 impl SessionDescription {
@@ -170,6 +171,13 @@ fn parse_media(value: &str, line: usize) -> Result<MediaDescription, ParseError>
         crypto: Vec::new(),
         direction: Direction::default(),
         connection: None,
+        fingerprint: None,
+        setup: None,
+        ice_ufrag: None,
+        ice_pwd: None,
+        ice_options: Vec::new(),
+        candidates: Vec::new(),
+        end_of_candidates: false,
     })
 }
 
@@ -201,6 +209,68 @@ fn apply_attribute(
             Ok(c) => m.crypto.push(c),
             Err(e) => tracing::debug!(line, ?e, "skipping malformed a=crypto line"),
         }
+        return Ok(());
+    }
+    // ---- DTLS-SRTP + ICE attributes (RFC 5763 / RFC 8122 / RFC 8839) ----
+    //
+    // All soft-fail on parse — a malformed line should never fail the
+    // whole SDP; the negotiator will see missing fields and decide
+    // whether to reject at the transport level.
+    if let Some(rest) = value.strip_prefix("fingerprint:")
+        && let Some(m) = cur.as_mut()
+    {
+        let rest = rest.trim();
+        if let Some((algo, val)) = rest.split_once(char::is_whitespace) {
+            m.fingerprint = Some(Fingerprint {
+                algorithm: algo.to_ascii_lowercase(),
+                value: val.trim().to_owned(),
+            });
+        } else {
+            tracing::debug!(line, "skipping malformed a=fingerprint (missing value)");
+        }
+        return Ok(());
+    }
+    if let Some(rest) = value.strip_prefix("setup:")
+        && let Some(m) = cur.as_mut()
+    {
+        if let Some(s) = DtlsSetup::parse(rest.trim()) {
+            m.setup = Some(s);
+        } else {
+            tracing::debug!(line, token = rest, "skipping unknown a=setup");
+        }
+        return Ok(());
+    }
+    if let Some(rest) = value.strip_prefix("ice-ufrag:")
+        && let Some(m) = cur.as_mut()
+    {
+        m.ice_ufrag = Some(rest.trim().to_owned());
+        return Ok(());
+    }
+    if let Some(rest) = value.strip_prefix("ice-pwd:")
+        && let Some(m) = cur.as_mut()
+    {
+        m.ice_pwd = Some(IcePassword(rest.trim().to_owned()));
+        return Ok(());
+    }
+    if let Some(rest) = value.strip_prefix("ice-options:")
+        && let Some(m) = cur.as_mut()
+    {
+        m.ice_options = rest.split_whitespace().map(str::to_owned).collect();
+        return Ok(());
+    }
+    if let Some(rest) = value.strip_prefix("candidate:")
+        && let Some(m) = cur.as_mut()
+    {
+        match parse_candidate(rest, line) {
+            Ok(c) => m.candidates.push(c),
+            Err(e) => tracing::debug!(line, ?e, "skipping malformed a=candidate line"),
+        }
+        return Ok(());
+    }
+    if value == "end-of-candidates"
+        && let Some(m) = cur.as_mut()
+    {
+        m.end_of_candidates = true;
         return Ok(());
     }
     let dir = match value {
@@ -253,6 +323,94 @@ fn parse_rtpmap(rest: &str, line: usize) -> Result<RtpMap, ParseError> {
         codec,
         clock_rate,
         channels,
+    })
+}
+
+/// `candidate:<foundation> <component> <transport> <priority> <ip>
+/// <port> typ <type> [raddr <ip>] [rport <port>] [<k> <v>]*`.
+fn parse_candidate(rest: &str, line: usize) -> Result<IceCandidate, ParseError> {
+    let mut parts = rest.split_whitespace();
+    let mut next = |field: &'static str| {
+        parts.next().ok_or_else(|| ParseError::Malformed {
+            line,
+            reason: format!("candidate missing {field}"),
+        })
+    };
+    let foundation = next("foundation")?.to_owned();
+    let component = next("component")?
+        .parse::<u8>()
+        .map_err(|e| ParseError::Malformed {
+            line,
+            reason: format!("candidate component: {e}"),
+        })?;
+    let transport = next("transport")?.to_owned();
+    let priority = next("priority")?
+        .parse::<u32>()
+        .map_err(|e| ParseError::Malformed {
+            line,
+            reason: format!("candidate priority: {e}"),
+        })?;
+    let address_str = next("address")?;
+    let address = IpAddr::from_str(address_str).map_err(|e| ParseError::Malformed {
+        line,
+        reason: format!("candidate address `{address_str}`: {e}"),
+    })?;
+    let port = next("port")?
+        .parse::<u16>()
+        .map_err(|e| ParseError::Malformed {
+            line,
+            reason: format!("candidate port: {e}"),
+        })?;
+    let typ_tok = next("`typ`")?;
+    if !typ_tok.eq_ignore_ascii_case("typ") {
+        return Err(ParseError::Malformed {
+            line,
+            reason: format!("candidate expected `typ`, got `{typ_tok}`"),
+        });
+    }
+    let candidate_type = next("type")?.to_owned();
+
+    // Everything after `typ <type>` is optional: `raddr <ip>`,
+    // `rport <port>`, then arbitrary k/v pairs. We consume the
+    // remaining tokens two at a time.
+    let mut related_address = None;
+    let mut related_port = None;
+    let mut raw_params = Vec::new();
+    while let Some(key) = parts.next() {
+        let Some(value) = parts.next() else {
+            return Err(ParseError::Malformed {
+                line,
+                reason: format!("candidate trailing key `{key}` without value"),
+            });
+        };
+        match key {
+            "raddr" => {
+                related_address =
+                    Some(IpAddr::from_str(value).map_err(|e| ParseError::Malformed {
+                        line,
+                        reason: format!("candidate raddr: {e}"),
+                    })?);
+            }
+            "rport" => {
+                related_port = Some(value.parse::<u16>().map_err(|e| ParseError::Malformed {
+                    line,
+                    reason: format!("candidate rport: {e}"),
+                })?);
+            }
+            _ => raw_params.push((key.to_owned(), value.to_owned())),
+        }
+    }
+    Ok(IceCandidate {
+        foundation,
+        component,
+        transport,
+        priority,
+        address,
+        port,
+        candidate_type,
+        related_address,
+        related_port,
+        raw_params,
     })
 }
 

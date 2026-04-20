@@ -117,8 +117,12 @@ async fn invite_establishes_dialog_ack_then_bye() {
     );
     client.send_to(ack.as_bytes(), uas_addr).await.unwrap();
 
-    // Give the UAS a moment to process.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Give the UAS a moment to process the ACK (which cancels the
+    // §13.3.1.4 2xx retransmit loop). Under heavy test parallelism
+    // the first retransmit can race the ACK; the BYE-response loop
+    // below filters any stray INVITE 200s so the test stays
+    // deterministic.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // ---- BYE → 200 OK ----
     let bye = format!(
@@ -137,12 +141,20 @@ async fn invite_establishes_dialog_ack_then_bye() {
     );
     client.send_to(bye.as_bytes(), uas_addr).await.unwrap();
 
-    let bye_ok = recv_str(&client).await;
+    // Drain responses until we find the BYE reply. Any late INVITE 2xx
+    // retransmit that slipped past the ACK cancellation is discarded —
+    // the retransmit contract is verified explicitly in
+    // `invite_2xx_is_retransmitted_on_lost_ack`.
+    let bye_ok = loop {
+        let resp = recv_str(&client).await;
+        if resp.contains("CSeq: 2 BYE\r\n") {
+            break resp;
+        }
+    };
     assert!(
         bye_ok.starts_with("SIP/2.0 200 OK\r\n"),
         "BYE reply: {bye_ok}"
     );
-    assert!(bye_ok.contains("CSeq: 2 BYE\r\n"));
     assert!(
         bye_ok.contains(&format!("To: Alice <sip:alice@127.0.0.1>;tag={to_tag}")),
         "BYE reply To-tag must match dialog tag; got: {bye_ok}"
@@ -177,8 +189,13 @@ async fn bye_without_dialog_returns_481() {
     );
 }
 
+/// RFC 3261 §13.3.1.4: until ACK lands, the TU owns the 2xx
+/// retransmit schedule. Starting at T1 (500 ms), the UAS re-sends the
+/// byte-identical 200 OK; the interval doubles each time up to T2.
+/// A peer that retransmits the INVITE instead of waiting gets
+/// silently dropped — the UAS does **not** re-answer off-schedule.
 #[tokio::test(flavor = "multi_thread")]
-async fn invite_retransmit_replays_same_200() {
+async fn invite_2xx_is_retransmitted_on_lost_ack() {
     let uas_addr = spawn_uas().await;
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let ca = client.local_addr().unwrap();
@@ -198,16 +215,95 @@ async fn invite_retransmit_replays_same_200() {
         ca = ca,
     );
 
-    // First INVITE: expect 100 Trying + 200 OK.
+    // First INVITE → 100 Trying + 200 OK.
     client.send_to(invite.as_bytes(), uas_addr).await.unwrap();
     let trying = recv_str(&client).await;
     assert!(trying.starts_with("SIP/2.0 100 Trying\r\n"));
     let first_ok = recv_str(&client).await;
     assert!(first_ok.starts_with("SIP/2.0 200 OK\r\n"));
 
-    // Retransmit same INVITE: must replay same 200 OK byte-for-byte
-    // (same To-tag, same everything). No new 100 Trying.
+    // A retransmitted INVITE is now dropped, not answered — the TU
+    // drives replay. Confirm no immediate response arrives within a
+    // sub-T1 window (200 ms gives plenty of slack).
     client.send_to(invite.as_bytes(), uas_addr).await.unwrap();
-    let second_ok = recv_str(&client).await;
-    assert_eq!(first_ok, second_ok, "retransmit must be identical");
+    let mut buf = vec![0u8; 4096];
+    let early = timeout(Duration::from_millis(200), client.recv_from(&mut buf)).await;
+    assert!(
+        early.is_err(),
+        "peer-retransmitted INVITE must not trigger an off-schedule answer"
+    );
+
+    // Wait for the T1-driven retransmit. T1 = 500 ms; generous slack
+    // for CI scheduling jitter.
+    let second_ok = timeout(Duration::from_millis(1200), async {
+        let (n, _) = client.recv_from(&mut buf).await.unwrap();
+        String::from_utf8(buf[..n].to_vec()).unwrap()
+    })
+    .await
+    .expect("UAS must retransmit 200 at T1");
+    assert_eq!(
+        first_ok, second_ok,
+        "retransmitted 2xx must be byte-identical to the original"
+    );
+
+    // Next retransmit fires at 2·T1 (1 s).
+    let third_ok = timeout(Duration::from_millis(1800), async {
+        let (n, _) = client.recv_from(&mut buf).await.unwrap();
+        String::from_utf8(buf[..n].to_vec()).unwrap()
+    })
+    .await
+    .expect("UAS must retransmit again at 2·T1 (doubling)");
+    assert_eq!(first_ok, third_ok, "doubled retransmit still identical");
+}
+
+/// ACK arrival must cancel the TU-owned retransmit loop. After ACK
+/// no further 2xx should land on the peer socket, even past T1.
+#[tokio::test(flavor = "multi_thread")]
+async fn ack_cancels_2xx_retransmit() {
+    let uas_addr = spawn_uas().await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let ca = client.local_addr().unwrap();
+
+    let invite = format!(
+        concat!(
+            "INVITE sip:alice@127.0.0.1 SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP {ca};branch=z9hG4bK-ackcancel-1;rport\r\n",
+            "From: Bob <sip:bob@127.0.0.1>;tag=bob\r\n",
+            "To: Alice <sip:alice@127.0.0.1>\r\n",
+            "Call-ID: ackcancel-cid@127.0.0.1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Max-Forwards: 70\r\n",
+            "Contact: <sip:bob@{ca}>\r\n",
+            "Content-Length: 0\r\n\r\n",
+        ),
+        ca = ca,
+    );
+    client.send_to(invite.as_bytes(), uas_addr).await.unwrap();
+    let _trying = recv_str(&client).await;
+    let ok = recv_str(&client).await;
+    let local_tag = to_tag_of(&ok).expect("200 must carry our to-tag");
+
+    let ack = format!(
+        concat!(
+            "ACK sip:alice@127.0.0.1 SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP {ca};branch=z9hG4bK-ackcancel-2;rport\r\n",
+            "From: Bob <sip:bob@127.0.0.1>;tag=bob\r\n",
+            "To: Alice <sip:alice@127.0.0.1>;tag={tag}\r\n",
+            "Call-ID: ackcancel-cid@127.0.0.1\r\n",
+            "CSeq: 1 ACK\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n\r\n",
+        ),
+        ca = ca,
+        tag = local_tag,
+    );
+    client.send_to(ack.as_bytes(), uas_addr).await.unwrap();
+
+    // Well past T1 (500 ms) — no retransmitted 200 must arrive.
+    let mut buf = vec![0u8; 4096];
+    let extra = timeout(Duration::from_millis(800), client.recv_from(&mut buf)).await;
+    assert!(
+        extra.is_err(),
+        "ACK must cancel the §13.3.1.4 retransmit loop"
+    );
 }

@@ -64,3 +64,15 @@ dir = "plugins"
 # skipped on macOS / BSD.
 # no_new_privs = true
 
+# Seccomp-BPF syscall filter (Linux only, v0.29.0+).
+#   "off"        — no filter (default, same as pre-v0.29.0).
+#   "allowlist"  — install the curated baseline + extras below;
+#                  everything else returns EPERM.
+# See docs/operator-runbook.md for the rationale behind the
+# baseline list.
+# seccomp = "allowlist"
+
+# Optional per-plugin extras on top of the allowlist baseline.
+# Each entry is a syscall name; unknown names fail fast at spawn.
+# seccomp_extra_allow = ["io_uring_setup", "io_uring_enter", "io_uring_register"]
+

@@ -14,6 +14,10 @@
 //! protocols**. Adding a new adapter (gRPC, Matrix, webhook, ...) is
 //! wrapping the transport around the same trait set.
 
+// Slice 1.7 lint tightening.
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod a2a;
 pub mod audit;
 pub mod control;

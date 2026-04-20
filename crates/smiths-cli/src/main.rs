@@ -142,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
         bus: Some(bus.clone()),
         wasm_engine,
         metrics: Some(Arc::clone(&metrics)),
-        sandbox: config.plugins.sandbox,
+        sandbox: config.plugins.sandbox.clone(),
     };
     let mut plugins_loaded: Vec<String> = Vec::new();
     let mut plugins_failed: Vec<(String, String)> = Vec::new();
