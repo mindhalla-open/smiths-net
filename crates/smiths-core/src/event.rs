@@ -126,4 +126,33 @@ pub enum SipEvent {
         /// `Call-ID` header value.
         call_id: String,
     },
+    /// Media-plane security failure — typed so dashboards + alerting
+    /// treat DTLS fingerprint mismatches and SRTP auth-tag failures as
+    /// first-class events rather than scraping logs. Emitted from the
+    /// media fabric when a leg tears down for a crypto reason.
+    MediaSecurityError {
+        /// `Call-ID` of the affected dialog, when known.
+        call_id: Option<String>,
+        /// Failure class — see [`MediaSecurityFailure`].
+        kind: MediaSecurityFailure,
+        /// Human-readable detail, safe to log.
+        detail: String,
+    },
+}
+
+/// Media-plane security failure kinds. Stable — operators' dashboards
+/// key on these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MediaSecurityFailure {
+    /// DTLS handshake's peer cert did not match the SDP-advertised
+    /// fingerprint (RFC 5763 §8).
+    DtlsFingerprint,
+    /// DTLS handshake failed for a non-fingerprint reason — cipher
+    /// mismatch, malformed message, peer reset.
+    DtlsHandshake,
+    /// SRTP auth-tag verification failed on an inbound packet.
+    SrtpAuthTag,
+    /// Negotiated protection profile isn't one we support (MVP is
+    /// `AES_CM_128_HMAC_SHA1_80` only).
+    UnsupportedSuite,
 }

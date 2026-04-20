@@ -53,6 +53,7 @@ async fn streaming_transcribe_emits_partials_on_bus() {
         bus: Some(bus.clone()),
         wasm_engine: None,
         metrics: None,
+        ..Default::default()
     };
     let report = load_plugins(tmp.path(), &registry, opts).await.unwrap();
     assert!(

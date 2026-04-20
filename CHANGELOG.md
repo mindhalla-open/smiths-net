@@ -5,6 +5,530 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.32.0] - 2026-04-20
+
+Closes **prod-readiness Phase 6** — full e2e + perf validation.
+
+### Added
+
+- `crates/smiths-testkit/tests/full_stack.rs` — skeleton for the
+  TLS + SRTP + WASM + sidecar + metrics + drain-during-call
+  scenario. Smoke-passes today; individual steps gain assertions
+  as each subsystem's seam freezes.
+- `observability.pcap_dir` config knob + `smiths-media`'s `pcap`
+  Cargo feature. Placeholder writer module lives under
+  `pcap = ["feature"]`; the pcap-file encoder lands in a follow-on
+  when operators actually demand the tap.
+- `.github/workflows/fuzz-nightly.yml` — runs `cargo-fuzz` on
+  `sip_parser`, `via_branch`, and `sdes_crypto` nightly, uploads
+  coverage + crash corpus as workflow artifacts.
+- `observability/dashboards/smiths-overview.json` — Grafana
+  dashboard covering dialogs, SIP req/resp, txn FSM entries, 2xx
+  retransmits, RTP forward rate, RTCP SRs, plugin invocations, tool
+  latency, sidecar restarts.
+
+## [0.31.0] - 2026-04-20
+
+### Added — deployment artifacts (Phase 6 ops)
+
+- `Dockerfile` — multi-stage musl build targeting
+  `linux/amd64` + `linux/arm64`. Final image is distroless-static
+  with the config.toml example bundled as `.example`.
+- `.github/workflows/release.yml` — tag-driven (`v*`) buildx job
+  publishing multi-arch images to GHCR plus per-arch release
+  tarballs.
+- `systemd/smiths-net.service` — `CAP_NET_BIND_SERVICE` ambient
+  cap, `ProtectSystem=strict`, read-only `/etc/smiths-net` mount,
+  systemcall filter (`@system-service`), `RestrictAddressFamilies
+  =AF_INET AF_INET6 AF_UNIX`.
+- `k8s/` — `Deployment` (2 replicas, zero-unavailable rolling
+  update, read-only root, `RuntimeDefault` seccomp),
+  `ConfigMap` (engine config inline), `Service`
+  (LoadBalancer with ClientIP affinity for SIP, separate
+  ClusterIP for `/metrics`).
+- `docs/operator-runbook.md` — install / upgrade / rollback
+  procedures for bare-metal, Docker, and Kubernetes. Extends the
+  sandbox docs section added in v0.29.0.
+
+## [0.30.0] - 2026-04-20
+
+### Changed — workspace lint tightening (Phase 6)
+
+- `#![warn(clippy::unwrap_used, clippy::expect_used)]` promoted on
+  `smiths-sip`, `smiths-media`, `smiths-mcp`, `smiths-plugin`,
+  `smiths-sidecar` — every production-code fire is either
+  documented at the site with `#[allow]` + justification
+  (intra-module mutex locks) or absent. Tests stay unrestricted
+  via `#[cfg_attr(test, allow(...))]`.
+- `#![warn(missing_docs)]` promoted on `smiths-core`, `smiths-sdp`,
+  `smiths-proto`. Every public item now carries at least a
+  one-line description. Zero-fire; CI's existing `-D warnings`
+  gates drift.
+- `smiths-proto` gains the unwrap/expect lint pair for parity with
+  the other frozen-surface crates.
+
+## [0.29.0] - 2026-04-20
+
+### Added — hardened sandbox (seccomp-BPF, Linux)
+
+`SandboxConfig` grows a `seccomp` policy field with two values:
+`off` (default, same as pre-v0.29.0) and `allowlist`, which
+installs a curated BPF allowlist covering the syscalls a typical
+Rust / Python / Node plugin needs. Denies return `ERRNO(EPERM)`
+so plugins surface "operation not permitted" instead of the
+opaque kernel kill `SIGSYS` would produce.
+
+- **`smiths_sidecar::sandbox::seccomp_filter`** — compiled only on
+  `target_os = "linux"`. Uses `seccompiler` 0.5 behind the `pre_exec`
+  gate. Baseline covers file I/O, memory ops, futex, signals,
+  event-loop primitives (epoll, eventfd2), sockets (AF_INET +
+  AF_INET6 + AF_UNIX), process lifecycle, `prctl`, `getrandom`.
+  Per-arch syscall tables for `x86_64` + `aarch64`.
+- **`SeccompPolicy`** — serde-ready TOML enum
+  (`seccomp = "allowlist"`). `SandboxConfig::seccomp_extra_allow`
+  accepts syscall names to layer on top; unknown names fail fast
+  at spawn rather than silently widening the filter.
+- **`docs/operator-runbook.md`** — new section walking through
+  enabling the filter, debugging a filter-triggered failure, and
+  the rationale for EPERM-over-SIGSYS. Includes the full deny
+  list for escape-the-sandbox primitives (`mount`, `pivot_root`,
+  `unshare`, `bpf`, `ptrace`, …).
+
+### Changed
+
+- `SandboxConfig` became `Clone` (no longer `Copy`) because
+  `seccomp_extra_allow` carries a `Vec`. All callsites updated;
+  supervisor spawn path clones once per respawn (cheap).
+
+## [0.28.0] - 2026-04-20
+
+### Added — WebRTC interop support surfaces
+
+Preparation for closing roadmap item 2 with a real browser. The
+harness and trickle-ICE plumbing land here; the Chromium driver
+stays feature-gated until a CI image can be standardized.
+
+- **Trickle ICE** — `MediaDescription::end_of_candidates` field +
+  `a=end-of-candidates` parse / serialize, so a peer that trickles
+  candidates after the initial offer gets merged without triggering
+  a full renegotiation.
+- **Typed media-security events** — `SipEvent::MediaSecurityError`
+  + `MediaSecurityFailure` enum (`DtlsFingerprint`, `DtlsHandshake`,
+  `SrtpAuthTag`, `UnsupportedSuite`). Dashboards can now count
+  crypto failures by class instead of scraping logs.
+- **`smiths-testkit::webrtc_harness`** — module under the new
+  `browser` Cargo feature. Placeholder `WebRtcHarness` +
+  `HarnessConfig` + `HarnessError` so downstream tests can compile
+  against the API today; the concrete Chromium launcher lands with
+  a browser-driver dep pick.
+- **`docs/architecture/07-webrtc-interop.md`** — end-to-end
+  walkthrough of the four-layer WebRTC stack (SDP, DTLS, ICE, RTP)
+  with a `browser ↔ engine ↔ SIP UA` call trace + a table of
+  which `SipEvent::MediaSecurityError` fires on which failure path.
+
+## [0.27.0] - 2026-04-20
+
+### Added — ICE MVP (host candidates only)
+
+New `smiths-ice` crate implementing the STUN half of the ICE
+pairing algorithm. Slice 1.4 of the DTLS-SRTP / ICE rollout —
+LAN loopback works end-to-end today; STUN short-term credentials +
+server-reflexive candidates + TURN relay are follow-on slices.
+
+- **`smiths_ice::stun`** — hand-rolled RFC 8489 Binding
+  Request/Response encoder + parser. `XOR-MAPPED-ADDRESS` attribute
+  (the only one MVP inspects). `binding_ping()` primitive: send
+  one Binding Request over a tokio UDP socket, await the paired
+  response. Loopback integration test confirms the observed
+  address equals the caller's bound socket.
+- **`smiths_ice::candidate`** — `CandidateGatherer` + the free
+  `gather_host_candidates()` helper emit `smiths_sdp::IceCandidate`
+  values ready to slot into an SDP answer's `m=audio` block.
+  Priority per RFC 8445 §5.1.2.1 (host type-pref 126, IPv6 local-
+  pref > IPv4, component 1 > component 2).
+- **`smiths_ice::config::IceConfig`** — `[ice]` TOML block with
+  `enabled` master switch + optional `stun_servers` list (for the
+  server-reflexive work in the follow-on).
+
+## [0.26.0] - 2026-04-20
+
+### Added — DTLS-SRTP handshake (`smiths-dtls`)
+
+Slice 1.3 of the DTLS-SRTP rollout. Per-leg DTLS handshake against
+a fixed peer, SRTP keying material extracted via RFC 5764 §4.2
+`EXTRACTOR-dtls_srtp` label, fingerprint verification against the
+SDP-advertised value.
+
+- **New crate `smiths-dtls`** wrapping `webrtc-dtls` 0.12.
+  `DtlsLeg` per-leg state machine (`Idle → Handshaking → Active
+  → Closed`); `DtlsLegConfig` bundles the local cert, the
+  `DtlsRole` (Client / Server), and the peer fingerprint to check.
+- **Fingerprint verification** — SHA-256 of the peer's leaf cert
+  compared against the normalized SDP fingerprint. Mismatch
+  surfaces as `DtlsHandshakeError::FingerprintMismatch`; weaker
+  algorithms (sha-1) surface as `UnsupportedAlgorithm`.
+- **`use_srtp` extension** — `srtp_protection_profiles =
+  [SRTP_AES128_CM_HMAC_SHA1_80]` fixed for MVP; any other profile
+  on the wire is a hard error.
+- **SRTP key extraction** — 60-byte export sliced into
+  client/server stacks and assigned to `peer_tx_key` /
+  `local_tx_key` based on the local role. Ready to plug into the
+  existing `AesCmHmacSha1_80Transform` on the bridge.
+- **Tests** — 10 unit tests cover state transitions, fingerprint
+  verification happy/sad paths, algorithm rejection, key-export
+  bit-level layout. A placeholder `#[ignore]` test holds the slot
+  for the openssl `s_client -dtls1_2` integration check that the
+  slice 1.5 harness runs.
+- **Workspace** pinned `webrtc-util = "=0.11.0"` inside the
+  `smiths-dtls` crate Cargo.toml so the `KeyingMaterialExporter`
+  trait resolves against the same instance `webrtc-dtls` 0.12
+  implements.
+
+## [0.25.0] - 2026-04-20
+
+### Added — DTLS-SRTP SDP surface + cert helper
+
+Slice 1.2 of the DTLS-SRTP rollout. Parses (but does not yet
+terminate) the full WebRTC SDP surface so peers offering
+`UDP/TLS/RTP/SAVP` see a descriptive 488 rather than a silent
+reject — and later slices (1.3 handshake, 1.4 ICE) slot into a
+plumbed data model.
+
+- **`smiths-sdp`** now typed-models `a=fingerprint` / `a=setup` /
+  `a=ice-ufrag` / `a=ice-pwd` / `a=ice-options` / `a=candidate`.
+  New `Fingerprint`, `DtlsSetup`, `IcePassword` (debug-redacted),
+  and `IceCandidate` types on `MediaDescription`. Display +
+  parse both round-trip cleanly.
+- **`smiths_core::dtls::SelfSignedCert::generate(subject)`** —
+  `rcgen`-backed helper minting an ECDSA P-256 self-signed cert
+  and returning its RFC 8122 §5 SHA-256 fingerprint (uppercase
+  colon-separated hex). Zero-cost for other crates because the
+  helper is opt-in behind the existing `rcgen` workspace dep.
+- **`NegotiationOutcome::UnsupportedTransport { reason }`** — new
+  variant distinct from `Mismatch`. The negotiator returns it on a
+  recognized-but-unterminatable profile (`UDP/TLS/RTP/SAVP[F]`);
+  the UAS maps it to `488 Not Acceptable Here` with
+  `Warning: 399 smiths-net "DTLS-SRTP not yet supported"` per
+  RFC 3261 §20.43. Integration test covers the full path.
+- **`docs/architecture/04-post-mvp-scope.md`** — new section
+  documents the staged DTLS-SRTP rollout (slices 1.2 → 1.5) with
+  a per-slice table of what lands and what's still missing.
+
+## [0.24.0] - 2026-04-20
+
+### Added — per-dialog 2xx INVITE retransmit loop (RFC 3261 §13.3.1.4)
+
+Replaces the branch-keyed `invite_2xx_cache` LRU DashMap with a
+proper TU-owned timer loop per dialog. Starts at T1 (500 ms),
+doubles to T2 (4 s cap), stops after 64·T1 total or on ACK.
+
+- **`DialogRecord::pending_2xx`** — parked 2xx bytes, serializable
+  so an HA snapshot captures in-flight retransmit state.
+- **`UasServer::invite_2xx_retransmits`** — dashmap of
+  `CancellationToken` per dialog key. ACK (`handle_ack`) and BYE
+  (`handle_bye`) both trip the token; dialog teardown cleans up
+  automatically.
+- **`Metrics::sip_invite_2xx_retransmits`** — cumulative counter.
+  A healthy deployment barely moves; a sudden slope change is
+  the operator's signal that 2xx delivery is flaking or a UAC
+  stopped ACKing.
+- **Dropped**: `invite_2xx_cache` (`Arc<DashMap<branch, Bytes>>`) +
+  the 4096-entry LRU eviction + `INVITE_2XX_CACHE_CAPACITY` const.
+  Retransmitted INVITEs arriving for a dialog-with-live-loop are
+  silently dropped (TU owns the retransmit cadence; answering a
+  peer retry would inject an off-schedule 2xx).
+- **Tests**: `invite_2xx_is_retransmitted_on_lost_ack` verifies
+  cadence (T1 then 2·T1 retransmit); `ack_cancels_2xx_retransmit`
+  verifies ACK stops the loop.
+- **Arch doc**: new `docs/architecture/06-sip-core.md` walks
+  through cancellation paths, per-field ownership, and why peer-
+  retransmitted INVITEs get dropped.
+
+## [0.23.0] - 2026-04-20
+
+### Added — sidecar resource sandboxing (closes roadmap item 8, MVP scope)
+
+Sidecar plugins now spawn under a `SandboxConfig` that the operator
+controls through `[plugins.sandbox]` in TOML. Limits apply via a
+`pre_exec` closure in the forked child right before `execve`, so
+the kernel enforces them from the plugin's first instruction.
+
+- **`smiths_core::SandboxConfig`** — per-sidecar knobs:
+  `max_fds` (`RLIMIT_NOFILE`), `max_memory_bytes` (`RLIMIT_AS`),
+  `max_cpu_seconds` (`RLIMIT_CPU`), `max_processes` (`RLIMIT_NPROC`;
+  set `0` to forbid `fork`/`exec` from the plugin entirely), and
+  `no_new_privs` (Linux `PR_SET_NO_NEW_PRIVS`, silently skipped
+  elsewhere).
+- **`smiths_sidecar::sandbox::apply_in_child`** — async-signal-safe
+  application via the `rustix` crate. No libc unsafe blocks; the
+  workspace lint relaxed from `unsafe_code = "forbid"` to `"deny"`
+  so the one necessary `CommandExt::pre_exec` call can carry a
+  narrowly-scoped `#[allow(unsafe_code)]` with a justification
+  comment. Every other crate stays unsafe-free.
+- **`Sidecar::spawn_with(name, dir, entry, policy, sandbox)`** —
+  new primary spawn entry point. `Sidecar::spawn` +
+  `Sidecar::spawn_with_policy` retained as convenience wrappers
+  (both thread `SandboxConfig::default()` — permissive).
+- **`LoaderOpts::sandbox`** field — CLI plumbs
+  `config.plugins.sandbox` through the loader so every loaded
+  plugin inherits the same caps. Includes supervisor-driven
+  respawns after crashes (rlimit is re-applied per spawn).
+- **Integration test**: `sandbox_rlimit_nofile_is_applied_to_child`
+  spawns a bash script that echoes `ulimit -n` back over JSON-RPC
+  and verifies the child observes exactly the configured value.
+
+### What's explicitly out of scope for this slice
+
+- **seccomp-BPF syscall filtering** — its correctness is bound to
+  the plugin's runtime (tokio, Python, etc.), so it needs its own
+  curation pass and config surface. Tracked as a separate slice.
+- **User-namespace isolation / cgroups** — same story, significantly
+  bigger, deserves its own plan.
+- **macOS `sandbox-exec`** — deprecated Apple API; not worth wiring
+  given the current dev-primary role of macOS.
+
+This satisfies roadmap item 8 (MVP sandboxing — FD / memory / CPU /
+process caps + privilege-escalation gate); hardened-seccomp +
+namespaces move to the "hardening follow-on" list.
+
+### Changed
+
+- Workspace lint `unsafe_code = "forbid"` → `"deny"`. The sole
+  narrow exception is documented at the `pre_exec` call site in
+  `smiths-sidecar::supervisor`.
+- `examples/config.toml` gained a documented `[plugins.sandbox]`
+  section with every knob commented out at conservative defaults
+  so operators can uncomment and deploy.
+
+## [0.22.0] - 2026-04-20
+
+### Changed — UAS INVITE path migrated onto the server transaction FSM
+
+Closes the UAS FSM migration started in v0.21.0. Every inbound
+request the UAS responds to — INVITE included — now lives as a
+`ServerInviteTxn` or `ServerNonInviteTxn` entry in the driver.
+Retransmit replay, G/H/I timer arming, ACK-for-non-2xx transitions,
+and 2xx bypass are all FSM-driven. The legacy `dedupe` `DashMap` is
+gone as a general-purpose cache.
+
+- **`ServerInviteTxn` + ACK correlation**: INVITE registers a server
+  FSM on arrival; the handler's `send_provisional` (100 Trying) and
+  `respond` (2xx / 401 / 488 / …) both route through
+  `driver.send_response(...)`. Non-2xx transitions the FSM to
+  Completed (G + H armed). The ACK for a non-2xx carries the
+  INVITE's branch per §17.1.1.3 — `handle_ack` now delivers it to
+  the INVITE FSM for the Completed → Confirmed transition + timer I.
+- **`invite_2xx_cache`** (narrow replacement for `dedupe`): RFC 3261
+  §13.3.1.4 gives the Transaction User ownership of 2xx retransmit
+  so the FSM bypasses straight to Terminated on 2xx send. Until the
+  UAS grows a per-dialog 2xx retransmit loop, a small branch-keyed
+  cache parks the 2xx bytes for simple peer-retry replay. Keeps the
+  4096-entry LRU cap + shard-scoped eviction (v0.13.1 pattern).
+- Existing integration tests (`invite_retransmit_replays_same_200`,
+  `invite_401_cancel`, `invite_establishes_dialog_ack_then_bye`,
+  `dedupe_eviction.rs`) all pass unchanged through the new path —
+  that is the regression contract for the migration.
+
+### Added — `sip_server_txns_active` Prometheus gauge
+
+`TransactionDriver::with_metrics` wires an `Arc<Metrics>` handle
+into the driver; `start_server` / terminate keep the
+`sip_server_txns_active` gauge in sync. The UAS's `with_metrics`
+builder now rebuilds the driver with the shared handle so
+operators see live FSM entry counts on `/metrics` — replaces the
+visibility the old LRU-capped `dedupe` table provided, now that
+the FSM table has no cap. New unit test
+`metrics_gauge_tracks_server_txn_lifecycle` covers the inc/dec.
+
+### Added — `clippy::unwrap_used` on smiths-core + smiths-sdp
+
+Both crates have zero production-code unwraps / expects (every use
+is inside `#[cfg(test)]` mods). Promoted via crate-level
+`#![warn(clippy::unwrap_used, clippy::expect_used)]` +
+`#![cfg_attr(test, allow(...))]` in each `lib.rs` — Cargo 1.74+
+doesn't permit mixing `[lints] workspace = true` with
+`[lints.clippy]` overrides, so the crate-level-attr pattern is
+the idiomatic per-package route.
+
+### Added — `sdes_crypto` fuzz target
+
+New `fuzz/fuzz_targets/sdes_crypto.rs` drives `SdesCrypto::parse`
++ `SessionDescription::parse` with adversarial bytes. Matches the
+existing `sip_parser` target's shape. Run via
+`cargo +nightly fuzz run sdes_crypto`.
+
+## [0.21.0] - 2026-04-20
+
+### Changed — UAS non-INVITE path migrated onto the server transaction FSM
+
+Every non-INVITE request the UAS actually responds to — OPTIONS,
+BYE, REGISTER, CANCEL, unknown-method 405s — now registers a
+`ServerNonInviteTxn` in the shared `TransactionDriver` on first
+arrival. Response bytes flow through `driver.send_response(...)`;
+the FSM caches the last response in its `last_response` field and
+arms timer J. Retransmits of the same request route to
+`driver.deliver_request(...)`, which replays the cached response
+via the FSM.
+
+- **Replaces the legacy `dedupe` `DashMap` path for non-INVITE**,
+  keeping the deadlock-fix semantics (v0.13.1) but eliminating the
+  need for a capacity-bound LRU scan entirely — the FSM's timer J
+  is wall-clock-driven (`64 · T1 = 32 s`).
+- **INVITE + ACK still use `dedupe`**. INVITE's server FSM needs
+  ACK correlation + G/H/I retransmit timers, which is its own
+  slice. ACK never elicits a response, so neither path matters.
+- `UasServer` gained a `txn_driver: TransactionDriver<T>` field
+  constructed alongside the existing transport. Same transport is
+  shared with the UAC's driver; the server driver maintains its
+  own transaction table keyed by `(branch, method, Server)`.
+- Existing integration tests (`retransmission_replays_cached_response`,
+  all REGISTER / BYE / OPTIONS / auth scenarios) pass unchanged
+  through the new path — that is the regression test.
+- New helper `is_fsm_candidate(method)` keeps the split explicit at
+  every call site so the follow-on INVITE migration is a one-line
+  change.
+
+### Added — MCP stdio binary smoke test
+
+`crates/smiths-cli/tests/mcp_stdio.rs` — spawns the real
+`smiths-net` binary with `--mcp stdio`, drives JSON-RPC over stdin,
+verifies:
+
+- `initialize` returns our server name + protocol version + the
+  tools / resources capability block.
+- `tools/list` enumerates the canonical in-box tool set.
+- `tools/call health` returns `{"status":"ok"}` with a numeric
+  `uptime_secs`.
+- Closing stdin triggers a clean exit (CLI honors stdin-EOF).
+
+Closes the last Phase 5 pending item (`docs/plans/todo.md`).
+
+### Added — workspace lint tightening (phase-6 hardening, first slice)
+
+Five prospective `clippy::...` lints promoted to `warn` at the
+workspace level. Zero current fires, so this is pure forward
+protection — future PRs that sneak in debug artifacts get caught
+by CI:
+
+- `clippy::dbg_macro`
+- `clippy::print_stdout`
+- `clippy::print_stderr`
+- `clippy::todo`
+- `clippy::unimplemented` (test fakes in
+  `crates/smiths-wasm/tests/engine.rs` get a crate-local
+  `#![allow(...)]` — that's the idiomatic "shouldn't be hit"
+  marker in test doubles.)
+
+`clippy::unwrap_used` / `missing_docs` from the original Phase 6
+plan are deferred — each needs a dedicated slice to avoid a
+262-fire cliff across src/ + integration tests.
+
+### Maintenance
+
+- `rand` dep bumped `0.9 → 0.10.1` (workspace-transitively; the
+  one direct use in `smiths-sdp::negotiate::fresh_sdes_key`
+  migrated from `RngCore::fill_bytes` to `Rng::fill_bytes` per the
+  new trait split).
+- `wasmtime` bumped `43 → 44.0.0`.
+
+## [0.20.0] - 2026-04-20
+
+### Added — SDES negotiator wiring end-to-end
+
+SRTP SDES (`AES_CM_128_HMAC_SHA1_80`) now flows end-to-end through
+the SDP offer/answer exchange. Before this release, the SRTP
+transforms existed in `smiths-media` but bridges had to be
+instantiated with manually-injected key material; from now on, a UAS
+that receives an `RTP/SAVP` INVITE with `a=crypto:` responds with a
+matching `a=crypto:` line carrying an engine-generated key, and the
+media fabric wires per-direction transforms on the resulting bridge
+automatically.
+
+- **`smiths-core::sdp::SrtpKeys`** — new struct carrying the peer's
+  advertised key + the engine's chosen answer key + the cipher suite.
+  `NegotiationOutcome::Accepted` gained an `srtp: Option<SrtpKeys>`
+  field. `Debug` is hand-written to redact key bytes (log-safe).
+- **`smiths-core::media::BridgeLeg`** — new spec struct used by
+  `MediaFabric::bridge`. Replaces the prior 4-arg
+  `bridge(a, peer_a, b, peer_b)` signature with
+  `bridge(a: BridgeLeg, b: BridgeLeg)` where each leg optionally
+  carries SRTP keys. Constructors `BridgeLeg::plain` +
+  `BridgeLeg::with_srtp`.
+- **`smiths-sdp::MediaDescription::crypto`** — parses + serializes
+  `a=crypto:` lines. `a=crypto:` parse errors on one line are soft
+  (logged + skipped), so a single bad line doesn't kill the whole
+  SDP document.
+- **`smiths-sdp::Negotiator::answer`** — detects `RTP/SAVP` + any
+  supported `a=crypto:`, generates an engine key via
+  `fresh_sdes_key()` (CSPRNG), emits the matching answer line, and
+  returns `NegotiationResult::Answer { sdp, srtp }`. `RTP/SAVP`
+  without acceptable crypto → `Mismatch` (RFC 4568 §5.1.2 no
+  plaintext downgrade).
+- **`smiths-sip::uas`** — threads `SrtpKeys` from the negotiator
+  outcome into `PendingLeg`, then into the `BridgeLeg` spec passed
+  to `MediaFabric::bridge` on rendezvous pairing. Plain-RTP calls
+  keep their prior zero-crypto path.
+- **`smiths-media::UdpMediaFabric::bridge`** — materializes each
+  leg's `SrtpKeys` into `AesCmHmacSha1_80Transform` instances and
+  attaches them to `LegSrtp` on the bridge.
+- New workspace dep `rand = "0.9"` (direct use: engine-side SDES key
+  generation only).
+
+### Added — `codec_mismatch` integration coverage (`tests/codec_mismatch.rs`)
+
+Four richer SDP-offer shapes the UAS must reject with 488:
+- Multiple unknown codecs at three different clock rates in one
+  offer (guards against a regression where the first PT number
+  matched regardless of codec name).
+- Video-only offer (engine is audio-only).
+- `RTP/SAVP` with a supported codec but **no** `a=crypto:` line
+  (RFC 4568 §5.1.2 — must not downgrade to plaintext).
+- `RTP/SAVP` with `a=crypto:` advertising a suite we don't support
+  (`AES_256_GCM`).
+
+All four also confirm `100 Trying` still fires before the 488, so
+provisional behavior doesn't regress under the negotiator refactor.
+
+### Added — SRTP end-to-end integration test (`tests/sdp_srtp.rs`)
+
+Two fake UAs rendezvous on a `sip:<key>@engine` with `RTP/SAVP` +
+`a=crypto:`. The engine answers each with an engine-chosen crypto
+line, pairs the legs, and wires SRTP transforms. UA-A encrypts an
+RTP packet with its offer key; UA-B receives ciphertext and decrypts
+it with the key the engine advertised in UA-B's 200 OK. Confirms:
+
+- Engine never echoes either UA's offer key as its own answer key
+  (no leaked peer secret).
+- Bridge SSRC rewrite still fires on the SRTP path.
+- End-to-end payload round-trip.
+
+### Changed — `MediaFabric::bridge` trait signature
+
+Moved from `bridge(a, peer_a, b, peer_b)` to
+`bridge(a: BridgeLeg, b: BridgeLeg)`. Every in-tree caller migrated;
+external trait implementers need to update their `bridge` signature
+and import `smiths_core::BridgeLeg`.
+
+### Docs
+
+- `docs/architecture/03-mcp-and-ops.md` — rewritten MCP section to
+  reflect the actual three-transport surface (stdio, HTTP, SSE) +
+  the A2A HTTP adapter, the shipped tool + resource sets, SSE
+  notification stream, and bearer/rate-limit/audit posture. Closes
+  the Phase 5 pending item.
+
+### Roadmap tidy-up
+
+Two items in `.vscode/prod-readiness-roadmap.md` were already done
+but still listed as pending:
+
+- **Loss-% tracking on the sender side** — v0.15.0 landed
+  `StreamStats` cumulative-loss tracking; RR blocks now carry real
+  numbers.
+- **sipp perf validation** — v0.13.0 ran it; found + fixed the
+  dedupe-eviction deadlock (v0.13.1); the engine now sustains
+  ~10 k cps REGISTER on loopback.
+
 ## [0.19.0] - 2026-04-19
 
 ### Added — Transaction FSM slice 5 (final)

@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smiths-net-config
+  labels:
+    app.kubernetes.io/name: smiths-net
+    app.kubernetes.io/component: signaling
+data:
+  # Matches the live engine config shape. Operators swap the inline
+  # TOML for their own without touching the Deployment. Mounted at
+  # /etc/smiths-net/config.toml read-only via the volume below.
+  config.toml: |
+    [core]
+    log_format = "json"
+
+    [sip]
+    # Kubernetes services bind ports for us — the pod binds 0.0.0.0
+    # and relies on NetworkPolicy + LoadBalancer for addressing.
+    bind = "0.0.0.0:5060"
+    transports = ["udp", "tcp"]
+    drain_timeout_secs = 10
+
+    [sip.rate_limit]
+    per_sec = 50
+    burst = 100
+
+    [observability]
+    health_bind = "0.0.0.0:8080"
+
+    [plugins]
+    dir = "/etc/smiths-net/plugins"
+
+    [plugins.sandbox]
+    max_fds = 256
+    max_memory_bytes = 536870912
+    max_processes = 0
+    no_new_privs = true
+    # seccomp = "allowlist"    # Enable once plugin syscalls audited.

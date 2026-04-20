@@ -67,6 +67,10 @@ impl RateLimiter {
                 })
             })
             .downgrade();
+        // Mutex-poison means another thread panicked mid-refill. Rate
+        // limiting is a best-effort signal; treat poison as "allow"
+        // rather than cascade the panic through every request path.
+        #[allow(clippy::expect_used)]
         let mut b = bucket.lock().expect("rate limit bucket poisoned");
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(b.last_refill).as_secs_f64();

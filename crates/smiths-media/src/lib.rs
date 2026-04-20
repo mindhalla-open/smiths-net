@@ -5,8 +5,14 @@
 //! emits periodic RTCP Sender Reports with live packet/byte/jitter
 //! stats. Jitter buffer and per-frame plugin hooks are follow-up work.
 
+// Slice 1.7 lint tightening — matches smiths-sip posture.
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod bridge;
 pub mod fabric;
+#[cfg(feature = "pcap")]
+pub mod pcap;
 pub mod port_allocator;
 pub mod rtcp;
 pub mod rtp_stats;

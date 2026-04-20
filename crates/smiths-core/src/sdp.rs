@@ -9,6 +9,46 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use crate::SrtpSuite;
+
+/// SRTP keying material negotiated via SDES (RFC 4568).
+///
+/// Emitted by [`NegotiationOutcome::Accepted`] when the offer used
+/// `RTP/SAVP` + a supported `a=crypto:` line. The responder (UAS)
+/// threads this into the media fabric's bridge spawn so each leg runs
+/// with the correct decrypt/encrypt pair.
+///
+/// Key-material handedness follows SDES semantics:
+/// - `peer_tx_key` is what **the peer** encrypts with — the engine uses
+///   it to **decrypt** ingress on the leg facing this peer.
+/// - `local_tx_key` is the key the **engine** put in its `a=crypto:`
+///   answer — the engine uses it to **encrypt** egress toward this
+///   peer; the peer decrypts with it on receipt.
+///
+/// `Debug` is hand-written to redact the key bytes; SDES key material
+/// is a long-lived secret per call and must not leak into logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SrtpKeys {
+    /// Cipher suite both sides agreed on.
+    pub suite: SrtpSuite,
+    /// Peer-chosen key material (from the offer's `a=crypto:`). Length
+    /// equals `suite.key_material_len()`.
+    pub peer_tx_key: Vec<u8>,
+    /// Engine-chosen key material (emitted in the answer's `a=crypto:`).
+    /// Length equals `suite.key_material_len()`.
+    pub local_tx_key: Vec<u8>,
+}
+
+impl std::fmt::Debug for SrtpKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SrtpKeys")
+            .field("suite", &self.suite)
+            .field("peer_tx_key_len", &self.peer_tx_key.len())
+            .field("local_tx_key_len", &self.local_tx_key.len())
+            .finish()
+    }
+}
+
 /// Outcome of running offer/answer against an inbound SDP offer.
 #[derive(Clone, Debug)]
 pub enum NegotiationOutcome {
@@ -20,9 +60,25 @@ pub enum NegotiationOutcome {
         /// used by the bridge to send forward traffic. `None` if the
         /// offer declared port 0 or omitted a connection line.
         remote_media: Option<SocketAddr>,
+        /// SRTP keying material when the offer asked for `RTP/SAVP`
+        /// with a supported `a=crypto:` suite. `None` for plain
+        /// `RTP/AVP` passthrough calls. The UAS threads this into the
+        /// bridge spawn so each leg runs with the right transform.
+        srtp: Option<SrtpKeys>,
     },
     /// No common codec — responder should send `488 Not Acceptable Here`.
     Mismatch,
+    /// Transport profile the engine recognizes but can't terminate yet
+    /// (today: `UDP/TLS/RTP/SAVP` — DTLS-SRTP). Responder should reply
+    /// `488 Not Acceptable Here` with a `Warning: 399` header carrying
+    /// `reason` so the peer knows the call was rejected because of
+    /// transport support, not codec mismatch. Distinct variant so the
+    /// UAS doesn't have to string-sniff `Mismatch`.
+    UnsupportedTransport {
+        /// Short, operator-facing reason ("DTLS-SRTP not yet supported",
+        /// etc). Emitted into the SIP `Warning:` header verbatim.
+        reason: String,
+    },
     /// Offer body was malformed; responder should send `400 Bad Request`.
     Malformed(String),
 }

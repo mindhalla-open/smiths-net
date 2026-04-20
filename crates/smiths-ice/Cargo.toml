@@ -1,0 +1,25 @@
+[package]
+name         = "smiths-ice"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+license      = { workspace = true }
+description  = "ICE / STUN MVP (host candidates only) for smiths-net."
+
+[dependencies]
+smiths-core = { workspace = true }
+smiths-sdp  = { workspace = true }
+
+tokio     = { workspace = true }
+bytes     = { workspace = true }
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+rand      = { workspace = true }
+serde     = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "test-util"] }
+toml  = "0.9"
+
+[lints]
+workspace = true

@@ -14,6 +14,10 @@
 //! live in `smiths-core::ai`; this crate just implements the traits
 //! and owns the host-tier sub-crates.
 
+// Slice 1.7 lint tightening.
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod dispatcher;
 pub mod error;
 pub mod loader;

@@ -40,6 +40,8 @@ pub struct LoadReport {
 /// - `wasm_engine`: required to load `type = "wasm"` manifests.
 ///   Without it, WASM plugins fail-partial with a descriptive error
 ///   while sidecar plugins still load.
+/// - `sandbox`: resource caps applied to every spawned sidecar child
+///   (rlimits + Linux `no_new_privs`). Default is permissive.
 #[derive(Clone, Debug, Default)]
 pub struct LoaderOpts {
     /// See struct docs.
@@ -50,6 +52,9 @@ pub struct LoaderOpts {
     /// plugin records `plugin_invocations` + `plugin_invoke_duration`
     /// + (sidecars) `sidecar_restarts` through this registry.
     pub metrics: Option<Arc<Metrics>>,
+    /// Per-sidecar resource sandbox. See the
+    /// [`smiths_core::SandboxConfig`] doc for field semantics.
+    pub sandbox: smiths_core::SandboxConfig,
 }
 
 /// Scan `root` for subdirectories containing `plugin.toml`, spawn each,
@@ -131,8 +136,17 @@ pub(crate) async fn load_one(
         }
     }
 
-    // Spawn the subprocess.
-    let sidecar = smiths_sidecar::Sidecar::spawn(&name, dir, &manifest.entry).await?;
+    // Spawn the subprocess under the configured sandbox. The default
+    // policy is permissive, so `LoaderOpts::default()` preserves the
+    // pre-sandboxing behaviour bit-for-bit.
+    let sidecar = smiths_sidecar::Sidecar::spawn_with(
+        &name,
+        dir,
+        &manifest.entry,
+        smiths_sidecar::RestartPolicy::default(),
+        opts.sandbox,
+    )
+    .await?;
     if let Some(m) = &opts.metrics {
         sidecar.set_metrics(Arc::clone(m));
     }

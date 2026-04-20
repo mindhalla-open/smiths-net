@@ -7,6 +7,13 @@
 //! Full RFC 3261 transaction FSMs with timers A–K land in follow-up
 //! passes.
 
+// Slice 1.7: lint-level `warn` on unwraps. The existing call sites
+// live under a forward-work bucket — new code fires a warning that
+// reviewers can chase before merge, even while legacy usage is
+// still being retired.
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod auth;
 pub mod error;
 pub mod rate_limit;

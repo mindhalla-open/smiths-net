@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: smiths-net
+  labels:
+    app.kubernetes.io/name: smiths-net
+    app.kubernetes.io/component: signaling
+spec:
+  # LoadBalancer exposes the SIP ports to the outside world. For
+  # in-cluster-only deployments switch to `ClusterIP`; for bare-metal
+  # + MetalLB the same `LoadBalancer` spec still applies.
+  type: LoadBalancer
+  # SIP is stateful — the same client's dialog must land on the same
+  # pod. Source-IP affinity is the cheapest thing that works without
+  # drilling Via / Call-ID awareness into the ingress.
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600
+  selector:
+    app.kubernetes.io/name: smiths-net
+  ports:
+    - name: sip-udp
+      port: 5060
+      targetPort: sip-udp
+      protocol: UDP
+    - name: sip-tcp
+      port: 5060
+      targetPort: sip-tcp
+      protocol: TCP
+    - name: sip-tls
+      port: 5061
+      targetPort: sip-tls
+      protocol: TCP
+---
+# Separate ClusterIP for scrape + health. Operators running Prometheus
+# inside the cluster point at this; staying off the LoadBalancer
+# keeps the SIP vhost's exposed surface minimal.
+apiVersion: v1
+kind: Service
+metadata:
+  name: smiths-net-health
+  labels:
+    app.kubernetes.io/name: smiths-net
+    app.kubernetes.io/component: observability
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: smiths-net
+  ports:
+    - name: health
+      port: 8080
+      targetPort: health
+      protocol: TCP

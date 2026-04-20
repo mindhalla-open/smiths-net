@@ -13,13 +13,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use smiths_core::Metrics;
-use smiths_core::media::{BridgeId, Endpoint, EndpointId, MediaEndpoint, MediaError, MediaFabric};
+use smiths_core::media::{
+    BridgeId, BridgeLeg, Endpoint, EndpointId, MediaEndpoint, MediaError, MediaFabric,
+};
+use smiths_core::sdp::SrtpKeys;
+use smiths_core::{Metrics, SrtpTransform};
 use tokio::net::UdpSocket;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
-use crate::bridge::{Bridge, BridgeConfig, Leg, RtcpLeg};
+use crate::bridge::{Bridge, BridgeConfig, Leg, LegSrtp, RtcpLeg};
 use crate::port_allocator::{DEFAULT_MAX_ATTEMPTS, allocate_rtp_rtcp_pair};
+use crate::srtp::AesCmHmacSha1_80Transform;
 
 /// Derive the peer's RTCP socket address from its RTP address per
 /// RFC 3550 §11 (even RTP / odd RTCP, i.e. `port + 1`). This is the
@@ -29,6 +33,31 @@ fn peer_rtcp_from_rtp(peer_rtp: SocketAddr) -> SocketAddr {
     let mut out = peer_rtp;
     out.set_port(peer_rtp.port().wrapping_add(1));
     out
+}
+
+/// Materialize [`LegSrtp`] transforms from negotiated [`SrtpKeys`].
+/// `None` in → `None` out (plain RTP). Failures propagate as
+/// [`MediaError::Io`] wrapping an `InvalidData` I/O error; the only
+/// realistic cause is wrong key-material length for the suite, which
+/// the negotiator path shouldn't produce.
+fn build_leg_srtp(keys: Option<&SrtpKeys>) -> Result<Option<LegSrtp>, MediaError> {
+    let Some(keys) = keys else {
+        return Ok(None);
+    };
+    // `AesCmHmacSha1_80Transform::from_sdes` is the only suite wired
+    // today; extending to another profile is a match on `keys.suite`.
+    let peer_tx = AesCmHmacSha1_80Transform::from_sdes(&keys.peer_tx_key).map_err(|e| {
+        warn!(?e, "SRTP peer-tx transform init failed");
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+    })?;
+    let local_tx = AesCmHmacSha1_80Transform::from_sdes(&keys.local_tx_key).map_err(|e| {
+        warn!(?e, "SRTP local-tx transform init failed");
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+    })?;
+    Ok(Some(LegSrtp {
+        peer_tx: Arc::new(peer_tx) as Arc<dyn SrtpTransform>,
+        local_tx: Arc::new(local_tx) as Arc<dyn SrtpTransform>,
+    }))
 }
 
 /// RTP + RTCP socket pair the fabric owns for one endpoint.
@@ -97,51 +126,45 @@ impl MediaFabric for UdpMediaFabric {
         }))
     }
 
-    #[instrument(skip(self), fields(?a, ?b, %peer_a, %peer_b))]
-    async fn bridge(
-        &self,
-        a: EndpointId,
-        peer_a: SocketAddr,
-        b: EndpointId,
-        peer_b: SocketAddr,
-    ) -> Result<BridgeId, MediaError> {
+    #[instrument(skip(self, a, b), fields(?a.endpoint, ?b.endpoint, peer_a = %a.peer, peer_b = %b.peer))]
+    async fn bridge(&self, a: BridgeLeg, b: BridgeLeg) -> Result<BridgeId, MediaError> {
         let (sock_a, rtcp_a) = {
             let entry = self
                 .endpoints
-                .get(&a)
-                .ok_or(MediaError::UnknownEndpoint(a))?;
+                .get(&a.endpoint)
+                .ok_or(MediaError::UnknownEndpoint(a.endpoint))?;
             (Arc::clone(&entry.rtp), Arc::clone(&entry.rtcp))
         };
         let (sock_b, rtcp_b) = {
             let entry = self
                 .endpoints
-                .get(&b)
-                .ok_or(MediaError::UnknownEndpoint(b))?;
+                .get(&b.endpoint)
+                .ok_or(MediaError::UnknownEndpoint(b.endpoint))?;
             (Arc::clone(&entry.rtp), Arc::clone(&entry.rtcp))
         };
+
+        let srtp_a = build_leg_srtp(a.srtp.as_ref())?;
+        let srtp_b = build_leg_srtp(b.srtp.as_ref())?;
 
         let id = self.fresh_bridge_id();
         let leg_a = Leg {
             socket: sock_a,
-            peer: peer_a,
+            peer: a.peer,
             rtcp: Some(RtcpLeg {
                 socket: rtcp_a,
                 // Peer RTCP port = peer RTP port + 1 (RFC 3550 §11).
-                peer: peer_rtcp_from_rtp(peer_a),
+                peer: peer_rtcp_from_rtp(a.peer),
             }),
-            // SRTP is bound by the SDP negotiator path, which passes
-            // `LegSrtp` in via a follow-on fabric method. Today the
-            // default path stays plain-RTP passthrough.
-            srtp: None,
+            srtp: srtp_a,
         };
         let leg_b = Leg {
             socket: sock_b,
-            peer: peer_b,
+            peer: b.peer,
             rtcp: Some(RtcpLeg {
                 socket: rtcp_b,
-                peer: peer_rtcp_from_rtp(peer_b),
+                peer: peer_rtcp_from_rtp(b.peer),
             }),
-            srtp: None,
+            srtp: srtp_b,
         };
         let cfg = BridgeConfig {
             metrics: self.metrics.clone(),
@@ -216,7 +239,10 @@ mod tests {
         let addr_ua_b = ua_b.local_addr().unwrap();
 
         let bid = fab
-            .bridge(ep_a.id(), addr_ua_a, ep_b.id(), addr_ua_b)
+            .bridge(
+                BridgeLeg::plain(ep_a.id(), addr_ua_a),
+                BridgeLeg::plain(ep_b.id(), addr_ua_b),
+            )
             .await
             .unwrap();
 
@@ -244,10 +270,8 @@ mod tests {
         let bogus = EndpointId(9999);
         let err = fab
             .bridge(
-                ep.id(),
-                "127.0.0.1:1".parse().unwrap(),
-                bogus,
-                "127.0.0.1:2".parse().unwrap(),
+                BridgeLeg::plain(ep.id(), "127.0.0.1:1".parse().unwrap()),
+                BridgeLeg::plain(bogus, "127.0.0.1:2".parse().unwrap()),
             )
             .await
             .unwrap_err();
@@ -263,10 +287,8 @@ mod tests {
         let ua_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let bid = fab
             .bridge(
-                ep_a.id(),
-                ua_a.local_addr().unwrap(),
-                ep_b.id(),
-                ua_b.local_addr().unwrap(),
+                BridgeLeg::plain(ep_a.id(), ua_a.local_addr().unwrap()),
+                BridgeLeg::plain(ep_b.id(), ua_b.local_addr().unwrap()),
             )
             .await
             .unwrap();

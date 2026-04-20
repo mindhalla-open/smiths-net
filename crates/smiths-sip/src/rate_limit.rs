@@ -168,16 +168,21 @@ mod tests {
 
     #[test]
     fn bucket_refills_over_time() {
+        // 50 tok/s = 20 ms per token. The gap between the two
+        // back-to-back `allow` calls must be under one token's worth
+        // of time, otherwise the bucket silently refills and the
+        // "denied" assertion flakes. 20 ms is comfortably larger
+        // than any realistic inter-call scheduling delay, and the
+        // 40 ms sleep is still well above one-token of refill, so
+        // the "allowed again" side of the test stays deterministic.
         let lim = SipRateLimiter::new(SipRateLimit {
-            per_sec: 1000,
+            per_sec: 50,
             burst: 1,
         });
         let src = ip(10, 0, 0, 1);
         assert!(lim.allow(src));
         assert!(!lim.allow(src));
-        // 2 ms at 1000 tokens/s should yield two tokens; one is
-        // enough to pass.
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::thread::sleep(std::time::Duration::from_millis(40));
         assert!(lim.allow(src), "bucket should have refilled");
     }
 }

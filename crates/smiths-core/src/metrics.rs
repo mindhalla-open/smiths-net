@@ -27,25 +27,30 @@ pub const DEFAULT_LATENCY_BUCKETS: &[f64] = &[
 /// `sip_requests_total{method="..."}`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct SipMethodLabel {
+    /// SIP method name — `"INVITE"`, `"OPTIONS"`, etc.
     pub method: String,
 }
 
 /// `sip_responses_total{code="..."}`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct SipCodeLabel {
+    /// Decimal status code as a string (`"200"`, `"488"`, …).
     pub code: String,
 }
 
 /// `tool_invocations_total{tool="...", outcome="..."}`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ToolOutcomeLabel {
+    /// Tool name — matches the MCP registry entry.
     pub tool: String,
+    /// `"ok"` / `"error"` / future invocation verdicts.
     pub outcome: String,
 }
 
 /// `tool_duration_seconds{tool="..."}` histogram key.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ToolLabel {
+    /// Tool name — matches the MCP registry entry.
     pub tool: String,
 }
 
@@ -54,13 +59,16 @@ pub struct ToolLabel {
 /// Prometheus cardinality stays bounded.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct RtpDirLabel {
+    /// `"a_to_b"` or `"b_to_a"`.
     pub direction: String,
 }
 
 /// `plugin_invocations_total{plugin="...", outcome="..."}`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PluginOutcomeLabel {
+    /// Plugin name as declared in its manifest.
     pub plugin: String,
+    /// `"ok"` / `"error"` etc.
     pub outcome: String,
 }
 
@@ -68,6 +76,7 @@ pub struct PluginOutcomeLabel {
 /// histograms and counters that only need the plugin-name dimension.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PluginLabel {
+    /// Plugin name as declared in its manifest.
     pub plugin: String,
 }
 
@@ -86,6 +95,23 @@ pub struct Metrics {
     pub dialogs_active: Gauge,
     /// Number of active UDP bridges the media fabric is running.
     pub bridges_active: Gauge,
+    /// Server-side SIP transactions currently held by the
+    /// `TransactionDriver`. Each inbound non-ACK request registers
+    /// one FSM entry that lives until its method-appropriate absorb
+    /// timer fires (J for non-INVITE, I/H/`2xx-bypass` for INVITE).
+    /// Under normal load this approximates "active server
+    /// transactions"; under adversarial traffic it's the closest
+    /// signal we have to "dedupe table pressure" now that the
+    /// LRU-capped `DashMap` is gone.
+    pub sip_server_txns_active: Gauge,
+    /// Per-dialog 2xx INVITE retransmissions emitted by the UAS per
+    /// RFC 3261 §13.3.1.4. Cumulative count of individual retransmit
+    /// sends — *not* the count of dialogs that have ever entered the
+    /// retransmit loop. A healthy deployment sees this tick slowly
+    /// (the first 200 OK usually lands and the ACK cancels before
+    /// the first T1 fires). A sudden slope change points at either
+    /// lossy ACK arrival or a UAC that's stopped `ACK`ing at all.
+    pub sip_invite_2xx_retransmits: Counter,
     /// RTP packets the bridge forwarded (post-SSRC-rewrite), keyed
     /// by direction.
     pub rtp_packets_forwarded: Family<RtpDirLabel, Counter>,
@@ -114,6 +140,8 @@ impl Metrics {
         let sip_parse_errors = Counter::default();
         let dialogs_active = Gauge::default();
         let bridges_active = Gauge::default();
+        let sip_server_txns_active = Gauge::default();
+        let sip_invite_2xx_retransmits = Counter::default();
         let rtp_packets_forwarded = Family::<RtpDirLabel, Counter>::default();
         let rtcp_sr_sent = Counter::default();
         let tool_invocations = Family::<ToolOutcomeLabel, Counter>::default();
@@ -144,6 +172,18 @@ impl Metrics {
             "media_bridges_active",
             "Currently-live media bridges",
             bridges_active.clone(),
+        );
+        registry.register(
+            "sip_server_txns_active",
+            "Server-side SIP transaction FSM entries currently held by \
+             the driver (per-branch, live until the method-appropriate \
+             absorb timer fires).",
+            sip_server_txns_active.clone(),
+        );
+        registry.register(
+            "sip_invite_2xx_retransmits",
+            "Per-dialog 2xx INVITE retransmissions (RFC 3261 §13.3.1.4).",
+            sip_invite_2xx_retransmits.clone(),
         );
         registry.register(
             "rtp_packets_forwarded",
@@ -187,6 +227,8 @@ impl Metrics {
             sip_parse_errors,
             dialogs_active,
             bridges_active,
+            sip_server_txns_active,
+            sip_invite_2xx_retransmits,
             rtp_packets_forwarded,
             rtcp_sr_sent,
             tool_invocations,

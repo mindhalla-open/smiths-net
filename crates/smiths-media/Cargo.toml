@@ -6,6 +6,14 @@ version      = { workspace = true }
 license      = { workspace = true }
 description  = "RTP/RTCP session, jitter buffer, media router (passthrough)."
 
+[features]
+default = []
+# Per-call packet-capture tap writing `<observability.pcap_dir>/
+# <call-id>.pcap`. Off by default because `pcap-file` pulls in a
+# non-trivial dependency chain; enable in release builds that need
+# offline triage.
+pcap = []
+
 [dependencies]
 smiths-core = { workspace = true }
 tokio       = { workspace = true }

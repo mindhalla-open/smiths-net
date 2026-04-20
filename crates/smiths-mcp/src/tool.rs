@@ -193,10 +193,8 @@ pub(crate) mod test_support {
         }
         async fn bridge(
             &self,
-            _: EndpointId,
-            _: SocketAddr,
-            _: EndpointId,
-            _: SocketAddr,
+            _: smiths_core::BridgeLeg,
+            _: smiths_core::BridgeLeg,
         ) -> Result<BridgeId, MediaError> {
             Err(MediaError::PortExhausted("null fabric".into()))
         }

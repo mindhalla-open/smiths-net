@@ -27,7 +27,6 @@ pub struct StreamStats {
     inner: Arc<Inner>,
 }
 
-#[derive(Default)]
 struct Inner {
     /// Count of packets observed (valid RTP only).
     packets: AtomicU64,
@@ -57,12 +56,35 @@ struct Inner {
     /// 1/16-tick smoothing; on read we shift back down.
     jitter_x16: AtomicU32,
     /// Arrival instant of the previous packet, as nanos-since-start.
-    /// `0` means "no prior packet".
+    /// `u64::MAX` means "no prior packet" — we can't use `0` as the
+    /// sentinel because `epoch.elapsed()` legitimately returns 0 ns
+    /// for the first observation on a fast path, which collides with
+    /// "never set" and silently skips the jitter update on packet 2.
     prev_arrival_ns: AtomicU64,
     /// Previous packet's RTP timestamp (plain, not fixed-point).
     prev_rtp_ts: AtomicU32,
     /// Bridge start time for deriving `prev_arrival_ns` deltas.
     epoch: std::sync::OnceLock<Instant>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            packets: AtomicU64::new(0),
+            octets: AtomicU64::new(0),
+            last_seq: AtomicU32::new(0),
+            max_seq: AtomicU32::new(0),
+            base_seq: AtomicU32::new(0),
+            cycles: AtomicU32::new(0),
+            seen_first: AtomicU32::new(0),
+            last_rtp_ts: AtomicU32::new(0),
+            last_ssrc: AtomicU32::new(0),
+            jitter_x16: AtomicU32::new(0),
+            prev_arrival_ns: AtomicU64::new(u64::MAX),
+            prev_rtp_ts: AtomicU32::new(0),
+            epoch: std::sync::OnceLock::new(),
+        }
+    }
 }
 
 /// A point-in-time snapshot of a [`StreamStats`].
@@ -154,7 +176,7 @@ impl StreamStats {
 
         let prev_arrival = self.inner.prev_arrival_ns.swap(now_ns, Ordering::Relaxed);
         let prev_ts = self.inner.prev_rtp_ts.swap(rtp_ts, Ordering::Relaxed);
-        if prev_arrival == 0 {
+        if prev_arrival == u64::MAX {
             // First packet — nothing to compare against yet.
             return;
         }
