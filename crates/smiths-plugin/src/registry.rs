@@ -13,9 +13,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
+use smiths_core::Metrics;
 use smiths_core::ai::{
     AiProvider, AiRegistry as AiRegistryTrait, CapabilityDescriptor, ProviderError,
 };
+use smiths_core::metrics::{PluginLabel, PluginOutcomeLabel};
 use smiths_sidecar::Sidecar;
 
 use crate::manifest::Manifest;
@@ -35,6 +37,9 @@ pub struct PluginEntry {
     pub sidecar: Sidecar,
     /// Descriptors returned by `describe_capabilities` at load.
     pub capabilities: Vec<CapabilityDescriptor>,
+    /// Optional metrics handle. When present, each `invoke` records
+    /// `plugin_invocations` + `plugin_invoke_duration_seconds`.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 #[async_trait]
@@ -55,11 +60,41 @@ impl AiProvider for PluginEntry {
         &self.capabilities
     }
     async fn invoke(&self, method: &str, params: Value) -> Result<Value, ProviderError> {
-        self.sidecar
+        let name = &self.manifest.name;
+        let start = std::time::Instant::now();
+        let result = self
+            .sidecar
             .call(method, params)
             .await
-            .map_err(|e| ProviderError(format!("plugin `{}`: {e}", self.manifest.name)))
+            .map_err(|e| ProviderError(format!("plugin `{name}`: {e}")));
+        record_invocation(self.metrics.as_deref(), name, &result, start);
+        result
     }
+}
+
+/// Record `plugin_invocations` + `plugin_invoke_duration_seconds`
+/// for both the sidecar and WASM `AiProvider::invoke` paths.
+pub(crate) fn record_invocation<T>(
+    metrics: Option<&Metrics>,
+    plugin: &str,
+    result: &Result<T, ProviderError>,
+    start: std::time::Instant,
+) {
+    let Some(m) = metrics else {
+        return;
+    };
+    let outcome = if result.is_ok() { "ok" } else { "error" };
+    m.plugin_invocations
+        .get_or_create(&PluginOutcomeLabel {
+            plugin: plugin.to_owned(),
+            outcome: outcome.to_owned(),
+        })
+        .inc();
+    m.plugin_invoke_duration
+        .get_or_create(&PluginLabel {
+            plugin: plugin.to_owned(),
+        })
+        .observe(start.elapsed().as_secs_f64());
 }
 
 /// Plugin registry. Cheap to clone.

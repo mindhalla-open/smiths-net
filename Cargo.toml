@@ -6,7 +6,7 @@ exclude  = ["fuzz"]
 [workspace.package]
 edition      = "2024"
 rust-version = "1.85"
-version      = "0.8.0"
+version      = "0.15.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
@@ -59,6 +59,17 @@ hex     = "0.4"
 # WASM host
 wasmtime = { version = "43", default-features = false, features = ["cranelift", "runtime"] }
 wat      = "1"
+
+# Wire schema (prost without build.rs — derives only)
+prost       = { version = "0.14.3", default-features = false, features = ["std", "derive"] }
+prost-types = { version = "0.14.3" }
+
+# Filesystem watching (hot reload for plugin dirs)
+notify = "8.2.0"
+
+# SRTP (built-in, not a plugin — per-packet crypto on the bridge hot
+# path). Pure Rust, no libsrtp FFI, MIT/Apache-2.0.
+webrtc-srtp = "0.17"
 
 # TLS
 rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

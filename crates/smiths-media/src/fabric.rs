@@ -13,20 +13,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use smiths_core::Metrics;
 use smiths_core::media::{BridgeId, Endpoint, EndpointId, MediaEndpoint, MediaError, MediaFabric};
 use tokio::net::UdpSocket;
 use tracing::{debug, instrument};
 
-use crate::bridge::{Bridge, Leg};
+use crate::bridge::{Bridge, BridgeConfig, Leg, RtcpLeg};
 use crate::port_allocator::{DEFAULT_MAX_ATTEMPTS, allocate_rtp_rtcp_pair};
+
+/// Derive the peer's RTCP socket address from its RTP address per
+/// RFC 3550 §11 (even RTP / odd RTCP, i.e. `port + 1`). This is the
+/// standard convention when SDP doesn't carry an explicit `a=rtcp:`
+/// attribute — which our minimal SDP generator doesn't.
+fn peer_rtcp_from_rtp(peer_rtp: SocketAddr) -> SocketAddr {
+    let mut out = peer_rtp;
+    out.set_port(peer_rtp.port().wrapping_add(1));
+    out
+}
 
 /// RTP + RTCP socket pair the fabric owns for one endpoint.
 struct EndpointSockets {
     rtp: Arc<UdpSocket>,
-    /// RTCP socket kept bound even though the MVP bridge ignores it —
-    /// holding it prevents another allocation from claiming the
-    /// paired port, and leaves the door open for RTCP passthrough.
-    _rtcp: Arc<UdpSocket>,
+    /// RTCP socket paired with `rtp` (port = `rtp_port` + 1). Bridges
+    /// spawned after v0.11.0 use it to emit periodic Sender Reports.
+    rtcp: Arc<UdpSocket>,
 }
 
 /// Default UDP-backed [`MediaFabric`].
@@ -36,12 +46,23 @@ pub struct UdpMediaFabric {
     next_bridge: AtomicU64,
     endpoints: DashMap<EndpointId, EndpointSockets>,
     bridges: DashMap<BridgeId, Bridge>,
+    /// Shared metrics handle. `None` on test fabrics; the CLI wires
+    /// the engine-wide `Arc<Metrics>` via [`Self::with_metrics`].
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl UdpMediaFabric {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach a metrics handle. Builder-style so existing tests can
+    /// keep using `new()` without changes.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     fn fresh_endpoint_id(&self) -> EndpointId {
@@ -65,7 +86,7 @@ impl MediaFabric for UdpMediaFabric {
             id,
             EndpointSockets {
                 rtp: Arc::new(pair.rtp),
-                _rtcp: Arc::new(pair.rtcp),
+                rtcp: Arc::new(pair.rtcp),
             },
         );
         debug!(?id, %rtp_addr, %rtcp_addr, "media endpoint allocated");
@@ -84,36 +105,62 @@ impl MediaFabric for UdpMediaFabric {
         b: EndpointId,
         peer_b: SocketAddr,
     ) -> Result<BridgeId, MediaError> {
-        let sock_a = self
-            .endpoints
-            .get(&a)
-            .ok_or(MediaError::UnknownEndpoint(a))?
-            .rtp
-            .clone();
-        let sock_b = self
-            .endpoints
-            .get(&b)
-            .ok_or(MediaError::UnknownEndpoint(b))?
-            .rtp
-            .clone();
+        let (sock_a, rtcp_a) = {
+            let entry = self
+                .endpoints
+                .get(&a)
+                .ok_or(MediaError::UnknownEndpoint(a))?;
+            (Arc::clone(&entry.rtp), Arc::clone(&entry.rtcp))
+        };
+        let (sock_b, rtcp_b) = {
+            let entry = self
+                .endpoints
+                .get(&b)
+                .ok_or(MediaError::UnknownEndpoint(b))?;
+            (Arc::clone(&entry.rtp), Arc::clone(&entry.rtcp))
+        };
 
         let id = self.fresh_bridge_id();
         let leg_a = Leg {
             socket: sock_a,
             peer: peer_a,
+            rtcp: Some(RtcpLeg {
+                socket: rtcp_a,
+                // Peer RTCP port = peer RTP port + 1 (RFC 3550 §11).
+                peer: peer_rtcp_from_rtp(peer_a),
+            }),
+            // SRTP is bound by the SDP negotiator path, which passes
+            // `LegSrtp` in via a follow-on fabric method. Today the
+            // default path stays plain-RTP passthrough.
+            srtp: None,
         };
         let leg_b = Leg {
             socket: sock_b,
             peer: peer_b,
+            rtcp: Some(RtcpLeg {
+                socket: rtcp_b,
+                peer: peer_rtcp_from_rtp(peer_b),
+            }),
+            srtp: None,
         };
-        let bridge = Bridge::spawn(id, &leg_a, &leg_b);
+        let cfg = BridgeConfig {
+            metrics: self.metrics.clone(),
+            ..BridgeConfig::default()
+        };
+        let bridge = Bridge::spawn_with(id, &leg_a, &leg_b, &cfg);
         self.bridges.insert(id, bridge);
+        if let Some(m) = &self.metrics {
+            m.bridges_active.inc();
+        }
         Ok(id)
     }
 
     async fn release_bridge(&self, id: BridgeId) {
         if let Some((_, bridge)) = self.bridges.remove(&id) {
             bridge.shutdown().await;
+            if let Some(m) = &self.metrics {
+                m.bridges_active.dec();
+            }
         }
     }
 

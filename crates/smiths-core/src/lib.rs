@@ -10,6 +10,7 @@ pub mod bus;
 pub mod call;
 pub mod codec;
 pub mod config;
+pub mod drain;
 pub mod error;
 pub mod event;
 pub mod media;
@@ -23,17 +24,18 @@ pub use ai::{
     ValidationError, validate_controls,
 };
 pub use bus::EventBus;
-pub use call::{CallError, CallOriginator, DialogKey, DialogRecord, DialogState};
+pub use call::{CallError, CallLookup, CallOriginator, DialogKey, DialogRecord, DialogState};
 pub use codec::{linear_to_ulaw, pcm16_to_pcmu, pcmu_to_pcm16, ulaw_to_linear};
 pub use config::{
     A2aConfig, BindSpec, BindSpecError, Config, CoreConfig, LogFormat, McpConfig,
-    ObservabilityConfig, PluginsConfig, RateLimitConfig, SipConfig, SipTransport,
+    ObservabilityConfig, PluginsConfig, RateLimitConfig, SipConfig, SipRateLimit, SipTransport,
 };
+pub use drain::Drain;
 pub use error::Error;
 pub use event::{Event, PluginEvent, SipEvent, SystemEvent};
 pub use media::{
     BridgeId, Endpoint, EndpointId, EndpointKind, MediaEndpoint, MediaError, MediaFabric,
-    MediaSession,
+    MediaSession, SrtpError, SrtpSuite, SrtpTransform,
 };
 pub use metrics::Metrics;
 pub use rtp::RtpPacket;

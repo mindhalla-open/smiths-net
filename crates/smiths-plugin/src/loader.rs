@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
+use smiths_core::Metrics;
 use smiths_core::ai::parse_descriptors;
 use smiths_core::{Event, EventBus, PluginEvent};
 use smiths_wasm::WasmEngine;
@@ -45,6 +46,10 @@ pub struct LoaderOpts {
     pub bus: Option<EventBus>,
     /// See struct docs.
     pub wasm_engine: Option<WasmEngine>,
+    /// Optional engine-wide metrics handle. When set, every loaded
+    /// plugin records `plugin_invocations` + `plugin_invoke_duration`
+    /// + (sidecars) `sidecar_restarts` through this registry.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 /// Scan `root` for subdirectories containing `plugin.toml`, spawn each,
@@ -109,7 +114,15 @@ pub(crate) async fn load_one(
 
     match manifest.plugin_type {
         PluginType::Sidecar => { /* fall through to sidecar path below */ }
-        PluginType::Wasm => return load_wasm(dir, manifest, opts.wasm_engine, registry),
+        PluginType::Wasm => {
+            return load_wasm(
+                dir,
+                manifest,
+                opts.wasm_engine,
+                opts.metrics.clone(),
+                registry,
+            );
+        }
         PluginType::Script => {
             return Err(Error::Load {
                 plugin: name,
@@ -120,6 +133,9 @@ pub(crate) async fn load_one(
 
     // Spawn the subprocess.
     let sidecar = smiths_sidecar::Sidecar::spawn(&name, dir, &manifest.entry).await?;
+    if let Some(m) = &opts.metrics {
+        sidecar.set_metrics(Arc::clone(m));
+    }
 
     // Handshake: ask the plugin what it provides.
     let raw = sidecar
@@ -149,6 +165,7 @@ pub(crate) async fn load_one(
         dir: dir.to_path_buf(),
         sidecar,
         capabilities,
+        metrics: opts.metrics.clone(),
     });
     Ok(name)
 }
@@ -162,6 +179,7 @@ fn load_wasm(
     dir: &Path,
     manifest: Manifest,
     wasm_engine: Option<WasmEngine>,
+    metrics: Option<Arc<Metrics>>,
     registry: &AiRegistry,
 ) -> Result<String, Error> {
     let name = manifest.name.clone();
@@ -176,6 +194,10 @@ fn load_wasm(
             plugin: name.clone(),
             reason,
         })?;
+    let provider = match metrics {
+        Some(m) => provider.with_metrics(m),
+        None => provider,
+    };
     registry.insert_wasm(Arc::new(provider));
     Ok(name)
 }

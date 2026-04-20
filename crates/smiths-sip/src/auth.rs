@@ -432,9 +432,23 @@ pub mod digest {
             }
 
             // The `uri` in Authorization should be what the client
-            // signed. Accept either exact match or basic substring
-            // equivalence (clients sometimes canonicalize ports/scheme).
-            if params.uri != request_uri && !request_uri.contains(&params.uri) {
+            // signed. RFC 2617 is silent on canonicalization, so in
+            // practice clients vary:
+            //   - sipp drops the user-part (`sip:127.0.0.1:5062`
+            //     instead of `sip:smiths.test@127.0.0.1:5062`).
+            //   - some UAs normalize ports or scheme.
+            // Accept an exact match, a prefix/substring containment
+            // (legacy behaviour), or an authority-only match where
+            // `host[:port]` agrees and only the user-part differs.
+            let uri_ok = params.uri == request_uri
+                || request_uri.contains(&params.uri)
+                || sip_uri_authority(&params.uri) == sip_uri_authority(request_uri);
+            if !uri_ok {
+                tracing::debug!(
+                    auth_uri = %params.uri,
+                    request_uri,
+                    "digest URI mismatch"
+                );
                 return Err(AuthError::UriMismatch);
             }
 
@@ -468,6 +482,21 @@ pub mod digest {
             let cutoff = now_secs().saturating_sub(self.ttl.as_secs());
             self.nonces.retain(|_, issued_at| *issued_at >= cutoff);
         }
+    }
+
+    /// Extract the authority (`host[:port]`) portion of a SIP URI.
+    /// Strips the `sip:` / `sips:` scheme, any `user@` user-info, and
+    /// trailing `;params` / `?headers`. Used for the permissive URI
+    /// match in digest auth — clients often sign just the authority
+    /// (e.g. sipp's default) even when the request-line carries a
+    /// user-part.
+    fn sip_uri_authority(uri: &str) -> &str {
+        let body = uri
+            .strip_prefix("sips:")
+            .or_else(|| uri.strip_prefix("sip:"))
+            .unwrap_or(uri);
+        let after_user = body.rfind('@').map_or(body, |i| &body[i + 1..]);
+        after_user.split([';', '?']).next().unwrap_or(after_user)
     }
 
     /// Constant-time byte slice equality — guards against timing-based

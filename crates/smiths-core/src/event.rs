@@ -44,6 +44,27 @@ pub enum PluginEvent {
         /// Params the plugin attached, if any.
         params: Option<Value>,
     },
+    /// A WASM plugin called `smiths::publish_event` with a free-form
+    /// topic + payload. The host forwards it verbatim so subscribers
+    /// can react without the plugin needing to know about the
+    /// engine's internal event taxonomy.
+    Published {
+        /// Plugin name from the host state.
+        plugin: String,
+        /// Caller-chosen topic string.
+        topic: String,
+        /// Raw payload bytes the plugin wrote into its buffer.
+        data: Vec<u8>,
+    },
+    /// A WASM plugin called `smiths::timer_set` and its timer fired.
+    /// `event_id` is the tag the plugin passed so it can match the
+    /// fire-back to the scheduling site on its own.
+    TimerFired {
+        /// Plugin name from the host state.
+        plugin: String,
+        /// Opaque guest-chosen tag (passed back verbatim).
+        event_id: i32,
+    },
 }
 
 /// Lifecycle signals emitted by the main runtime.

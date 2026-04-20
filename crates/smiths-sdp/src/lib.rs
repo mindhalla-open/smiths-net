@@ -12,10 +12,12 @@
 pub mod error;
 pub mod negotiate;
 pub mod parse;
+pub mod srtp_attr;
 pub mod types;
 
 pub use error::ParseError;
 pub use negotiate::{NegotiationResult, Negotiator};
+pub use srtp_attr::{SdesCrypto, SdesParseError};
 pub use types::{
     ConnectionInfo, Direction, MediaDescription, MediaKind, Origin, RtpMap, SessionDescription,
 };

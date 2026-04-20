@@ -53,6 +53,7 @@ async fn loads_wasm_plugin_and_surfaces_capability() {
     let opts = LoaderOpts {
         bus: None,
         wasm_engine: Some(engine),
+        metrics: None,
     };
     let report = load_plugins(root.path(), &reg, opts).await.unwrap();
     assert!(
@@ -66,6 +67,77 @@ async fn loads_wasm_plugin_and_surfaces_capability() {
     assert_eq!(caps.len(), 1);
     assert_eq!(caps[0].capability, "ai.log");
     assert_eq!(caps[0].plugin, "wat-logger");
+
+    reg.shutdown_all().await;
+}
+
+/// Inline WAT with full `describe` + `alloc` + `invoke` surface. The
+/// `invoke` export always returns `{"result":"ok"}`. Used by the
+/// end-to-end test that exercises the `AiProvider::invoke` trampoline.
+const INVOKE_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  ;; Descriptor JSON at offset 0, length 57.
+  (data (i32.const 0) "{\"capability\":\"ai.log\",\"plugin\":\"wat-logger\",\"abi\":\"1.0\"}")
+  (func (export "describe") (result i64)
+    i64.const 57)
+  ;; Response envelope at offset 128, length 15.
+  (data (i32.const 128) "{\"result\":\"ok\"}")
+  (global $HEAP (mut i32) (i32.const 512))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $HEAP))
+    (global.set $HEAP (i32.add (global.get $HEAP) (local.get $len)))
+    (local.get $ptr))
+  (func (export "invoke") (param i32 i32 i32 i32) (result i64)
+    ;; (128 << 32) | 15 = 549_755_813_903
+    i64.const 549755813903))
+"#;
+
+fn stage_invoke_plugin(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    let wasm = wat::parse_str(INVOKE_WAT).expect("WAT parse");
+    fs::write(dir.join("plugin.wasm"), &wasm).unwrap();
+    fs::write(
+        dir.join("plugin.toml"),
+        "name        = \"wat-logger\"\n\
+         version     = \"0.1.0\"\n\
+         type        = \"wasm\"\n\
+         entry       = \"./plugin.wasm\"\n\
+         provides    = [\"ai.log\"]\n\
+         abi         = \"1.0\"\n\
+         description = \"Inline-WAT wasm plugin with full invoke surface.\"\n",
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_round_trips_end_to_end_through_provider() {
+    let root = tempdir().unwrap();
+    stage_invoke_plugin(&root.path().join("wat-logger"));
+
+    let reg = AiRegistry::new();
+    let engine = WasmEngine::new().expect("WasmEngine::new");
+    let opts = LoaderOpts {
+        bus: None,
+        wasm_engine: Some(engine),
+        metrics: None,
+    };
+    let report = load_plugins(root.path(), &reg, opts).await.unwrap();
+    assert!(
+        report.failed.is_empty(),
+        "load failures: {:?}",
+        report.failed
+    );
+
+    // Fetch the provider through the trait seam and invoke it.
+    let provider = smiths_core::ai::AiRegistry::get(&reg, "wat-logger")
+        .expect("wat-logger should be registered");
+    let out = provider
+        .invoke("ping", serde_json::json!({"msg": "hello"}))
+        .await
+        .expect("invoke should succeed");
+    assert_eq!(out, serde_json::Value::String("ok".into()));
 
     reg.shutdown_all().await;
 }

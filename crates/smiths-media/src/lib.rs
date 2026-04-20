@@ -1,17 +1,22 @@
 //! Media plane for smiths-net.
 //!
 //! Today: a UDP bridge that parses RTP headers, rewrites SSRC
-//! per-leg, and forwards packets between the two sides of a call.
-//! Jitter buffer, RTCP sender/receiver reports, and per-frame plugin
-//! hooks are follow-up work.
+//! per-leg, forwards packets between the two sides of a call, and
+//! emits periodic RTCP Sender Reports with live packet/byte/jitter
+//! stats. Jitter buffer and per-frame plugin hooks are follow-up work.
 
 pub mod bridge;
 pub mod fabric;
 pub mod port_allocator;
+pub mod rtcp;
+pub mod rtp_stats;
+pub mod srtp;
 
-pub use bridge::{Bridge, Leg};
+pub use bridge::{Bridge, BridgeConfig, Leg, RtcpLeg};
 pub use fabric::UdpMediaFabric;
 pub use port_allocator::{PortPair, allocate_rtp_rtcp_pair};
+pub use rtp_stats::{StreamStats, StreamStatsSnapshot};
+pub use srtp::AesCmHmacSha1_80Transform;
 
 // Codec + RTP packet types live in `smiths-core` (pure math, no
 // deps). Re-exported here so existing `smiths-media::*` paths keep

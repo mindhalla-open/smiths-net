@@ -7,6 +7,7 @@ license      = { workspace = true }
 description  = "Wire schema shared by core, WASM plugins, and sidecar plugins."
 
 [dependencies]
+prost = { workspace = true }
 
 [lints]
 workspace = true

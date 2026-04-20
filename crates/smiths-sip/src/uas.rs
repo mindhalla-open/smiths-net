@@ -120,6 +120,14 @@ pub struct UasServer<T: Transport> {
     /// (the [`crate::UacClient`]). `None` = UAS-only deployment;
     /// responses are simply dropped (old behaviour).
     response_router: Option<Arc<crate::ResponseRouter>>,
+    /// Shared graceful-drain flag. When set, new `INVITE`s are
+    /// rejected with `503 Service Unavailable` so load balancers
+    /// route traffic elsewhere while live dialogs finish naturally.
+    /// `None` = drain disabled (tests, single-shot deployments).
+    drain: Option<smiths_core::Drain>,
+    /// Per-source-IP token bucket. Always present — when config
+    /// disables rate limiting it's a cheap always-allow.
+    rate_limit: crate::rate_limit::SipRateLimiter,
 }
 
 impl<T: Transport> UasServer<T> {
@@ -150,6 +158,8 @@ impl<T: Transport> UasServer<T> {
             registrar: None,
             metrics: Metrics::noop(),
             response_router: None,
+            drain: None,
+            rate_limit: crate::rate_limit::SipRateLimiter::disabled(),
         })
     }
 
@@ -174,6 +184,25 @@ impl<T: Transport> UasServer<T> {
     #[must_use]
     pub fn with_response_router(mut self, router: Arc<crate::ResponseRouter>) -> Self {
         self.response_router = Some(router);
+        self
+    }
+
+    /// Attach a shared [`smiths_core::Drain`] so the UAS can refuse
+    /// new INVITEs during graceful shutdown. Without it, drain-aware
+    /// shutdown is a no-op (new dialogs keep being admitted until the
+    /// cancel token fires).
+    #[must_use]
+    pub fn with_drain(mut self, drain: smiths_core::Drain) -> Self {
+        self.drain = Some(drain);
+        self
+    }
+
+    /// Attach a per-source-IP rate limiter. Without this, the UAS
+    /// runs with an always-allow limiter (zero overhead) — the CLI
+    /// wires a real one from `config.sip.rate_limit`.
+    #[must_use]
+    pub fn with_rate_limit(mut self, rate_limit: crate::rate_limit::SipRateLimiter) -> Self {
+        self.rate_limit = rate_limit;
         self
     }
 
@@ -202,11 +231,19 @@ impl<T: Transport> UasServer<T> {
 
     async fn handle_datagram(&self, dg: Datagram) {
         let peer = dg.peer;
+        // Rate-limit *before* parsing: reject hostile bursts without
+        // burning the rsip parser on them. Disabled limiter is a
+        // single-atomic no-op.
+        if !self.rate_limit.allow(peer.ip()) {
+            debug!(%peer, "SIP datagram dropped by rate limiter");
+            return;
+        }
         let parse = match rsip::SipMessage::try_from(dg.bytes.as_ref()) {
             Ok(msg) => msg,
             Err(e) => {
                 let reason = e.to_string();
                 warn!(%peer, %reason, "malformed SIP message dropped");
+                self.metrics.sip_parse_errors.inc();
                 let _ = self
                     .bus
                     .publish(Event::Sip(SipEvent::ParseError { peer, reason }));
@@ -362,6 +399,28 @@ impl<T: Transport> UasServer<T> {
     #[allow(clippy::too_many_lines)] // negotiation + bridge wiring belong together
     #[instrument(skip_all, fields(%peer, call_id = %req.call_id.as_deref().unwrap_or("-")))]
     async fn handle_invite(&self, req: &RequestSummary, peer: SocketAddr) {
+        // Graceful drain: refuse new INVITEs before touching auth /
+        // media / dialog state. Existing dialogs keep flowing through
+        // the BYE path unchanged because drain only gates fresh
+        // INVITEs. `Retry-After: 0` tells compliant peers to retry
+        // immediately against the next hop in their load-balancer set.
+        if let Some(d) = &self.drain
+            && d.is_draining()
+        {
+            debug!(%peer, "rejecting INVITE while draining");
+            self.respond(
+                req,
+                503,
+                "Service Unavailable",
+                Some(&next_tag()),
+                &[("Retry-After", "0")],
+                &[],
+                peer,
+            )
+            .await;
+            return;
+        }
+
         // When a registrar is attached, INVITE requires digest auth. We
         // challenge before emitting 100 Trying so the rejection path
         // stays tight — no media allocation, no dialog state, just the
@@ -635,12 +694,20 @@ impl<T: Transport> UasServer<T> {
         ));
 
         if let Some(branch) = req.branch.as_ref() {
-            if self.dedupe.len() >= DEDUPE_CAPACITY
-                && let Some(entry) = self.dedupe.iter().next()
-            {
-                let k = entry.key().clone();
-                drop(entry);
-                self.dedupe.remove(&k);
+            if self.dedupe.len() >= DEDUPE_CAPACITY {
+                // Evict one entry. We scope the `iter()` tightly so the
+                // Iter (which holds a shard read-guard) is dropped
+                // *before* we call `remove()` on the same shard —
+                // otherwise the `remove` deadlocks on its own read
+                // guard. An earlier version relied on `drop(entry)` +
+                // temporary-lifetime rules, but `if let` extends the
+                // `iter()` rvalue's lifetime through the full scope,
+                // which kept the guard alive and wedged the UAS
+                // permanently once DEDUPE_CAPACITY was hit under load.
+                let evict_key = self.dedupe.iter().next().map(|e| e.key().clone());
+                if let Some(k) = evict_key {
+                    self.dedupe.remove(&k);
+                }
             }
             self.dedupe.insert(branch.clone(), bytes.clone());
         }
@@ -669,6 +736,25 @@ impl<T: Transport> UasServer<T> {
 /// Extract the first `Via` header's `branch` parameter from any raw
 /// SIP message (request or response). Returns `None` when the header
 /// or parameter is missing. Used by the response-router forwarder.
+/// Fuzz-only hooks. Exposed so `smiths-fuzz` can drive our hand-rolled
+/// parsers directly without booting a full UAS. Not part of the
+/// stable API — internal to the workspace.
+#[doc(hidden)]
+pub mod __fuzz {
+    use bytes::Bytes;
+
+    /// Run `summarize_request` on arbitrary bytes. Panics/UB/OOB are
+    /// the bugs the fuzzer hunts for.
+    pub fn summarize_request(raw: &[u8]) {
+        let _ = super::summarize_request(&Bytes::copy_from_slice(raw));
+    }
+
+    /// Run `extract_via_branch` on arbitrary bytes.
+    pub fn extract_via_branch(raw: &[u8]) {
+        let _ = super::extract_via_branch(&Bytes::copy_from_slice(raw));
+    }
+}
+
 fn extract_via_branch(raw: &Bytes) -> Option<String> {
     let text = std::str::from_utf8(raw).ok()?;
     for line in text.split("\r\n") {

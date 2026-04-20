@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use dashmap::DashMap;
 use serde::Serialize;
 use smiths_core::media::EndpointId;
-use smiths_core::{Event, EventBus, SipEvent};
+use smiths_core::{CallLookup, Event, EventBus, SipEvent};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -157,6 +157,15 @@ impl ControlState {
     #[must_use]
     pub fn uptime_secs(&self) -> u64 {
         unix_seconds().saturating_sub(self.started_at)
+    }
+}
+
+impl CallLookup for ControlState {
+    fn endpoint_for(&self, call_id: &str) -> Option<(EndpointId, SocketAddr)> {
+        let snap = self.calls.get(call_id)?;
+        let endpoint = snap.media_endpoint?;
+        let remote = snap.remote_rtp?;
+        Some((endpoint, remote))
     }
 }
 

@@ -3,5 +3,8 @@ version     = "0.1.0"
 type        = "wasm"
 entry       = "./rust_logger.wasm"
 provides    = ["ai.log"]
+# No extra permissions — the plugin only calls smiths::log, which is
+# unrestricted. If it later needed persistent KV, add "state" here.
+permissions = []
 abi         = "1.0"
-description = "Smoke-test WASM plugin: calls `smiths::log` from `run`, advertises one `ai.log` descriptor from `describe`."
+description = "Smoke-test WASM plugin: calls `smiths::log` from `run`, advertises one `ai.log` descriptor from `describe`, and implements the `invoke` ABI with a fixed OK response."

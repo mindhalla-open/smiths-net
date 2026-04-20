@@ -5,6 +5,434 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-04-20
+
+### Added — SRTP (SDES)
+
+- **`smiths-core::SrtpTransform` + `SrtpSuite` + `SrtpError`** —
+  trait seam + suite enum + typed errors. `SrtpSuite` knows its own
+  key / salt lengths and SDP name. `SrtpTransform` is `&self` with
+  interior mutability so a bridge forwarder can share a transform
+  across tasks; per-direction instances keep SSRC state / rollover
+  counters isolated.
+- **`smiths-media::srtp::AesCmHmacSha1_80Transform`** —
+  `webrtc-srtp`-backed implementation. Pure Rust, MIT/Apache,
+  `AES_CM_128_HMAC_SHA1_80` suite. `from_sdes(key_material: &[u8])`
+  constructs from the 30-byte SDES master-key + salt; auth-failure
+  bytes from the backend map to `SrtpError::AuthFailed`. 4 unit
+  tests: round-trip / wrong-key-rejected / wrong-size-rejected /
+  sequential-packets.
+- **`smiths-sdp::SdesCrypto` + `SdesParseError`** — SDES
+  `a=crypto:<tag> <suite> inline:<b64>` parser / generator with 7
+  tests (canonical, `|lifetime|mki` tail, round-trip, wrong-suite,
+  short-key, truncated, not-a-crypto early bail-out).
+- **`smiths-media::Bridge` SRTP integration** — `Leg.srtp:
+  Option<LegSrtp>` carries `(peer_tx, local_tx)`. Forwarder: decrypt
+  with ingress-leg's `peer_tx` → rewrite SSRC on plaintext →
+  re-encrypt with egress-leg's `local_tx`. Re-sign happens under
+  SRTP because auth covers the header (including SSRC). Integration
+  test proves A encrypts → engine decrypts → rewrites SSRC →
+  re-encrypts → B decrypts, payload byte-identical. SDP-negotiator
+  wiring (UAS answering `a=crypto:` offers end-to-end) is the next
+  slice.
+- **`webrtc-srtp = "0.17"`** pinned as workspace dep.
+
+### Added — RTCP cumulative-loss tracking
+
+- **`StreamStats` grew `base_seq` / `cycles` / `seen_first` atomics**
+  implementing RFC 3550 §A.3 extended-max + wrap detection.
+  `snapshot().cumulative_lost` returns `expected - received` clamped
+  at 0 (reordered arrivals don't push the count negative).
+- **SR emitter now feeds real loss into Report Blocks** instead of
+  the `0` placeholder. Peer receivers finally see the engine's view
+  of the stream health.
+- 3 new unit tests: gap-counted-as-lost, no-gap-stays-zero,
+  reorder-clamps-at-zero.
+
+### Added — env-driven credential seed (`SMITHS_TEST_CREDS`)
+
+- CLI reads `SMITHS_TEST_CREDS=user:realm:pass[,user:realm:pass…]`
+  at startup, builds an in-memory `Registrar`, attaches it to
+  every UAS. Every realm stanza shares the first one. Disabled by
+  default — production credential stores land via the
+  `CredentialStore` trait (DB, LDAP, …). Unset = no registrar (dev
+  blind-200-OK path from prior versions).
+
+### Fixed — digest URI mismatch on clients that drop the user-part
+
+- Some UAs (sipp, many real-world SIP stacks) sign only the
+  host-authority in the digest `uri=` parameter even when the
+  Request-URI carries a user-part. Previously the UAS rejected
+  them with `UriMismatch` / re-challenged forever. Fix: extract
+  the `host[:port]` authority from both URIs and accept a match on
+  that, in addition to the existing exact / substring rules.
+  Found during the auth-exercised sipp prove-out (below).
+
+### Validated — sipp auth-exercised perf run
+
+- With `SMITHS_TEST_CREDS="sipp:smiths.test:s3cret"` on the engine,
+  ran `scenarios/sipp/register.xml` (the digest-authenticated
+  variant):
+  - 500 calls @ 100 cps → 100% success, 0 retrans.
+  - 5000 calls @ 1000 cps → 100% success, 0 retrans.
+  - Every call exercised the full 4-message round-trip
+    (REGISTER → 401 → REGISTER+Auth → 200).
+- Engine metrics after the 1000 cps run: 11000 REGISTER requests,
+  5500 × 401, 5500 × 200, 0 parse errors.
+
+## [0.14.0] - 2026-04-20
+
+### Validated — fuzz harness run
+
+- Ran `cargo +nightly fuzz run sip_parser` for ~4 minutes
+  (**5.2M runs**) with a seeded corpus covering OPTIONS, INVITE,
+  REGISTER-with-auth, and responses. **Zero crashes, zero panics,
+  zero OOMs** across three parse layers:
+  1. `rsip::SipMessage::try_from` (third-party gate)
+  2. `summarize_request` (our hand-rolled request-summary parser)
+  3. `extract_via_branch` (response-router branch extractor)
+- Exposed the latter two via a `#[doc(hidden)] pub mod __fuzz`
+  inside `smiths-sip::uas` so the fuzz target can drive them
+  directly without booting a UAS.
+- Seeded `fuzz/corpus/sip_parser/` with four realistic inputs —
+  future fuzz runs start from meaningful mutations, not `[]`.
+
+### Added — per-source-IP SIP rate limiting
+
+- **`smiths-sip::rate_limit::SipRateLimiter`** — token bucket per
+  source IP. `SipRateLimit { per_sec, burst }` config tuple lands
+  on `SipConfig` (disabled by default; `per_sec == 0`). Over-limit
+  datagrams are silently dropped *before* the rsip parser runs,
+  keeping the hot path short during a flood.
+- **`UasServer::with_rate_limit(...)`** — builder. UAS checks the
+  limiter in `handle_datagram`, before parse, before any state
+  touch. Per-IP buckets in a `DashMap`; disabled case is a single
+  atomic compare so the hot path stays cheap.
+- CLI wires one shared limiter across all transports (UDP, TCP,
+  TLS) so a hostile peer can't bypass the limit by hopping
+  transports. `SMITHS__SIP__RATE_LIMIT__PER_SEC=50` enables.
+- Two integration tests: caps-at-burst, and
+  per_sec=0-lets-everything-through.
+
+### Added — RTCP Receiver Reports (embedded + listener)
+
+- **`smiths-media::rtcp::build_sr_with_rb` / `build_rr` /
+  `parse_rr` / `ReportBlock`** — RFC 3550 §6.4 wire layout for
+  Report Blocks. 24-byte RB carries `ssrc` / `fraction_lost` /
+  24-bit signed `cumulative_lost` / `extended_highest_seq` /
+  `jitter` / `last_sr` / `delay_since_last_sr`. 4 round-trip /
+  validation tests cover the happy path, wrong PT, lying RC.
+- **Bridge emitter now embeds a Report Block** in each outgoing SR
+  describing what the engine *received* from the peer of the
+  current direction. When no inbound packets have been observed
+  yet (fresh bridge), the emitter still emits a bare SR (`RC=0`)
+  rather than burning cycles building an empty RB.
+- **`spawn_rr_listener`** — per-direction RTCP listener that reads
+  incoming RR packets, parses them, logs the peer's loss / jitter
+  numbers at debug level. Hooking the values back into
+  `StreamStats` (for `last_sr` / DLSR) is deferred — needs the
+  cumulative-lost counter wired on the emitter side first.
+
+### Bug-check notes
+
+- Fuzz found nothing new after the v0.13.1 dedupe-eviction fix.
+- Rate limiter defense protects against the saturation scenario
+  observed during the sipp perf run (2000 cps burst → OS socket
+  buffer overflow). With a 50 rps / 100 burst limit the attacker
+  gets 100 datagrams, then silence.
+
+## [0.13.1] - 2026-04-20
+
+### Fixed — UAS dedupe-eviction deadlock
+
+- **The bug:** `UasServer::respond` evicted a cache entry via
+  `self.dedupe.iter().next()` + `remove(&k)`. Rust's `if let`
+  lifetime rules extend the `iter()` rvalue temporary through the
+  full scope, so the `Iter` (holding a `DashMap` shard read guard)
+  was still alive when `remove` took a write lock on the same
+  shard. The UAS wedged permanently once `DEDUPE_CAPACITY` (4096)
+  was hit under load — no further SIP datagrams got dispatched
+  even though the process, health endpoint, and metrics all looked
+  healthy.
+- **The fix:** extract the eviction key in a self-contained
+  expression (`self.dedupe.iter().next().map(|e| e.key().clone())`)
+  so the `Iter` is dropped before `remove`. The hot path stays
+  single-threaded (UAS serializes `handle_datagram`); the bug
+  surfaced because macOS's loopback buffered 4096+ datagrams fast
+  enough to push us past the threshold.
+- **Regression test:** `crates/smiths-sip/tests/dedupe_eviction.rs`
+  sends 4200 unique OPTIONS requests and asserts at least 4100 get
+  200 OK back. Pre-fix this hung after ~4096. Post-fix all 4200
+  land. Takes ~10 s on dev hardware.
+- **Validated via sipp** on loopback: 50,000 REGISTERs at
+  ~10,000 cps, 100% success, 0 retransmits, 0 failed. Prior to
+  the fix the engine froze after ~4096 REGISTERs regardless of
+  arrival rate.
+
+### Added
+
+- **`scenarios/sipp/register_noauth.xml`** — blind-200 variant of
+  the REGISTER scenario for running throughput smokes against the
+  default (no-credential-store) engine. The existing
+  `register.xml` still drives the auth round-trip; use this one
+  when seeding the credential store is not on the table.
+
+## [0.13.0] - 2026-04-20
+
+### Added — graceful drain
+
+- **`smiths-core::Drain`** — cheaply-clonable atomic flag shared
+  across subsystems. `Drain::start()` flips to "draining";
+  `Drain::is_draining()` is a relaxed load on the hot path.
+- **`UasServer::with_drain(Drain)`** — when set, `handle_invite`
+  short-circuits to `503 Service Unavailable` (with `Retry-After: 0`)
+  before touching auth, media allocation, or dialog state. Live
+  dialogs (BYE, ACK, re-INVITE on the same dialog) flow through
+  unaffected; only fresh call setup is refused.
+- **`SMITHS_DRAIN_SECS` env var** — the CLI reads this on shutdown
+  (default 5). Flow: SIGTERM → `drain.start()` → sleep window →
+  fire the existing cancel token. Setting it to `0` reverts to
+  the pre-v0.13 instant-cancel behaviour (used by the e2e test).
+- Two integration tests in `smiths-sip/tests/drain.rs`:
+  `draining_uas_rejects_new_invite_with_503` and
+  `non_draining_uas_still_accepts_invite`.
+
+### Added — deep `/health` endpoint
+
+- **`/health` now returns structured JSON** instead of
+  `{"status":"ok"}`. Fields:
+  - `status`: `"ok"` or `"draining"`.
+  - `draining`: boolean from the shared `Drain`.
+  - `uptime_secs`: seconds since process start.
+  - `sip.binds`: list of `proto://addr` strings for every configured
+    SIP listener (`udp://`, `tcp://`, `tls://`).
+  - `plugins.loaded`: plugin names successfully registered.
+  - `plugins.failed`: `[{ dir, error }]` entries for failed loads.
+  - `dialogs_active`: live gauge read from `Metrics`.
+  - `bridges_active`: live gauge read from `Metrics`.
+- **`HealthState` / `HttpState`** — axum state types in
+  `smiths-cli/src/main.rs`. Spawned after SIP bind collection so
+  the snapshot is complete on the first request.
+
+### Changed
+
+- `smiths-cli`'s shutdown sequence now runs `drain.start()` before
+  `shutdown.trigger()`, sleeping `SMITHS_DRAIN_SECS` in between. The
+  existing system event (`ShutdownRequested`) is still published at
+  the start of drain.
+- `UasServer::new(...)`'s four builder methods now include
+  `with_drain(...)`; constructions without it (tests, single-shot
+  helpers) fall back to "never draining".
+- The full-binary e2e test now sets `SMITHS_DRAIN_SECS=0` so its
+  SIGTERM-to-exit assertion stays within its 5 s budget.
+
+### Operational / deferred
+
+- sipp perf validation remains an operator task. `scenarios/sipp/
+  register.xml` + `README.md` document the run. Needs a host with
+  sipp installed; not reproducible inside the sandbox.
+
+## [0.12.0] - 2026-04-20
+
+### Added — engine-wide metrics coverage
+
+- **`smiths-core::Metrics`** grew seven new fields covering the
+  subsystems that previously had no visibility:
+  - `sip_parse_errors` (counter) — incremented in UAS when rsip
+    rejects an inbound datagram. Pairs with the `ParseError` event.
+  - `bridges_active` (gauge) — in/dec on `MediaFabric::bridge` /
+    `release_bridge` so operators see the live passthrough count.
+  - `rtp_packets_forwarded{direction}` (counter family) —
+    `direction="a_to_b"` / `"b_to_a"`; incremented after successful
+    `send_to` in each forwarder task.
+  - `rtcp_sr_sent` (counter) — incremented in the SR emitter task
+    on each successful RTCP write.
+  - `plugin_invocations{plugin, outcome}` (counter family) —
+    recorded on every `AiProvider::invoke`; `outcome="ok"|"error"`.
+  - `plugin_invoke_duration_seconds{plugin}` (histogram family) —
+    same hook; uses the default latency buckets shared with the
+    tool-duration histogram.
+  - `sidecar_restarts{plugin}` (counter family) — emitted by the
+    supervisor each time `supervise_loop` successfully respawns a
+    crashed child.
+- **Metrics threading.** The CLI builds a single `Arc<Metrics>` at
+  boot and threads it through:
+  - `LoaderOpts::metrics` — every loaded `PluginEntry` and
+    `WasmProvider` receives it at registration time.
+  - `UdpMediaFabric::with_metrics` — fabric propagates it to every
+    bridge via `BridgeConfig::metrics`.
+  - `Sidecar::set_metrics` — set post-`spawn` (uses `OnceLock`
+    internally so the hot path reads without locking).
+- **Optional at every layer.** Each new hook checks `Option<Arc<
+  Metrics>>`; tests and embedded use that bypass the registry
+  continue to work unchanged.
+
+### Changed
+
+- `BridgeConfig` is no longer `#[derive(Default)]` — it now has an
+  explicit `Default` so the new `metrics` field initializes to
+  `None` without shifting the `rtcp_interval` default.
+- `PluginEntry` gained a `metrics: Option<Arc<Metrics>>` field.
+  Existing consumers that destructure the struct need the extra
+  field; construction via the loader is unaffected.
+- `Metrics` now derives `Debug` (required to keep `PluginEntry`'s
+  derive working).
+
+## [0.11.0] - 2026-04-20
+
+### Added — RTP stats + RTCP SR emission
+
+- **`smiths-media::rtp_stats`** — per-direction `StreamStats`
+  tracker. Observes every forwarded RTP packet: counts, bytes,
+  highest sequence, last RTP timestamp + SSRC, and the RFC 3550
+  §A.8 interarrival jitter (smoothed at 1/16, stored in fixed
+  point). Snapshot is atomics-only, no locking.
+- **`smiths-media::rtcp`** — Sender Report builder + parser.
+  Packet layout per RFC 3550 §6.4.1 (28 bytes, no report blocks
+  yet). `ntp_now()` helper returns the 64-bit NTP timestamp with
+  the 1900-epoch offset. Five byte-layout round-trip tests cover
+  success and every rejection path.
+- **`Bridge` grew `spawn_with(id, a, b, cfg)`** — when the legs
+  carry `RtcpLeg` handles and `BridgeConfig::rtcp_interval` is
+  `Some`, the bridge fires periodic Sender Reports to each peer's
+  RTCP port. Stats travel through the forwarder path (observed
+  after SSRC rewrite so the SR's SSRC matches the egress SSRC).
+  `Bridge::stats()` returns a `BridgeStats` snapshot for both
+  directions.
+- **`UdpMediaFabric::bridge`** now populates `RtcpLeg` from the
+  already-allocated RTCP sockets (previously `_rtcp` — bound but
+  idle). Peer RTCP address is derived as `peer RTP port + 1` per
+  RFC 3550 §11; explicit `a=rtcp:` SDP lines can land later.
+- Two new integration tests: stats tick as packets flow; SRs land
+  on the peer within 2 s with the correct packet count.
+
+### Added — WASM `send_rtp` host fn
+
+- **`smiths::send_rtp(call_id_ptr, call_id_len, bytes_ptr, bytes_len) -> i32`**
+  — guest hands the host a call-id + payload; host looks up the
+  call's media endpoint + remote RTP address and dispatches via
+  `MediaFabric::send_packet`. Returns `0` on dispatch, `-1` for
+  unknown calls. Gated behind the new `"send_rtp"` permission.
+- **`smiths-core::CallLookup`** trait — seam for `call-id →
+  (EndpointId, SocketAddr)`. Lives in `smiths-core` so
+  `smiths-wasm` can consume it without linking the MCP crate.
+  `ControlState` implements it.
+- **`WasmEngine::with_media(lookup, fabric)`** — builder that
+  attaches both handles to every store the engine builds. CLI
+  wires control-plane state + `UdpMediaFabric` at boot.
+- Test coverage: `send_rtp` dispatches correctly through a
+  recording fabric; permission-denied traps cleanly; both paths
+  are verified inline via WAT.
+
+### Changed
+
+- CLI now builds `UdpMediaFabric` before the WASM engine so the
+  engine can carry its handle. Prior ordering put fabric
+  construction after the plugin load — moving it up kept the
+  single `Arc<dyn MediaFabric>` shared across all consumers.
+
+## [0.10.0] - 2026-04-20
+
+### Added — WASM host surface expansion
+
+- **`smiths::publish_event(topic_ptr, topic_len, data_ptr, data_len) -> i32`**
+  — guest publishes `(topic, bytes)` to the engine's event bus as
+  `PluginEvent::Published`. Returns `0` on success, `-1` when no
+  subscribers were live (non-fatal). Requires the `events`
+  permission.
+- **`smiths::timer_set(delay_ms, event_id) -> i32`** — guest schedules
+  a one-shot host timer. When the delay elapses, the engine
+  publishes a `PluginEvent::TimerFired` carrying `event_id`.
+  Implementation uses a `std::thread` rather than `tokio::spawn` so
+  sync `run_entry` callers without a runtime still work. Requires
+  the `timers` permission.
+- **`WasmEngine::with_bus(EventBus)`** — builder that attaches the
+  engine-wide bus to every store the engine builds. CLI wires it
+  at boot, so `load_plugins` plugins get bus access without any
+  extra threading.
+- **`PluginEvent::Published` / `PluginEvent::TimerFired`** — two
+  new variants on the bus. Subscribers (MCP forwarder, sidecar
+  bridge, future routing agents) can react without linking the
+  WASM crate.
+
+### Added — plugin hot reload
+
+- **`smiths-plugin::watcher`** — `spawn(root, registry) ->
+  WatcherHandle` launches a background task that polls the plugins
+  directory and calls `AiRegistry::reload(name)` when `plugin.toml`
+  or an entry file changes. Uses `notify::PollWatcher` with
+  `compare_contents(true)` for same-second-edit detection
+  (platform-independent; macOS HFS+ and editor save bursts
+  handled). Bursts are debounced with a 250 ms trailing delay so a
+  noisy editor save only triggers one reload per plugin.
+- **`WatcherHandle`** — canceling it (drop or `shutdown().await`)
+  tears down the background task cleanly.
+- Integration test `hot_reload::watcher_triggers_reload_on_manifest_touch`
+  loads a sidecar stub, touches `plugin.toml`, and verifies the
+  registry swaps in a fresh `Arc<PluginEntry>` within 5 s.
+
+### Added — proto schema v1 frozen
+
+- **`smiths-proto`** grew `Envelope` / `Request` / `Response` /
+  `Notification` messages with prost-derive annotations — no
+  `build.rs`, no `protoc` dependency at compile time. Field
+  numbers are locked; future additions use fresh tags so old peers
+  decode correctly. Six round-trip tests cover each variant and
+  the empty-envelope edge case.
+- When the sidecar transport eventually migrates from JSON-RPC to
+  length-prefixed protobuf, these types serialize both sides.
+
+## [0.9.0] - 2026-04-19
+
+### Added — WASM plugin invocation dispatch
+
+- **`WasmEngine::call_invoke(module, plugin, method, &params) ->
+  Result<Value, WasmError>`** — the invoke trampoline. Guest ABI:
+  module exports `memory`, `alloc(len: i32) -> i32`, and
+  `invoke(method_ptr, method_len, params_ptr, params_len) -> i64`.
+  The host serializes `params` as JSON, allocates + writes both
+  buffers via `alloc`, calls `invoke`, and decodes the packed
+  `(ptr << 32) | len` response envelope.
+- **Response envelope** — the guest returns a JSON object matching
+  one of `{"result": X}` (success, `X` passed back to the caller)
+  or `{"error": "msg"}` (plugin-level failure surfaced as
+  `WasmError::PluginError`). Malformed envelopes trap.
+- **`WasmProvider::invoke` wired** — replaces the prior "not yet
+  wired" stub. Real WASM plugins now run full describe + invoke
+  through `AiRegistry`, matching sidecar semantics.
+- **`rust-logger` example** — grew `alloc` (4 KiB static bump
+  buffer) and `invoke` (fixed `{"result":"ok"}` envelope) exports
+  so it's a complete, buildable reference for the WASM tier.
+
+### Added — plugin permission model
+
+- **`permissions: Vec<String>`** — new `plugin.toml` field. Empty
+  by default; only the plugins that need gated host surfaces opt
+  in. Today's meaningful value: `"state"` (required by
+  `smiths::state_{get,set}`). Future slices key `"send_sip"`,
+  `"send_rtp"`, timers, etc. off the same list.
+- **`WasmEngine::set_plugin_permissions(name, perms)`** — engine-
+  side registry. Called at load time with the manifest's list; the
+  per-invocation `HostState` cheaply clones the resulting
+  `Arc<HashSet<String>>` so every host fn can gate in O(1).
+- **`WasmError::PermissionDenied { plugin, permission, op }`** —
+  typed trap variant so operators can distinguish "plugin over-
+  reach" from plain traps / fuel exhaustion / timeouts. Surfaces
+  the exact permission string the author needs to add to
+  `plugin.toml`.
+- **`HostState::for_plugin_with_state` signature grew a
+  `permissions` parameter** — single construction point now covers
+  the three pieces of per-call plugin context (name, persistent
+  state, permission set).
+
+### Changed
+
+- Tests for `state_get` / `state_set` now explicitly register the
+  `"state"` permission via `engine.set_plugin_permissions(...)` —
+  previously permission-free access was implicit, now it's the
+  *declared* path. `for_plugin` (the empty-default helper) now
+  grants no permissions, matching runtime behavior.
+
 ## [0.8.0] - 2026-04-18
 
 ### Added — bidirectional plugin RPC (streaming notifications)

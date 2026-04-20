@@ -103,6 +103,116 @@ pub trait MediaSession: Send + Sync {
     async fn stop(&self);
 }
 
+/// SRTP cipher suites the engine understands on the wire.
+///
+/// Today we support **`AES_CM_128_HMAC_SHA1_80`** only — the baseline
+/// SDES / DTLS-SRTP profile every mainstream UA offers and the one
+/// all of our current test tooling emits. Adding further suites is a
+/// matter of registering a new variant and wiring the corresponding
+/// `webrtc-srtp` `ProtectionProfile` in `smiths-media::srtp`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SrtpSuite {
+    /// RFC 4568 §6.2.1 — 128-bit AES counter mode with 80-bit HMAC
+    /// SHA-1 authentication. 30-byte SDES key material
+    /// (16-byte master key + 14-byte master salt).
+    AesCm128HmacSha1_80,
+}
+
+impl SrtpSuite {
+    /// Length of the master key in bytes.
+    #[must_use]
+    pub const fn key_len(self) -> usize {
+        match self {
+            Self::AesCm128HmacSha1_80 => 16,
+        }
+    }
+
+    /// Length of the master salt in bytes.
+    #[must_use]
+    pub const fn salt_len(self) -> usize {
+        match self {
+            Self::AesCm128HmacSha1_80 => 14,
+        }
+    }
+
+    /// Total SDES key-material length (`key_len + salt_len`). This is
+    /// what `base64`-decodes out of an `a=crypto:... inline:...`.
+    #[must_use]
+    pub const fn key_material_len(self) -> usize {
+        self.key_len() + self.salt_len()
+    }
+
+    /// Canonical wire name used in SDP `a=crypto:` (RFC 4568 §6.2).
+    #[must_use]
+    pub const fn sdp_name(self) -> &'static str {
+        match self {
+            Self::AesCm128HmacSha1_80 => "AES_CM_128_HMAC_SHA1_80",
+        }
+    }
+
+    /// Parse an SDP suite name. Unknown names return `None` so the
+    /// SDP negotiator can surface them as a rejected offer.
+    #[must_use]
+    pub fn from_sdp_name(name: &str) -> Option<Self> {
+        match name {
+            "AES_CM_128_HMAC_SHA1_80" => Some(Self::AesCm128HmacSha1_80),
+            _ => None,
+        }
+    }
+}
+
+/// Errors surfaced by an [`SrtpTransform`].
+#[derive(Debug, Error)]
+pub enum SrtpError {
+    /// Master key/salt length didn't match the suite's expectations.
+    /// Usually means an SDES line carried the wrong suite tag.
+    #[error("SRTP key material wrong size: expected {expected}, got {got}")]
+    KeyLength {
+        /// Bytes the suite requires (key + salt).
+        expected: usize,
+        /// Bytes the caller supplied.
+        got: usize,
+    },
+    /// Packet's HMAC didn't verify against the key — either wrong
+    /// keys or tampering.
+    #[error("SRTP authentication failed")]
+    AuthFailed,
+    /// Any other transform-layer failure (encrypt/decrypt returned an
+    /// error the backend didn't classify more specifically).
+    #[error("SRTP transform error: {0}")]
+    Other(String),
+}
+
+/// Per-direction SRTP encryption/decryption primitive.
+///
+/// Exposed as a trait so the engine can swap backends (pure-Rust
+/// `webrtc-srtp` today; `libsrtp` FFI or an HSM-backed variant
+/// tomorrow) without touching the bridge. **Per-direction**: one
+/// transform instance for the local→peer stream, another for
+/// peer→local. Sharing a transform across directions mixes SSRC
+/// state machines and breaks SRTP's rollover counter accounting.
+///
+/// `&self` methods with interior mutability: SRTP contexts track
+/// per-SSRC state (ROC, replay detector) that mutates per packet, so
+/// the bridge needs shared access from multiple tasks. Implementations
+/// wrap a `Mutex<Context>` or equivalent.
+///
+/// **Not a plugin.** Per-packet crypto on a 20 ms RTP frame is the
+/// kind of hot path that can't tolerate a plugin hop. The plugin
+/// model is reserved for AI / control-plane async RPC.
+pub trait SrtpTransform: Send + Sync {
+    /// Encrypt an outgoing RTP packet. Returns the ciphertext + auth
+    /// tag as a fresh buffer (may be longer than the input).
+    fn protect_rtp(&self, plaintext: &[u8]) -> Result<Vec<u8>, SrtpError>;
+
+    /// Decrypt and authenticate an incoming RTP packet. Returns the
+    /// plaintext (same shape as the original pre-encryption packet).
+    /// Auth-tag failures surface as [`SrtpError::AuthFailed`] — the
+    /// bridge drops the packet on that path without touching further
+    /// state.
+    fn unprotect_rtp(&self, ciphertext: &[u8]) -> Result<Vec<u8>, SrtpError>;
+}
+
 /// Errors surfaced by [`MediaFabric`] operations.
 #[derive(Debug, Error)]
 pub enum MediaError {

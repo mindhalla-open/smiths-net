@@ -85,6 +85,24 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = Shutdown::new();
     let bus = EventBus::new(1024);
 
+    // Graceful-drain flag — UAS reads it on every INVITE to decide
+    // whether to admit new dialogs. Flipped by the shutdown driver
+    // before the cancel token fires.
+    let drain = smiths_core::Drain::new();
+
+    // Per-source-IP rate limiter for SIP ingress. Shared across all
+    // listeners (UDP / TCP / TLS) so a single noisy peer can't bypass
+    // the limit by hopping transports.
+    let sip_rate_limit = smiths_sip::SipRateLimiter::new(config.sip.rate_limit);
+
+    // Optional env-driven credential seed. `SMITHS_TEST_CREDS=
+    // user:realm:pass[,user:realm:pass...]` populates an in-memory
+    // registrar so sipp / dev traffic can exercise the digest auth
+    // round-trip. Disabled by default — production credential stores
+    // land via the CredentialStore trait (database, LDAP, …) rather
+    // than through this env knob.
+    let registrar = build_test_registrar();
+
     // One Prometheus registry, shared between the /metrics endpoint
     // and every subsystem that increments counters.
     let metrics_registry = Arc::new(Mutex::new(Registry::default()));
@@ -97,13 +115,21 @@ async fn main() -> anyhow::Result<()> {
     // with live data. It's cheap and draining is cooperative.
     let (control_state, control_task) = ControlState::spawn(&bus, shutdown.token());
 
+    // Build the shared media fabric before the WASM engine so guest
+    // `send_rtp` can push packets through it.
+    let media_fabric: Arc<dyn MediaFabric> =
+        Arc::new(UdpMediaFabric::new().with_metrics(Arc::clone(&metrics)));
+
     // Load plugins from the configured directory. Failures are per-
     // plugin and logged; they don't block startup.
     let ai_registry = smiths_plugin::AiRegistry::new();
     // Build a shared WASM engine so `type = "wasm"` manifests can load.
     // Failing this shouldn't block sidecar plugins — log and proceed.
     let wasm_engine = match smiths_plugin::wasm::WasmEngine::new() {
-        Ok(e) => Some(e),
+        Ok(e) => Some(
+            e.with_bus(bus.clone())
+                .with_media(Arc::new(control_state.clone()), Arc::clone(&media_fabric)),
+        ),
         Err(err) => {
             warn!(
                 ?err,
@@ -115,7 +141,10 @@ async fn main() -> anyhow::Result<()> {
     let loader_opts = smiths_plugin::LoaderOpts {
         bus: Some(bus.clone()),
         wasm_engine,
+        metrics: Some(Arc::clone(&metrics)),
     };
+    let mut plugins_loaded: Vec<String> = Vec::new();
+    let mut plugins_failed: Vec<(String, String)> = Vec::new();
     match smiths_plugin::load_plugins(&config.plugins.dir, &ai_registry, loader_opts).await {
         Ok(report) => {
             if !report.loaded.is_empty() {
@@ -126,6 +155,8 @@ async fn main() -> anyhow::Result<()> {
                     warn!(%dir, %err, "plugin load failed");
                 }
             }
+            plugins_loaded = report.loaded;
+            plugins_failed = report.failed;
         }
         Err(e) => warn!(?e, "plugin scan failed"),
     }
@@ -136,17 +167,17 @@ async fn main() -> anyhow::Result<()> {
     let ai_registry_dyn: Arc<dyn AiRegistry> = Arc::new(ai_registry.clone());
     let config_snapshot = Arc::new(config.clone());
 
-    // One shared media fabric — built here (before any adapter that
-    // might reach into it) so the control-plane ToolContext and the
-    // SIP subsystem see the same Arc.
-    let media_fabric: Arc<dyn MediaFabric> = Arc::new(UdpMediaFabric::new());
-
     // Shared response correlator. The UAS forwards responses to it;
     // the UAC subscribes by branch.
     let response_router = Arc::new(ResponseRouter::new());
 
     // ---- SIP subsystem ----
     let mut sip_handles: Vec<JoinHandle<()>> = Vec::new();
+    // Collected for `/health`. We push the intended `proto://addr`
+    // string for each spawn attempt; the health payload reflects the
+    // operator's intent even when a particular bind fails (the failure
+    // is already in the startup warn! log).
+    let mut sip_binds_report: Vec<String> = Vec::new();
     let udp_enabled = config.sip.transports.contains(&SipTransport::Udp);
     let tcp_enabled = config.sip.transports.contains(&SipTransport::Tcp);
     let tls_enabled = config.sip.transports.contains(&SipTransport::Tls);
@@ -165,6 +196,7 @@ async fn main() -> anyhow::Result<()> {
     let mut originator: Option<Arc<dyn CallOriginator>> = None;
     if udp_enabled && let Some(bind) = config.sip.bind.first() {
         let addr = bind.socket_addr();
+        sip_binds_report.push(format!("udp://{addr}"));
         match spawn_sip_udp(
             addr,
             bus.clone(),
@@ -172,6 +204,9 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&media_fabric),
             Arc::clone(&metrics),
             Arc::clone(&response_router),
+            drain.clone(),
+            sip_rate_limit.clone(),
+            registrar.clone(),
             /* build_uac */ true,
         )
         .await
@@ -214,19 +249,13 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // ---- health + metrics HTTP endpoint ----
-    let health = tokio::spawn(serve_health(
-        config.observability.health_bind,
-        shutdown.token(),
-        Arc::clone(&metrics_registry),
-    ));
-
     // Additional SIP binds. The first UDP bind (when UDP is enabled)
     // was already consumed above to stand up the UAC; other binds
     // come online here as UAS-only listeners.
     for (idx, bind) in config.sip.bind.iter().enumerate() {
         let addr = bind.socket_addr();
         if udp_enabled && !(idx == 0 && originator.is_some()) {
+            sip_binds_report.push(format!("udp://{addr}"));
             match spawn_sip_udp(
                 addr,
                 bus.clone(),
@@ -234,6 +263,9 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(&media_fabric),
                 Arc::clone(&metrics),
                 Arc::clone(&response_router),
+                drain.clone(),
+                sip_rate_limit.clone(),
+                registrar.clone(),
                 /* build_uac */ false,
             )
             .await
@@ -243,12 +275,16 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         if tcp_enabled {
+            sip_binds_report.push(format!("tcp://{addr}"));
             match spawn_sip_tcp(
                 addr,
                 bus.clone(),
                 shutdown.token(),
                 Arc::clone(&media_fabric),
                 Arc::clone(&metrics),
+                drain.clone(),
+                sip_rate_limit.clone(),
+                registrar.clone(),
             )
             .await
             {
@@ -259,6 +295,7 @@ async fn main() -> anyhow::Result<()> {
         if tls_enabled
             && let (Some(cert), Some(key)) = (&config.sip.tls_cert_path, &config.sip.tls_key_path)
         {
+            sip_binds_report.push(format!("tls://{addr}"));
             match spawn_sip_tls(
                 addr,
                 cert,
@@ -267,6 +304,9 @@ async fn main() -> anyhow::Result<()> {
                 shutdown.token(),
                 Arc::clone(&media_fabric),
                 Arc::clone(&metrics),
+                drain.clone(),
+                sip_rate_limit.clone(),
+                registrar.clone(),
             )
             .await
             {
@@ -275,6 +315,26 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    // ---- health + metrics HTTP endpoint ----
+    // Spawned after SIP bind collection so /health's snapshot is
+    // complete on the first request.
+    let health_state = HealthState {
+        started_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        sip_binds: sip_binds_report,
+        plugins_loaded,
+        plugins_failed,
+        metrics: Arc::clone(&metrics),
+        drain: drain.clone(),
+    };
+    let health = tokio::spawn(serve_health(
+        config.observability.health_bind,
+        shutdown.token(),
+        Arc::clone(&metrics_registry),
+        health_state,
+    ));
 
     // ---- A2A HTTP adapter (optional) ----
     let mut adapter_handles: Vec<JoinHandle<()>> = Vec::new();
@@ -340,9 +400,23 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("installing signal handlers")?;
     }
-    shutdown.trigger();
-    info!("shutdown signal received; draining");
+    // Graceful drain: flip the UAS flag first, sleep the drain
+    // window so live dialogs can reach BYE on their own, then fire
+    // the hard cancel. `SMITHS_DRAIN_SECS` (default 5) overrides;
+    // setting it to `0` keeps the pre-v0.13 instant-cancel behaviour
+    // for tight test loops.
+    drain.start();
+    info!("shutdown signal received; draining new INVITEs");
     let _ = bus.publish(Event::System(SystemEvent::ShutdownRequested));
+    let drain_secs: u64 = std::env::var("SMITHS_DRAIN_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    if drain_secs > 0 {
+        info!(drain_secs, "holding new INVITEs with 503 during drain");
+        tokio::time::sleep(std::time::Duration::from_secs(drain_secs)).await;
+    }
+    shutdown.trigger();
 
     for h in sip_handles {
         if let Err(err) = h.await {
@@ -384,6 +458,9 @@ async fn spawn_sip_udp(
     media_fabric: Arc<dyn MediaFabric>,
     metrics: Arc<Metrics>,
     router: Arc<ResponseRouter>,
+    drain: smiths_core::Drain,
+    rate_limit: smiths_sip::SipRateLimiter,
+    registrar: Option<smiths_sip::auth::digest::Registrar>,
     build_uac: bool,
 ) -> anyhow::Result<SpawnedSipUdp> {
     let transport = UdpTransport::bind(bind)
@@ -399,7 +476,7 @@ async fn spawn_sip_udp(
     // `o=` / `c=`. A single-bind deployment has one negotiator; a
     // multi-bind deployment has one per listener.
     let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(local.ip()));
-    let server = UasServer::new(
+    let mut server = UasServer::new(
         Arc::clone(&transport),
         bus.clone(),
         Arc::clone(&media_fabric),
@@ -407,7 +484,12 @@ async fn spawn_sip_udp(
     )
     .with_context(|| format!("building UAS on {local}"))?
     .with_metrics(Arc::clone(&metrics))
-    .with_response_router(Arc::clone(&router));
+    .with_response_router(Arc::clone(&router))
+    .with_drain(drain.clone())
+    .with_rate_limit(rate_limit.clone());
+    if let Some(reg) = registrar {
+        server = server.with_registrar(reg);
+    }
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP UDP listening");
 
@@ -442,6 +524,9 @@ async fn spawn_sip_tls(
     cancel: CancellationToken,
     media_fabric: Arc<dyn MediaFabric>,
     metrics: Arc<Metrics>,
+    drain: smiths_core::Drain,
+    rate_limit: smiths_sip::SipRateLimiter,
+    registrar: Option<smiths_sip::auth::digest::Registrar>,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let transport = TlsTransport::bind(bind, cert, key)
         .await
@@ -453,20 +538,29 @@ async fn spawn_sip_tls(
     let reader = transport.spawn_reader(tx, cancel.clone());
 
     let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(local.ip()));
-    let server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
+    let mut server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
         .with_context(|| format!("building UAS on {local}"))?
-        .with_metrics(metrics);
+        .with_metrics(metrics)
+        .with_drain(drain)
+        .with_rate_limit(rate_limit);
+    if let Some(reg) = registrar {
+        server = server.with_registrar(reg);
+    }
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP TLS listening");
     Ok(vec![reader, server_handle])
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_sip_tcp(
     bind: SocketAddr,
     bus: EventBus,
     cancel: CancellationToken,
     media_fabric: Arc<dyn MediaFabric>,
     metrics: Arc<Metrics>,
+    drain: smiths_core::Drain,
+    rate_limit: smiths_sip::SipRateLimiter,
+    registrar: Option<smiths_sip::auth::digest::Registrar>,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let transport = TcpTransport::bind(bind)
         .await
@@ -478,12 +572,59 @@ async fn spawn_sip_tcp(
     let reader = transport.spawn_reader(tx, cancel.clone());
 
     let negotiator: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(local.ip()));
-    let server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
+    let mut server = UasServer::new(Arc::clone(&transport), bus, media_fabric, negotiator)
         .with_context(|| format!("building UAS on {local}"))?
-        .with_metrics(metrics);
+        .with_metrics(metrics)
+        .with_drain(drain)
+        .with_rate_limit(rate_limit);
+    if let Some(reg) = registrar {
+        server = server.with_registrar(reg);
+    }
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP TCP listening");
     Ok(vec![reader, server_handle])
+}
+
+/// Build an `Arc<Registrar>` from `SMITHS_TEST_CREDS` if set.
+/// Format: `user:realm:pass[,user:realm:pass…]`. All credentials
+/// share the first realm — the realm is the Registrar's challenge
+/// scope, and SIP auth only validates accounts within it. Returns
+/// `None` when the env var is unset or malformed (logged).
+fn build_test_registrar() -> Option<smiths_sip::auth::digest::Registrar> {
+    use smiths_sip::auth::digest::Registrar;
+    use smiths_sip::auth::{Credentials, InMemoryCredentialStore};
+    use std::sync::Arc;
+    let raw = std::env::var("SMITHS_TEST_CREDS").ok()?;
+    let store = Arc::new(InMemoryCredentialStore::new());
+    let mut realm: Option<String> = None;
+    for entry in raw.split(',').filter(|s| !s.is_empty()) {
+        let mut parts = entry.splitn(3, ':');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(u), Some(r), Some(p)) if !u.is_empty() && !r.is_empty() => {
+                if realm.is_none() {
+                    realm = Some(r.to_owned());
+                }
+                store.insert(Credentials {
+                    username: u.to_owned(),
+                    realm: r.to_owned(),
+                    password: p.to_owned(),
+                });
+            }
+            _ => {
+                warn!(
+                    entry,
+                    "SMITHS_TEST_CREDS entry ignored (expected user:realm:pass)"
+                );
+            }
+        }
+    }
+    let realm = realm?;
+    info!(
+        realm = %realm,
+        accounts = store.len(),
+        "test credential store seeded from SMITHS_TEST_CREDS"
+    );
+    Some(Registrar::new(&realm, store))
 }
 
 fn init_tracing(level: &str, format: LogFormat, mcp_stdio: bool) -> anyhow::Result<()> {
@@ -508,15 +649,38 @@ fn init_tracing(level: &str, format: LogFormat, mcp_stdio: bool) -> anyhow::Resu
     Ok(())
 }
 
+/// Snapshot of startup state + live handles that the `/health`
+/// endpoint reports on. Cloneable; the handler holds it behind axum's
+/// `State` extractor.
+#[derive(Clone)]
+struct HealthState {
+    started_at: u64,
+    sip_binds: Vec<String>,
+    plugins_loaded: Vec<String>,
+    plugins_failed: Vec<(String, String)>,
+    metrics: Arc<smiths_core::Metrics>,
+    drain: smiths_core::Drain,
+}
+
+/// Combined state the axum router carries: the Prometheus registry
+/// for `/metrics` and the rich `HealthState` for `/health`.
+#[derive(Clone)]
+struct HttpState {
+    registry: Arc<Mutex<Registry>>,
+    health: HealthState,
+}
+
 async fn serve_health(
     bind: SocketAddr,
     cancel: CancellationToken,
     registry: Arc<Mutex<Registry>>,
+    health: HealthState,
 ) -> anyhow::Result<()> {
+    let state = HttpState { registry, health };
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
-        .with_state(registry);
+        .with_state(state);
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding health endpoint on {bind}"))?;
@@ -530,18 +694,48 @@ async fn serve_health(
     Ok(())
 }
 
-async fn health_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok" }))
+/// Detailed `/health` payload. Fields are stable — consumers (k8s
+/// liveness / load balancer health probes) rely on this shape.
+async fn health_handler(
+    axum::extract::State(state): axum::extract::State<HttpState>,
+) -> Json<serde_json::Value> {
+    let hs = &state.health;
+    let uptime = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .saturating_sub(hs.started_at);
+    let status = if hs.drain.is_draining() {
+        "draining"
+    } else {
+        "ok"
+    };
+    let failed: Vec<serde_json::Value> = hs
+        .plugins_failed
+        .iter()
+        .map(|(dir, err)| serde_json::json!({ "dir": dir, "error": err }))
+        .collect();
+    Json(serde_json::json!({
+        "status": status,
+        "draining": hs.drain.is_draining(),
+        "uptime_secs": uptime,
+        "sip": { "binds": hs.sip_binds },
+        "plugins": {
+            "loaded": hs.plugins_loaded,
+            "failed": failed,
+        },
+        "dialogs_active": hs.metrics.dialogs_active.get(),
+        "bridges_active": hs.metrics.bridges_active.get(),
+    }))
 }
 
 async fn metrics_handler(
-    axum::extract::State(registry): axum::extract::State<Arc<Mutex<Registry>>>,
+    axum::extract::State(state): axum::extract::State<HttpState>,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::http::header::CONTENT_TYPE;
     use axum::response::IntoResponse;
     let mut out = String::new();
-    let guard = registry.lock().await;
+    let guard = state.registry.lock().await;
     if let Err(e) = prometheus_client::encoding::text::encode(&mut out, &guard) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")).into_response();
     }

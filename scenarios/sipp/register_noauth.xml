@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Register against a smiths-net engine running *without* a
+  CredentialStore (default dev mode) — every REGISTER is answered
+  200 OK immediately. Exercises the UAS request-dispatch + response
+  build + UDP send hot path under load, which is what we want for
+  a raw-throughput number.
+
+  Use `register.xml` for the auth-exercised variant once the engine
+  is seeded with the `sipp` user.
+-->
+<scenario name="REGISTER-noauth">
+
+  <send retrans="500">
+    <![CDATA[
+
+      REGISTER sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+      Via: SIP/2.0/UDP [local_ip]:[local_port];branch=[branch]
+      From: sipp <sip:sipp@smiths.test>;tag=[call_number]
+      To: sipp <sip:sipp@smiths.test>
+      Call-ID: [call_id]
+      CSeq: 1 REGISTER
+      Contact: <sip:sipp@[local_ip]:[local_port]>
+      Max-Forwards: 70
+      Expires: 60
+      Content-Length: 0
+
+    ]]>
+  </send>
+
+  <recv response="200"/>
+
+  <ResponseTimeRepartition value="1, 2, 5, 10, 20, 50, 100, 200, 500, 1000"/>
+  <CallLengthRepartition  value="1, 5, 10, 50, 100, 500, 1000"/>
+
+</scenario>
