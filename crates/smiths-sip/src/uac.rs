@@ -25,8 +25,6 @@ use smiths_core::call::{CallError, CallOriginator};
 use smiths_core::metrics::{Metrics, SipMethodLabel};
 use smiths_core::{Event, EventBus, MediaFabric, SdpNegotiator, SipEvent};
 use thiserror::Error;
-use tokio::sync::oneshot;
-use tokio::time::timeout;
 use tracing::{debug, info, instrument, warn};
 
 use crate::response_router::ResponseRouter;
@@ -87,7 +85,6 @@ pub struct UacClient<T: Transport> {
     bus: EventBus,
     media_fabric: Arc<dyn MediaFabric>,
     negotiator: Arc<dyn SdpNegotiator>,
-    router: Arc<ResponseRouter>,
     media_bind_ip: IpAddr,
     local_sip_addr: SocketAddr,
     contact: String,
@@ -96,6 +93,10 @@ pub struct UacClient<T: Transport> {
     dialogs: Arc<DashMap<String, Arc<UacDialog>>>,
     metrics: Arc<Metrics>,
     deadline: Duration,
+    /// Transaction-layer driver. Today only BYE flows through it
+    /// (v0.17.0); INVITE migrates once the client-INVITE FSM
+    /// (timers A/B/D) lands.
+    txn_driver: crate::txn::TransactionDriver<T>,
 }
 
 impl<T: Transport> UacClient<T> {
@@ -113,18 +114,22 @@ impl<T: Transport> UacClient<T> {
         metrics: Arc<Metrics>,
     ) -> Self {
         let contact = format!("<sip:smiths@{local_sip_addr}>");
+        // The response router is owned by the driver now — both INVITE
+        // and BYE paths route responses through it, and the UAC has
+        // no direct use for the router after slice 3 (v0.18.0).
+        let txn_driver = crate::txn::TransactionDriver::new(Arc::clone(&transport), router);
         Self {
             transport,
             bus,
             media_fabric,
             negotiator,
-            router,
             media_bind_ip: local_sip_addr.ip(),
             local_sip_addr,
             contact,
             dialogs: Arc::new(DashMap::new()),
             metrics,
             deadline: DEFAULT_DEADLINE,
+            txn_driver,
         }
     }
 
@@ -139,6 +144,7 @@ impl<T: Transport> UacClient<T> {
     /// Place an outbound call to the SIP URI `target`. Returns the
     /// allocated `Call-ID` on 200 OK.
     #[instrument(skip(self), fields(target = %target))]
+    #[allow(clippy::too_many_lines)] // End-to-end INVITE setup lives in one place; splitting hurts readability.
     pub async fn place_call(&self, target: &str) -> Result<String, UacError> {
         let (target_uri, peer_host_port) = parse_target(target)?;
         let peer: SocketAddr = peer_host_port
@@ -178,37 +184,57 @@ impl<T: Transport> UacClient<T> {
             sdp: &sdp_offer,
         });
 
-        // Subscribe to the response *before* we hit the wire — if the
-        // peer answers fast the 100 / 200 must find us waiting.
-        let rx = self.router.subscribe(&branch);
         self.metrics
             .sip_requests
             .get_or_create(&SipMethodLabel {
                 method: "INVITE".into(),
             })
             .inc();
-        self.transport
-            .send(Bytes::from(invite), peer)
-            .await
-            .map_err(|e| {
-                self.router.cancel(&branch);
-                UacError::Io(e)
-            })?;
-        debug!(%peer, branch, "UAC → INVITE");
 
-        // Wait for the final response, skipping 1xx. The router only
-        // delivers whatever response happens to arrive for this branch;
-        // the UAS retransmission dedupe makes duplicate 100s harmless.
-        let final_bytes = wait_for_final(
-            rx,
-            &self.router,
-            &branch,
-            self.deadline,
-            self.metrics.clone(),
-        )
-        .await?;
+        // Drive the INVITE through the RFC 3261 §17.1.1 client FSM.
+        // The FSM handles timer-A retransmits, timer-B overall
+        // timeout, and (crucially) auto-generates ACK for any non-2xx
+        // final — the TU only needs to handle 2xx end-to-end ACK
+        // itself, which still happens below.
+        let txn = crate::txn::ClientInviteTxn::new(branch.clone(), Bytes::from(invite));
+        let mut tu_rx = self.txn_driver.start_client(Box::new(txn), peer);
+        debug!(%peer, branch, "UAC → INVITE (via FSM driver)");
 
-        let status = parse_status(&final_bytes)?;
+        // Drain TuEvents until we see a final (≥200) or the overall
+        // deadline expires. Provisionals are logged and skipped; a
+        // `Terminated` without a final means timer B fired.
+        let final_result = tokio::time::timeout(self.deadline, async {
+            loop {
+                match tu_rx.recv().await {
+                    Some(crate::txn::TuEvent::Response { status, .. })
+                        if (100..200).contains(&status) =>
+                    {
+                        debug!(status, "provisional during INVITE");
+                    }
+                    Some(crate::txn::TuEvent::Response { status, bytes }) => {
+                        return Ok::<_, UacError>((status, bytes));
+                    }
+                    Some(crate::txn::TuEvent::Terminated) | None => {
+                        return Err(UacError::Timeout { millis: u64::MAX });
+                    }
+                }
+            }
+        })
+        .await;
+        let (status, final_bytes) = match final_result {
+            Ok(Ok(x)) => x,
+            Ok(Err(e)) => {
+                self.media_fabric.release_endpoint(endpoint.id()).await;
+                return Err(e);
+            }
+            Err(_) => {
+                self.media_fabric.release_endpoint(endpoint.id()).await;
+                return Err(UacError::Timeout {
+                    millis: u64::try_from(self.deadline.as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+        };
+
         if status != 200 {
             let reason = parse_reason(&final_bytes);
             self.media_fabric.release_endpoint(endpoint.id()).await;
@@ -261,6 +287,13 @@ impl<T: Transport> UacClient<T> {
     }
 
     /// Tear down an outbound dialog with a BYE.
+    ///
+    /// Since **v0.17.0** this runs through the RFC 3261 §17.1.2
+    /// client non-INVITE transaction FSM via
+    /// [`crate::txn::TransactionDriver`]. The behavioural upshot vs
+    /// the prior ad-hoc path: if the BYE's first send is lost on
+    /// UDP, the driver retransmits at T1=500 ms, 1 s, 2 s, 4 s, …
+    /// up to the overall 30 s budget instead of giving up silently.
     #[instrument(skip(self), fields(%call_id))]
     pub async fn hangup(&self, call_id: &str) -> Result<(), UacError> {
         let dialog = self
@@ -282,34 +315,55 @@ impl<T: Transport> UacClient<T> {
             call_id,
             cseq,
         });
-
-        let rx = self.router.subscribe(&branch);
         self.metrics
             .sip_requests
             .get_or_create(&SipMethodLabel {
                 method: "BYE".into(),
             })
             .inc();
-        self.transport
-            .send(Bytes::from(bye), dialog.peer)
-            .await
-            .map_err(|e| {
-                self.router.cancel(&branch);
-                UacError::Io(e)
-            })?;
-        debug!(%dialog.peer, branch, "UAC → BYE");
 
-        let final_bytes = wait_for_final(
-            rx,
-            &self.router,
-            &branch,
-            self.deadline,
-            self.metrics.clone(),
-        )
-        .await?;
-        let status = parse_status(&final_bytes)?;
+        // Drive the BYE through the non-INVITE FSM. The driver owns
+        // the retransmit timer schedule + routes the peer's final
+        // response through the TU channel.
+        let txn = crate::txn::ClientNonInviteTxn::new(branch.clone(), "BYE", Bytes::from(bye));
+        let mut tu_rx = self.txn_driver.start_client(Box::new(txn), dialog.peer);
+        debug!(%dialog.peer, branch, "UAC → BYE (via FSM driver)");
+
+        // Read TU events until we see a final (≥200) response or the
+        // overall deadline expires. Provisionals (1xx) are logged and
+        // skipped. `TuEvent::Terminated` before any final means the
+        // FSM's own timer F fired — surface as a timeout to the caller.
+        let final_status = match tokio::time::timeout(self.deadline, async {
+            loop {
+                match tu_rx.recv().await {
+                    Some(crate::txn::TuEvent::Response { status, .. })
+                        if (100..200).contains(&status) =>
+                    {
+                        debug!(status, "provisional during BYE; continuing");
+                    }
+                    Some(crate::txn::TuEvent::Response { status, bytes }) => {
+                        return Ok::<_, UacError>((status, bytes));
+                    }
+                    Some(crate::txn::TuEvent::Terminated) | None => {
+                        return Err(UacError::Timeout { millis: u64::MAX });
+                    }
+                }
+            }
+        })
+        .await
+        {
+            Ok(Ok(ok)) => ok,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(UacError::Timeout {
+                    millis: u64::try_from(self.deadline.as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+        };
+
+        let (status, bytes) = final_status;
         if status != 200 {
-            let reason = parse_reason(&final_bytes);
+            let reason = parse_reason(&bytes);
             return Err(UacError::Rejected { status, reason });
         }
 
@@ -444,62 +498,6 @@ fn build_bye(f: ByeFields<'_>) -> Vec<u8> {
 /// Wait for a non-provisional response on `branch`. Resubscribes on
 /// the same branch when a 1xx arrives so the next response lands on
 /// a fresh oneshot.
-async fn wait_for_final(
-    mut rx: oneshot::Receiver<Bytes>,
-    router: &ResponseRouter,
-    branch: &str,
-    deadline: Duration,
-    metrics: Arc<Metrics>,
-) -> Result<Bytes, UacError> {
-    let start = std::time::Instant::now();
-    loop {
-        let remaining = deadline.saturating_sub(start.elapsed());
-        if remaining.is_zero() {
-            router.cancel(branch);
-            return Err(UacError::Timeout {
-                millis: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
-            });
-        }
-        let bytes = match timeout(remaining, rx).await {
-            Ok(Ok(b)) => b,
-            Ok(Err(_)) => return Err(UacError::Internal("response channel dropped".into())),
-            Err(_) => {
-                router.cancel(branch);
-                return Err(UacError::Timeout {
-                    millis: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
-                });
-            }
-        };
-        let status = parse_status(&bytes)?;
-        metrics
-            .sip_responses
-            .get_or_create(&smiths_core::metrics::SipCodeLabel {
-                code: status.to_string(),
-            })
-            .inc();
-        if status / 100 == 1 {
-            // Provisional — resubscribe for the final and keep waiting.
-            debug!(status, branch, "UAC provisional response; keep waiting");
-            rx = router.subscribe(branch);
-            continue;
-        }
-        return Ok(bytes);
-    }
-}
-
-fn parse_status(bytes: &[u8]) -> Result<u16, UacError> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|e| UacError::Internal(format!("response not UTF-8: {e}")))?;
-    let line = text.lines().next().unwrap_or("");
-    let mut parts = line.splitn(3, ' ');
-    let _version = parts.next();
-    let code = parts
-        .next()
-        .ok_or_else(|| UacError::Internal(format!("bad status line: {line}")))?;
-    code.parse()
-        .map_err(|e| UacError::Internal(format!("bad status code `{code}`: {e}")))
-}
-
 fn parse_reason(bytes: &[u8]) -> String {
     let text = std::str::from_utf8(bytes).unwrap_or("");
     let line = text.lines().next().unwrap_or("");
@@ -620,14 +618,6 @@ mod tests {
     fn parse_target_rejects_non_sip() {
         let err = parse_target("tel:+1234").unwrap_err();
         assert!(matches!(err, UacError::InvalidTarget(_)));
-    }
-
-    #[test]
-    fn parse_status_reads_common_codes() {
-        let bytes = b"SIP/2.0 200 OK\r\n\r\n";
-        assert_eq!(parse_status(bytes).unwrap(), 200);
-        let bytes = b"SIP/2.0 486 Busy Here\r\n\r\n";
-        assert_eq!(parse_status(bytes).unwrap(), 486);
     }
 
     #[test]
