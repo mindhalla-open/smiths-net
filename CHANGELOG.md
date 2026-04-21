@@ -5,6 +5,351 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.42.0] - 2026-04-21
+
+Slice 3.5 — Proxy/VPN transports. SIP-over-TCP and SIP-over-TLS can
+now tunnel outbound connects through a SOCKS5 or HTTP-CONNECT
+proxy. A WireGuard deployment guide lands alongside, plus a
+feature-flag scaffold for the embedded `boringtun` path. Ingress
+is untouched — operators who need it terminate TLS or put a
+reverse proxy in front of the engine as before.
+
+### Added
+
+- **`ProxyConnector` trait** in `smiths-sip::transport::proxy`,
+  with three impls: `DirectConnector` (default, = plain
+  `TcpStream::connect`), `Socks5Connector` (RFC 1928 + RFC 1929
+  user/password), `HttpConnectConnector` (HTTP/1.1 CONNECT +
+  `Proxy-Authorization: Basic`). Every connector returns a
+  `TcpStream` positioned at the first app-data byte; the rest of
+  the SIP pipeline is unaffected.
+- **`TcpTransport::with_proxy`** — builder that swaps the
+  outbound-connect shim. `DirectConnector` remains the default so
+  existing callers pay zero cost.
+- **`[sip.proxy]` config** — `mode = "none"|"socks5"|"http-connect"`,
+  `address`, `username`, `password`. Redacted at
+  `sip.proxy.password` in `config://current`.
+- **`[sip.vpn]` config + `wireguard` Cargo feature** on
+  `smiths-cli`. Accepts `private_key`, `peer_public_key`,
+  `peer_endpoint`, `allowed_ips`, `interface_ip`. Runtime device
+  is a follow-on: 0.42.0 logs a clear warning at startup when
+  `mode = "wireguard"` so operators aren't surprised by the
+  deferral. `sip.vpn.private_key` joins the redaction list.
+- **`docs/deployment/vpn.md`** — sidecar-vs-embedded tradeoffs,
+  host / Kubernetes setup, verification ladder for tunnel issues.
+- **Tests** — 7 unit tests on the proxy module: SOCKS5 no-auth
+  handshake + app-data streaming, SOCKS5 user/pass round trip,
+  SOCKS5 `0xFF` refusal path, HTTP-CONNECT 200 tunnel + basic-auth
+  header presence + 407 error surfacing, and
+  `connector_from_config` covering every mode. Integration test
+  `proxy_socks5_tor.rs` runs end-to-end through a real SOCKS5
+  proxy when `TOR_SOCKS_PROXY=host:port` is set in the env;
+  silently no-ops otherwise so CI images without a proxy still
+  pass.
+
+### Notes
+
+The proxy shim applies only to the outbound-connect path on
+TCP-based SIP transports (today: `TcpTransport`; TLS is
+listener-only in 0.42.0). UDP is a connectionless protocol that
+can't tunnel through a stream-oriented CONNECT proxy — the UDP
+transport ignores `[sip.proxy]` with no warning, mirroring how
+curl handles the same mismatch.
+
+Embedded `boringtun` is feature-flagged + config-scaffolded in
+this release; the tun-interface-creation + SIP-binding plumbing
+lands in a dedicated follow-on. For production deployments today
+the sidecar WireGuard pattern documented in
+`docs/deployment/vpn.md` is the supported path.
+
+## [0.41.0] - 2026-04-21
+
+Slice 3.4 — Vector + Recording storage. Two new pluggable storage
+traits join `CdrStore` / `KvStore`: `VectorStore` backs the new
+`search_calls_semantic` MCP tool, and `RecordingStore` unblocks the
+call-id-only path on `transcribe_call` / `summarize_call`. The
+engine ships real Rust impls (in-memory vectors + filesystem
+recordings) and scaffolds sidecars for the hosted backends.
+
+### Added
+
+- **`smiths-core::storage::VectorStore`** — embedding-indexed
+  search with sync `upsert` / `delete` / `search` / `len`. The
+  `MemoryVectorStore` default does NaN-safe cosine similarity,
+  skips dimension-mismatched records on search, and enforces
+  non-empty id/vector at upsert.
+- **`smiths-core::storage::RecordingStore`** — per-call audio
+  retention. The `FsRecordingStore` default writes
+  `<hex(call_id)>.wav` + `<hex(call_id)>.cid` pairs so arbitrary
+  call-ids round-trip through the filesystem and `list()` honestly
+  surfaces the originals. `prune_older_than(Duration)` deletes by
+  mtime — the engine runs it on an hourly sweeper when
+  `[storage.recording] retention_days > 0`.
+- **`[storage.vector]` and `[storage.recording]` config** — each
+  with `backend = "none" | "memory"|"fs" | "sidecar"` and a
+  `plugin` field for the sidecar path. `retention_days` gates the
+  sweeper; `fs.root` points at the recording directory.
+- **Capability namespace `storage.*`** — joins `ai.*` and
+  `media.*` on the plugin manifest validator. Two new tokens:
+  `STORAGE_VECTOR = "storage.vector"` and
+  `STORAGE_RECORDING = "storage.recording"`.
+- **MCP tool `search_calls_semantic(query, k)`** — embeds `query`
+  via the `ai.embed` dispatcher lane, runs top-k against the wired
+  `VectorStore`, returns `{hits: [{id, score, metadata}]}`. Handles
+  three embed response shapes: in-tree `{vectors: [[...]]}`,
+  OpenAI-compat `{embeddings: [...]}`, and raw OpenAI
+  `{data: [{embedding: [...]}]}`. Observed on
+  `smiths_ai_pipeline_duration_seconds{pipeline="search_calls_semantic"}`.
+- **Pipeline tools now consult the recording store** —
+  `transcribe_call` / `summarize_call` resolve `audio_base64` from
+  `[storage.recording]` when the caller omits it. The new error
+  message names the specific missing piece ("no backend wired" vs
+  "no recording for this call").
+- **`ToolContext::with_vector` / `with_recording`** — engine
+  threads the constructed stores onto tool context. CLI auto-
+  wires the in-memory + filesystem backends from config; sidecar
+  adapters for both stores are scaffolded via the new sidecars
+  below but not yet plugged into the trait seam.
+- **`plugins/examples/store-qdrant/`** — stdlib-only Qdrant HTTP
+  API wrapper. Auto-creates the collection with configured size +
+  distance, upserts with string-id preservation, surfaces cosine
+  top-k via `search`. Env: `QDRANT_URL`, `QDRANT_COLLECTION`,
+  `QDRANT_VECTOR_SIZE`, `QDRANT_DISTANCE`, `QDRANT_API_KEY`.
+- **`plugins/examples/store-s3-recording/`** — stdlib-only sidecar
+  that shells out to the `aws` CLI (so SigV4 + credential
+  discovery stay in one place). `put` / `get` / `delete` / `list` /
+  `prune_older_than` over JSON-RPC; works against S3, MinIO,
+  R2, B2.
+- **Tests** — 9 new unit tests on `storage` (`MemoryVectorStore`
+  round-trip + input validation + dimension-mismatch skip,
+  `FsRecordingStore` put/get/list/delete/prune); 2 new capability-
+  validation tests for `storage.vector` / `storage.recording`; 4
+  new MCP tool tests + 2 embed-shape extractor tests on
+  `search_calls_semantic`. `semantic_search_pipeline.rs`
+  integration test exercises the upsert → embed → search round
+  trip end-to-end with a deterministic stub embed provider.
+
+### Notes
+
+The storage-sidecar adapter — the shim that lets
+`[storage.vector] backend = "sidecar"` pick up a loaded Qdrant
+plugin and present it through the `VectorStore` trait — is
+scaffolded but not yet wired. Selecting `sidecar` today logs a
+warning and falls through to "no backend"; `search_calls_semantic`
+returns `NotFound`. Landing the adapter is a small follow-on
+slice once we have a second vector backend asking for the same
+seam.
+
+Retention is wall-clock mtime-based on the filesystem store; on
+disks without reliable mtimes (some NFS mounts, tmpfs under
+certain containers) the sweeper may mis-classify. Object-store
+backends use the LIST response's `LastModified` timestamp.
+
+## [0.40.0] - 2026-04-21
+
+Slice 3.3 — ASR + composite AI pipelines. `ai-asr-whisper`
+sidecar (local whisper.cpp) joins the `ai.asr` seam, and two new
+MCP tools — `transcribe_call` and `summarize_call` — route through
+the dispatcher so agents name a capability, not a plugin. The
+summarize tool is the first engine-shipped composite: ASR → LLM,
+both hops failover-aware, end-to-end wall clock observed on a new
+pipeline histogram.
+
+### Added
+
+- **`plugins/examples/ai-asr-whisper/`** — stdlib-only Python
+  sidecar that execs `whisper-cli` (or the legacy `main`) with a
+  local GGML model. Decodes `audio_base64` → temp WAV (crude-
+  upsamples 8 kHz telephony audio to the 16 kHz whisper.cpp
+  expects), invokes the binary with `-oj`, parses the JSON
+  transcript. `priority = 20` so the dispatcher picks Whisper over
+  the canned `ai-asr-mock` (50). Env: `WHISPER_BIN`,
+  `WHISPER_MODEL`, `WHISPER_THREADS`, `WHISPER_LANG`.
+- **MCP tool `transcribe_call(call_id)`** — ASR only, dispatcher-
+  routed at `ai.asr`. Returns `{transcript, raw}`. Accepts an
+  `audio_base64` argument until the recording store lands (slice
+  3.4); a call-id-only invocation returns a clean `NotFound` that
+  names the missing backend.
+- **MCP tool `summarize_call(call_id)`** — flagship composite.
+  Transcribes via `ai.asr`, then summarizes via `ai.llm.chat` with
+  a concise-meeting-notes system prompt; `max_sentences` bounds the
+  output length. Returns `{transcript, summary}`. Same deferral
+  path when the recording store isn't wired.
+- **`smiths_ai_pipeline_duration_seconds{pipeline}` histogram** —
+  one sample per invocation of a composite pipeline tool, keyed by
+  the tool name. Sits alongside `tool_duration_seconds` but scoped
+  to AI compositions so operators can grep end-to-end ASR→LLM
+  latency without mixing in every other MCP tool.
+- **`ToolContext::with_metrics`** — engine threads its
+  `Arc<Metrics>` onto the tool context. Pipeline tools observe
+  histograms through this handle; tools that don't need metrics
+  ignore the field. Older test fixtures keep working (the field
+  defaults to `None` and the pipeline tools fall through to
+  `Metrics::noop()` when absent).
+- **Demo update — `examples/python-client/voice_agent.py`** — the
+  STT + LLM path is now a single `summarize_call` hop; the summary
+  is then routed through `translate` (slice 3.1) into the caller's
+  preferred language before TTS. The old per-plugin wrappers stay
+  as a fallback illustration.
+- **Tests** — 4 new MCP tool tests covering the honest-deferral
+  paths on `transcribe_call` + `summarize_call` (no audio →
+  `NotFound`; no asr provider → `NotFound`; missing `call_id` →
+  `InvalidArguments`). Total MCP tool-unit-test count is now 24.
+
+### Notes
+
+The call-id-only path on `transcribe_call` / `summarize_call` is an
+honest deferral: without a `storage.recording` backend the engine
+has nowhere to pull audio from. Slice 3.4 lands that backend
+(`storage.recording` trait + filesystem default + S3 sidecar); at
+that point both tools will resolve audio from `call_id` alone and
+the `audio_base64` parameter becomes the override, not the
+requirement.
+
+The Whisper sidecar can't be exercised in CI — each invocation
+shells out to the `whisper-cli` binary and loads a 100 MB+ GGML
+model from disk. The tool-level tests use the mock registry and
+prove the dispatcher hookup; the real binary is covered by the
+README's smoke-test recipe.
+
+## [0.39.0] - 2026-04-21
+
+Slice 3.2 — Cloud AI parity. `ai-llm-openai` and `ai-llm-anthropic`
+reference sidecars join the local `ai-llm-ollama` at the
+`ai.llm.chat` seam, all behind the same ABI. Streaming partials
+ride the existing plugin-notification rail as `ai.llm.partial`
+frames, and every response that carries `usage.*_tokens` ticks the
+new `smiths_ai_tokens_total` counter.
+
+### Added
+
+- **`plugins/examples/ai-llm-openai/`** — stdlib-only sidecar
+  against `/v1/chat/completions`. Streaming via SSE when
+  `controls.stream = true`; emits one `ai.llm.partial` notification
+  per delta plus a final-marker. `priority = 15` so the dispatcher
+  prefers cloud OpenAI over local Ollama (20) and the mock (50).
+  Env: `OPENAI_API_KEY`, `OPENAI_API_BASE`, `OPENAI_MODEL`,
+  `OPENAI_TIMEOUT_SECS`.
+- **`plugins/examples/ai-llm-anthropic/`** — stdlib-only sidecar
+  against `/v1/messages`. Splits `system` turns into Anthropic's
+  top-level `system` field; streams via SSE
+  (`content_block_delta` → `ai.llm.partial`). `priority = 16` so it
+  fails over behind OpenAI. Env: `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_API_BASE`, `ANTHROPIC_MODEL`, `ANTHROPIC_VERSION`,
+  `ANTHROPIC_MAX_TOKENS`, `ANTHROPIC_TIMEOUT_SECS`.
+- **`[ai]` config section + `AiConfig`** — optional
+  `openai_api_key`, `anthropic_api_key` fields. Redacted in
+  `config://current` via the existing MCP resource layer; the three
+  secret paths now are `a2a.bearer_token`, `ai.openai_api_key`,
+  `ai.anthropic_api_key`.
+- **`smiths_ai_tokens_total{provider, dir}` metric** —
+  dispatcher-credited on every `AiProvider::invoke` success whose
+  response includes `usage.input_tokens` / `usage.output_tokens`
+  (directly or nested under `message.usage`). `provider` = plugin
+  name; `dir` ∈ `{"input", "output"}`. Zero-cost for plugins that
+  don't report usage (counter stays at 0 for that label set).
+- **Streaming partials demo** — the canned `ai-llm-mock` now
+  honors `controls.stream = true`, emitting one `ai.llm.partial`
+  per token plus the final marker. The declared descriptor gains
+  `streaming.supported = true` + a `stream` control so the plugin
+  validator accepts it end-to-end.
+- **Tests** — 3 redaction tests on `resource::redact_secrets`
+  covering the bearer-token + two AI-key paths; 2 dispatcher-token
+  tests (usage credited on success; zero credit when plugin omits
+  usage); `streaming_llm.rs` integration test loading `ai-llm-mock`,
+  invoking `chat` with streaming on, and asserting that
+  `ai.llm.partial` notifications reach the engine's bus as
+  `PluginEvent::Notification`.
+
+### Notes
+
+The engine does **not** auto-forward `[ai]` config secrets into
+sidecar child environments — operators still set `OPENAI_API_KEY` /
+`ANTHROPIC_API_KEY` in the engine's own environment, which the
+sidecars inherit on spawn. The config surface exists so secrets have
+one canonical home on disk + a tested redaction path; an env-
+injection layer ("secrets plumbing") is a small follow-on.
+
+The two cloud sidecars can't be exercised in CI (no API keys on
+CI runners), which is why the streaming-partials test uses the
+extended mock. The mock + the two cloud sidecars emit identical
+wire frames (`ai.llm.partial` shape, final-marker, token accounting
+in the RPC response), so a passing mock test implies the cloud
+path is protocol-correct.
+
+## [0.38.0] - 2026-04-21
+
+Slice 3.1 — AI providers: `AiDispatcher` + fail-over. Agents now
+say `ai_invoke(capability, ...)` and the engine picks the best
+candidate by priority + health; a single flapping plugin no longer
+blocks the whole call. Reference sidecars (`ai-llm-ollama`,
+`ai-tts-piper`) land alongside the canned mocks so operators have a
+"real model talking to a real call" path on day one.
+
+### Added
+
+- **`smiths-core::ai::AiDispatcher`** — capability-routed dispatcher
+  over `AiRegistry`. Selection rule: candidates filtered by
+  `capability` string, sorted by descriptor `priority` (lower wins;
+  ties broken by `latency_ms.p50`, then lexical plugin name),
+  breaker-open plugins partitioned to the tail. `invoke(capability,
+  method, params)` runs the chain with per-attempt timeout + fail-
+  over; returns the first `Ok`, or `DispatchError::AllFailed` with
+  the final error attached.
+- **`DispatchPolicy`** — `per_attempt_timeout` (30 s default),
+  `max_attempts` (4 default). Builder on the dispatcher:
+  `with_policy`, `with_metrics`.
+- **Per-plugin health (`ProviderHealth`)** — simple count-with-
+  cooldown breaker: 3 consecutive failures trip it Open for 30 s;
+  one success closes it. Breaker is internal — the dispatcher still
+  tries Open candidates if nothing else is healthy so a partially-
+  degraded registry doesn't refuse service.
+- **`CapabilityDescriptor.priority: u8`** — optional, defaults to
+  `DEFAULT_PRIORITY = 50`. Reference sidecars (Ollama, Piper)
+  advertise `priority = 20` so the dispatcher prefers them over the
+  canned mocks without the operator having to configure anything.
+- **Metrics** — `smiths_ai_invocations` (one per dispatcher call)
+  and `smiths_ai_failovers` (one per fail-over tick, not per
+  attempt). Labelled by `capability`. Wired via
+  `AiDispatcher::with_metrics`.
+- **MCP tool `translate(text, to)`** — first dispatcher-native tool.
+  Routes through `ai.llm.chat` with a fixed translator system
+  prompt; returns the translated text alongside the raw provider
+  response. Handles Ollama, OpenAI-compat, and flat-`content`
+  shapes. `NotFound` when no `ai.llm.chat` is loaded.
+- **`plugins/examples/ai-llm-ollama/`** — sidecar that shells into a
+  local Ollama daemon (`/api/chat`, `stream=false`). Stdlib-only;
+  env-overridable (`OLLAMA_HOST`, `OLLAMA_MODEL`,
+  `OLLAMA_TIMEOUT_SECS`). README walks the three-command install.
+- **`plugins/examples/ai-tts-piper/`** — sidecar that execs the
+  `piper` binary with `--output_raw` and returns PCM16. Stdlib-only;
+  env-overridable (`PIPER_BIN`, `PIPER_VOICE`, `PIPER_VOICE_ID`,
+  `PIPER_LANG`). Decimates Piper's native 22.05 kHz to 8 / 16 kHz
+  on request.
+- **Tests** — 7 new dispatcher tests in `smiths-core::ai::tests`
+  (candidate ordering, `NoProvider`, fail-over, `AllFailed` surfaces
+  last error, timeout trips fail-over, breaker opens after 3
+  failures, metrics increment on success + fail-over) and 5 new MCP
+  tool tests (`translate` arg validation, `NoProvider` surface, and
+  three `extract_chat_content` shapes: flat, `message.content`,
+  `choices[0].message.content`).
+
+### Notes
+
+Dispatcher metrics are plumbed through `AiDispatcher::with_metrics`
+but the MCP `translate` tool constructs its own dispatcher per
+call and currently runs **without** a metrics handle — engine-level
+wiring (one dispatcher on `ToolContext`, `Arc<Metrics>` threaded
+through) is a small follow-on slice. `smiths_ai_invocations` /
+`smiths_ai_failovers` are still registered on the Prometheus
+registry so they show up at 0 until the wiring lands.
+
+The two reference sidecars assume a healthy local install — Ollama
+daemon up, or `piper` + an ONNX voice on disk. Each sidecar still
+serves `describe_capabilities` when its backend is unreachable, so
+the dispatcher sees the candidate and fails over on `invoke`. That
+keeps `list_ai_providers` honest in both states.
+
 ## [0.37.0] - 2026-04-21
 
 Slice 2.5 — Inband DTMF via Goertzel. Covers legs that never

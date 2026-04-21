@@ -50,6 +50,13 @@ pub struct CapabilityDescriptor {
     /// Concurrency limits the plugin advertises.
     #[serde(default)]
     pub concurrency: Option<ConcurrencyHint>,
+    /// Dispatch priority (slice 3.1). **Lower wins** — 0 is the
+    /// strongest preference, 100 the weakest. Providers that omit
+    /// the field default to [`DEFAULT_PRIORITY`]. The dispatcher
+    /// sorts candidates by this value; ties broken by advertised
+    /// p50 latency, then lexical plugin name for determinism.
+    #[serde(default = "default_priority")]
+    pub priority: u8,
     /// Catch-all for capability-specific fields (`voices`, `languages`,
     /// `controls`, etc.). Passed straight through to agents in
     /// `list_ai_providers` / `describe_provider`.
@@ -81,6 +88,15 @@ fn default_abi() -> String {
     "1.0".to_string()
 }
 
+/// Dispatcher default when a provider doesn't set `priority`.
+/// Middle of the 0–100 range so operators have head- and tail-room
+/// in both directions.
+pub const DEFAULT_PRIORITY: u8 = 50;
+
+const fn default_priority() -> u8 {
+    DEFAULT_PRIORITY
+}
+
 /// Parse the JSON body a plugin returned from `describe_capabilities`
 /// (sidecar handshake) or the `describe()` export (WASM tier). Accepts
 /// either a single descriptor object or an array of them. Rejects an
@@ -109,7 +125,7 @@ impl CapabilityDescriptor {
     /// Validate common-envelope invariants. Returns a descriptive
     /// error when the plugin is confused.
     ///
-    /// Capabilities live in one of two namespaces today:
+    /// Capabilities live in one of three namespaces today:
     ///
     /// - `ai.*` — AI providers (LLM, TTS, ASR, embed). The original
     ///   plugin tier.
@@ -117,13 +133,21 @@ impl CapabilityDescriptor {
     ///   so a sidecar plugin can declare itself as something that
     ///   receives per-packet RTP from the engine (e.g. the deferred
     ///   `dtmf-inband` Python sidecar). See [`MEDIA_STREAMING_RTP`].
+    /// - `storage.*` — pluggable backends for the storage traits
+    ///   (slice 3.4). `storage.vector` backs
+    ///   `search_calls_semantic`; `storage.recording` backs audio
+    ///   retention. See [`STORAGE_VECTOR`] and
+    ///   [`STORAGE_RECORDING`].
     pub fn validate(&self) -> Result<(), String> {
         if self.capability.is_empty() {
             return Err("capability is empty".into());
         }
-        if !self.capability.starts_with("ai.") && !self.capability.starts_with("media.") {
+        if !self.capability.starts_with("ai.")
+            && !self.capability.starts_with("media.")
+            && !self.capability.starts_with("storage.")
+        {
             return Err(format!(
-                "capability `{}` is outside the `ai.*` / `media.*` namespaces",
+                "capability `{}` is outside the `ai.*` / `media.*` / `storage.*` namespaces",
                 self.capability
             ));
         }
@@ -153,6 +177,19 @@ impl CapabilityDescriptor {
 /// - **Recording sidecars** — write each frame to a rolling file
 ///   or object store (P23 `storage.recording` follow-on).
 pub const MEDIA_STREAMING_RTP: &str = "media.streaming_rtp";
+
+/// Capability token declaring a plugin that serves an embedding-
+/// indexed vector store (slice 3.4). The MCP `search_calls_semantic`
+/// tool routes through this seam to back its top-k queries. The
+/// reference sidecar is `store-qdrant` (Qdrant HTTP API wrapper).
+pub const STORAGE_VECTOR: &str = "storage.vector";
+
+/// Capability token declaring a plugin that serves per-call audio
+/// retention (slice 3.4). The filesystem default ships in-tree;
+/// operators pointing `[storage.recording] backend = "sidecar"` at
+/// an S3-compatible sidecar route through this seam. The reference
+/// sidecar is `store-s3-recording`.
+pub const STORAGE_RECORDING: &str = "storage.recording";
 
 // ---------------------------------------------------------------------
 // Control-schema validation
@@ -387,6 +424,318 @@ pub trait AiRegistry: Send + Sync {
 }
 
 // ---------------------------------------------------------------------
+// Dispatcher — slice 3.1
+// ---------------------------------------------------------------------
+
+/// Errors surfaced by [`AiDispatcher::invoke`].
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    /// No plugin in the registry claims `capability`. Either the
+    /// operator didn't load one, or none survived validation.
+    #[error("no provider for capability `{0}`")]
+    NoProvider(String),
+    /// Every candidate the dispatcher tried failed or timed out.
+    /// The last error is surfaced; the dispatcher logs each prior
+    /// failure at `warn` before proceeding to the next candidate.
+    #[error("all {tried} providers failed; last: {last}")]
+    AllFailed {
+        /// How many providers the dispatcher tried before giving up.
+        tried: usize,
+        /// Error from the final attempt — most useful single signal.
+        last: ProviderError,
+    },
+}
+
+/// Policy knobs for [`AiDispatcher::invoke`].
+#[derive(Clone, Debug)]
+pub struct DispatchPolicy {
+    /// Per-attempt timeout. The dispatcher fails over when this
+    /// expires, not when the underlying transport times out — that's
+    /// a floor, not a ceiling.
+    pub per_attempt_timeout: std::time::Duration,
+    /// Maximum number of candidates to try before returning
+    /// [`DispatchError::AllFailed`]. Safety-valve against a
+    /// pathological registry with dozens of broken providers.
+    pub max_attempts: usize,
+}
+
+impl Default for DispatchPolicy {
+    fn default() -> Self {
+        Self {
+            // LLMs can take ~tens of seconds for long generations;
+            // 30 s is a generous default that still lets the
+            // dispatcher fail over before the MCP call-level
+            // timeout triggers.
+            per_attempt_timeout: std::time::Duration::from_secs(30),
+            max_attempts: 4,
+        }
+    }
+}
+
+/// Breaker state for one provider, tracked by the dispatcher so a
+/// flapping plugin doesn't keep getting picked first.
+///
+/// Simple count-with-cooldown: after `OPEN_AFTER` consecutive
+/// failures the provider is marked Open for `OPEN_COOLDOWN`; during
+/// that window the dispatcher skips it. Any success closes it.
+#[derive(Debug, Default)]
+struct ProviderHealth {
+    consecutive_failures: std::sync::atomic::AtomicU32,
+    /// Unix-seconds at which the breaker last tripped. `0` means Closed.
+    tripped_at_unix: std::sync::atomic::AtomicU64,
+}
+
+impl ProviderHealth {
+    const OPEN_AFTER: u32 = 3;
+    const OPEN_COOLDOWN_SECS: u64 = 30;
+
+    fn is_open(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let tripped = self.tripped_at_unix.load(Ordering::Acquire);
+        if tripped == 0 {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        now.saturating_sub(tripped) < Self::OPEN_COOLDOWN_SECS
+    }
+
+    fn record_success(&self) {
+        use std::sync::atomic::Ordering;
+        self.consecutive_failures.store(0, Ordering::Release);
+        self.tripped_at_unix.store(0, Ordering::Release);
+    }
+
+    fn record_failure(&self) {
+        use std::sync::atomic::Ordering;
+        let n = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        if n >= Self::OPEN_AFTER {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            self.tripped_at_unix.store(now, Ordering::Release);
+        }
+    }
+}
+
+/// Routes `ai_invoke(capability, ...)` calls to the best available
+/// provider, handling priority ordering, per-plugin health, and
+/// fail-over to the next candidate on timeout / error.
+///
+/// One dispatcher per engine is enough — cheap to `Arc`-clone.
+///
+/// ## Selection rule
+///
+/// 1. Every provider whose `capabilities()` includes a descriptor
+///    with matching `capability` string is a candidate.
+/// 2. Breaker-open providers are skipped unless every candidate is
+///    Open (in which case the dispatcher still tries them — fail
+///    late rather than refuse service).
+/// 3. Remaining candidates are sorted by the descriptor's `priority`
+///    (lower wins). Ties broken by `latency_ms.p50`, then the
+///    plugin name lexically for determinism.
+pub struct AiDispatcher {
+    registry: Arc<dyn AiRegistry>,
+    policy: DispatchPolicy,
+    metrics: Option<Arc<crate::Metrics>>,
+    /// Per-plugin health. Populated lazily on first failure.
+    health: std::sync::Mutex<std::collections::BTreeMap<String, Arc<ProviderHealth>>>,
+}
+
+impl AiDispatcher {
+    /// Build a dispatcher against `registry` with default policy.
+    #[must_use]
+    pub fn new(registry: Arc<dyn AiRegistry>) -> Self {
+        Self {
+            registry,
+            policy: DispatchPolicy::default(),
+            metrics: None,
+            health: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    /// Builder: override the default dispatch policy.
+    #[must_use]
+    pub fn with_policy(mut self, policy: DispatchPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Builder: attach a metrics handle. When set, the dispatcher
+    /// increments `smiths_ai_invocations` on each call and
+    /// `smiths_ai_failovers` on each fail-over.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<crate::Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Return the ranked provider list for `capability` — highest-
+    /// priority first. Public so the `describe_provider` MCP tool
+    /// can show the dispatcher's current view without invoking.
+    #[must_use]
+    pub fn candidates(&self, capability: &str) -> Vec<Arc<dyn AiProvider>> {
+        let mut ranked: Vec<(Arc<dyn AiProvider>, u8, u64, String)> = self
+            .registry
+            .snapshot()
+            .into_iter()
+            .filter_map(|p| {
+                let desc = p
+                    .capabilities()
+                    .iter()
+                    .find(|d| d.capability == capability)?
+                    .clone();
+                let p50 = desc
+                    .latency_ms
+                    .as_ref()
+                    .and_then(|l| l.p50)
+                    .unwrap_or(u64::MAX);
+                let name = p.name().to_owned();
+                Some((p, desc.priority, p50, name))
+            })
+            .collect();
+        ranked.sort_by_key(|(_, pri, p50, name)| (*pri, *p50, name.clone()));
+        ranked.into_iter().map(|(p, _, _, _)| p).collect()
+    }
+
+    /// Invoke `method` on the best-fit provider for `capability`,
+    /// failing over on timeout / error. Returns the first success
+    /// or [`DispatchError::AllFailed`].
+    pub async fn invoke(
+        &self,
+        capability: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, DispatchError> {
+        if let Some(m) = &self.metrics {
+            m.ai_invocations
+                .get_or_create(&crate::metrics::AiCapabilityLabel {
+                    capability: capability.to_owned(),
+                })
+                .inc();
+        }
+        let candidates = self.candidates(capability);
+        if candidates.is_empty() {
+            return Err(DispatchError::NoProvider(capability.to_owned()));
+        }
+
+        // Partition by breaker state — healthy first, Open providers
+        // last. Within each partition preserve the priority order.
+        let (healthy, open): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|p| !self.health_for(p.name()).is_open());
+        let ordered: Vec<_> = healthy.into_iter().chain(open).collect();
+
+        let mut last_err: Option<ProviderError> = None;
+        let mut tried = 0usize;
+        for (idx, provider) in ordered
+            .into_iter()
+            .take(self.policy.max_attempts)
+            .enumerate()
+        {
+            if idx > 0 {
+                // Any attempt after the first is a fail-over. The
+                // prior provider must have returned error or timeout
+                // (the `return Ok(v)` below short-circuits on
+                // success). Increment BEFORE the call so we don't
+                // lose the tick when this attempt also returns Ok.
+                if let Some(m) = &self.metrics {
+                    m.ai_failovers
+                        .get_or_create(&crate::metrics::AiCapabilityLabel {
+                            capability: capability.to_owned(),
+                        })
+                        .inc();
+                }
+            }
+            tried += 1;
+            let health = self.health_for(provider.name());
+            let attempt = tokio::time::timeout(
+                self.policy.per_attempt_timeout,
+                provider.invoke(method, params.clone()),
+            )
+            .await;
+            match attempt {
+                Ok(Ok(v)) => {
+                    health.record_success();
+                    self.credit_tokens(provider.name(), &v);
+                    return Ok(v);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        plugin = %provider.name(), capability, ?e,
+                        "ai dispatcher: provider failed; falling over"
+                    );
+                    health.record_failure();
+                    last_err = Some(e);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        plugin = %provider.name(), capability,
+                        timeout_ms = u64::try_from(self.policy.per_attempt_timeout.as_millis()).unwrap_or(u64::MAX),
+                        "ai dispatcher: provider timed out; falling over"
+                    );
+                    health.record_failure();
+                    last_err = Some(ProviderError(format!(
+                        "timeout after {} ms",
+                        self.policy.per_attempt_timeout.as_millis()
+                    )));
+                }
+            }
+        }
+        Err(DispatchError::AllFailed {
+            tried,
+            last: last_err.unwrap_or_else(|| ProviderError("no attempts recorded".into())),
+        })
+    }
+
+    /// Scrape `usage.{input,output}_tokens` off a successful response
+    /// and credit `smiths_ai_tokens_total`. Accepts both the flat shape
+    /// (`{"usage": {"input_tokens": N, "output_tokens": M}}`, which is
+    /// what the reference sidecars emit) and a nested `message.usage`
+    /// shape for providers that wrap the assistant reply. Silently
+    /// no-ops when no metrics handle is attached or the shape doesn't
+    /// match — the metric is best-effort, not load-bearing.
+    fn credit_tokens(&self, provider: &str, response: &Value) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let usage = response
+            .get("usage")
+            .or_else(|| response.get("message").and_then(|m| m.get("usage")));
+        let Some(usage) = usage else { return };
+        for (key, dir) in [("input_tokens", "input"), ("output_tokens", "output")] {
+            if let Some(n) = usage.get(key).and_then(Value::as_u64)
+                && n > 0
+            {
+                metrics
+                    .ai_tokens
+                    .get_or_create(&crate::metrics::AiTokensLabel {
+                        provider: provider.to_owned(),
+                        dir: dir.to_owned(),
+                    })
+                    .inc_by(n);
+            }
+        }
+    }
+
+    fn health_for(&self, plugin: &str) -> Arc<ProviderHealth> {
+        // Mutex can only poison if a prior holder panicked mid-update;
+        // the entries are plain atomics, so recovery is just "clear
+        // any half-written state" — which in our case is nothing. Treat
+        // poison as benign and reuse the inner map.
+        let mut guard = self
+            .health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .entry(plugin.to_owned())
+            .or_insert_with(|| Arc::new(ProviderHealth::default()))
+            .clone()
+    }
+}
+
+// ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
 
@@ -420,9 +769,45 @@ mod tests {
             description: String::new(),
             latency_ms: None,
             concurrency: None,
+            priority: DEFAULT_PRIORITY,
             extra: BTreeMap::new(),
         };
         assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_storage_vector_capability() {
+        // Slice 3.4: `storage.*` joins `ai.*` / `media.*` as a
+        // recognized plugin capability namespace so vector /
+        // recording sidecars validate.
+        let d = CapabilityDescriptor {
+            capability: STORAGE_VECTOR.into(),
+            plugin: "store-qdrant".into(),
+            model_id: String::new(),
+            abi: "1.0".into(),
+            description: "Qdrant vector store".into(),
+            latency_ms: None,
+            concurrency: None,
+            priority: DEFAULT_PRIORITY,
+            extra: BTreeMap::new(),
+        };
+        d.validate().expect("storage.vector must validate");
+    }
+
+    #[test]
+    fn accepts_storage_recording_capability() {
+        let d = CapabilityDescriptor {
+            capability: STORAGE_RECORDING.into(),
+            plugin: "store-s3-recording".into(),
+            model_id: String::new(),
+            abi: "1.0".into(),
+            description: "S3-compatible recording store".into(),
+            latency_ms: None,
+            concurrency: None,
+            priority: DEFAULT_PRIORITY,
+            extra: BTreeMap::new(),
+        };
+        d.validate().expect("storage.recording must validate");
     }
 
     #[test]
@@ -439,6 +824,7 @@ mod tests {
             description: "inband DTMF detector".into(),
             latency_ms: None,
             concurrency: None,
+            priority: DEFAULT_PRIORITY,
             extra: BTreeMap::new(),
         };
         d.validate().expect("media.streaming_rtp must validate");
@@ -512,5 +898,260 @@ mod tests {
         let err = validate_controls(&declared(), &json!({"voice": "c"})).unwrap_err();
         assert_eq!(err.field, "controls.voice");
         assert_eq!(err.reason, "not in allowed enum");
+    }
+
+    // -----------------------------------------------------------------
+    // Dispatcher tests (slice 3.1)
+    // -----------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+
+    /// Scripted provider used to verify dispatcher ordering + failover.
+    /// Each invoke returns the next entry from `script`; `"ok"` →
+    /// success with the plugin name echoed back, `"err"` → error,
+    /// `"slow"` → sleep 200 ms then error (for timeout tests).
+    struct MockProvider {
+        name: String,
+        cap: CapabilityDescriptor,
+        script: std::sync::Mutex<Vec<&'static str>>,
+        calls: AtomicUsize,
+    }
+
+    impl MockProvider {
+        fn new(name: &str, capability: &str, priority: u8) -> Arc<Self> {
+            let desc = CapabilityDescriptor {
+                capability: capability.into(),
+                plugin: name.into(),
+                model_id: String::new(),
+                abi: "1.0".into(),
+                description: format!("mock {name}"),
+                latency_ms: None,
+                concurrency: None,
+                priority,
+                extra: BTreeMap::new(),
+            };
+            Arc::new(Self {
+                name: name.into(),
+                cap: desc,
+                script: std::sync::Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn script(self: &Arc<Self>, verdicts: &[&'static str]) {
+            *self.script.lock().unwrap() = verdicts.iter().rev().copied().collect();
+        }
+    }
+
+    #[async_trait]
+    impl AiProvider for MockProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn version(&self) -> &'static str {
+            "0.0.0"
+        }
+        fn description(&self) -> &str {
+            &self.cap.description
+        }
+        fn abi(&self) -> &str {
+            &self.cap.abi
+        }
+        fn capabilities(&self) -> &[CapabilityDescriptor] {
+            std::slice::from_ref(&self.cap)
+        }
+        async fn invoke(&self, _method: &str, _params: Value) -> Result<Value, ProviderError> {
+            self.calls.fetch_add(1, AOrd::Relaxed);
+            let verdict = self.script.lock().unwrap().pop().unwrap_or("ok");
+            match verdict {
+                "ok" => Ok(json!({ "who": self.name })),
+                "err" => Err(ProviderError(format!("{} boom", self.name))),
+                "slow" => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    Err(ProviderError("still slow".into()))
+                }
+                "usage" => Ok(json!({
+                    "who": self.name,
+                    "usage": { "input_tokens": 12, "output_tokens": 34 },
+                })),
+                other => Err(ProviderError(format!("unknown verdict `{other}`"))),
+            }
+        }
+    }
+
+    struct MockRegistry(Vec<Arc<dyn AiProvider>>);
+
+    #[async_trait]
+    impl AiRegistry for MockRegistry {
+        fn get(&self, name: &str) -> Option<Arc<dyn AiProvider>> {
+            self.0.iter().find(|p| p.name() == name).cloned()
+        }
+        fn snapshot(&self) -> Vec<Arc<dyn AiProvider>> {
+            self.0.clone()
+        }
+        async fn shutdown_all(&self) {}
+    }
+
+    fn registry(providers: Vec<Arc<dyn AiProvider>>) -> Arc<dyn AiRegistry> {
+        Arc::new(MockRegistry(providers))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn candidates_order_lowest_priority_first() {
+        let a: Arc<dyn AiProvider> = MockProvider::new("a", "ai.llm.chat", 30);
+        let b: Arc<dyn AiProvider> = MockProvider::new("b", "ai.llm.chat", 10);
+        let c: Arc<dyn AiProvider> = MockProvider::new("c", "ai.llm.chat", 50);
+        let d = AiDispatcher::new(registry(vec![a, b, c]));
+        let names: Vec<String> = d
+            .candidates("ai.llm.chat")
+            .into_iter()
+            .map(|p| p.name().to_owned())
+            .collect();
+        assert_eq!(names, vec!["b", "a", "c"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_provider_for_unknown_capability() {
+        let d = AiDispatcher::new(registry(vec![MockProvider::new("a", "ai.llm.chat", 50)]));
+        match d.invoke("ai.asr", "transcribe", json!({})).await {
+            Err(DispatchError::NoProvider(cap)) => assert_eq!(cap, "ai.asr"),
+            other => panic!("expected NoProvider, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failover_picks_second_candidate_on_first_error() {
+        let a: Arc<MockProvider> = MockProvider::new("a", "ai.llm.chat", 10);
+        let b: Arc<MockProvider> = MockProvider::new("b", "ai.llm.chat", 20);
+        a.script(&["err"]);
+        b.script(&["ok"]);
+        let dp: Arc<dyn AiProvider> = a.clone();
+        let dp2: Arc<dyn AiProvider> = b.clone();
+        let d = AiDispatcher::new(registry(vec![dp, dp2]));
+        let v = d.invoke("ai.llm.chat", "chat", json!({})).await.unwrap();
+        assert_eq!(v["who"], "b", "dispatcher must fail over to b");
+        assert_eq!(a.calls.load(AOrd::Relaxed), 1);
+        assert_eq!(b.calls.load(AOrd::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn all_failed_returns_last_error() {
+        let a: Arc<MockProvider> = MockProvider::new("a", "ai.llm.chat", 10);
+        let b: Arc<MockProvider> = MockProvider::new("b", "ai.llm.chat", 20);
+        a.script(&["err"]);
+        b.script(&["err"]);
+        let dp: Arc<dyn AiProvider> = a;
+        let dp2: Arc<dyn AiProvider> = b;
+        let d = AiDispatcher::new(registry(vec![dp, dp2]));
+        match d.invoke("ai.llm.chat", "chat", json!({})).await {
+            Err(DispatchError::AllFailed { tried, last }) => {
+                assert_eq!(tried, 2);
+                assert!(last.0.contains("b boom"));
+            }
+            other => panic!("expected AllFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timeout_trips_failover() {
+        let slow: Arc<MockProvider> = MockProvider::new("slow", "ai.llm.chat", 10);
+        let fast: Arc<MockProvider> = MockProvider::new("fast", "ai.llm.chat", 20);
+        slow.script(&["slow"]);
+        fast.script(&["ok"]);
+        let dp: Arc<dyn AiProvider> = slow;
+        let dp2: Arc<dyn AiProvider> = fast;
+        let d = AiDispatcher::new(registry(vec![dp, dp2])).with_policy(DispatchPolicy {
+            per_attempt_timeout: std::time::Duration::from_millis(30),
+            max_attempts: 4,
+        });
+        let v = d.invoke("ai.llm.chat", "chat", json!({})).await.unwrap();
+        assert_eq!(v["who"], "fast");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn breaker_opens_after_three_consecutive_failures() {
+        let flaky: Arc<MockProvider> = MockProvider::new("flaky", "ai.llm.chat", 10);
+        let stable: Arc<MockProvider> = MockProvider::new("stable", "ai.llm.chat", 20);
+        flaky.script(&["err", "err", "err", "ok", "ok"]);
+        stable.script(&["ok", "ok", "ok", "ok"]);
+        let dp: Arc<dyn AiProvider> = flaky.clone();
+        let dp2: Arc<dyn AiProvider> = stable.clone();
+        let d = AiDispatcher::new(registry(vec![dp, dp2]));
+
+        // First three calls each fail through flaky → failover to stable.
+        for _ in 0..3 {
+            let _ = d.invoke("ai.llm.chat", "chat", json!({})).await.unwrap();
+        }
+        // Fourth call — flaky's breaker is Open; dispatcher skips it.
+        let before = flaky.calls.load(AOrd::Relaxed);
+        let _ = d.invoke("ai.llm.chat", "chat", json!({})).await.unwrap();
+        let after = flaky.calls.load(AOrd::Relaxed);
+        assert_eq!(
+            before, after,
+            "open breaker must skip flaky entirely (calls: {before} → {after})"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metrics_count_invocations_and_failovers() {
+        let a: Arc<MockProvider> = MockProvider::new("a", "ai.llm.chat", 10);
+        let b: Arc<MockProvider> = MockProvider::new("b", "ai.llm.chat", 20);
+        a.script(&["err", "ok"]);
+        b.script(&["ok", "ok"]);
+        let metrics = crate::Metrics::noop();
+        let dp: Arc<dyn AiProvider> = a;
+        let dp2: Arc<dyn AiProvider> = b;
+        let d = AiDispatcher::new(registry(vec![dp, dp2])).with_metrics(metrics.clone());
+
+        // Call 1 — a errors, b succeeds → 1 invocation + 1 failover.
+        d.invoke("ai.llm.chat", "chat", json!({})).await.unwrap();
+        // Call 2 — a succeeds first try → 1 more invocation, no failover.
+        d.invoke("ai.llm.chat", "chat", json!({})).await.unwrap();
+
+        let lbl = crate::metrics::AiCapabilityLabel {
+            capability: "ai.llm.chat".into(),
+        };
+        assert_eq!(metrics.ai_invocations.get_or_create(&lbl).get(), 2);
+        assert_eq!(metrics.ai_failovers.get_or_create(&lbl).get(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tokens_metric_credits_input_and_output_on_success() {
+        let a: Arc<MockProvider> = MockProvider::new("a", "ai.llm.chat", 10);
+        a.script(&["usage", "usage"]);
+        let metrics = crate::Metrics::noop();
+        let dp: Arc<dyn AiProvider> = a;
+        let d = AiDispatcher::new(registry(vec![dp])).with_metrics(metrics.clone());
+
+        // Two calls, each credits 12 input + 34 output.
+        d.invoke("ai.llm.chat", "chat", json!({})).await.unwrap();
+        d.invoke("ai.llm.chat", "chat", json!({})).await.unwrap();
+
+        let input_label = crate::metrics::AiTokensLabel {
+            provider: "a".into(),
+            dir: "input".into(),
+        };
+        let output_label = crate::metrics::AiTokensLabel {
+            provider: "a".into(),
+            dir: "output".into(),
+        };
+        assert_eq!(metrics.ai_tokens.get_or_create(&input_label).get(), 24);
+        assert_eq!(metrics.ai_tokens.get_or_create(&output_label).get(), 68);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tokens_metric_silent_when_usage_absent() {
+        let a: Arc<MockProvider> = MockProvider::new("a", "ai.llm.chat", 10);
+        a.script(&["ok"]);
+        let metrics = crate::Metrics::noop();
+        let dp: Arc<dyn AiProvider> = a;
+        let d = AiDispatcher::new(registry(vec![dp])).with_metrics(metrics.clone());
+        d.invoke("ai.llm.chat", "chat", json!({})).await.unwrap();
+        // No usage block → no credit, no fresh label entry observed.
+        let lbl = crate::metrics::AiTokensLabel {
+            provider: "a".into(),
+            dir: "input".into(),
+        };
+        assert_eq!(metrics.ai_tokens.get_or_create(&lbl).get(), 0);
     }
 }

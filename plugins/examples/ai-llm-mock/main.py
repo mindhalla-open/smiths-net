@@ -23,7 +23,7 @@ DESCRIPTOR = {
     "max_output": 512,
     "features": ["system_prompt"],
     "roles": ["system", "user", "assistant"],
-    "streaming": {"supported": False},
+    "streaming": {"supported": True, "event": "ai.llm.partial"},
     "controls": {
         "temperature": {
             "type": "number",
@@ -36,6 +36,10 @@ DESCRIPTOR = {
             "minimum": 1,
             "maximum": 512,
             "default": 128,
+        },
+        "stream": {
+            "type": "boolean",
+            "default": False,
         },
     },
     "latency_ms": {"p50": 20, "p95": 80},
@@ -64,6 +68,18 @@ def reply(id_: int | None, *, result=None, error=None) -> None:
     sys.stdout.flush()
 
 
+def notify(method: str, params: dict) -> None:
+    """Emit a JSON-RPC 2.0 notification (no `id`). The supervisor
+    broadcasts every notification frame through
+    `Sidecar::subscribe_notifications`; the plugin loader forwards them
+    onto the engine's event bus as `PluginEvent::Notification`, and the
+    MCP adapter surfaces them as `notifications/plugin/<method>`.
+    Streaming LLM partials ride this rail."""
+    frame = {"jsonrpc": "2.0", "method": method, "params": params}
+    sys.stdout.write(json.dumps(frame) + "\n")
+    sys.stdout.flush()
+
+
 def log(msg: str) -> None:
     sys.stderr.write(f"[ai-llm-mock] {msg}\n")
     sys.stderr.flush()
@@ -85,6 +101,29 @@ def fake_chat(params: dict) -> dict:
         if needle in low:
             text = resp
             break
+
+    # Slice 3.2: if the caller opts in via `controls.stream = true`,
+    # emit cumulative partials as notifications before returning the
+    # final response. Demonstrates the streaming rail that cloud
+    # sidecars (OpenAI/Anthropic) use for real model partials.
+    controls = params.get("controls") or {}
+    if controls.get("stream") is True:
+        tokens = text.split(" ")
+        acc = ""
+        for i, tok in enumerate(tokens):
+            acc = f"{acc} {tok}".strip()
+            notify("ai.llm.partial", {
+                "text_delta": (" " if i > 0 else "") + tok,
+                "text": acc,
+                "is_final": False,
+            })
+        # Final partial marker — some clients prefer a terminator.
+        notify("ai.llm.partial", {
+            "text_delta": "",
+            "text": acc,
+            "is_final": True,
+        })
+
     return {
         "message": {"role": "assistant", "content": text},
         "usage": {

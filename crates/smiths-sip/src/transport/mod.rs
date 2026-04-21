@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use bytes::Bytes;
 
 pub mod framing;
+pub mod proxy;
 pub mod tcp;
 pub mod tls;
 pub mod udp;

@@ -29,6 +29,27 @@ transports = ["udp"]
 # Grace period (seconds) to finish in-flight transactions on shutdown.
 drain_timeout_secs = 10
 
+# Outbound-connect proxy for SIP over TCP / TLS (slice 3.5 / P16).
+# SOCKS5 and HTTP-CONNECT are stream protocols, so UDP can't ride
+# them — UDP transports ignore this block.
+[sip.proxy]
+mode    = "none"              # "none" | "socks5" | "http-connect"
+# address  = "127.0.0.1:9050"
+# username = "alice"
+# password = "s3cret"         # redacted in config://current
+
+# Embedded WireGuard (slice 3.5 / feature `wireguard`). See
+# docs/deployment/vpn.md for sidecar-vs-embedded tradeoffs. The
+# runtime device is a follow-on; 0.42.0 accepts the config and
+# logs a clear warning at startup so operators aren't surprised.
+[sip.vpn]
+mode = "none"                 # "none" | "wireguard"
+# private_key     = "..."      # redacted in config://current
+# peer_public_key = "..."
+# peer_endpoint   = "203.0.113.7:51820"
+# allowed_ips     = ["10.42.0.0/24"]
+# interface_ip    = "10.42.0.5/24"
+
 # Subscriber DB + digest-auth realm (P8 / slice 2.1).
 # `backend = "none"` (default) keeps pre-v0.33.0 behaviour — REGISTER
 # blindly 200s. `backend = "sqlite"` enables the embedded SQLite
@@ -65,12 +86,41 @@ backend = "none"   # "none" | "sqlite"
 # [storage.sqlite]
 # path = "/var/lib/smiths-net/storage.db"
 
+# Vector search (slice 3.4 / P23). `memory` is the in-process
+# cosine-similarity store — loses every record on restart, good for
+# dev loops. `sidecar` delegates to a plugin advertising
+# `storage.vector` (see plugins/examples/store-qdrant).
+[storage.vector]
+backend = "none"   # "none" | "memory" | "sidecar"
+# plugin  = "store-qdrant"
+
+# Per-call audio retention (slice 3.4 / P23). `fs` writes
+# <hex(call_id)>.wav files under `[storage.recording.fs] root`.
+# Operators who enable it unlock the `call_id`-only path on
+# `transcribe_call` / `summarize_call` (no more inline audio_base64).
+[storage.recording]
+backend        = "none"   # "none" | "fs" | "sidecar"
+retention_days = 0        # 0 disables the hourly sweeper; >0 deletes blobs older than N days
+# plugin = "store-s3-recording"
+
+# [storage.recording.fs]
+# root = "/var/lib/smiths-net/recordings"
+
 # Media-plane tunings. `inband_dtmf` (slice 2.5) runs the Goertzel
 # detector on plaintext PCMU frames and surfaces keypresses on the
 # bus as `SipEvent::Dtmf` alongside the always-on RFC 4733 path.
 # Costs ~3k FLOPs per 20 ms frame per leg — off by default.
 [media]
 inband_dtmf = false
+
+# Cloud-AI secrets (slice 3.2 / P22). All fields optional — sidecars
+# read their own API keys from environment variables (`OPENAI_API_KEY`,
+# `ANTHROPIC_API_KEY`). This block exists so operators have one
+# canonical home on disk + a redaction-tested surface. Values here are
+# replaced with `"***"` in the `config://current` MCP resource.
+[ai]
+# openai_api_key    = "sk-..."
+# anthropic_api_key = "sk-ant-..."
 
 [plugins]
 # Directory the loader scans at startup. Each subdirectory with a

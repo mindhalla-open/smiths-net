@@ -1,0 +1,7 @@
+name        = "ai-llm-anthropic"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["ai.llm.chat"]
+abi         = "1.0"
+description = "Anthropic-backed `ai.llm.chat` sidecar. Talks to /v1/messages; supports streaming via `ai.llm.partial` notifications when `controls.stream = true`. Priority 16 — fails over from ai-llm-openai and ahead of Ollama/mock."

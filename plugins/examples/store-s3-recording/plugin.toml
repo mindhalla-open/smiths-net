@@ -1,0 +1,7 @@
+name        = "store-s3-recording"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["storage.recording"]
+abi         = "1.0"
+description = "S3-compatible `storage.recording` sidecar. Shells out to the `aws` CLI so SigV4 signing + credential discovery stay in one place (no boto3 dependency). Works against AWS S3, MinIO, Cloudflare R2, and Backblaze B2."

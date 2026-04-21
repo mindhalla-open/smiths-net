@@ -1,0 +1,7 @@
+name        = "store-qdrant"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["storage.vector"]
+abi         = "1.0"
+description = "Qdrant-backed `storage.vector` sidecar. Talks to a local or remote Qdrant HTTP API (default http://127.0.0.1:6333). Collection, vector size, and distance metric are env-configured; the engine's `search_calls_semantic` MCP tool routes here when wired."

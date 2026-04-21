@@ -1,0 +1,7 @@
+name        = "ai-asr-whisper"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["ai.asr"]
+abi         = "1.0"
+description = "whisper.cpp-backed `ai.asr` sidecar. Shells out to the `whisper-cli` / `main` binary with a local GGML model. Priority 20 so the dispatcher picks Whisper over the canned mock (50) when both are loaded."

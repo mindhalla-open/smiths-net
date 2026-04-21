@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument, warn};
 
 use super::framing::{FrameOutcome, take_one_message};
+use super::proxy::{DirectConnector, ProxyConnector};
 use super::{Datagram, Transport};
 
 /// Per-connection writer mpsc depth. Small on purpose — backpressure
@@ -40,6 +41,11 @@ pub struct TcpTransport {
     /// this to open outbound connections when no pool entry exists.
     /// `OnceLock` so the trait-object-safe `send` stays immutable.
     inbound: Arc<OnceLock<InboundState>>,
+    /// Outbound-connect shim (slice 3.5). `DirectConnector` by
+    /// default — identical to calling `TcpStream::connect` — so the
+    /// proxy path is a zero-cost option when `[sip.proxy] mode =
+    /// "none"`.
+    connector: Arc<dyn ProxyConnector>,
 }
 
 #[derive(Clone)]
@@ -56,7 +62,19 @@ impl TcpTransport {
             listener: Arc::new(listener),
             peers: Arc::new(DashMap::new()),
             inbound: Arc::new(OnceLock::new()),
+            connector: Arc::new(DirectConnector),
         })
+    }
+
+    /// Install a [`ProxyConnector`] for outbound connects (slice 3.5).
+    /// The default is [`DirectConnector`]; swap in
+    /// [`super::proxy::Socks5Connector`] or
+    /// [`super::proxy::HttpConnectConnector`] to tunnel SIP-over-TCP
+    /// through an outbound proxy without touching the listener path.
+    #[must_use]
+    pub fn with_proxy(mut self, connector: Arc<dyn ProxyConnector>) -> Self {
+        self.connector = connector;
+        self
     }
 
     /// Spawn the accept loop. Per-peer reader tasks forward framed
@@ -119,7 +137,12 @@ impl Transport for TcpTransport {
         };
         // Evict the stale entry, if any, before reconnecting.
         self.peers.remove(&peer);
-        let stream = TcpStream::connect(peer).await?;
+        let stream = self.connector.connect(peer).await.map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("tcp outbound via {}: {e}", self.connector.label()),
+            )
+        })?;
         let sender = register_connection(
             stream,
             peer,

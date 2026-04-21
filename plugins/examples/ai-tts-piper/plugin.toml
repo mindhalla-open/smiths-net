@@ -1,0 +1,7 @@
+name        = "ai-tts-piper"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["ai.tts"]
+abi         = "1.0"
+description = "Piper-backed `ai.tts` sidecar. Shells out to the `piper` binary (github.com/rhasspy/piper) with a local ONNX voice. Lower priority than the mock so the dispatcher picks Piper first when both are loaded."

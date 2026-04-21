@@ -42,6 +42,39 @@ pub struct Config {
     /// Media-plane tunings (DTMF inband detection, later: jitter
     /// buffer depth, comfort-noise on silence).
     pub media: MediaConfig,
+    /// AI-provider configuration (P22 / slice 3.2). Keys here are
+    /// secrets — the `config://current` resource redacts them on
+    /// render. Sidecars read their own API keys from environment
+    /// variables; the operator threads them through here for
+    /// single-source-of-truth deployments.
+    pub ai: AiConfig,
+}
+
+/// `[ai]` TOML block — cloud-provider secrets for the reference
+/// sidecars. All fields are optional.
+///
+/// ```toml
+/// [ai]
+/// openai_api_key    = "sk-..."
+/// anthropic_api_key = "sk-ant-..."
+/// ```
+///
+/// Keys are redacted in `config://current` via the MCP resource
+/// layer. Today the engine does **not** forward these to sidecar
+/// child processes automatically — operators set the corresponding
+/// env vars (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) in the engine's
+/// own environment, and the sidecars inherit them. This section
+/// exists so the secrets have one canonical home on disk + a
+/// redaction-tested surface.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AiConfig {
+    /// `OpenAI` API key — consumed by `ai-llm-openai`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_api_key: Option<String>,
+    /// `Anthropic` API key — consumed by `ai-llm-anthropic`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_api_key: Option<String>,
 }
 
 /// `[media]` TOML block — per-leg media-plane tunings.
@@ -82,6 +115,122 @@ pub struct StorageConfig {
     pub backend: StorageBackend,
     /// SQLite-specific settings. Ignored when `backend != "sqlite"`.
     pub sqlite: SqliteStorageConfig,
+    /// Embedding-indexed search surface (slice 3.4). Off by default
+    /// — `search_calls_semantic` returns a clean `NotFound` when
+    /// this is `none`.
+    pub vector: VectorStoreConfig,
+    /// Per-call audio retention (slice 3.4). Off by default; the
+    /// filesystem backend makes `transcribe_call` / `summarize_call`
+    /// self-resolve audio from a bare `call_id`.
+    pub recording: RecordingStoreConfig,
+}
+
+/// `[storage.vector]` TOML block — vector-index backend selection.
+///
+/// ```toml
+/// [storage.vector]
+/// backend = "memory"        # "none" | "memory" | "sidecar"
+///
+/// # When backend = "sidecar":
+/// # plugin = "store-qdrant"
+/// ```
+///
+/// `memory` is the in-process [`crate::MemoryVectorStore`] —
+/// good for tests and single-node deployments without durability.
+/// `sidecar` delegates to a loaded plugin that advertises the
+/// `storage.vector` capability (today: `store-qdrant`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VectorStoreConfig {
+    /// Which backend to wire up.
+    pub backend: VectorBackend,
+    /// When `backend = "sidecar"`, the plugin name that serves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+}
+
+/// Vector-store backend selector.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VectorBackend {
+    /// No vector store wired. `search_calls_semantic` returns
+    /// `NotFound`.
+    #[default]
+    None,
+    /// In-process [`crate::MemoryVectorStore`]. Loses every record
+    /// on restart; appropriate for tests + ephemeral dev loops.
+    Memory,
+    /// Delegates to a loaded plugin via the `storage.vector`
+    /// capability seam. The plugin name is taken from
+    /// [`VectorStoreConfig::plugin`].
+    Sidecar,
+}
+
+/// `[storage.recording]` TOML block — per-call audio retention.
+///
+/// ```toml
+/// [storage.recording]
+/// backend        = "fs"          # "none" | "fs" | "sidecar"
+/// retention_days = 30            # 0 disables retention sweeps
+///
+/// [storage.recording.fs]
+/// root = "/var/lib/smiths-net/recordings"
+/// ```
+///
+/// The filesystem backend writes `<hex(call_id)>.wav` +
+/// `<hex(call_id)>.cid` sidecar files. Sidecar backends (S3,
+/// Azure Blob, GCS) slot in the same way the vector sidecar does
+/// — by advertising the `storage.recording` capability.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecordingStoreConfig {
+    /// Which backend to wire up.
+    pub backend: RecordingBackend,
+    /// Filesystem-specific settings. Ignored unless `backend = "fs"`.
+    pub fs: FsRecordingConfig,
+    /// Retention in days. `0` disables the periodic sweeper; the
+    /// engine then only prunes when an operator calls `truncate`
+    /// equivalents manually. Non-zero values start a once-per-hour
+    /// sweep that deletes blobs whose on-disk mtime is older.
+    pub retention_days: u32,
+    /// When `backend = "sidecar"`, the plugin name that serves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+}
+
+/// Recording backend selector.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordingBackend {
+    /// No audio retention. Post-processing tools that need audio
+    /// (`transcribe_call`, `summarize_call`) still work via the
+    /// `audio_base64` override but can't self-resolve from a
+    /// bare `call_id`.
+    #[default]
+    None,
+    /// [`crate::FsRecordingStore`] at [`FsRecordingConfig::root`].
+    Fs,
+    /// Delegates to a loaded plugin via the `storage.recording`
+    /// capability seam (today: `store-s3-recording`).
+    Sidecar,
+}
+
+/// `[storage.recording.fs]` settings.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FsRecordingConfig {
+    /// Root directory for stored recordings. Auto-created on
+    /// first write; operators should point this at a persistent
+    /// volume in production.
+    pub root: std::path::PathBuf,
+}
+
+impl Default for FsRecordingConfig {
+    fn default() -> Self {
+        Self {
+            root: std::path::PathBuf::from("smiths-recordings"),
+        }
+    }
 }
 
 /// Storage backend selector.
@@ -305,6 +454,123 @@ pub struct SipConfig {
     pub tls_key_path: Option<std::path::PathBuf>,
     /// Per-source-IP rate limit on inbound SIP datagrams.
     pub rate_limit: SipRateLimit,
+    /// Outbound proxy / VPN shim (slice 3.5). Applies to the
+    /// TCP-based SIP transports (TCP, TLS inner TCP) — SOCKS5 and
+    /// HTTP-CONNECT are stream protocols so UDP can't ride them.
+    /// The UDP path ignores this block.
+    pub proxy: SipProxyConfig,
+    /// Optional embedded-`WireGuard` device (slice 3.5 / feature
+    /// `wireguard`). Operators who run `WireGuard` as a host sidecar
+    /// leave this `mode = "none"`; operators on appliance-style
+    /// hosts enable it to bring up the tunnel in-process.
+    pub vpn: SipVpnConfig,
+}
+
+/// `[sip.vpn]` — embedded userspace `WireGuard` device. Gated behind
+/// the `smiths-cli/wireguard` Cargo feature at runtime. See
+/// `docs/deployment/vpn.md` for the full deployment story.
+///
+/// ```toml
+/// [sip.vpn]
+/// mode            = "wireguard"       # "none" | "wireguard"
+/// private_key     = "..."              # base64 Curve25519 private key
+/// peer_public_key = "..."
+/// peer_endpoint   = "203.0.113.7:51820"
+/// allowed_ips     = ["10.42.0.0/24"]
+/// interface_ip    = "10.42.0.5/24"
+/// ```
+///
+/// The runtime plumbing (creating the tun interface, binding SIP
+/// against it) is a follow-on — the 0.42.0 release ships only the
+/// config surface. An engine built with `features = ["wireguard"]`
+/// and `mode = "wireguard"` warns at startup and falls back to
+/// `mode = "none"` until the runtime lands.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SipVpnConfig {
+    /// Which VPN mode to activate.
+    pub mode: VpnMode,
+    /// Base64 Curve25519 private key for this engine's WG device.
+    /// Redacted in `config://current`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    /// Base64 Curve25519 peer public key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_public_key: Option<String>,
+    /// Remote peer endpoint (`host:port`) the local device dials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_endpoint: Option<String>,
+    /// CIDR ranges routed into the tunnel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_ips: Vec<String>,
+    /// Local IP (with prefix) to assign to the in-process interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_ip: Option<String>,
+}
+
+/// Embedded-VPN mode selector.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum VpnMode {
+    /// No embedded VPN. Operators either run `WireGuard` as a host
+    /// sidecar or don't need a tunnel at all.
+    #[default]
+    None,
+    /// Embedded `boringtun` device. Only honored when the binary
+    /// was built with `--features wireguard`; otherwise the engine
+    /// falls back to `None` with a warning log.
+    Wireguard,
+}
+
+/// `[sip.proxy]` — outbound-connection shim for TCP-based SIP
+/// transports. Mirrors how curl / aws-cli expose the same knobs
+/// operators already know.
+///
+/// ```toml
+/// [sip.proxy]
+/// mode = "socks5"                       # "none" | "socks5" | "http-connect"
+/// address = "127.0.0.1:9050"            # proxy host:port
+/// username = "circuit-a"                # optional for socks5 / http-connect
+/// password = "secret"                   # optional; redacted in config://current
+/// ```
+///
+/// The proxy is applied at outbound-connect time (the `send` path
+/// opens a fresh TCP connection to a peer). Listener binds are
+/// unaffected — operators wanting ingress protection terminate TLS
+/// or run a reverse proxy in front of the engine.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SipProxyConfig {
+    /// Which proxy protocol to wrap outbound TCP connects in.
+    pub mode: ProxyMode,
+    /// Proxy host:port. Required when `mode != "none"`; ignored
+    /// otherwise. Parsed as `SocketAddr` at config-load time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<SocketAddr>,
+    /// Optional username for `socks5` (RFC 1929) or HTTP-CONNECT
+    /// `Proxy-Authorization: Basic` auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Optional password paired with `username`. Redacted in the
+    /// `config://current` MCP resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+/// Outbound-proxy protocol selector.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyMode {
+    /// No proxy. Outbound TCP connects go direct.
+    #[default]
+    None,
+    /// RFC 1928 SOCKS5 CONNECT. Supports RFC 1929 user/password auth
+    /// when `username` + `password` are set; otherwise the `no-auth`
+    /// method is offered.
+    Socks5,
+    /// HTTP/1.1 CONNECT tunnel (RFC 9110 §9.3.6). `username` +
+    /// `password` flow as `Proxy-Authorization: Basic ...`.
+    HttpConnect,
 }
 
 /// Token-bucket rate limit applied per source IP at UAS ingress.
@@ -336,6 +602,8 @@ impl Default for SipConfig {
             tls_cert_path: None,
             tls_key_path: None,
             rate_limit: SipRateLimit::default(),
+            proxy: SipProxyConfig::default(),
+            vpn: SipVpnConfig::default(),
         }
     }
 }

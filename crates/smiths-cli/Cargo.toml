@@ -10,6 +10,18 @@ description  = "smiths-net binary: CLI, config loading, and subsystem wiring."
 name = "smiths-net"
 path = "src/main.rs"
 
+[features]
+# Slice 3.5 / P16. Turns on the config surface for the embedded
+# `boringtun` WireGuard device. Runtime plumbing (creating the
+# tun/tap interface, binding SIP against it) is a dedicated
+# follow-on — today the feature accepts the config and logs a
+# warning at startup, so deployments that enable it get a clear
+# signal rather than silent fallthrough. Off by default because
+# most operators run WireGuard as a host sidecar (see
+# docs/deployment/vpn.md).
+default   = []
+wireguard = []
+
 [dependencies]
 smiths-core        = { workspace = true }
 smiths-sip         = { workspace = true }

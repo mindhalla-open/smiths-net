@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::{Value, json};
-use smiths_core::ai::{AiProvider, CapabilityDescriptor, validate_controls};
+use smiths_core::ai::{
+    AiDispatcher, AiProvider, CapabilityDescriptor, DispatchError, validate_controls,
+};
 
 use crate::control::CallPhase;
 use crate::tool::{Tool, ToolContext, ToolError};
@@ -43,7 +45,489 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(ReloadPluginTool);
     reg.register(ListCdrTool);
     reg.register(SendDtmfTool);
+    reg.register(TranslateTool);
+    reg.register(TranscribeCallTool);
+    reg.register(SummarizeCallTool);
+    reg.register(SearchCallsSemanticTool);
     reg
+}
+
+/// `search_calls_semantic(query, k)` — slice 3.4. Embeds the
+/// natural-language `query` via the `ai.embed` capability, then runs
+/// a top-k search against the wired `[storage.vector]` backend.
+/// Returns every hit's `id`, `score`, and indexed `metadata` — the
+/// caller typically seeded the metadata with `{call_id, transcript,
+/// started_at_unix, ...}` when upserting, so a hit is immediately
+/// actionable without a second lookup.
+pub struct SearchCallsSemanticTool;
+
+#[async_trait]
+impl Tool for SearchCallsSemanticTool {
+    fn name(&self) -> &'static str {
+        "search_calls_semantic"
+    }
+
+    fn description(&self) -> &'static str {
+        "Embed `query` via `ai.embed` and return the top-`k` nearest \
+         indexed records from the vector store. Metadata attached at \
+         upsert time (call_id, transcript, ...) rides back on every hit."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Natural-language query." },
+                "k":     { "type": "integer", "minimum": 1, "maximum": 50,
+                           "description": "Top-k hits (default 5)." },
+                "plugin": { "type": "string",
+                            "description": "Override embed plugin (optional; dispatcher picks otherwise)." }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let started = Instant::now();
+        let result = search_calls_semantic_inner(&args, ctx).await;
+        observe_pipeline(ctx, "search_calls_semantic", started.elapsed());
+        result
+    }
+}
+
+async fn search_calls_semantic_inner(args: &Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::InvalidArguments("query required".into()))?;
+    if query.trim().is_empty() {
+        return Err(ToolError::InvalidArguments(
+            "query must not be empty".into(),
+        ));
+    }
+    let k = usize::try_from(args.get("k").and_then(Value::as_u64).unwrap_or(5))
+        .map_err(|_| ToolError::InvalidArguments("k out of range".into()))?;
+
+    let Some(vector_store) = &ctx.vector else {
+        return Err(ToolError::NotFound(
+            "no `[storage.vector]` backend is wired; \
+             set `backend = \"memory\"` (or `\"sidecar\"`) to enable semantic search"
+                .into(),
+        ));
+    };
+
+    let dispatcher = smiths_core::AiDispatcher::new(Arc::clone(&ctx.plugins));
+    let embed_params = json!({ "inputs": [query] });
+    let embed = match dispatcher.invoke("ai.embed", "embed", embed_params).await {
+        Ok(v) => v,
+        Err(smiths_core::DispatchError::NoProvider(cap)) => {
+            return Err(ToolError::NotFound(format!(
+                "no `{cap}` provider is loaded — install an ai.embed plugin"
+            )));
+        }
+        Err(e @ smiths_core::DispatchError::AllFailed { .. }) => {
+            return Err(ToolError::Internal(format!("embed failed: {e}")));
+        }
+    };
+    let vector = extract_first_embedding(&embed)
+        .ok_or_else(|| ToolError::Internal(format!("embed response shape unexpected: {embed}")))?;
+
+    let hits = vector_store
+        .search(&vector, k)
+        .map_err(|e| ToolError::Internal(format!("vector search: {e}")))?;
+
+    Ok(json!({
+        "query": query,
+        "k":     k,
+        "count": hits.len(),
+        "hits":  hits,
+    }))
+}
+
+/// Pull the first embedding vector out of whatever shape the
+/// `ai.embed` plugin returned. Accepts `{vectors: [[...], ...]}`
+/// (in-tree mock), `{embeddings: [...]}` (OpenAI-compat), and
+/// `{data: [{embedding: [...]}]}` (raw `OpenAI`).
+fn extract_first_embedding(v: &Value) -> Option<Vec<f32>> {
+    let arr = v
+        .get("vectors")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first().and_then(Value::as_array))
+        .or_else(|| {
+            v.get("embeddings")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first().and_then(Value::as_array))
+        })
+        .or_else(|| {
+            v.get("data")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(|e| e.get("embedding"))
+                .and_then(Value::as_array)
+        })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for x in arr {
+        out.push(x.as_f64()? as f32);
+    }
+    Some(out)
+}
+
+/// Resolve the audio payload for the pipeline tools. Inline
+/// `audio_base64` wins; otherwise the recording store is consulted;
+/// otherwise a `NotFound` with a targeted error surfaces so the
+/// caller sees *exactly* which config knob is missing.
+fn resolve_audio_base64(
+    call_id: &str,
+    args: &Value,
+    ctx: &ToolContext,
+) -> Result<String, ToolError> {
+    use base64::Engine as _;
+
+    if let Some(inline) = args.get("audio_base64").and_then(Value::as_str) {
+        return Ok(inline.to_owned());
+    }
+    let Some(store) = &ctx.recording else {
+        return Err(ToolError::NotFound(
+            "no `[storage.recording]` backend is wired; \
+             pass `audio_base64` inline on this call"
+                .into(),
+        ));
+    };
+    let bytes = store.get(call_id).map_err(|e| match e {
+        smiths_core::storage::StorageError::NotFound(_) => ToolError::NotFound(format!(
+            "no recording on disk for call `{call_id}`; \
+             pass `audio_base64` inline or check the retention window"
+        )),
+        other => ToolError::Internal(format!("recording lookup: {other}")),
+    })?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// Observe one pipeline's end-to-end wall clock. Falls through to a
+/// fresh `Metrics::noop()` when the context doesn't carry a handle
+/// (older tests construct `ToolContext` without one); the observation
+/// is still recorded, just onto a registry nobody is reading.
+fn observe_pipeline(ctx: &ToolContext, pipeline: &str, elapsed: std::time::Duration) {
+    let target = ctx
+        .metrics
+        .clone()
+        .unwrap_or_else(smiths_core::Metrics::noop);
+    target
+        .ai_pipeline_duration
+        .get_or_create(&smiths_core::metrics::AiPipelineLabel {
+            pipeline: pipeline.to_owned(),
+        })
+        .observe(elapsed.as_secs_f64());
+}
+
+/// `transcribe_call(call_id)` — slice 3.3. Routes through the AI
+/// dispatcher at capability `ai.asr`, so the caller doesn't pick a
+/// plugin. The audio source is the call's recording — which today
+/// is only available when the operator passed `audio_base64` on the
+/// arguments payload. A dedicated recording store (slice 3.4) will
+/// let this tool self-resolve audio from the call id alone.
+pub struct TranscribeCallTool;
+
+#[async_trait]
+impl Tool for TranscribeCallTool {
+    fn name(&self) -> &'static str {
+        "transcribe_call"
+    }
+
+    fn description(&self) -> &'static str {
+        "Transcribe a call's audio via the best-fit `ai.asr` provider. \
+         Pass `audio_base64` alongside `call_id` until the recording \
+         store lands (slice 3.4); routes through the AI dispatcher."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "call_id":      { "type": "string", "description": "SIP Call-ID." },
+                "audio_base64": { "type": "string",
+                                  "description": "PCM16 LE audio bytes, base64-encoded. Required until \
+                                                  the recording store lands." },
+                "sample_rate":  { "type": "integer", "description": "Sample rate of the audio (default 8000)." },
+                "language":     { "type": "string",  "description": "BCP-47 tag or `auto`." },
+                "controls":     { "type": "object",  "description": "Provider-specific controls." }
+            },
+            "required": ["call_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let started = Instant::now();
+        let result = transcribe_call_inner(&args, ctx).await;
+        observe_pipeline(ctx, "transcribe_call", started.elapsed());
+        result
+    }
+}
+
+async fn transcribe_call_inner(args: &Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+    let call_id = args
+        .get("call_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::InvalidArguments("call_id required".into()))?;
+    let audio = resolve_audio_base64(call_id, args, ctx)?;
+
+    let dispatcher = smiths_core::AiDispatcher::new(Arc::clone(&ctx.plugins));
+    let params = json!({
+        "audio_base64": audio,
+        "sample_rate":  args.get("sample_rate"),
+        "language":     args.get("language"),
+        "controls":     args.get("controls"),
+    });
+    match dispatcher.invoke("ai.asr", "transcribe", params).await {
+        Ok(v) => {
+            let text = v
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            Ok(json!({
+                "call_id":   call_id,
+                "transcript": text,
+                "raw":        v,
+            }))
+        }
+        Err(smiths_core::DispatchError::NoProvider(cap)) => Err(ToolError::NotFound(format!(
+            "no `{cap}` provider is loaded — install an ai.asr plugin"
+        ))),
+        Err(e @ smiths_core::DispatchError::AllFailed { .. }) => {
+            Err(ToolError::Internal(e.to_string()))
+        }
+    }
+}
+
+/// `summarize_call(call_id)` — slice 3.3 flagship composite tool.
+/// Pipes ASR over the dispatcher's `ai.asr` lane, then hands the
+/// transcript to `ai.llm.chat` with a summary prompt. Returns both
+/// the transcript (so the agent doesn't re-transcribe) and the
+/// summary text.
+pub struct SummarizeCallTool;
+
+#[async_trait]
+impl Tool for SummarizeCallTool {
+    fn name(&self) -> &'static str {
+        "summarize_call"
+    }
+
+    fn description(&self) -> &'static str {
+        "Transcribe a call via `ai.asr`, then summarize the transcript \
+         via `ai.llm.chat`. Returns `{transcript, summary}`. Pass \
+         `audio_base64` until the recording store lands (slice 3.4)."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "call_id":      { "type": "string", "description": "SIP Call-ID." },
+                "audio_base64": { "type": "string",
+                                  "description": "PCM16 LE audio bytes, base64-encoded." },
+                "sample_rate":  { "type": "integer", "description": "Sample rate (default 8000)." },
+                "language":     { "type": "string",  "description": "BCP-47 tag or `auto`." },
+                "max_sentences":{ "type": "integer", "minimum": 1, "maximum": 20,
+                                  "description": "Target summary length (default 3)." }
+            },
+            "required": ["call_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let started = Instant::now();
+        let result = summarize_call_inner(&args, ctx).await;
+        observe_pipeline(ctx, "summarize_call", started.elapsed());
+        result
+    }
+}
+
+async fn summarize_call_inner(args: &Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+    let call_id = args
+        .get("call_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::InvalidArguments("call_id required".into()))?;
+    let audio = resolve_audio_base64(call_id, args, ctx)?;
+    let max_sentences = args
+        .get("max_sentences")
+        .and_then(Value::as_u64)
+        .unwrap_or(3);
+
+    let dispatcher = smiths_core::AiDispatcher::new(Arc::clone(&ctx.plugins));
+
+    let asr_params = json!({
+        "audio_base64": audio,
+        "sample_rate":  args.get("sample_rate"),
+        "language":     args.get("language"),
+    });
+    let transcript = match dispatcher.invoke("ai.asr", "transcribe", asr_params).await {
+        Ok(v) => v
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        Err(smiths_core::DispatchError::NoProvider(cap)) => {
+            return Err(ToolError::NotFound(format!(
+                "no `{cap}` provider is loaded — install an ai.asr plugin"
+            )));
+        }
+        Err(e @ smiths_core::DispatchError::AllFailed { .. }) => {
+            return Err(ToolError::Internal(format!("asr failed: {e}")));
+        }
+    };
+    if transcript.trim().is_empty() {
+        return Err(ToolError::Internal(
+            "transcription returned empty text; cannot summarize".into(),
+        ));
+    }
+
+    let system = format!(
+        "You are a concise meeting-note taker. Summarize the following \
+         phone-call transcript in {max_sentences} sentence(s) or fewer. \
+         Preserve action items and proper nouns. Reply with the summary \
+         text only — no preamble."
+    );
+    let llm_params = json!({
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": transcript.clone()},
+        ]
+    });
+    let summary = match dispatcher.invoke("ai.llm.chat", "chat", llm_params).await {
+        Ok(v) => extract_chat_content(&v).unwrap_or_else(|| v.to_string()),
+        Err(smiths_core::DispatchError::NoProvider(cap)) => {
+            return Err(ToolError::NotFound(format!(
+                "no `{cap}` provider is loaded — install an ai.llm.chat plugin"
+            )));
+        }
+        Err(e @ smiths_core::DispatchError::AllFailed { .. }) => {
+            return Err(ToolError::Internal(format!("llm failed: {e}")));
+        }
+    };
+
+    Ok(json!({
+        "call_id":    call_id,
+        "transcript": transcript,
+        "summary":    summary,
+    }))
+}
+
+/// `translate` — render `text` into language `to` by routing through
+/// the [`AiDispatcher`] at capability `ai.llm.chat` (slice 3.1, P4).
+///
+/// The caller does not pick a plugin; the dispatcher selects the
+/// highest-priority healthy `ai.llm.chat` provider, failing over on
+/// timeout or error. This is the canonical "built on top of the
+/// dispatcher" tool — other multi-plugin helpers should follow the
+/// same shape instead of hand-rolling provider selection.
+pub struct TranslateTool;
+
+#[async_trait]
+impl Tool for TranslateTool {
+    fn name(&self) -> &'static str {
+        "translate"
+    }
+
+    fn description(&self) -> &'static str {
+        "Translate `text` into language `to` (BCP-47 tag or natural name) \
+         via the best-fit `ai.llm.chat` provider. Routes through the AI \
+         dispatcher with automatic fail-over."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "Source text to translate." },
+                "to":   { "type": "string",
+                          "description": "Target language (BCP-47 like `es-MX` or a name like `Spanish`)." },
+                "from": { "type": "string",
+                          "description": "Optional source-language hint. Omit for auto-detect." }
+            },
+            "required": ["text", "to"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let text = args
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("text required".into()))?;
+        let to = args
+            .get("to")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("to required".into()))?;
+        let from = args.get("from").and_then(Value::as_str);
+
+        let source_clause = from.map_or_else(
+            || "Detect the source language.".to_owned(),
+            |f| format!("The source language is {f}."),
+        );
+        let prompt = format!(
+            "{source_clause} Translate the following text into {to}. \
+             Return only the translation — no commentary, no quoting, no \
+             language tags.\n\nText:\n{text}"
+        );
+
+        let dispatcher = AiDispatcher::new(Arc::clone(&ctx.plugins));
+        let params = json!({
+            "messages": [
+                {"role": "system", "content":
+                    "You are a professional translator. Preserve formatting \
+                     and proper nouns. Reply with the translated text only."},
+                {"role": "user", "content": prompt}
+            ]
+        });
+        match dispatcher.invoke("ai.llm.chat", "chat", params).await {
+            Ok(v) => {
+                let translated = extract_chat_content(&v).unwrap_or_else(|| v.to_string());
+                Ok(json!({
+                    "text":         text,
+                    "to":           to,
+                    "from":         from,
+                    "translated":   translated,
+                    "raw":          v,
+                }))
+            }
+            Err(DispatchError::NoProvider(cap)) => Err(ToolError::NotFound(format!(
+                "no `{cap}` provider is loaded — install an ai.llm.chat plugin"
+            ))),
+            Err(e @ DispatchError::AllFailed { .. }) => Err(ToolError::Internal(e.to_string())),
+        }
+    }
+}
+
+/// Pull the assistant's textual reply out of whatever shape the
+/// `ai.llm.chat` plugin returned. Accepts both the direct
+/// `{content: "..."}` and nested `{message: {content: "..."}}` forms —
+/// different backends (Ollama, OpenAI-compat) normalize differently.
+fn extract_chat_content(v: &Value) -> Option<String> {
+    if let Some(s) = v.get("content").and_then(Value::as_str) {
+        return Some(s.to_owned());
+    }
+    if let Some(s) = v
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+    {
+        return Some(s.to_owned());
+    }
+    if let Some(s) = v
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+    {
+        return Some(s.to_owned());
+    }
+    None
 }
 
 /// `list_cdr` — bounded query over the CDR store (slice 2.3, P23).
@@ -1248,7 +1732,7 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 15);
+        assert_eq!(reg.len(), 19);
         for name in [
             "list_calls",
             "get_call_status",
@@ -1265,9 +1749,133 @@ mod tests {
             "reload_plugin",
             "list_cdr",
             "send_dtmf",
+            "translate",
+            "transcribe_call",
+            "summarize_call",
+            "search_calls_semantic",
         ] {
             assert!(reg.get(name).is_some(), "missing tool: {name}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_calls_semantic_without_vector_store_is_not_found() {
+        let (ctx, _c) = ctx_with_state();
+        let err = SearchCallsSemanticTool
+            .call(json!({"query": "billing issue"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_calls_semantic_rejects_empty_query() {
+        let (ctx, _c) = ctx_with_state();
+        let err = SearchCallsSemanticTool
+            .call(json!({"query": "   "}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn search_extracts_from_mock_shape() {
+        let v = json!({"vectors": [[0.1, 0.2, 0.3]]});
+        assert_eq!(extract_first_embedding(&v), Some(vec![0.1, 0.2, 0.3]));
+    }
+
+    #[test]
+    fn search_extracts_from_openai_data_shape() {
+        let v = json!({
+            "data": [{"embedding": [1.0, 2.0, 3.0]}],
+            "model": "text-embedding-3-small"
+        });
+        assert_eq!(extract_first_embedding(&v), Some(vec![1.0, 2.0, 3.0]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn translate_without_provider_is_not_found() {
+        let (ctx, _c) = ctx_with_state();
+        let err = TranslateTool
+            .call(json!({"text": "hello", "to": "es"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn translate_rejects_missing_target() {
+        let (ctx, _c) = ctx_with_state();
+        let err = TranslateTool
+            .call(json!({"text": "hello"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn translate_extracts_from_flat_content() {
+        let v = json!({"content": "hola"});
+        assert_eq!(extract_chat_content(&v).as_deref(), Some("hola"));
+    }
+
+    #[test]
+    fn translate_extracts_from_nested_message() {
+        // Ollama-style response.
+        let v = json!({"message": {"role": "assistant", "content": "hola"}});
+        assert_eq!(extract_chat_content(&v).as_deref(), Some("hola"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transcribe_call_requires_audio_until_recording_store_lands() {
+        let (ctx, _c) = ctx_with_state();
+        // call_id alone = NotFound with guidance, not a panic.
+        let err = TranscribeCallTool
+            .call(json!({"call_id": "abc"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transcribe_call_without_asr_provider_is_not_found() {
+        let (ctx, _c) = ctx_with_state();
+        let err = TranscribeCallTool
+            .call(json!({"call_id": "abc", "audio_base64": ""}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn summarize_call_requires_audio() {
+        let (ctx, _c) = ctx_with_state();
+        let err = SummarizeCallTool
+            .call(json!({"call_id": "abc"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn summarize_call_rejects_missing_call_id() {
+        let (ctx, _c) = ctx_with_state();
+        let err = SummarizeCallTool
+            .call(json!({"audio_base64": "AAA"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn translate_extracts_from_choices() {
+        // OpenAI-compatible response.
+        let v = json!({
+            "choices": [
+                {"message": {"role": "assistant", "content": "hola"}}
+            ]
+        });
+        assert_eq!(extract_chat_content(&v).as_deref(), Some("hola"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

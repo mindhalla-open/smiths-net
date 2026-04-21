@@ -72,6 +72,40 @@ pub struct PluginOutcomeLabel {
     pub outcome: String,
 }
 
+/// `smiths_ai_failovers_total{capability="..."}` label (slice 3.1).
+/// One increment per dispatcher fail-over — the first-choice provider
+/// errored out and the dispatcher moved to the next candidate.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AiCapabilityLabel {
+    /// Capability the dispatcher was routing — e.g. `"ai.llm.chat"`.
+    pub capability: String,
+}
+
+/// `smiths_ai_pipeline_duration_seconds{pipeline}` label (slice 3.3).
+/// Histogram keyed by a short pipeline name (`"transcribe_call"`,
+/// `"summarize_call"`) — the composite tools observe their own
+/// wall-clock end-to-end. Separate from `tool_duration_seconds` so
+/// operators can grep per-pipeline latency without wading through
+/// every MCP tool's timing.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AiPipelineLabel {
+    /// Pipeline name (`"transcribe_call"` / `"summarize_call"` / …).
+    pub pipeline: String,
+}
+
+/// `smiths_ai_tokens_total{provider, dir}` label (slice 3.2). The
+/// dispatcher scrapes `usage.{input,output}_tokens` off the plugin's
+/// response and credits the counters — zero-cost when a plugin
+/// doesn't report usage. Operators divide by wall-clock to get
+/// tokens/sec; multiply by the vendor rate card to get `$/day`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AiTokensLabel {
+    /// Plugin name as declared in its manifest (e.g. `"ai-llm-openai"`).
+    pub provider: String,
+    /// `"input"` (prompt tokens) or `"output"` (completion tokens).
+    pub dir: String,
+}
+
 /// `plugin_invoke_duration_seconds{plugin="..."}` / other per-plugin
 /// histograms and counters that only need the plugin-name dimension.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -128,12 +162,35 @@ pub struct Metrics {
     pub plugin_invoke_duration: Family<PluginLabel, Histogram, fn() -> Histogram>,
     /// Sidecar supervisor respawns, keyed by plugin name.
     pub sidecar_restarts: Family<PluginLabel, Counter>,
+    /// Dispatcher fail-overs (slice 3.1): cumulative count of times
+    /// the AI dispatcher fell through to the next candidate because
+    /// the first-choice provider timed out, errored, or was
+    /// breaker-open. Keyed by capability so operators can tell LLM
+    /// failures from TTS failures at a glance.
+    pub ai_failovers: Family<AiCapabilityLabel, Counter>,
+    /// Dispatcher invocations (slice 3.1): one increment per
+    /// `AiDispatcher::invoke` call, keyed by capability. Divide
+    /// `ai_failovers / ai_invocations` for the per-capability
+    /// failure-rate.
+    pub ai_invocations: Family<AiCapabilityLabel, Counter>,
+    /// AI token consumption (slice 3.2), credited on every
+    /// dispatcher invocation that returns with a `usage.*_tokens`
+    /// block. Labelled by `provider` (plugin name) and `dir` (`input`
+    /// / `output`). Zero-cost for providers that don't report usage
+    /// — the counter simply stays at 0 for that label combination.
+    pub ai_tokens: Family<AiTokensLabel, Counter>,
+    /// End-to-end wall-clock of composite AI pipelines (slice 3.3)
+    /// like `transcribe_call` and `summarize_call`. Observed
+    /// once per tool invocation regardless of how many dispatcher
+    /// hops the pipeline made.
+    pub ai_pipeline_duration: Family<AiPipelineLabel, Histogram, fn() -> Histogram>,
 }
 
 impl Metrics {
     /// Register every metric on `registry` and return a cheaply-
     /// clonable handle.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn register(registry: &mut Registry) -> Arc<Self> {
         let sip_requests = Family::<SipMethodLabel, Counter>::default();
         let sip_responses = Family::<SipCodeLabel, Counter>::default();
@@ -151,6 +208,11 @@ impl Metrics {
         let plugin_invoke_duration: Family<PluginLabel, Histogram, fn() -> Histogram> =
             Family::new_with_constructor(default_histogram);
         let sidecar_restarts = Family::<PluginLabel, Counter>::default();
+        let ai_failovers = Family::<AiCapabilityLabel, Counter>::default();
+        let ai_invocations = Family::<AiCapabilityLabel, Counter>::default();
+        let ai_tokens = Family::<AiTokensLabel, Counter>::default();
+        let ai_pipeline_duration: Family<AiPipelineLabel, Histogram, fn() -> Histogram> =
+            Family::new_with_constructor(default_histogram);
 
         registry.register(
             "sip_requests",
@@ -220,6 +282,26 @@ impl Metrics {
             "Sidecar supervisor respawns, per plugin",
             sidecar_restarts.clone(),
         );
+        registry.register(
+            "smiths_ai_failovers",
+            "AI dispatcher fail-overs, per capability",
+            ai_failovers.clone(),
+        );
+        registry.register(
+            "smiths_ai_invocations",
+            "AI dispatcher invocations, per capability",
+            ai_invocations.clone(),
+        );
+        registry.register(
+            "smiths_ai_tokens",
+            "AI token consumption, per provider and direction (input / output)",
+            ai_tokens.clone(),
+        );
+        registry.register(
+            "smiths_ai_pipeline_duration_seconds",
+            "End-to-end wall-clock of composite AI pipelines (e.g. transcribe_call, summarize_call).",
+            ai_pipeline_duration.clone(),
+        );
 
         Arc::new(Self {
             sip_requests,
@@ -236,6 +318,10 @@ impl Metrics {
             plugin_invocations,
             plugin_invoke_duration,
             sidecar_restarts,
+            ai_failovers,
+            ai_invocations,
+            ai_tokens,
+            ai_pipeline_duration,
         })
     }
 

@@ -18,10 +18,12 @@ thiserror         = { workspace = true }
 tracing           = { workspace = true }
 rcgen             = { workspace = true }
 sha2              = { workspace = true }
+hex               = { workspace = true }
 
 [dev-dependencies]
-tokio   = { workspace = true, features = ["macros", "test-util"] }
-figment = { workspace = true, features = ["test"] }
+tokio    = { workspace = true, features = ["macros", "test-util"] }
+figment  = { workspace = true, features = ["test"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
