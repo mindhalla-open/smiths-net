@@ -125,7 +125,7 @@ impl CapabilityDescriptor {
     /// Validate common-envelope invariants. Returns a descriptive
     /// error when the plugin is confused.
     ///
-    /// Capabilities live in one of two namespaces today:
+    /// Capabilities live in one of three namespaces today:
     ///
     /// - `ai.*` — AI providers (LLM, TTS, ASR, embed). The original
     ///   plugin tier.
@@ -133,13 +133,21 @@ impl CapabilityDescriptor {
     ///   so a sidecar plugin can declare itself as something that
     ///   receives per-packet RTP from the engine (e.g. the deferred
     ///   `dtmf-inband` Python sidecar). See [`MEDIA_STREAMING_RTP`].
+    /// - `storage.*` — pluggable backends for the storage traits
+    ///   (slice 3.4). `storage.vector` backs
+    ///   `search_calls_semantic`; `storage.recording` backs audio
+    ///   retention. See [`STORAGE_VECTOR`] and
+    ///   [`STORAGE_RECORDING`].
     pub fn validate(&self) -> Result<(), String> {
         if self.capability.is_empty() {
             return Err("capability is empty".into());
         }
-        if !self.capability.starts_with("ai.") && !self.capability.starts_with("media.") {
+        if !self.capability.starts_with("ai.")
+            && !self.capability.starts_with("media.")
+            && !self.capability.starts_with("storage.")
+        {
             return Err(format!(
-                "capability `{}` is outside the `ai.*` / `media.*` namespaces",
+                "capability `{}` is outside the `ai.*` / `media.*` / `storage.*` namespaces",
                 self.capability
             ));
         }
@@ -169,6 +177,19 @@ impl CapabilityDescriptor {
 /// - **Recording sidecars** — write each frame to a rolling file
 ///   or object store (P23 `storage.recording` follow-on).
 pub const MEDIA_STREAMING_RTP: &str = "media.streaming_rtp";
+
+/// Capability token declaring a plugin that serves an embedding-
+/// indexed vector store (slice 3.4). The MCP `search_calls_semantic`
+/// tool routes through this seam to back its top-k queries. The
+/// reference sidecar is `store-qdrant` (Qdrant HTTP API wrapper).
+pub const STORAGE_VECTOR: &str = "storage.vector";
+
+/// Capability token declaring a plugin that serves per-call audio
+/// retention (slice 3.4). The filesystem default ships in-tree;
+/// operators pointing `[storage.recording] backend = "sidecar"` at
+/// an S3-compatible sidecar route through this seam. The reference
+/// sidecar is `store-s3-recording`.
+pub const STORAGE_RECORDING: &str = "storage.recording";
 
 // ---------------------------------------------------------------------
 // Control-schema validation
@@ -752,6 +773,41 @@ mod tests {
             extra: BTreeMap::new(),
         };
         assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_storage_vector_capability() {
+        // Slice 3.4: `storage.*` joins `ai.*` / `media.*` as a
+        // recognized plugin capability namespace so vector /
+        // recording sidecars validate.
+        let d = CapabilityDescriptor {
+            capability: STORAGE_VECTOR.into(),
+            plugin: "store-qdrant".into(),
+            model_id: String::new(),
+            abi: "1.0".into(),
+            description: "Qdrant vector store".into(),
+            latency_ms: None,
+            concurrency: None,
+            priority: DEFAULT_PRIORITY,
+            extra: BTreeMap::new(),
+        };
+        d.validate().expect("storage.vector must validate");
+    }
+
+    #[test]
+    fn accepts_storage_recording_capability() {
+        let d = CapabilityDescriptor {
+            capability: STORAGE_RECORDING.into(),
+            plugin: "store-s3-recording".into(),
+            model_id: String::new(),
+            abi: "1.0".into(),
+            description: "S3-compatible recording store".into(),
+            latency_ms: None,
+            concurrency: None,
+            priority: DEFAULT_PRIORITY,
+            extra: BTreeMap::new(),
+        };
+        d.validate().expect("storage.recording must validate");
     }
 
     #[test]

@@ -223,12 +223,61 @@ async fn main() -> anyhow::Result<()> {
     let mut tool_ctx = ToolContext::new(
         control_state,
         ai_registry_dyn,
-        config_snapshot,
+        config_snapshot.clone(),
         Arc::clone(&media_fabric),
     )
     .with_metrics(Arc::clone(&metrics));
     if let Some(o) = originator.clone() {
         tool_ctx = tool_ctx.with_originator(o);
+    }
+
+    // Slice 3.4 storage wiring. Today the CLI supports `memory` for
+    // vectors and `fs` for recordings natively; `sidecar` variants
+    // resolve at a follow-on slice when the adapter lands.
+    match config_snapshot.storage.vector.backend {
+        smiths_core::VectorBackend::Memory => {
+            let store: Arc<dyn smiths_core::VectorStore> =
+                Arc::new(smiths_core::MemoryVectorStore::new());
+            tool_ctx = tool_ctx.with_vector(store);
+            tracing::info!("vector store: in-memory");
+        }
+        smiths_core::VectorBackend::None => {}
+        smiths_core::VectorBackend::Sidecar => {
+            tracing::warn!(
+                plugin = ?config_snapshot.storage.vector.plugin,
+                "storage.vector = sidecar: adapter not yet wired; \
+                 search_calls_semantic will return NotFound"
+            );
+        }
+    }
+    match config_snapshot.storage.recording.backend {
+        smiths_core::RecordingBackend::Fs => {
+            let root = &config_snapshot.storage.recording.fs.root;
+            match smiths_core::FsRecordingStore::new(root) {
+                Ok(store) => {
+                    let handle: Arc<dyn smiths_core::RecordingStore> = Arc::new(store);
+                    tool_ctx = tool_ctx.with_recording(Arc::clone(&handle));
+                    tracing::info!(root = %root.display(), "recording store: filesystem");
+                    spawn_recording_retention_sweeper(
+                        Arc::clone(&handle),
+                        config_snapshot.storage.recording.retention_days,
+                        shutdown.token(),
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    root = %root.display(), ?e,
+                    "recording store: failed to initialize; continuing without"
+                ),
+            }
+        }
+        smiths_core::RecordingBackend::None => {}
+        smiths_core::RecordingBackend::Sidecar => {
+            tracing::warn!(
+                plugin = ?config_snapshot.storage.recording.plugin,
+                "storage.recording = sidecar: adapter not yet wired; \
+                 pipeline tools still accept inline `audio_base64`"
+            );
+        }
     }
 
     // MCP stdio is now additive: it runs alongside SIP / health / A2A
@@ -450,6 +499,43 @@ struct SpawnedSipUdp {
     /// Populated only on the bind we designate as the outbound-call
     /// origin. `None` for every other UDP listener.
     uac: Option<Arc<UacClient<UdpTransport>>>,
+}
+
+/// Fire-and-forget retention sweep for the filesystem recording
+/// store (slice 3.4). Runs once at boot then every hour until
+/// shutdown fires. `retention_days = 0` disables the sweep entirely
+/// so operators who want indefinite retention opt in by leaving
+/// the field at its default.
+fn spawn_recording_retention_sweeper(
+    store: Arc<dyn smiths_core::RecordingStore>,
+    retention_days: u32,
+    cancel: CancellationToken,
+) {
+    if retention_days == 0 {
+        return;
+    }
+    let max_age = std::time::Duration::from_secs(u64::from(retention_days) * 86_400);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                _ = ticker.tick() => {
+                    match store.prune_older_than(max_age) {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(removed = n, retention_days,
+                                "recording retention sweep removed expired blobs");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(?e, "recording retention sweep failed");
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

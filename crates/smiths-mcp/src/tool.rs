@@ -17,7 +17,7 @@ use smiths_core::Metrics;
 use smiths_core::ai::AiRegistry;
 use smiths_core::call::{CallOriginator, RegistrationView};
 use smiths_core::media::MediaFabric;
-use smiths_core::storage::CdrStore;
+use smiths_core::storage::{CdrStore, RecordingStore, VectorStore};
 use thiserror::Error;
 
 use crate::control::ControlState;
@@ -57,6 +57,14 @@ pub struct ToolContext {
     /// pipeline tools) fall back to `Metrics::noop()` when absent
     /// so the observe call still goes somewhere reasonable.
     pub metrics: Option<Arc<Metrics>>,
+    /// Vector store (slice 3.4). `None` when `[storage.vector]
+    /// backend = "none"`; `search_calls_semantic` returns a clean
+    /// `NotFound` in that case.
+    pub vector: Option<Arc<dyn VectorStore>>,
+    /// Recording store (slice 3.4). `None` when `[storage.recording]
+    /// backend = "none"`; `transcribe_call` / `summarize_call` then
+    /// require the `audio_base64` argument as before.
+    pub recording: Option<Arc<dyn RecordingStore>>,
 }
 
 impl ToolContext {
@@ -77,7 +85,26 @@ impl ToolContext {
             registrations: None,
             cdr: None,
             metrics: None,
+            vector: None,
+            recording: None,
         }
+    }
+
+    /// Attach a [`VectorStore`] so `search_calls_semantic` is live.
+    /// Without one the tool returns a clean `NotFound` naming the
+    /// config knob the operator hasn't flipped.
+    #[must_use]
+    pub fn with_vector(mut self, store: Arc<dyn VectorStore>) -> Self {
+        self.vector = Some(store);
+        self
+    }
+
+    /// Attach a [`RecordingStore`] so the pipeline tools can
+    /// resolve audio from a bare `call_id`.
+    #[must_use]
+    pub fn with_recording(mut self, store: Arc<dyn RecordingStore>) -> Self {
+        self.recording = Some(store);
+        self
     }
 
     /// Attach the engine's metrics handle so pipeline tools can

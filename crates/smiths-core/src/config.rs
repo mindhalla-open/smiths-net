@@ -115,6 +115,122 @@ pub struct StorageConfig {
     pub backend: StorageBackend,
     /// SQLite-specific settings. Ignored when `backend != "sqlite"`.
     pub sqlite: SqliteStorageConfig,
+    /// Embedding-indexed search surface (slice 3.4). Off by default
+    /// — `search_calls_semantic` returns a clean `NotFound` when
+    /// this is `none`.
+    pub vector: VectorStoreConfig,
+    /// Per-call audio retention (slice 3.4). Off by default; the
+    /// filesystem backend makes `transcribe_call` / `summarize_call`
+    /// self-resolve audio from a bare `call_id`.
+    pub recording: RecordingStoreConfig,
+}
+
+/// `[storage.vector]` TOML block — vector-index backend selection.
+///
+/// ```toml
+/// [storage.vector]
+/// backend = "memory"        # "none" | "memory" | "sidecar"
+///
+/// # When backend = "sidecar":
+/// # plugin = "store-qdrant"
+/// ```
+///
+/// `memory` is the in-process [`crate::MemoryVectorStore`] —
+/// good for tests and single-node deployments without durability.
+/// `sidecar` delegates to a loaded plugin that advertises the
+/// `storage.vector` capability (today: `store-qdrant`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VectorStoreConfig {
+    /// Which backend to wire up.
+    pub backend: VectorBackend,
+    /// When `backend = "sidecar"`, the plugin name that serves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+}
+
+/// Vector-store backend selector.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VectorBackend {
+    /// No vector store wired. `search_calls_semantic` returns
+    /// `NotFound`.
+    #[default]
+    None,
+    /// In-process [`crate::MemoryVectorStore`]. Loses every record
+    /// on restart; appropriate for tests + ephemeral dev loops.
+    Memory,
+    /// Delegates to a loaded plugin via the `storage.vector`
+    /// capability seam. The plugin name is taken from
+    /// [`VectorStoreConfig::plugin`].
+    Sidecar,
+}
+
+/// `[storage.recording]` TOML block — per-call audio retention.
+///
+/// ```toml
+/// [storage.recording]
+/// backend        = "fs"          # "none" | "fs" | "sidecar"
+/// retention_days = 30            # 0 disables retention sweeps
+///
+/// [storage.recording.fs]
+/// root = "/var/lib/smiths-net/recordings"
+/// ```
+///
+/// The filesystem backend writes `<hex(call_id)>.wav` +
+/// `<hex(call_id)>.cid` sidecar files. Sidecar backends (S3,
+/// Azure Blob, GCS) slot in the same way the vector sidecar does
+/// — by advertising the `storage.recording` capability.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecordingStoreConfig {
+    /// Which backend to wire up.
+    pub backend: RecordingBackend,
+    /// Filesystem-specific settings. Ignored unless `backend = "fs"`.
+    pub fs: FsRecordingConfig,
+    /// Retention in days. `0` disables the periodic sweeper; the
+    /// engine then only prunes when an operator calls `truncate`
+    /// equivalents manually. Non-zero values start a once-per-hour
+    /// sweep that deletes blobs whose on-disk mtime is older.
+    pub retention_days: u32,
+    /// When `backend = "sidecar"`, the plugin name that serves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
+}
+
+/// Recording backend selector.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordingBackend {
+    /// No audio retention. Post-processing tools that need audio
+    /// (`transcribe_call`, `summarize_call`) still work via the
+    /// `audio_base64` override but can't self-resolve from a
+    /// bare `call_id`.
+    #[default]
+    None,
+    /// [`crate::FsRecordingStore`] at [`FsRecordingConfig::root`].
+    Fs,
+    /// Delegates to a loaded plugin via the `storage.recording`
+    /// capability seam (today: `store-s3-recording`).
+    Sidecar,
+}
+
+/// `[storage.recording.fs]` settings.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FsRecordingConfig {
+    /// Root directory for stored recordings. Auto-created on
+    /// first write; operators should point this at a persistent
+    /// volume in production.
+    pub root: std::path::PathBuf,
+}
+
+impl Default for FsRecordingConfig {
+    fn default() -> Self {
+        Self {
+            root: std::path::PathBuf::from("smiths-recordings"),
+        }
+    }
 }
 
 /// Storage backend selector.

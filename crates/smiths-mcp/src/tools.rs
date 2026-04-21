@@ -48,7 +48,160 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(TranslateTool);
     reg.register(TranscribeCallTool);
     reg.register(SummarizeCallTool);
+    reg.register(SearchCallsSemanticTool);
     reg
+}
+
+/// `search_calls_semantic(query, k)` — slice 3.4. Embeds the
+/// natural-language `query` via the `ai.embed` capability, then runs
+/// a top-k search against the wired `[storage.vector]` backend.
+/// Returns every hit's `id`, `score`, and indexed `metadata` — the
+/// caller typically seeded the metadata with `{call_id, transcript,
+/// started_at_unix, ...}` when upserting, so a hit is immediately
+/// actionable without a second lookup.
+pub struct SearchCallsSemanticTool;
+
+#[async_trait]
+impl Tool for SearchCallsSemanticTool {
+    fn name(&self) -> &'static str {
+        "search_calls_semantic"
+    }
+
+    fn description(&self) -> &'static str {
+        "Embed `query` via `ai.embed` and return the top-`k` nearest \
+         indexed records from the vector store. Metadata attached at \
+         upsert time (call_id, transcript, ...) rides back on every hit."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Natural-language query." },
+                "k":     { "type": "integer", "minimum": 1, "maximum": 50,
+                           "description": "Top-k hits (default 5)." },
+                "plugin": { "type": "string",
+                            "description": "Override embed plugin (optional; dispatcher picks otherwise)." }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let started = Instant::now();
+        let result = search_calls_semantic_inner(&args, ctx).await;
+        observe_pipeline(ctx, "search_calls_semantic", started.elapsed());
+        result
+    }
+}
+
+async fn search_calls_semantic_inner(args: &Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::InvalidArguments("query required".into()))?;
+    if query.trim().is_empty() {
+        return Err(ToolError::InvalidArguments(
+            "query must not be empty".into(),
+        ));
+    }
+    let k = usize::try_from(args.get("k").and_then(Value::as_u64).unwrap_or(5))
+        .map_err(|_| ToolError::InvalidArguments("k out of range".into()))?;
+
+    let Some(vector_store) = &ctx.vector else {
+        return Err(ToolError::NotFound(
+            "no `[storage.vector]` backend is wired; \
+             set `backend = \"memory\"` (or `\"sidecar\"`) to enable semantic search"
+                .into(),
+        ));
+    };
+
+    let dispatcher = smiths_core::AiDispatcher::new(Arc::clone(&ctx.plugins));
+    let embed_params = json!({ "inputs": [query] });
+    let embed = match dispatcher.invoke("ai.embed", "embed", embed_params).await {
+        Ok(v) => v,
+        Err(smiths_core::DispatchError::NoProvider(cap)) => {
+            return Err(ToolError::NotFound(format!(
+                "no `{cap}` provider is loaded — install an ai.embed plugin"
+            )));
+        }
+        Err(e @ smiths_core::DispatchError::AllFailed { .. }) => {
+            return Err(ToolError::Internal(format!("embed failed: {e}")));
+        }
+    };
+    let vector = extract_first_embedding(&embed)
+        .ok_or_else(|| ToolError::Internal(format!("embed response shape unexpected: {embed}")))?;
+
+    let hits = vector_store
+        .search(&vector, k)
+        .map_err(|e| ToolError::Internal(format!("vector search: {e}")))?;
+
+    Ok(json!({
+        "query": query,
+        "k":     k,
+        "count": hits.len(),
+        "hits":  hits,
+    }))
+}
+
+/// Pull the first embedding vector out of whatever shape the
+/// `ai.embed` plugin returned. Accepts `{vectors: [[...], ...]}`
+/// (in-tree mock), `{embeddings: [...]}` (OpenAI-compat), and
+/// `{data: [{embedding: [...]}]}` (raw `OpenAI`).
+fn extract_first_embedding(v: &Value) -> Option<Vec<f32>> {
+    let arr = v
+        .get("vectors")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first().and_then(Value::as_array))
+        .or_else(|| {
+            v.get("embeddings")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first().and_then(Value::as_array))
+        })
+        .or_else(|| {
+            v.get("data")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(|e| e.get("embedding"))
+                .and_then(Value::as_array)
+        })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for x in arr {
+        out.push(x.as_f64()? as f32);
+    }
+    Some(out)
+}
+
+/// Resolve the audio payload for the pipeline tools. Inline
+/// `audio_base64` wins; otherwise the recording store is consulted;
+/// otherwise a `NotFound` with a targeted error surfaces so the
+/// caller sees *exactly* which config knob is missing.
+fn resolve_audio_base64(
+    call_id: &str,
+    args: &Value,
+    ctx: &ToolContext,
+) -> Result<String, ToolError> {
+    use base64::Engine as _;
+
+    if let Some(inline) = args.get("audio_base64").and_then(Value::as_str) {
+        return Ok(inline.to_owned());
+    }
+    let Some(store) = &ctx.recording else {
+        return Err(ToolError::NotFound(
+            "no `[storage.recording]` backend is wired; \
+             pass `audio_base64` inline on this call"
+                .into(),
+        ));
+    };
+    let bytes = store.get(call_id).map_err(|e| match e {
+        smiths_core::storage::StorageError::NotFound(_) => ToolError::NotFound(format!(
+            "no recording on disk for call `{call_id}`; \
+             pass `audio_base64` inline or check the retention window"
+        )),
+        other => ToolError::Internal(format!("recording lookup: {other}")),
+    })?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 /// Observe one pipeline's end-to-end wall clock. Falls through to a
@@ -118,13 +271,7 @@ async fn transcribe_call_inner(args: &Value, ctx: &ToolContext) -> Result<Value,
         .get("call_id")
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::InvalidArguments("call_id required".into()))?;
-    let Some(audio) = args.get("audio_base64").and_then(Value::as_str) else {
-        return Err(ToolError::NotFound(
-            "call recordings are served by the forthcoming `storage.recording` backend \
-             (slice 3.4); pass `audio_base64` inline until it ships"
-                .into(),
-        ));
-    };
+    let audio = resolve_audio_base64(call_id, args, ctx)?;
 
     let dispatcher = smiths_core::AiDispatcher::new(Arc::clone(&ctx.plugins));
     let params = json!({
@@ -204,13 +351,7 @@ async fn summarize_call_inner(args: &Value, ctx: &ToolContext) -> Result<Value, 
         .get("call_id")
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::InvalidArguments("call_id required".into()))?;
-    let Some(audio) = args.get("audio_base64").and_then(Value::as_str) else {
-        return Err(ToolError::NotFound(
-            "call recordings are served by the forthcoming `storage.recording` backend \
-             (slice 3.4); pass `audio_base64` inline until it ships"
-                .into(),
-        ));
-    };
+    let audio = resolve_audio_base64(call_id, args, ctx)?;
     let max_sentences = args
         .get("max_sentences")
         .and_then(Value::as_u64)
@@ -1591,7 +1732,7 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 18);
+        assert_eq!(reg.len(), 19);
         for name in [
             "list_calls",
             "get_call_status",
@@ -1611,9 +1752,45 @@ mod tests {
             "translate",
             "transcribe_call",
             "summarize_call",
+            "search_calls_semantic",
         ] {
             assert!(reg.get(name).is_some(), "missing tool: {name}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_calls_semantic_without_vector_store_is_not_found() {
+        let (ctx, _c) = ctx_with_state();
+        let err = SearchCallsSemanticTool
+            .call(json!({"query": "billing issue"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_calls_semantic_rejects_empty_query() {
+        let (ctx, _c) = ctx_with_state();
+        let err = SearchCallsSemanticTool
+            .call(json!({"query": "   "}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn search_extracts_from_mock_shape() {
+        let v = json!({"vectors": [[0.1, 0.2, 0.3]]});
+        assert_eq!(extract_first_embedding(&v), Some(vec![0.1, 0.2, 0.3]));
+    }
+
+    #[test]
+    fn search_extracts_from_openai_data_shape() {
+        let v = json!({
+            "data": [{"embedding": [1.0, 2.0, 3.0]}],
+            "model": "text-embedding-3-small"
+        });
+        assert_eq!(extract_first_embedding(&v), Some(vec![1.0, 2.0, 3.0]));
     }
 
     #[tokio::test(flavor = "multi_thread")]

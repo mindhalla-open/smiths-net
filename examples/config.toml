@@ -65,6 +65,26 @@ backend = "none"   # "none" | "sqlite"
 # [storage.sqlite]
 # path = "/var/lib/smiths-net/storage.db"
 
+# Vector search (slice 3.4 / P23). `memory` is the in-process
+# cosine-similarity store — loses every record on restart, good for
+# dev loops. `sidecar` delegates to a plugin advertising
+# `storage.vector` (see plugins/examples/store-qdrant).
+[storage.vector]
+backend = "none"   # "none" | "memory" | "sidecar"
+# plugin  = "store-qdrant"
+
+# Per-call audio retention (slice 3.4 / P23). `fs` writes
+# <hex(call_id)>.wav files under `[storage.recording.fs] root`.
+# Operators who enable it unlock the `call_id`-only path on
+# `transcribe_call` / `summarize_call` (no more inline audio_base64).
+[storage.recording]
+backend        = "none"   # "none" | "fs" | "sidecar"
+retention_days = 0        # 0 disables the hourly sweeper; >0 deletes blobs older than N days
+# plugin = "store-s3-recording"
+
+# [storage.recording.fs]
+# root = "/var/lib/smiths-net/recordings"
+
 # Media-plane tunings. `inband_dtmf` (slice 2.5) runs the Goertzel
 # detector on plaintext PCMU frames and surfaces keypresses on the
 # bus as `SipEvent::Dtmf` alongside the always-on RFC 4733 path.

@@ -5,6 +5,89 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.0] - 2026-04-21
+
+Slice 3.4 — Vector + Recording storage. Two new pluggable storage
+traits join `CdrStore` / `KvStore`: `VectorStore` backs the new
+`search_calls_semantic` MCP tool, and `RecordingStore` unblocks the
+call-id-only path on `transcribe_call` / `summarize_call`. The
+engine ships real Rust impls (in-memory vectors + filesystem
+recordings) and scaffolds sidecars for the hosted backends.
+
+### Added
+
+- **`smiths-core::storage::VectorStore`** — embedding-indexed
+  search with sync `upsert` / `delete` / `search` / `len`. The
+  `MemoryVectorStore` default does NaN-safe cosine similarity,
+  skips dimension-mismatched records on search, and enforces
+  non-empty id/vector at upsert.
+- **`smiths-core::storage::RecordingStore`** — per-call audio
+  retention. The `FsRecordingStore` default writes
+  `<hex(call_id)>.wav` + `<hex(call_id)>.cid` pairs so arbitrary
+  call-ids round-trip through the filesystem and `list()` honestly
+  surfaces the originals. `prune_older_than(Duration)` deletes by
+  mtime — the engine runs it on an hourly sweeper when
+  `[storage.recording] retention_days > 0`.
+- **`[storage.vector]` and `[storage.recording]` config** — each
+  with `backend = "none" | "memory"|"fs" | "sidecar"` and a
+  `plugin` field for the sidecar path. `retention_days` gates the
+  sweeper; `fs.root` points at the recording directory.
+- **Capability namespace `storage.*`** — joins `ai.*` and
+  `media.*` on the plugin manifest validator. Two new tokens:
+  `STORAGE_VECTOR = "storage.vector"` and
+  `STORAGE_RECORDING = "storage.recording"`.
+- **MCP tool `search_calls_semantic(query, k)`** — embeds `query`
+  via the `ai.embed` dispatcher lane, runs top-k against the wired
+  `VectorStore`, returns `{hits: [{id, score, metadata}]}`. Handles
+  three embed response shapes: in-tree `{vectors: [[...]]}`,
+  OpenAI-compat `{embeddings: [...]}`, and raw OpenAI
+  `{data: [{embedding: [...]}]}`. Observed on
+  `smiths_ai_pipeline_duration_seconds{pipeline="search_calls_semantic"}`.
+- **Pipeline tools now consult the recording store** —
+  `transcribe_call` / `summarize_call` resolve `audio_base64` from
+  `[storage.recording]` when the caller omits it. The new error
+  message names the specific missing piece ("no backend wired" vs
+  "no recording for this call").
+- **`ToolContext::with_vector` / `with_recording`** — engine
+  threads the constructed stores onto tool context. CLI auto-
+  wires the in-memory + filesystem backends from config; sidecar
+  adapters for both stores are scaffolded via the new sidecars
+  below but not yet plugged into the trait seam.
+- **`plugins/examples/store-qdrant/`** — stdlib-only Qdrant HTTP
+  API wrapper. Auto-creates the collection with configured size +
+  distance, upserts with string-id preservation, surfaces cosine
+  top-k via `search`. Env: `QDRANT_URL`, `QDRANT_COLLECTION`,
+  `QDRANT_VECTOR_SIZE`, `QDRANT_DISTANCE`, `QDRANT_API_KEY`.
+- **`plugins/examples/store-s3-recording/`** — stdlib-only sidecar
+  that shells out to the `aws` CLI (so SigV4 + credential
+  discovery stay in one place). `put` / `get` / `delete` / `list` /
+  `prune_older_than` over JSON-RPC; works against S3, MinIO,
+  R2, B2.
+- **Tests** — 9 new unit tests on `storage` (`MemoryVectorStore`
+  round-trip + input validation + dimension-mismatch skip,
+  `FsRecordingStore` put/get/list/delete/prune); 2 new capability-
+  validation tests for `storage.vector` / `storage.recording`; 4
+  new MCP tool tests + 2 embed-shape extractor tests on
+  `search_calls_semantic`. `semantic_search_pipeline.rs`
+  integration test exercises the upsert → embed → search round
+  trip end-to-end with a deterministic stub embed provider.
+
+### Notes
+
+The storage-sidecar adapter — the shim that lets
+`[storage.vector] backend = "sidecar"` pick up a loaded Qdrant
+plugin and present it through the `VectorStore` trait — is
+scaffolded but not yet wired. Selecting `sidecar` today logs a
+warning and falls through to "no backend"; `search_calls_semantic`
+returns `NotFound`. Landing the adapter is a small follow-on
+slice once we have a second vector backend asking for the same
+seam.
+
+Retention is wall-clock mtime-based on the filesystem store; on
+disks without reliable mtimes (some NFS mounts, tmpfs under
+certain containers) the sweeper may mis-classify. Object-store
+backends use the LIST response's `LastModified` timestamp.
+
 ## [0.40.0] - 2026-04-21
 
 Slice 3.3 — ASR + composite AI pipelines. `ai-asr-whisper`
