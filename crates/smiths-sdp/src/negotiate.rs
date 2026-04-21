@@ -1,9 +1,15 @@
 //! SDP offer/answer negotiation.
 //!
-//! Scope: audio passthrough with PCMU / PCMA / Opus. The negotiator
-//! intersects the offered codecs with the engine's `supported` list
-//! (matched by case-insensitive codec name *and* clock rate; payload
-//! type numbers follow the offer to stay passthrough-friendly).
+//! Scope: passthrough for audio (PCMU / PCMA / Opus) and video
+//! (H.264 / VP8 / VP9 — slice 5.1 / P11). The negotiator intersects
+//! the offered codecs with the engine's `supported` / `supported_video`
+//! lists (matched by case-insensitive codec name *and* clock rate;
+//! payload type numbers follow the offer to stay passthrough-friendly).
+//!
+//! Audio negotiation is required: an offer with no `m=audio` block
+//! mismatches. Video is additive — `m=video` in the offer is
+//! answered with either a matching codec on a caller-supplied port
+//! or `m=video 0 ...` to decline (RFC 3264 §6 port-zero).
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -51,15 +57,24 @@ pub enum NegotiationResult {
 pub struct Negotiator {
     /// IP address the engine publishes in `o=` / `c=`.
     pub local_ip: IpAddr,
-    /// Codecs the engine can pass through, in preference order.
-    /// Payload type numbers are placeholders; the answer uses the
-    /// offerer's PT for compatibility with passthrough B2BUAs.
+    /// Audio codecs the engine can pass through, in preference
+    /// order. Payload type numbers are placeholders; the answer
+    /// uses the offerer's PT for compatibility with passthrough
+    /// B2BUAs.
     pub supported: Vec<RtpMap>,
+    /// Video codecs the engine can pass through (slice 5.1 / P11).
+    /// Same matching semantics as [`Self::supported`]: the answer
+    /// echoes the offerer's PT so downstream B2BUAs stay happy.
+    /// Passthrough only — no decode, no transcoding.
+    pub supported_video: Vec<RtpMap>,
 }
 
 impl Negotiator {
     /// Build a negotiator with the canonical passthrough codec set:
-    /// `PCMU` (0) @ 8 kHz, `PCMA` (8) @ 8 kHz, `opus` (111) @ 48 kHz stereo.
+    /// `PCMU` (0) @ 8 kHz, `PCMA` (8) @ 8 kHz, `opus` (111) @ 48 kHz stereo
+    /// on the audio side, plus `H264` (96), `VP8` (97), `VP9` (98) at the
+    /// RTP clock rate of 90 000 Hz on the video side (RFC 6184 / RFC 7741
+    /// / draft-ietf-payload-vp9).
     #[must_use]
     pub fn with_default_codecs(local_ip: IpAddr) -> Self {
         Self {
@@ -84,15 +99,34 @@ impl Negotiator {
                     channels: Some(2),
                 },
             ],
+            supported_video: vec![
+                RtpMap {
+                    payload_type: 96,
+                    codec: "H264".into(),
+                    clock_rate: 90_000,
+                    channels: None,
+                },
+                RtpMap {
+                    payload_type: 97,
+                    codec: "VP8".into(),
+                    clock_rate: 90_000,
+                    channels: None,
+                },
+                RtpMap {
+                    payload_type: 98,
+                    codec: "VP9".into(),
+                    clock_rate: 90_000,
+                    channels: None,
+                },
+            ],
         }
     }
 
-    /// Produce an answer to `offer`, publishing `local_port` as the
-    /// media port.
-    ///
-    /// Currently only the first `m=audio` block is negotiated; other
-    /// media lines (video, application) are not acknowledged — extend
-    /// here once the Call FSM carries m-line lists.
+    /// Produce an audio-only answer to `offer`, publishing
+    /// `local_port` as the media port. Ignores any `m=video` /
+    /// `m=application` blocks the offer carries. Use
+    /// [`Self::answer_with_video`] when you want `m=video`
+    /// handling (slice 5.1 / P11).
     ///
     /// When the offer uses `RTP/SAVP` with at least one supported
     /// `a=crypto:` suite, the engine generates a fresh key and emits
@@ -205,6 +239,98 @@ impl Negotiator {
             srtp: srtp_keys,
         }
     }
+
+    /// Multi-stream answer (slice 5.1 / P11). Produces the same
+    /// shape as [`Self::answer`] on the audio side, then appends a
+    /// matching `m=video` block to preserve m-line ordering.
+    ///
+    /// Video-handling rules:
+    /// - Offer has no `m=video` → result identical to
+    ///   [`Self::answer`] (audio-only).
+    /// - Offer has `m=video` **and** `local_video_port` is
+    ///   `Some(port)` **and** at least one offered codec is in
+    ///   [`Self::supported_video`] → answer echoes the chosen codec
+    ///   on the given port.
+    /// - Offer has `m=video` but either port is `None` or no codec
+    ///   matches → answer carries `m=video 0 ...` (RFC 3264 §8.2 /
+    ///   §6 — port 0 declines a stream while keeping m-line
+    ///   alignment). Audio still negotiates normally.
+    ///
+    /// Never fails the whole negotiation on a video-only issue —
+    /// declining video is a normal SDP move, not a reason to 488
+    /// the call.
+    #[must_use]
+    pub fn answer_with_video(
+        &self,
+        offer: &SessionDescription,
+        local_audio_port: u16,
+        local_video_port: Option<u16>,
+    ) -> NegotiationResult {
+        let audio_result = self.answer(offer, local_audio_port);
+        let NegotiationResult::Answer {
+            mut sdp,
+            srtp: audio_srtp,
+        } = audio_result
+        else {
+            return audio_result;
+        };
+        let Some(offer_video) = offer.media.iter().find(|m| m.kind == MediaKind::Video) else {
+            return NegotiationResult::Answer {
+                sdp,
+                srtp: audio_srtp,
+            };
+        };
+        // Pick a passthrough codec; same match semantics as audio.
+        let chosen_video = offer_video.formats.iter().find_map(|pt| {
+            let rtpmap = offer_video.rtpmap.iter().find(|r| r.payload_type == *pt);
+            match rtpmap {
+                Some(r) => self
+                    .supported_video
+                    .iter()
+                    .find(|s| {
+                        s.codec.eq_ignore_ascii_case(&r.codec) && s.clock_rate == r.clock_rate
+                    })
+                    .map(|_| r.clone()),
+                None => self
+                    .supported_video
+                    .iter()
+                    .find(|s| s.payload_type == *pt)
+                    .cloned(),
+            }
+        });
+
+        let (video_port, video_formats, video_rtpmap) = match (local_video_port, chosen_video) {
+            (Some(port), Some(chosen)) => (port, vec![chosen.payload_type], vec![chosen]),
+            // Decline path: port 0 + keep the offer's formats so
+            // parsers that demand non-empty format lists stay
+            // happy. Empty rtpmap list means "we're not describing
+            // anything" which is fine for a declined stream.
+            _ => (0, offer_video.formats.clone(), Vec::new()),
+        };
+
+        let video_answer = MediaDescription {
+            kind: MediaKind::Video,
+            port: video_port,
+            protocol: offer_video.protocol.clone(),
+            formats: video_formats,
+            rtpmap: video_rtpmap,
+            crypto: Vec::new(),
+            direction: offer_video.direction.reverse(),
+            connection: None,
+            fingerprint: None,
+            setup: None,
+            ice_ufrag: None,
+            ice_pwd: None,
+            ice_options: Vec::new(),
+            candidates: Vec::new(),
+            end_of_candidates: false,
+        };
+        sdp.media.push(video_answer);
+        NegotiationResult::Answer {
+            sdp,
+            srtp: audio_srtp,
+        }
+    }
 }
 
 impl SdpNegotiator for Negotiator {
@@ -241,6 +367,44 @@ impl SdpNegotiator for Negotiator {
             NegotiationResult::Answer { sdp, srtp } => NegotiationOutcome::Accepted {
                 answer_body: sdp.to_string(),
                 remote_media,
+                // `negotiate_audio` is the audio-only path; video
+                // handling lives on the `negotiate` override below.
+                video_media: None,
+                srtp,
+            },
+            NegotiationResult::Mismatch => NegotiationOutcome::Mismatch,
+        }
+    }
+
+    fn negotiate(
+        &self,
+        offer_body: &str,
+        local_ip: IpAddr,
+        local_audio_port: u16,
+        local_video_port: Option<u16>,
+    ) -> NegotiationOutcome {
+        let offer = match SessionDescription::parse(offer_body) {
+            Ok(o) => o,
+            Err(e) => return NegotiationOutcome::Malformed(e.to_string()),
+        };
+        if offer
+            .media
+            .iter()
+            .any(|m| is_dtls_srtp_profile(&m.protocol))
+        {
+            return NegotiationOutcome::UnsupportedTransport {
+                reason: "DTLS-SRTP not yet supported".into(),
+            };
+        }
+        let remote_media = first_audio_endpoint(&offer);
+        let video_media = first_video_endpoint(&offer);
+        let mut scoped = self.clone();
+        scoped.local_ip = local_ip;
+        match scoped.answer_with_video(&offer, local_audio_port, local_video_port) {
+            NegotiationResult::Answer { sdp, srtp } => NegotiationOutcome::Accepted {
+                answer_body: sdp.to_string(),
+                remote_media,
+                video_media,
                 srtp,
             },
             NegotiationResult::Mismatch => NegotiationOutcome::Mismatch,
@@ -297,6 +461,18 @@ fn first_audio_endpoint(sdp: &SessionDescription) -> Option<SocketAddr> {
     }
     let conn = audio.connection.as_ref().or(sdp.connection.as_ref())?;
     Some(SocketAddr::new(conn.address, audio.port))
+}
+
+/// Extract the first video RTP endpoint from a parsed offer.
+/// Same rules as [`first_audio_endpoint`] — `None` on missing
+/// `m=video`, port 0 (declined / held), or no connection line.
+fn first_video_endpoint(sdp: &SessionDescription) -> Option<SocketAddr> {
+    let video = sdp.media.iter().find(|m| m.kind == MediaKind::Video)?;
+    if video.port == 0 {
+        return None;
+    }
+    let conn = video.connection.as_ref().or(sdp.connection.as_ref())?;
+    Some(SocketAddr::new(conn.address, video.port))
 }
 
 /// `true` if the media profile names DTLS-SRTP (RFC 5764 §8).
@@ -520,5 +696,194 @@ mod tests {
             }],
         );
         assert_eq!(neg.answer(&offer, 1_234), NegotiationResult::Mismatch);
+    }
+
+    // -----------------------------------------------------------------
+    // Slice 5.1 / P11 — video passthrough
+    // -----------------------------------------------------------------
+
+    fn audio_video_offer(audio_port: u16, video_port: u16) -> SessionDescription {
+        let mut sdp = offer_with(
+            vec![0],
+            vec![RtpMap {
+                payload_type: 0,
+                codec: "PCMU".into(),
+                clock_rate: 8_000,
+                channels: None,
+            }],
+        );
+        sdp.media[0].port = audio_port;
+        sdp.media.push(MediaDescription {
+            kind: MediaKind::Video,
+            port: video_port,
+            protocol: "RTP/AVP".into(),
+            formats: vec![96, 97],
+            rtpmap: vec![
+                RtpMap {
+                    payload_type: 96,
+                    codec: "H264".into(),
+                    clock_rate: 90_000,
+                    channels: None,
+                },
+                RtpMap {
+                    payload_type: 97,
+                    codec: "VP8".into(),
+                    clock_rate: 90_000,
+                    channels: None,
+                },
+            ],
+            crypto: Vec::new(),
+            direction: Direction::SendRecv,
+            connection: None,
+            fingerprint: None,
+            setup: None,
+            ice_ufrag: None,
+            ice_pwd: None,
+            ice_options: Vec::new(),
+            candidates: Vec::new(),
+            end_of_candidates: false,
+        });
+        sdp
+    }
+
+    #[test]
+    fn answer_with_video_echoes_first_supported_codec() {
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let offer = audio_video_offer(49_170, 49_172);
+        let NegotiationResult::Answer { sdp, .. } =
+            neg.answer_with_video(&offer, 16_384, Some(16_386))
+        else {
+            panic!("expected Answer");
+        };
+        assert_eq!(sdp.media.len(), 2);
+        assert_eq!(sdp.media[0].kind, MediaKind::Audio);
+        assert_eq!(sdp.media[0].port, 16_384);
+        assert_eq!(sdp.media[1].kind, MediaKind::Video);
+        assert_eq!(sdp.media[1].port, 16_386);
+        // H.264 was first in the offer's format list; it wins.
+        assert_eq!(sdp.media[1].formats, vec![96]);
+        assert_eq!(sdp.media[1].rtpmap.len(), 1);
+        assert_eq!(sdp.media[1].rtpmap[0].codec, "H264");
+    }
+
+    #[test]
+    fn answer_with_video_port_none_declines_with_port_zero() {
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let offer = audio_video_offer(49_170, 49_172);
+        let NegotiationResult::Answer { sdp, .. } = neg.answer_with_video(&offer, 16_384, None)
+        else {
+            panic!("expected Answer");
+        };
+        assert_eq!(sdp.media.len(), 2);
+        assert_eq!(sdp.media[1].kind, MediaKind::Video);
+        assert_eq!(sdp.media[1].port, 0, "declined video must use port 0");
+        // Audio still negotiates normally.
+        assert_eq!(sdp.media[0].port, 16_384);
+    }
+
+    #[test]
+    fn answer_with_video_unknown_codec_declines_but_keeps_audio() {
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        // AV1 isn't in the passthrough set.
+        let mut offer = audio_video_offer(49_170, 49_172);
+        offer.media[1].formats = vec![100];
+        offer.media[1].rtpmap = vec![RtpMap {
+            payload_type: 100,
+            codec: "AV1".into(),
+            clock_rate: 90_000,
+            channels: None,
+        }];
+        let NegotiationResult::Answer { sdp, .. } =
+            neg.answer_with_video(&offer, 16_384, Some(16_386))
+        else {
+            panic!("expected Answer");
+        };
+        assert_eq!(sdp.media.len(), 2);
+        assert_eq!(sdp.media[1].port, 0);
+        // Audio untouched.
+        assert_eq!(sdp.media[0].port, 16_384);
+    }
+
+    #[test]
+    fn answer_with_video_is_audio_only_when_offer_has_no_video() {
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let offer = offer_with(
+            vec![0],
+            vec![RtpMap {
+                payload_type: 0,
+                codec: "PCMU".into(),
+                clock_rate: 8_000,
+                channels: None,
+            }],
+        );
+        let NegotiationResult::Answer { sdp, .. } =
+            neg.answer_with_video(&offer, 16_384, Some(16_386))
+        else {
+            panic!("expected Answer");
+        };
+        assert_eq!(sdp.media.len(), 1);
+        assert_eq!(sdp.media[0].kind, MediaKind::Audio);
+    }
+
+    #[test]
+    fn negotiate_outcome_populates_video_media_when_peer_offers_video() {
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let offer = audio_video_offer(49_170, 49_172);
+        let body = offer.to_string();
+        let outcome = neg.negotiate(&body, IpAddr::V4(Ipv4Addr::LOCALHOST), 16_384, Some(16_386));
+        let smiths_core::NegotiationOutcome::Accepted {
+            remote_media,
+            video_media,
+            answer_body,
+            ..
+        } = outcome
+        else {
+            panic!("expected Accepted");
+        };
+        let audio_peer = remote_media.expect("audio peer");
+        let video_peer = video_media.expect("video peer");
+        assert_eq!(audio_peer.port(), 49_170);
+        assert_eq!(video_peer.port(), 49_172);
+        assert_eq!(audio_peer.ip(), video_peer.ip());
+        assert!(answer_body.contains("m=audio 16384"));
+        assert!(answer_body.contains("m=video 16386"));
+        assert!(answer_body.contains("H264"));
+    }
+
+    #[test]
+    fn negotiate_declines_video_cleanly_when_no_video_port() {
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let offer = audio_video_offer(49_170, 49_172);
+        let body = offer.to_string();
+        let outcome = neg.negotiate(&body, IpAddr::V4(Ipv4Addr::LOCALHOST), 16_384, None);
+        let smiths_core::NegotiationOutcome::Accepted {
+            video_media,
+            answer_body,
+            ..
+        } = outcome
+        else {
+            panic!("expected Accepted");
+        };
+        // Peer still offered video, so we expose their endpoint even
+        // though we're declining — consumers can opt in later without
+        // re-negotiating.
+        assert_eq!(video_media.unwrap().port(), 49_172);
+        assert!(answer_body.contains("m=video 0"));
+    }
+
+    #[test]
+    fn negotiate_audio_backcompat_path_leaves_video_media_none() {
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let offer = audio_video_offer(49_170, 49_172);
+        let body = offer.to_string();
+        // Via the older audio-only trait method.
+        let outcome = neg.negotiate_audio(&body, IpAddr::V4(Ipv4Addr::LOCALHOST), 16_384);
+        let smiths_core::NegotiationOutcome::Accepted { video_media, .. } = outcome else {
+            panic!("expected Accepted");
+        };
+        assert!(
+            video_media.is_none(),
+            "negotiate_audio must not expose video endpoint"
+        );
     }
 }

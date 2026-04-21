@@ -60,6 +60,17 @@ pub enum NegotiationOutcome {
         /// used by the bridge to send forward traffic. `None` if the
         /// offer declared port 0 or omitted a connection line.
         remote_media: Option<SocketAddr>,
+        /// Peer's video RTP endpoint (slice 5.1 / P11). Populated
+        /// when the offer carried a non-zero `m=video` block with at
+        /// least one codec in the passthrough set (H.264 / VP8 /
+        /// VP9). `None` when the offer was audio-only, declared
+        /// video port 0, or advertised only video codecs the
+        /// negotiator can't identify. The UAS spawns a second
+        /// [`crate::MediaFabric::bridge`] on this endpoint — that
+        /// wiring is a follow-on; today the field surfaces the
+        /// peer's video address so deployments that need it can opt
+        /// in without a second negotiation pass.
+        video_media: Option<SocketAddr>,
         /// SRTP keying material when the offer asked for `RTP/SAVP`
         /// with a supported `a=crypto:` suite. `None` for plain
         /// `RTP/AVP` passthrough calls. The UAS threads this into the
@@ -104,6 +115,30 @@ pub trait SdpNegotiator: Send + Sync {
         local_ip: IpAddr,
         local_rtp_port: u16,
     ) -> NegotiationOutcome;
+
+    /// Multi-stream negotiation (slice 5.1 / P11). Same contract as
+    /// [`Self::negotiate_audio`] but carries an optional video port
+    /// so the negotiator can emit a matching `m=video` block on the
+    /// answer. `video_port = None` declines any video the offer
+    /// carries (answer emits `m=video 0 ...` to preserve m-line
+    /// ordering, as required for re-INVITE interop); `Some(port)`
+    /// accepts passthrough video if at least one offered codec is
+    /// in the supported set.
+    ///
+    /// Default impl delegates to [`Self::negotiate_audio`] with the
+    /// video port dropped — so implementations that predate 5.1
+    /// stay trait-compatible. The in-tree
+    /// `smiths_sdp::Negotiator` overrides this to do real video
+    /// passthrough.
+    fn negotiate(
+        &self,
+        offer_body: &str,
+        local_ip: IpAddr,
+        local_audio_port: u16,
+        _local_video_port: Option<u16>,
+    ) -> NegotiationOutcome {
+        self.negotiate_audio(offer_body, local_ip, local_audio_port)
+    }
 
     /// Build a UAC-side SDP offer advertising `local_ip` +
     /// `local_rtp_port`. Called by `smiths-sip::UacClient` when the

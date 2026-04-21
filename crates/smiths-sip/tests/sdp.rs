@@ -163,3 +163,79 @@ async fn invite_with_only_unknown_codecs_returns_488() {
         String::from_utf8_lossy(&resp)
     );
 }
+
+/// Slice 5.1 / P11 — an audio+video offer round-trips through the
+/// UAS today and gets an answer that preserves m-line ordering.
+/// Video is declined with port 0 because the UAS's dual-bridge
+/// wiring is a dedicated follow-on; the important assertions are
+/// that the call isn't 488'd and the answer shape is RFC 3264-
+/// compliant.
+#[tokio::test(flavor = "multi_thread")]
+async fn invite_with_audio_plus_video_declines_video_but_keeps_audio() {
+    let uas_addr = spawn_uas().await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let ca = client.local_addr().unwrap();
+
+    let offer = concat!(
+        "v=0\r\n",
+        "o=bob 1 1 IN IP4 127.0.0.1\r\n",
+        "s=-\r\n",
+        "c=IN IP4 127.0.0.1\r\n",
+        "t=0 0\r\n",
+        "m=audio 40000 RTP/AVP 0\r\n",
+        "a=rtpmap:0 PCMU/8000\r\n",
+        "a=sendrecv\r\n",
+        "m=video 40002 RTP/AVP 96 97\r\n",
+        "a=rtpmap:96 H264/90000\r\n",
+        "a=rtpmap:97 VP8/90000\r\n",
+        "a=sendrecv\r\n",
+    );
+    let invite = format!(
+        concat!(
+            "INVITE sip:alice@127.0.0.1 SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP {ca};branch=z9hG4bK-sdp-av;rport\r\n",
+            "From: Bob <sip:bob@127.0.0.1>;tag=bob\r\n",
+            "To: Alice <sip:alice@127.0.0.1>\r\n",
+            "Call-ID: sdp-av@127.0.0.1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Max-Forwards: 70\r\n",
+            "Contact: <sip:bob@{ca}>\r\n",
+            "Content-Type: application/sdp\r\n",
+            "Content-Length: {clen}\r\n",
+            "\r\n",
+            "{body}",
+        ),
+        ca = ca,
+        clen = offer.len(),
+        body = offer,
+    );
+    client.send_to(invite.as_bytes(), uas_addr).await.unwrap();
+
+    let trying = recv(&client).await;
+    assert!(trying.starts_with(b"SIP/2.0 100 Trying\r\n"));
+    let ok = recv(&client).await;
+    let (headers, body) = split_sip(&ok);
+    assert!(
+        headers.starts_with("SIP/2.0 200 OK\r\n"),
+        "audio+video offer must not 488; got: {headers}"
+    );
+    let body_str = std::str::from_utf8(&body).expect("SDP body is ASCII");
+    let answer = SessionDescription::parse(body_str).expect("answer SDP parses");
+
+    // Two m-lines, in order, with video on port 0 (declined).
+    assert_eq!(
+        answer.media.len(),
+        2,
+        "answer must mirror the offer's m-line count"
+    );
+    assert_eq!(answer.media[0].kind, MediaKind::Audio);
+    assert_ne!(answer.media[0].port, 0);
+    assert_eq!(answer.media[1].kind, MediaKind::Video);
+    assert_eq!(
+        answer.media[1].port, 0,
+        "today the UAS declines video; the SDP layer already supports passthrough"
+    );
+    // Audio still carries a real codec.
+    assert_eq!(answer.media[0].rtpmap.len(), 1);
+    assert_eq!(answer.media[0].rtpmap[0].codec.to_ascii_uppercase(), "PCMU");
+}

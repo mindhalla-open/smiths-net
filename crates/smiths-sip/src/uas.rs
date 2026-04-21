@@ -686,14 +686,28 @@ impl<T: Transport> UasServer<T> {
             // and publish *that* in SDP — otherwise the remote UA
             // tries to sendto(0.0.0.0) and fails.
             let effective_local_ip = resolve_local_ip_for(self.media_bind_ip, peer).await;
-            match self.negotiator.negotiate_audio(
+            // Slice 5.1 / P11: call the multi-stream path with
+            // `video_port = None`. The negotiator preserves m-line
+            // ordering when the offer carries `m=video` by emitting
+            // an RFC 3264 port-0 decline — dual-bridge wiring that
+            // actually relays video is a follow-on, but the
+            // declining answer shape is right today.
+            match self.negotiator.negotiate(
                 body,
                 effective_local_ip,
                 endpoint.local_addr().port(),
+                None,
             ) {
                 NegotiationOutcome::Accepted {
                     answer_body,
                     remote_media,
+                    // Slice 5.1: video endpoint surfaces on the
+                    // outcome; the UAS's dual-bridge wiring is a
+                    // follow-on. Peers that offered video see a
+                    // declining `m=video 0 ...` in the answer, so
+                    // this binding isn't used yet but keeps the
+                    // destructure exhaustive.
+                    video_media: _video_media,
                     srtp,
                 } => (Some(endpoint), Some(answer_body), remote_media, srtp),
                 NegotiationOutcome::Mismatch => {

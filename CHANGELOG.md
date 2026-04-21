@@ -5,6 +5,82 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.0] - 2026-04-21
+
+Slice 5.1 — Video calls (passthrough). SDP negotiator gains
+`m=video` support for H.264 / VP8 / VP9 via a new multi-stream
+negotiation path. Peers that offer audio + video get a
+well-formed answer with both m-lines and the ordering preserved,
+so no more silent drops of the video m-line. Dual-bridge wiring
+in the UAS is honest-deferred — today video is answered with an
+RFC 3264 port-0 decline; the SDP layer is ready to relay as soon
+as the UAS allocates the second endpoint.
+
+### Added
+
+- **`smiths_sdp::Negotiator::supported_video`** — second codec
+  list on the negotiator. Defaults: `H264 @ 96`, `VP8 @ 97`,
+  `VP9 @ 98`, all at 90 000 Hz RTP clock rate. Payload-type
+  numbers are placeholders; the answer mirrors the offerer's
+  PT so passthrough B2BUAs stay happy.
+- **`Negotiator::answer_with_video(offer, audio_port,
+  video_port)`** — audio negotiation identical to
+  `answer()`, then appends a matching `m=video` block. When
+  `video_port` is `None` or no offered codec is in the
+  passthrough set, emits `m=video 0 ...` to decline while
+  preserving m-line ordering (RFC 3264 §6). Never fails the
+  whole negotiation on a video-only issue.
+- **`SdpNegotiator::negotiate(offer_body, local_ip, audio_port,
+  video_port)`** — new trait method. Default impl delegates to
+  `negotiate_audio` so existing impls stay trait-compatible;
+  the in-tree `Negotiator` overrides it to do the real
+  multi-stream answer.
+- **`NegotiationOutcome::Accepted::video_media`** — new
+  additive field carrying the peer's video RTP endpoint
+  (`m=video port` + `c=`) when the offer advertised non-zero
+  video. Populated even when the engine declines video so the
+  UAS's follow-on dual-bridge wiring can opt in without
+  re-negotiating.
+- **UAS now calls the multi-stream method** with
+  `video_port = None`. Observable consequence: a peer that
+  offers audio + video gets a 200 OK whose SDP answer has both
+  m-lines (audio with chosen PT, video with port 0). Audio
+  continues to bridge normally; video relay waits on the
+  follow-on.
+- **Tests** — 7 new unit tests in `smiths-sdp` covering
+  `answer_with_video` (H.264 wins, port-None declines,
+  unknown-codec declines, audio-only round-trips unchanged,
+  `NegotiationOutcome::video_media` populates + redacts
+  correctly, audio-backcompat path leaves `video_media` None)
+  + 1 new SIP-level integration test
+  (`invite_with_audio_plus_video_declines_video_but_keeps_audio`)
+  that drives the full UAS surface with a real audio+video
+  INVITE and asserts the declining answer shape.
+- **`docs/architecture/09-video-passthrough.md`** — "no
+  transcoding; passthrough only" framing, SDP shape table,
+  rollout plan for the UAS dual-bridge follow-on, reasoning
+  on why passthrough beats transcoding for the B2BUA use case.
+
+### Notes
+
+The UAS dual-bridge wiring (allocate a second
+`MediaEndpoint`, spawn a second `MediaFabric::bridge`, track
+both on `DialogRecord`, clean both on BYE) is a dedicated
+follow-on slice. It touches `DialogRecord` serialization,
+`PendingLeg` shape, `bridges_by_dialog` indexing, and every
+call site that reads the per-dialog media handle (control
+plane, MCP tools like `speak` / `send_dtmf`) — a multi-hour
+refactor that deserves its own release. Today's release
+closes the SDP-layer half cleanly: the declining answer is
+RFC-compliant, m-line ordering is preserved, and
+`NegotiationOutcome::video_media` surfaces the peer's endpoint
+so the follow-on wires in additively.
+
+The default video codec set picks RTP payload types `96`,
+`97`, `98`. Per RFC 3264 / RFC 3551 these are dynamic-range
+PTs; the negotiator mirrors the offerer's PT regardless, so
+codec selection is by name + clock rate, not by PT number.
+
 ## [0.47.0] - 2026-04-21
 
 Slice 4.5 — IoT bridges. Two reference sidecars land on the new
