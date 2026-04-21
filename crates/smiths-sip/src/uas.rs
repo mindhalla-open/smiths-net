@@ -73,6 +73,17 @@ struct PendingLeg {
     srtp: Option<SrtpKeys>,
 }
 
+/// Per-dialog CDR metadata captured at 200 OK INVITE. Consumed
+/// on BYE to emit a `CallDetailRecord` via the configured
+/// [`smiths_core::storage::CdrStore`].
+#[derive(Clone, Debug)]
+struct CdrInProgress {
+    call_id: String,
+    from_uri: String,
+    to_uri: String,
+    started_at_unix: i64,
+}
+
 /// Parsed request summary.
 struct RequestSummary {
     method: String,
@@ -95,6 +106,12 @@ struct RequestSummary {
     /// `None` on requests that omit Contact entirely — common on
     /// OPTIONS + BYE where the header isn't mandatory.
     contact: Option<String>,
+    /// URI-part of the `From:` header (`sip:bob@x`, no tag / params).
+    /// Extracted by [`summarize_request`] so the CDR path doesn't
+    /// re-parse the header.
+    from_uri: Option<String>,
+    /// URI-part of the `To:` header (`sip:alice@y`, no tag / params).
+    to_uri: Option<String>,
     /// Parsed `Expires:` header (RFC 3261 §20.19). For REGISTER the
     /// expiration is also carryable on each `Contact:` param via
     /// `;expires=N`; we honour the top-level header as the default
@@ -159,6 +176,17 @@ pub struct UasServer<T: Transport> {
     /// here via [`Self::with_registration_store`] so `sip://
     /// registrations` has something to read.
     registration_store: Option<Arc<dyn crate::auth::RegistrationStore>>,
+    /// Call-detail-record persistence (slice 2.3, P23). `None` =
+    /// CDR recording is off; `handle_bye` emits no CDR rows. When
+    /// wired, a row lands per dialog terminate with duration +
+    /// From/To + result ("answered").
+    cdr_store: Option<Arc<dyn smiths_core::storage::CdrStore>>,
+    /// Per-dialog CDR metadata captured at 200 OK INVITE and
+    /// consumed on `handle_bye`. Kept off `DialogRecord` so the
+    /// serializable snapshot surface (HA) stays clean — a failover
+    /// primary that resumes mid-call won't emit a CDR for the old
+    /// dialog it inherits, which is the correct posture.
+    cdr_pending: Arc<DashMap<DialogKey, CdrInProgress>>,
     /// Prometheus metrics. Defaults to [`Metrics::noop`] so tests and
     /// single-server setups can ignore observability entirely.
     metrics: Arc<Metrics>,
@@ -218,6 +246,8 @@ impl<T: Transport> UasServer<T> {
             bridges_by_dialog: Arc::new(DashMap::new()),
             registrar: None,
             registration_store: None,
+            cdr_store: None,
+            cdr_pending: Arc::new(DashMap::new()),
             metrics: Metrics::noop(),
             response_router: None,
             drain: None,
@@ -244,6 +274,15 @@ impl<T: Transport> UasServer<T> {
         store: Arc<dyn crate::auth::RegistrationStore>,
     ) -> Self {
         self.registration_store = Some(store);
+        self
+    }
+
+    /// Attach a [`smiths_core::storage::CdrStore`] so dialog
+    /// terminates emit a call-detail row. Without one, the UAS
+    /// still serves BYE correctly — it just produces no audit trail.
+    #[must_use]
+    pub fn with_cdr_store(mut self, store: Arc<dyn smiths_core::storage::CdrStore>) -> Self {
+        self.cdr_store = Some(store);
         self
     }
 
@@ -505,7 +544,10 @@ impl<T: Transport> UasServer<T> {
             return;
         };
         let Some(contact_uri) = first_contact_uri(contact_hdr) else {
-            debug!(contact = contact_hdr, "could not parse Contact URI; skipping bind");
+            debug!(
+                contact = contact_hdr,
+                "could not parse Contact URI; skipping bind"
+            );
             return;
         };
         let aor = format!("sip:{username}@{realm}");
@@ -755,8 +797,24 @@ impl<T: Transport> UasServer<T> {
             remote_media,
             pending_2xx: None,
         };
-        self.dialogs.insert(dialog_key, record);
+        self.dialogs.insert(dialog_key.clone(), record);
         self.metrics.dialogs_active.inc();
+
+        // CDR: remember the call's start + URIs so the `handle_bye`
+        // path can emit a complete record. We capture even when no
+        // `CdrStore` is wired — the side-table is cheap, and swapping
+        // the store at runtime (tests) doesn't lose the start time.
+        if self.cdr_store.is_some() {
+            self.cdr_pending.insert(
+                dialog_key.clone(),
+                CdrInProgress {
+                    call_id: call_id.clone(),
+                    from_uri: req.from_uri.clone().unwrap_or_default(),
+                    to_uri: req.to_uri.clone().unwrap_or_default(),
+                    started_at_unix: smiths_core::storage::CallDetailRecord::now_unix(),
+                },
+            );
+        }
 
         let mut extras: Vec<(&str, &str)> = vec![("Contact", self.contact.as_str())];
         if sdp_answer_body.is_some() {
@@ -854,6 +912,9 @@ impl<T: Transport> UasServer<T> {
                 }
                 self.respond(req, 200, "OK", Some(&record.local_tag), &[], &[], peer)
                     .await;
+                // CDR: fire after the 200 lands so a failing
+                // CdrStore::record never blocks the BYE response.
+                self.emit_cdr_for(&key, "answered");
                 let _ = self.bus.publish(Event::Sip(SipEvent::DialogTerminated {
                     call_id: record.call_id,
                 }));
@@ -870,6 +931,35 @@ impl<T: Transport> UasServer<T> {
                 )
                 .await;
             }
+        }
+    }
+
+    /// Pop the CDR-in-progress entry for `key`, compose a full
+    /// `CallDetailRecord`, and fire-and-forget through the configured
+    /// `CdrStore`. Silent no-op when no store is wired or no
+    /// in-progress entry exists (BYE for an unknown dialog, or a
+    /// failover-inherited call the side table didn't see).
+    fn emit_cdr_for(&self, key: &DialogKey, result: &str) {
+        let Some(store) = self.cdr_store.as_ref() else {
+            self.cdr_pending.remove(key);
+            return;
+        };
+        let Some((_, in_progress)) = self.cdr_pending.remove(key) else {
+            debug!(?key, "BYE without cdr_pending — no row emitted");
+            return;
+        };
+        let now = smiths_core::storage::CallDetailRecord::now_unix();
+        let cdr = smiths_core::storage::CallDetailRecord {
+            call_id: in_progress.call_id,
+            from_uri: in_progress.from_uri,
+            to_uri: in_progress.to_uri,
+            started_at_unix: in_progress.started_at_unix,
+            ended_at_unix: now,
+            duration_secs: now.saturating_sub(in_progress.started_at_unix).max(0),
+            result: result.to_owned(),
+        };
+        if let Err(e) = store.record(&cdr) {
+            warn!(?e, call_id = %cdr.call_id, "CDR write failed");
         }
     }
 
@@ -1167,6 +1257,8 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
     let mut authorization: Option<String> = None;
     let mut contact: Option<String> = None;
     let mut expires: Option<u32> = None;
+    let mut from_uri: Option<String> = None;
+    let mut to_uri: Option<String> = None;
 
     for line in lines {
         if line.is_empty() {
@@ -1189,9 +1281,11 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
         } else if from_tag.is_none() && (lower.starts_with("from:") || lower.starts_with("f:")) {
             let v = line.split_once(':').map_or("", |(_, v)| v);
             from_tag = extract_tag_param(v);
+            from_uri = first_contact_uri(v);
         } else if to_tag.is_none() && (lower.starts_with("to:") || lower.starts_with("t:")) {
             let v = line.split_once(':').map_or("", |(_, v)| v);
             to_tag = extract_tag_param(v);
+            to_uri = first_contact_uri(v);
         } else if content_type.is_none()
             && (lower.starts_with("content-type:") || lower.starts_with("c:"))
         {
@@ -1206,9 +1300,7 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
             if !v.is_empty() {
                 authorization = Some(v.to_owned());
             }
-        } else if contact.is_none()
-            && (lower.starts_with("contact:") || lower.starts_with("m:"))
-        {
+        } else if contact.is_none() && (lower.starts_with("contact:") || lower.starts_with("m:")) {
             let v = line.split_once(':').map_or("", |(_, v)| v).trim();
             if !v.is_empty() {
                 contact = Some(v.to_owned());
@@ -1233,6 +1325,8 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
         content_type,
         contact,
         expires,
+        from_uri,
+        to_uri,
         body: (!body.is_empty()).then(|| body.to_owned()),
         raw: raw.clone(),
     }

@@ -41,7 +41,74 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(MakeCallTool);
     reg.register(EndCallTool);
     reg.register(ReloadPluginTool);
+    reg.register(ListCdrTool);
     reg
+}
+
+/// `list_cdr` — bounded query over the CDR store (slice 2.3, P23).
+///
+/// Returns `{count, rows: [...]}` where each row is a
+/// [`smiths_core::storage::CallDetailRecord`]. When no backend is
+/// wired, `count` is 0 and `rows` is empty — operators tell the
+/// difference from "genuinely no calls yet" by reading
+/// `[storage] backend` off `config://current`.
+pub struct ListCdrTool;
+
+#[async_trait]
+impl Tool for ListCdrTool {
+    fn name(&self) -> &'static str {
+        "list_cdr"
+    }
+
+    fn description(&self) -> &'static str {
+        "List call-detail records. Optional filters: time range, From/To substring, result."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "since_unix":  { "type": "integer", "description": "Only CDRs where started_at_unix >= this." },
+                "until_unix":  { "type": "integer", "description": "Only CDRs where started_at_unix <= this." },
+                "from_like":   { "type": "string",  "description": "Case-insensitive substring match on From URI." },
+                "to_like":     { "type": "string",  "description": "Case-insensitive substring match on To URI." },
+                "result":      { "type": "string",  "description": "Exact match on result (e.g. 'answered')." },
+                "limit":       { "type": "integer", "minimum": 1, "maximum": 1000,
+                                  "description": "Max rows (default 100)." }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let Some(store) = ctx.cdr.as_ref() else {
+            return Ok(json!({"count": 0, "rows": []}));
+        };
+        let mut filter = smiths_core::storage::CdrFilter::new();
+        if let Some(v) = args.get("since_unix").and_then(Value::as_i64) {
+            filter.since_unix = Some(v);
+        }
+        if let Some(v) = args.get("until_unix").and_then(Value::as_i64) {
+            filter.until_unix = Some(v);
+        }
+        if let Some(v) = args.get("from_like").and_then(Value::as_str) {
+            filter.from_like = Some(v.to_owned());
+        }
+        if let Some(v) = args.get("to_like").and_then(Value::as_str) {
+            filter.to_like = Some(v.to_owned());
+        }
+        if let Some(v) = args.get("result").and_then(Value::as_str) {
+            filter.result = Some(v.to_owned());
+        }
+        if let Some(v) = args.get("limit").and_then(Value::as_u64) {
+            filter.limit = u32::try_from(v)
+                .map_err(|_| ToolError::InvalidArguments("`limit` must fit in u32".into()))?;
+        }
+        let rows = store
+            .list(&filter)
+            .map_err(|e| ToolError::Internal(format!("cdr list: {e}")))?;
+        Ok(json!({ "count": rows.len(), "rows": rows }))
+    }
 }
 
 /// `list_calls` — return every dialog the engine currently knows
@@ -1041,7 +1108,7 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 13);
+        assert_eq!(reg.len(), 14);
         for name in [
             "list_calls",
             "get_call_status",
@@ -1056,6 +1123,7 @@ mod tests {
             "make_call",
             "end_call",
             "reload_plugin",
+            "list_cdr",
         ] {
             assert!(reg.get(name).is_some(), "missing tool: {name}");
         }

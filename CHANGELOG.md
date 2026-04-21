@@ -5,6 +5,56 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.0] - 2026-04-21
+
+Slice 2.3 — Pluggable storage MVP (P23). Formalizes the persistence
+surface every post-MVP feature (HA, recording, RAG, presence) now
+targets. CDR recording wired end-to-end.
+
+### Added
+
+- **`smiths-core::storage` module** — three new traits:
+  - [`CdrStore`] with [`CallDetailRecord`] DTO and [`CdrFilter`]
+    for bounded queries (time range, From/To substring, result,
+    required `limit`, newest-first ordering).
+  - [`KvStore`] — opaque key/value for session state + hot-reload
+    snapshots. `get` / `put` / `delete` / `list_prefix`.
+  - [`StorageError`] — backend-agnostic error type.
+  (The existing `smiths-sip::auth::CredentialStore` stays in the
+  SIP crate; it's RFC-2617-shaped and this slice adds the generic
+  companions rather than shuffle the auth seam.)
+- **`[storage]` config section** — `backend = "none" | "sqlite"`,
+  `[storage.sqlite] path`. Defaults to `none` so fresh configs
+  stay silent until operators opt in.
+- **`SqliteAuthStore` v2 schema** — adds `cdr` + `kv` tables in a
+  second, idempotent migration. Same store now serves
+  `CredentialStore` + `RegistrationStore` + `CdrStore` + `KvStore`;
+  operators typically point `[auth.sqlite]` and `[storage.sqlite]`
+  at the same DB file. Indexes: `cdr(started_at_unix DESC)`,
+  `cdr(result)`.
+- **UAS CDR emission** — `handle_invite` stashes From/To + start
+  time in a per-dialog side table at 200 OK; `handle_bye` emits a
+  `CallDetailRecord` with `result = "answered"` and
+  `duration_secs` computed from wall-clock deltas. Silent no-op
+  when no `CdrStore` is wired (default).
+- **`list_cdr` MCP tool** — bounded query exposed through the
+  control plane. Returns `{count, rows}`; empty page when no
+  backend is wired.
+- **`UasServer::with_cdr_store`** + `ToolContext::with_cdr`
+  builders — same pattern as the slice-2.1 registration wiring.
+- **12 new tests** in `sqlite_store`: CDR record / list / filter
+  (result, since, substring) / upsert-on-conflict / zero-limit
+  rejection / truncate, plus KV round-trip / delete semantics /
+  prefix listing / wildcard-escape. Plus `cdr_record.rs`
+  integration: full INVITE→ACK→BYE produces exactly one CDR row
+  with the right From / To / duration.
+
+### Notes
+
+The Postgres sidecar adapter listed in the slice plan is deferred
+— no concrete operator ask yet, and the generic trait shape means
+it's a pure addition when it lands.
+
 ## [0.34.0] - 2026-04-21
 
 Slice 2.2 — HTTP webhook subscriber-DB backend (P8, second half).

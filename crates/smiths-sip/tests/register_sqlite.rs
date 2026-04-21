@@ -195,7 +195,10 @@ async fn sqlite_backed_register_persists_contact_binding() {
         .await
         .unwrap();
     let resp3 = recv_str(&client).await;
-    assert!(resp3.starts_with("SIP/2.0 200 OK\r\n"), "unbind resp:\n{resp3}");
+    assert!(
+        resp3.starts_with("SIP/2.0 200 OK\r\n"),
+        "unbind resp:\n{resp3}"
+    );
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     let after = RegistrationStore::snapshot(&*store).unwrap();

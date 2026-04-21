@@ -56,6 +56,15 @@ realm   = "smiths.local"
 # breaker_cooldown_secs = 30
 # failure_mode          = "fail_closed"
 
+# Pluggable storage (P23 / slice 2.3) — CDR + KV surfaces. Point at
+# the same DB file as `[auth.sqlite]` to share one store across auth
+# + registrations + call-detail-records + opaque KV.
+[storage]
+backend = "none"   # "none" | "sqlite"
+
+# [storage.sqlite]
+# path = "/var/lib/smiths-net/storage.db"
+
 [plugins]
 # Directory the loader scans at startup. Each subdirectory with a
 # `plugin.toml` becomes one sidecar or WASM plugin. Defaults to

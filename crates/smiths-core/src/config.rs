@@ -35,6 +35,65 @@ pub struct Config {
     pub plugins: PluginsConfig,
     /// Auth / subscriber-DB configuration (P8, slice 2.1).
     pub auth: AuthConfig,
+    /// Pluggable storage configuration (P23, slice 2.3). CDR + KV
+    /// backends share this section; auth has its own `[auth]`
+    /// because its lifetime + security story differs.
+    pub storage: StorageConfig,
+}
+
+/// `[storage]` TOML block — CDR + KV backend selection.
+///
+/// ```toml
+/// [storage]
+/// backend = "sqlite"        # "none" | "sqlite"
+///
+/// [storage.sqlite]
+/// path = "/var/lib/smiths-net/storage.db"
+/// ```
+///
+/// When operators point `[auth.sqlite]` and `[storage.sqlite]` at
+/// the same file the `SQLite` auth store serves both surfaces
+/// (credentials + registrations + CDR + KV) from one DB — that's
+/// the default the runbook recommends.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Which backend to wire up for `CdrStore` + `KvStore`.
+    pub backend: StorageBackend,
+    /// SQLite-specific settings. Ignored when `backend != "sqlite"`.
+    pub sqlite: SqliteStorageConfig,
+}
+
+/// Storage backend selector.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    /// No CDR / KV persistence. Dialog terminates produce no CDR
+    /// rows; `list_cdr` returns an empty page. Default so a
+    /// fresh `config.toml` stays silent until operators opt in.
+    #[default]
+    None,
+    /// Embedded `SQLite` store — shares schema with `[auth]` when
+    /// paths match (recommended).
+    Sqlite,
+}
+
+/// `[storage.sqlite]` settings.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SqliteStorageConfig {
+    /// Filesystem path to the `SQLite` database. Auto-created.
+    /// Point this at the same path as `[auth.sqlite] path` to share
+    /// one DB file across both traits.
+    pub path: std::path::PathBuf,
+}
+
+impl Default for SqliteStorageConfig {
+    fn default() -> Self {
+        Self {
+            path: std::path::PathBuf::from("smiths-storage.db"),
+        }
+    }
 }
 
 /// `[auth]` TOML block — subscriber-DB backend selection and realm.

@@ -45,13 +45,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension as _, params};
+use smiths_core::storage::{CallDetailRecord, CdrFilter, CdrStore, KvStore, StorageError};
 use smiths_core::{RegistrationSnapshot, RegistrationView};
 use thiserror::Error;
 use tracing::{debug, info};
 
-use super::{
-    Binding, CredentialStore, Credentials, RegistrationError, RegistrationStore,
-};
+use super::{Binding, CredentialStore, Credentials, RegistrationError, RegistrationStore};
 
 /// Errors raised while opening / migrating / reading the `SQLite` store.
 #[derive(Debug, Error)]
@@ -85,19 +84,31 @@ impl From<SqliteStoreError> for RegistrationError {
 
 /// Highest schema version this binary knows how to create / read.
 /// Bump when adding a migration to [`MIGRATIONS`].
-pub const CURRENT_SCHEMA_VERSION: i32 = 1;
+pub const CURRENT_SCHEMA_VERSION: i32 = 2;
 
 /// Ordered list of migration steps. Index 0 is applied first. Each
 /// step is run inside a single transaction; a failure rolls back
 /// cleanly and leaves `_schema_version` at its previous value.
-const MIGRATIONS: &[(&str, i32)] = &[(
-    "v1 — users / realms / contacts",
-    // All four tables live in one migration because the FK graph is
-    // mutual: users→realms, contacts are dialog-scoped (AOR+contact)
-    // so they don't need a FK, just a unique key. Keeps the v1 bundle
-    // atomic and the schema-version bookkeeping trivial.
-    1,
-)];
+const MIGRATIONS: &[(&str, i32)] = &[
+    (
+        "v1 — users / realms / contacts",
+        // All four tables live in one migration because the FK graph is
+        // mutual: users→realms, contacts are dialog-scoped (AOR+contact)
+        // so they don't need a FK, just a unique key. Keeps the v1 bundle
+        // atomic and the schema-version bookkeeping trivial.
+        1,
+    ),
+    (
+        "v2 — cdr / kv (slice 2.3: pluggable storage)",
+        // Adds the generic CDR + KV tables so the same DB file can
+        // back `CdrStore` + `KvStore` from `smiths-core::storage`.
+        // Operators typically point `[auth.sqlite]` and
+        // `[storage.sqlite]` at the same path; separate paths work
+        // too (each file migrates independently — the unused tables
+        // just sit empty).
+        2,
+    ),
+];
 
 /// Idempotent migration runner. Holds no state beyond the current
 /// version read off disk; every call to [`Self::run`] is safe to
@@ -114,11 +125,9 @@ impl MigrationRunner {
              );",
         )?;
         let current: i32 = conn
-            .query_row(
-                "SELECT version FROM _schema_version LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT version FROM _schema_version LIMIT 1", [], |r| {
+                r.get(0)
+            })
             .optional()?
             .unwrap_or(0);
         if current > CURRENT_SCHEMA_VERSION {
@@ -140,7 +149,11 @@ impl MigrationRunner {
                 params![target],
             )?;
             tx.commit()?;
-            info!(version = *target, name = *label, "sqlite auth schema migrated");
+            info!(
+                version = *target,
+                name = *label,
+                "sqlite auth schema migrated"
+            );
         }
 
         Ok(CURRENT_SCHEMA_VERSION)
@@ -171,6 +184,25 @@ fn apply_migration(target: i32, tx: &rusqlite::Transaction<'_>) -> Result<(), Sq
                  );
                  CREATE INDEX contacts_by_aor ON contacts(aor);
                  CREATE INDEX contacts_by_expiry ON contacts(expires_at_unix);",
+            )?;
+        }
+        2 => {
+            tx.execute_batch(
+                "CREATE TABLE cdr (
+                     call_id         TEXT    PRIMARY KEY,
+                     from_uri        TEXT    NOT NULL,
+                     to_uri          TEXT    NOT NULL,
+                     started_at_unix INTEGER NOT NULL,
+                     ended_at_unix   INTEGER NOT NULL,
+                     duration_secs   INTEGER NOT NULL,
+                     result          TEXT    NOT NULL
+                 );
+                 CREATE INDEX cdr_by_started ON cdr(started_at_unix DESC);
+                 CREATE INDEX cdr_by_result  ON cdr(result);
+                 CREATE TABLE kv (
+                     key   TEXT PRIMARY KEY,
+                     value BLOB NOT NULL
+                 );",
             )?;
         }
         other => {
@@ -385,6 +417,162 @@ impl RegistrationStore for SqliteAuthStore {
     }
 }
 
+/// Map any `rusqlite::Error` into the generic `StorageError` so the
+/// `CdrStore` + `KvStore` impls don't leak the dep through their
+/// signatures.
+fn to_storage(err: &rusqlite::Error) -> StorageError {
+    StorageError::Backend(err.to_string())
+}
+
+impl CdrStore for SqliteAuthStore {
+    fn record(&self, cdr: &CallDetailRecord) -> Result<(), StorageError> {
+        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        conn.execute(
+            "INSERT INTO cdr(call_id, from_uri, to_uri, started_at_unix,
+                             ended_at_unix, duration_secs, result)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(call_id) DO UPDATE SET
+                 from_uri        = excluded.from_uri,
+                 to_uri          = excluded.to_uri,
+                 started_at_unix = excluded.started_at_unix,
+                 ended_at_unix   = excluded.ended_at_unix,
+                 duration_secs   = excluded.duration_secs,
+                 result          = excluded.result",
+            params![
+                cdr.call_id,
+                cdr.from_uri,
+                cdr.to_uri,
+                cdr.started_at_unix,
+                cdr.ended_at_unix,
+                cdr.duration_secs,
+                cdr.result,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|e| to_storage(&e))
+    }
+
+    fn list(&self, filter: &CdrFilter) -> Result<Vec<CallDetailRecord>, StorageError> {
+        if filter.limit == 0 {
+            return Err(StorageError::Invalid("limit must be > 0".into()));
+        }
+        // Build the WHERE clause dynamically but keep it prepared —
+        // string-interpolate only the column list + fixed predicates;
+        // every user-supplied value goes through `params`.
+        let mut sql = String::from(
+            "SELECT call_id, from_uri, to_uri, started_at_unix,
+                    ended_at_unix, duration_secs, result
+             FROM cdr WHERE 1=1",
+        );
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(since) = filter.since_unix {
+            sql.push_str(" AND started_at_unix >= ?");
+            args.push(Box::new(since));
+        }
+        if let Some(until) = filter.until_unix {
+            sql.push_str(" AND started_at_unix <= ?");
+            args.push(Box::new(until));
+        }
+        if let Some(ref fl) = filter.from_like {
+            sql.push_str(" AND from_uri LIKE ?");
+            args.push(Box::new(format!("%{fl}%")));
+        }
+        if let Some(ref tl) = filter.to_like {
+            sql.push_str(" AND to_uri LIKE ?");
+            args.push(Box::new(format!("%{tl}%")));
+        }
+        if let Some(ref res) = filter.result {
+            sql.push_str(" AND result = ?");
+            args.push(Box::new(res.clone()));
+        }
+        sql.push_str(" ORDER BY started_at_unix DESC LIMIT ?");
+        args.push(Box::new(i64::from(filter.limit)));
+
+        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let mut stmt = conn.prepare(&sql).map_err(|e| to_storage(&e))?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            args.iter().map(std::convert::AsRef::as_ref).collect();
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok(CallDetailRecord {
+                    call_id: row.get(0)?,
+                    from_uri: row.get(1)?,
+                    to_uri: row.get(2)?,
+                    started_at_unix: row.get(3)?,
+                    ended_at_unix: row.get(4)?,
+                    duration_secs: row.get(5)?,
+                    result: row.get(6)?,
+                })
+            })
+            .map_err(|e| to_storage(&e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| to_storage(&e))?);
+        }
+        Ok(out)
+    }
+
+    fn truncate(&self) -> Result<(), StorageError> {
+        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        conn.execute("DELETE FROM cdr", [])
+            .map_err(|e| to_storage(&e))?;
+        Ok(())
+    }
+}
+
+impl KvStore for SqliteAuthStore {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        conn.query_row("SELECT value FROM kv WHERE key = ?1", params![key], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })
+        .optional()
+        .map_err(|e| to_storage(&e))
+    }
+
+    fn put(&self, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        conn.execute(
+            "INSERT INTO kv(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .map_err(|e| to_storage(&e))?;
+        Ok(())
+    }
+
+    fn delete(&self, key: &str) -> Result<bool, StorageError> {
+        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let removed = conn
+            .execute("DELETE FROM kv WHERE key = ?1", params![key])
+            .map_err(|e| to_storage(&e))?;
+        Ok(removed > 0)
+    }
+
+    fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        // `LIKE 'prefix%'` with `%` and `_` in the user-supplied
+        // prefix would be over-permissive; escape them so callers
+        // can pass arbitrary byte strings safely.
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let mut stmt = conn
+            .prepare("SELECT key FROM kv WHERE key LIKE ?1 ESCAPE '\\' ORDER BY key")
+            .map_err(|e| to_storage(&e))?;
+        let rows = stmt
+            .query_map(params![pattern], |row| row.get::<_, String>(0))
+            .map_err(|e| to_storage(&e))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| to_storage(&e))?);
+        }
+        Ok(out)
+    }
+}
+
 impl RegistrationView for SqliteAuthStore {
     fn snapshot(&self) -> Vec<RegistrationSnapshot> {
         // `RegistrationStore::snapshot` already filters expired rows;
@@ -469,11 +657,7 @@ mod tests {
     #[test]
     fn bind_and_snapshot_round_trip() {
         let store = SqliteAuthStore::open_in_memory().unwrap();
-        let b = binding(
-            "sip:alice@smiths.local",
-            "sip:alice@192.0.2.10:5060",
-            3600,
-        );
+        let b = binding("sip:alice@smiths.local", "sip:alice@192.0.2.10:5060", 3600);
         let stored = store.bind(&b).unwrap();
         assert_eq!(stored, b);
 
@@ -515,7 +699,9 @@ mod tests {
     #[test]
     fn unbind_unknown_aor_errors() {
         let store = SqliteAuthStore::open_in_memory().unwrap();
-        let err = store.unbind("sip:nobody@smiths.local", "sip:x@y").unwrap_err();
+        let err = store
+            .unbind("sip:nobody@smiths.local", "sip:x@y")
+            .unwrap_err();
         match err {
             RegistrationError::UnknownAor(aor) => assert_eq!(aor, "sip:nobody@smiths.local"),
             RegistrationError::Backend(_) => panic!("expected UnknownAor, got Backend"),
@@ -553,5 +739,145 @@ mod tests {
         let reopened = SqliteAuthStore::open(&path).unwrap();
         assert!(reopened.lookup("smiths.local", "persist").is_some());
         assert_eq!(RegistrationStore::snapshot(&reopened).unwrap().len(), 1);
+    }
+
+    // ---------- Slice 2.3: CDR + KV surface ----------
+
+    fn cdr(call_id: &str, started: i64, ended: i64, result: &str) -> CallDetailRecord {
+        CallDetailRecord {
+            call_id: call_id.into(),
+            from_uri: "sip:bob@x".into(),
+            to_uri: "sip:alice@y".into(),
+            started_at_unix: started,
+            ended_at_unix: ended,
+            duration_secs: (ended - started).max(0),
+            result: result.into(),
+        }
+    }
+
+    #[test]
+    fn cdr_record_and_list_newest_first() {
+        let store = SqliteAuthStore::open_in_memory().unwrap();
+        store
+            .record(&cdr("c-old", 1_700_000_000, 1_700_000_010, "answered"))
+            .unwrap();
+        store
+            .record(&cdr("c-new", 1_700_000_100, 1_700_000_130, "answered"))
+            .unwrap();
+
+        let rows = store.list(&CdrFilter::new()).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].call_id, "c-new", "newest must be first");
+        assert_eq!(rows[1].call_id, "c-old");
+    }
+
+    #[test]
+    fn cdr_filter_by_result_and_since() {
+        let store = SqliteAuthStore::open_in_memory().unwrap();
+        store.record(&cdr("c1", 100, 110, "answered")).unwrap();
+        store.record(&cdr("c2", 200, 205, "cancelled")).unwrap();
+        store.record(&cdr("c3", 300, 330, "answered")).unwrap();
+
+        let mut f = CdrFilter::new();
+        f.result = Some("answered".into());
+        f.since_unix = Some(150);
+        let rows = store.list(&f).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].call_id, "c3");
+    }
+
+    #[test]
+    fn cdr_filter_substring_from_to() {
+        let store = SqliteAuthStore::open_in_memory().unwrap();
+        let mut row = cdr("c-party", 1, 2, "answered");
+        row.from_uri = "sip:alice@party.example".into();
+        row.to_uri = "sip:bob@example".into();
+        store.record(&row).unwrap();
+
+        let mut f = CdrFilter::new();
+        f.from_like = Some("party".into());
+        assert_eq!(store.list(&f).unwrap().len(), 1);
+        let mut f2 = CdrFilter::new();
+        f2.from_like = Some("nobody".into());
+        assert_eq!(store.list(&f2).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn cdr_record_upserts_on_call_id_conflict() {
+        let store = SqliteAuthStore::open_in_memory().unwrap();
+        store.record(&cdr("dup", 1, 2, "answered")).unwrap();
+        let mut updated = cdr("dup", 1, 9, "answered");
+        updated.duration_secs = 8;
+        store.record(&updated).unwrap();
+        let rows = store.list(&CdrFilter::new()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ended_at_unix, 9);
+        assert_eq!(rows[0].duration_secs, 8);
+    }
+
+    #[test]
+    fn cdr_list_rejects_zero_limit() {
+        let store = SqliteAuthStore::open_in_memory().unwrap();
+        let mut f = CdrFilter::new();
+        f.limit = 0;
+        match store.list(&f) {
+            Err(StorageError::Invalid(_)) => {}
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cdr_truncate_empties_the_table() {
+        let store = SqliteAuthStore::open_in_memory().unwrap();
+        store.record(&cdr("c1", 1, 2, "answered")).unwrap();
+        store.record(&cdr("c2", 3, 4, "answered")).unwrap();
+        store.truncate().unwrap();
+        assert!(store.list(&CdrFilter::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn kv_round_trip() {
+        let store = SqliteAuthStore::open_in_memory().unwrap();
+        assert!(store.get("missing").unwrap().is_none());
+        store.put("hello", b"world").unwrap();
+        assert_eq!(
+            store.get("hello").unwrap().as_deref(),
+            Some(b"world" as &[u8])
+        );
+        // Overwrite.
+        store.put("hello", b"earth").unwrap();
+        assert_eq!(
+            store.get("hello").unwrap().as_deref(),
+            Some(b"earth" as &[u8])
+        );
+    }
+
+    #[test]
+    fn kv_delete_reports_whether_row_existed() {
+        let store = SqliteAuthStore::open_in_memory().unwrap();
+        store.put("doomed", b"x").unwrap();
+        assert!(store.delete("doomed").unwrap());
+        assert!(!store.delete("doomed").unwrap(), "second delete is false");
+    }
+
+    #[test]
+    fn kv_list_prefix_returns_only_matching_keys_in_order() {
+        let store = SqliteAuthStore::open_in_memory().unwrap();
+        for k in ["cfg/a", "cfg/b", "cfg/c", "other/x"] {
+            store.put(k, b"").unwrap();
+        }
+        let cfg_keys = store.list_prefix("cfg/").unwrap();
+        assert_eq!(cfg_keys, vec!["cfg/a", "cfg/b", "cfg/c"]);
+    }
+
+    #[test]
+    fn kv_list_prefix_escapes_wildcards() {
+        // Without escaping, a prefix of `%` would match every row —
+        // the escape-by-hand keeps user-supplied bytes literal.
+        let store = SqliteAuthStore::open_in_memory().unwrap();
+        store.put("real-prefix/a", b"").unwrap();
+        store.put("other/b", b"").unwrap();
+        let hits = store.list_prefix("%").unwrap();
+        assert!(hits.is_empty(), "literal `%` must not match anything");
     }
 }

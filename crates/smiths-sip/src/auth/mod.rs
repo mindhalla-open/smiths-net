@@ -66,7 +66,11 @@ pub struct Credentials {
 impl Credentials {
     /// Plaintext constructor — the common case for static seeding.
     #[must_use]
-    pub fn new(username: impl Into<String>, realm: impl Into<String>, password: impl Into<String>) -> Self {
+    pub fn new(
+        username: impl Into<String>,
+        realm: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
         Self {
             username: username.into(),
             realm: realm.into(),
@@ -664,9 +668,10 @@ pub mod digest {
             // passwords never have to cross the backend boundary.
             // Otherwise hash on demand from the plaintext the
             // in-memory / SQLite stores hold.
-            let ha1 = creds.ha1.clone().unwrap_or_else(|| {
-                ha1(alg, &creds.username, &creds.realm, &creds.password)
-            });
+            let ha1 = creds
+                .ha1
+                .clone()
+                .unwrap_or_else(|| ha1(alg, &creds.username, &creds.realm, &creds.password));
             let ha2 = ha2(alg, method, &params.uri);
 
             let expected = match (
