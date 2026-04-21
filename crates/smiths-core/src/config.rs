@@ -33,6 +33,221 @@ pub struct Config {
     pub a2a: A2aConfig,
     /// Plugin loader settings.
     pub plugins: PluginsConfig,
+    /// Auth / subscriber-DB configuration (P8, slice 2.1).
+    pub auth: AuthConfig,
+    /// Pluggable storage configuration (P23, slice 2.3). CDR + KV
+    /// backends share this section; auth has its own `[auth]`
+    /// because its lifetime + security story differs.
+    pub storage: StorageConfig,
+    /// Media-plane tunings (DTMF inband detection, later: jitter
+    /// buffer depth, comfort-noise on silence).
+    pub media: MediaConfig,
+}
+
+/// `[media]` TOML block — per-leg media-plane tunings.
+///
+/// ```toml
+/// [media]
+/// inband_dtmf = true    # run the Goertzel detector on every bridge
+/// ```
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MediaConfig {
+    /// Opt every bridge into the Goertzel inband DTMF detector
+    /// (slice 2.5). Off by default — the RFC 4733 telephone-event
+    /// path (always on when a DTMF sink is wired) covers most
+    /// softphones. Enable when legs that never negotiate 4733
+    /// (PSTN gateway crossings) need DTMF too.
+    pub inband_dtmf: bool,
+}
+
+/// `[storage]` TOML block — CDR + KV backend selection.
+///
+/// ```toml
+/// [storage]
+/// backend = "sqlite"        # "none" | "sqlite"
+///
+/// [storage.sqlite]
+/// path = "/var/lib/smiths-net/storage.db"
+/// ```
+///
+/// When operators point `[auth.sqlite]` and `[storage.sqlite]` at
+/// the same file the `SQLite` auth store serves both surfaces
+/// (credentials + registrations + CDR + KV) from one DB — that's
+/// the default the runbook recommends.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Which backend to wire up for `CdrStore` + `KvStore`.
+    pub backend: StorageBackend,
+    /// SQLite-specific settings. Ignored when `backend != "sqlite"`.
+    pub sqlite: SqliteStorageConfig,
+}
+
+/// Storage backend selector.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    /// No CDR / KV persistence. Dialog terminates produce no CDR
+    /// rows; `list_cdr` returns an empty page. Default so a
+    /// fresh `config.toml` stays silent until operators opt in.
+    #[default]
+    None,
+    /// Embedded `SQLite` store — shares schema with `[auth]` when
+    /// paths match (recommended).
+    Sqlite,
+}
+
+/// `[storage.sqlite]` settings.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SqliteStorageConfig {
+    /// Filesystem path to the `SQLite` database. Auto-created.
+    /// Point this at the same path as `[auth.sqlite] path` to share
+    /// one DB file across both traits.
+    pub path: std::path::PathBuf,
+}
+
+impl Default for SqliteStorageConfig {
+    fn default() -> Self {
+        Self {
+            path: std::path::PathBuf::from("smiths-storage.db"),
+        }
+    }
+}
+
+/// `[auth]` TOML block — subscriber-DB backend selection and realm.
+///
+/// ```toml
+/// [auth]
+/// backend = "sqlite"        # "none" | "sqlite"
+/// realm   = "smiths.local"
+///
+/// [auth.sqlite]
+/// path = "/var/lib/smiths-net/auth.db"
+/// ```
+///
+/// `backend = "none"` (the default today) keeps the pre-v0.33.0 dev
+/// behaviour: REGISTER is accepted blindly, INVITE isn't challenged.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Which subscriber-DB implementation to wire up.
+    pub backend: AuthBackend,
+    /// Digest-auth realm the engine advertises in `WWW-Authenticate`.
+    /// Must match the realm stored against each account; mismatched
+    /// realms surface to UAs as `401 Unauthorized` with the engine's
+    /// value.
+    pub realm: String,
+    /// SQLite-specific settings. Ignored when `backend != "sqlite"`.
+    pub sqlite: SqliteAuthConfig,
+    /// HTTP-webhook settings. Ignored when `backend != "http"`.
+    pub http: HttpAuthConfig,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            backend: AuthBackend::None,
+            realm: "smiths.local".to_owned(),
+            sqlite: SqliteAuthConfig::default(),
+            http: HttpAuthConfig::default(),
+        }
+    }
+}
+
+/// Subscriber-DB backend selector. Extend by adding a variant +
+/// wiring the corresponding `smiths-sip::auth::*_store` impl.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthBackend {
+    /// No credential store: REGISTER + INVITE accepted without auth.
+    /// Same as pre-v0.33.0 behaviour. Default so existing
+    /// `config.toml` files keep working.
+    #[default]
+    None,
+    /// Embedded `SQLite` store. Path configured via
+    /// [`AuthConfig::sqlite`].
+    Sqlite,
+    /// HTTP webhook — engine posts a challenge to the operator's
+    /// endpoint and expects a pre-computed HA1 or deny verdict back.
+    /// Config in [`AuthConfig::http`].
+    Http,
+}
+
+/// `[auth.sqlite]` settings.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SqliteAuthConfig {
+    /// Filesystem path to the `SQLite` database. Opened with
+    /// auto-create; the enclosing directory must already exist.
+    pub path: std::path::PathBuf,
+}
+
+impl Default for SqliteAuthConfig {
+    fn default() -> Self {
+        Self {
+            path: std::path::PathBuf::from("smiths-auth.db"),
+        }
+    }
+}
+
+/// `[auth.http]` settings — webhook endpoint + breaker tuning.
+///
+/// Mirror of `smiths-sip::auth::http_store::HttpAuthConfig`. Kept in
+/// `smiths-core` so operators configure auth without the CLI having
+/// to reach sideways into `smiths-sip`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpAuthConfig {
+    /// Full endpoint URL the engine POSTs challenges to. Required
+    /// when `backend = "http"`; empty on `"none"` / `"sqlite"`.
+    pub endpoint: String,
+    /// Per-request timeout, milliseconds. Default 2000.
+    pub timeout_ms: u64,
+    /// Retry count per lookup (on top of the first attempt).
+    /// Default 1.
+    pub retries: u8,
+    /// `Authorization: Bearer <token>` sent with every webhook
+    /// request, so the backend can authenticate the engine itself.
+    /// `None` = no bearer.
+    pub bearer_token: Option<String>,
+    /// Consecutive failures before the circuit breaker trips Open.
+    /// Default 5.
+    pub breaker_threshold: u32,
+    /// Cooldown (seconds) after the breaker trips Open before the
+    /// next probe is attempted. Default 30.
+    pub breaker_cooldown_secs: u64,
+    /// What to do while the breaker is Open. `"fail_closed"`
+    /// (default) treats every lookup as deny; `"fail_open"` returns
+    /// `UnknownUser` without touching the breaker — only appropriate
+    /// when auth is optional.
+    pub failure_mode: HttpFailureMode,
+}
+
+impl Default for HttpAuthConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            timeout_ms: 2_000,
+            retries: 1,
+            bearer_token: None,
+            breaker_threshold: 5,
+            breaker_cooldown_secs: 30,
+            failure_mode: HttpFailureMode::FailClosed,
+        }
+    }
+}
+
+/// Wire form of `smiths-sip::auth::http_store::FailureMode`.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpFailureMode {
+    /// Every lookup returns deny while the breaker is Open. Default.
+    #[default]
+    FailClosed,
+    /// Every lookup returns `UnknownUser` (no breaker increment).
+    FailOpen,
 }
 
 /// Core runtime tuning.

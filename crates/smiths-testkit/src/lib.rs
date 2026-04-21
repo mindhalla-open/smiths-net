@@ -5,6 +5,7 @@
 //! G.711 μ-law codec, a minimal WAV writer, and a signal generator so
 //! end-to-end audio and signaling scenarios don't need external tools.
 
+pub mod dtmf_gen;
 pub mod fake_uac;
 pub mod fake_uas;
 pub mod signal;

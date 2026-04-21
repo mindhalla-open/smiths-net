@@ -78,6 +78,14 @@ pub struct UdpMediaFabric {
     /// Shared metrics handle. `None` on test fabrics; the CLI wires
     /// the engine-wide `Arc<Metrics>` via [`Self::with_metrics`].
     metrics: Option<Arc<Metrics>>,
+    /// DTMF sink wired into every subsequently-spawned bridge. `None`
+    /// = bridges don't detect DTMF. Set via [`Self::with_dtmf_sink`]
+    /// — the CLI plumbs a `BusDtmfSink` here so RFC 4733 keypresses
+    /// land on the event bus.
+    dtmf_sink: Option<Arc<dyn smiths_core::dtmf::DtmfSink>>,
+    /// `true` → spawned bridges also run the Goertzel inband
+    /// detector on plaintext PCMU. Off by default (slice 2.5).
+    inband_dtmf: bool,
 }
 
 impl UdpMediaFabric {
@@ -91,6 +99,25 @@ impl UdpMediaFabric {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Attach a DTMF sink. Every bridge spawned after this call
+    /// receives RFC 4733 keypresses through the sink; bridges
+    /// spawned before keep their (empty) config. In practice the
+    /// CLI calls this once at boot and never again.
+    #[must_use]
+    pub fn with_dtmf_sink(mut self, sink: Arc<dyn smiths_core::dtmf::DtmfSink>) -> Self {
+        self.dtmf_sink = Some(sink);
+        self
+    }
+
+    /// Opt every subsequently-spawned bridge into the Goertzel
+    /// inband DTMF detector (slice 2.5). No-op without a wired
+    /// sink — detected presses need somewhere to go.
+    #[must_use]
+    pub fn with_inband_dtmf(mut self, enabled: bool) -> Self {
+        self.inband_dtmf = enabled;
         self
     }
 
@@ -168,6 +195,8 @@ impl MediaFabric for UdpMediaFabric {
         };
         let cfg = BridgeConfig {
             metrics: self.metrics.clone(),
+            dtmf_sink: self.dtmf_sink.clone(),
+            inband_dtmf: self.inband_dtmf,
             ..BridgeConfig::default()
         };
         let bridge = Bridge::spawn_with(id, &leg_a, &leg_b, &cfg);

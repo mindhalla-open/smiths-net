@@ -18,7 +18,7 @@ pub mod rtcp;
 pub mod rtp_stats;
 pub mod srtp;
 
-pub use bridge::{Bridge, BridgeConfig, Leg, RtcpLeg};
+pub use bridge::{Bridge, BridgeConfig, DtmfSink, Leg, RtcpLeg};
 pub use fabric::UdpMediaFabric;
 pub use port_allocator::{PortPair, allocate_rtp_rtcp_pair};
 pub use rtp_stats::{StreamStats, StreamStatsSnapshot};

@@ -86,6 +86,11 @@ pub struct RtcpLeg {
     pub peer: SocketAddr,
 }
 
+// The `DtmfSink` trait lives in `smiths-core::dtmf` so bus-adapter
+// implementations (`BusDtmfSink`) and the bridge share one type.
+// Re-exported here for callers who only depend on `smiths-media`.
+pub use smiths_core::dtmf::DtmfSink;
+
 /// Runtime tunables for a bridge.
 #[derive(Clone)]
 pub struct BridgeConfig {
@@ -99,6 +104,16 @@ pub struct BridgeConfig {
     /// emitter increment `rtp_packets_forwarded` / `rtcp_sr_sent`;
     /// when absent (tests, embedded use) the bridge runs silently.
     pub metrics: Option<std::sync::Arc<Metrics>>,
+    /// Optional DTMF sink — when wired, the forwarder parses
+    /// RFC 4733 telephone-event payloads before forwarding and
+    /// delivers each completed keypress to the sink. Slice 2.4.
+    pub dtmf_sink: Option<Arc<dyn DtmfSink>>,
+    /// `true` → also run the Goertzel inband DTMF detector on the
+    /// plaintext audio stream. Default `false` because the extra
+    /// FFT-like math costs ~3k FLOPs per 20 ms frame. Legs that
+    /// never negotiated RFC 4733 (PSTN gateway crossings) set this
+    /// to catch DTMF the RFC 4733 detector would miss. Slice 2.5.
+    pub inband_dtmf: bool,
 }
 
 impl Default for BridgeConfig {
@@ -106,6 +121,8 @@ impl Default for BridgeConfig {
         Self {
             rtcp_interval: Some(Duration::from_secs(5)),
             metrics: None,
+            dtmf_sink: None,
+            inband_dtmf: false,
         }
     }
 }
@@ -115,6 +132,8 @@ impl std::fmt::Debug for BridgeConfig {
         f.debug_struct("BridgeConfig")
             .field("rtcp_interval", &self.rtcp_interval)
             .field("metrics", &self.metrics.is_some())
+            .field("dtmf_sink", &self.dtmf_sink.is_some())
+            .field("inband_dtmf", &self.inband_dtmf)
             .finish()
     }
 }
@@ -171,6 +190,8 @@ impl Bridge {
             stats_a_to_b.clone(),
             srtp_ab,
             cfg.metrics.clone(),
+            cfg.dtmf_sink.clone(),
+            cfg.inband_dtmf,
             cancel.clone(),
             "a->b",
         );
@@ -182,6 +203,8 @@ impl Bridge {
             stats_b_to_a.clone(),
             srtp_ba,
             cfg.metrics.clone(),
+            cfg.dtmf_sink.clone(),
+            cfg.inband_dtmf,
             cancel.clone(),
             "b->a",
         );
@@ -312,6 +335,8 @@ fn spawn_rewriting_forward(
     stats: StreamStats,
     srtp: Option<(Arc<dyn SrtpTransform>, Arc<dyn SrtpTransform>)>,
     metrics: Option<Arc<Metrics>>,
+    dtmf_sink: Option<Arc<dyn DtmfSink>>,
+    inband_dtmf: bool,
     cancel: CancellationToken,
     dir: &'static str,
 ) -> JoinHandle<()> {
@@ -319,6 +344,18 @@ fn spawn_rewriting_forward(
         // RTP frames top out well under an MTU; 2 KB leaves headroom
         // (SRTP ciphertext adds only the auth tag suffix).
         let mut buf = vec![0u8; 2048];
+        // DTMF detector: one per direction. Lazily built only when a
+        // sink is actually wired so non-DTMF deployments pay nothing.
+        // Clock rate is fixed at 8 kHz; RFC 4733 rtpmap with a
+        // different clock is exotic and a follow-on slice.
+        let mut dtmf_detector = dtmf_sink
+            .as_ref()
+            .map(|_| smiths_core::DtmfDetector::new(dir, 8_000));
+        // Inband Goertzel detector — only built when `inband_dtmf`
+        // is opted in AND a sink is wired (no sink = nowhere to
+        // deliver, so the math would be wasted).
+        let mut inband_detector =
+            (inband_dtmf && dtmf_sink.is_some()).then(|| smiths_core::InbandDtmfDetector::new(dir));
         loop {
             tokio::select! {
                 biased;
@@ -361,6 +398,38 @@ fn spawn_rewriting_forward(
                         let egress_slice: &[u8] = egress_owned
                             .as_deref()
                             .unwrap_or(&buf[..n]);
+                        // DTMF detect on the plaintext RTP, before the
+                        // SSRC-rewritten bytes leave the engine. Parses
+                        // only when the PT matches RFC 4733 so the
+                        // common audio path pays at most one branch.
+                        if let Some(sink) = dtmf_sink.as_ref() {
+                            let plaintext_for_dtmf: &[u8] = match &srtp {
+                                None => &buf[..n],
+                                Some(_) => egress_owned
+                                    .as_deref()
+                                    .map_or(&buf[..n], |v| v),
+                            };
+                            // RFC 4733 telephone-event path (cheap —
+                            // one PT check per packet).
+                            if let Some(detector) = dtmf_detector.as_mut() {
+                                if let Some(press) =
+                                    detect_dtmf(plaintext_for_dtmf, detector)
+                                {
+                                    sink.deliver(dir, press);
+                                }
+                            }
+                            // Inband Goertzel path (opt-in). Only
+                            // runs on payload type 0 (PCMU) today;
+                            // PCMA / other codecs decode through the
+                            // same path once their decoders land.
+                            if let Some(inband) = inband_detector.as_mut() {
+                                for press in
+                                    detect_dtmf_inband(plaintext_for_dtmf, inband)
+                                {
+                                    sink.deliver(dir, press);
+                                }
+                            }
+                        }
                         // Observe on the (plaintext, rewritten) form
                         // for plain RTP; for SRTP the ciphertext
                         // header still carries the rewritten SSRC in
@@ -385,6 +454,51 @@ fn spawn_rewriting_forward(
         }
         debug!(dir, "bridge forwarder stopped");
     })
+}
+
+/// Pick out an RFC 4733 telephone-event payload from a raw RTP
+/// datagram and feed it through `detector`. Returns the detector's
+/// output directly so the caller can hand it to the `DtmfSink`.
+///
+/// Deliberately permissive: a malformed RTP header or a non-matching
+/// payload type returns `None` without logging — at 50 pps (20 ms
+/// frames) for the duration of a call, spurious warnings would
+/// drown real issues.
+fn detect_dtmf(
+    rtp_bytes: &[u8],
+    detector: &mut smiths_core::DtmfDetector,
+) -> Option<smiths_core::DtmfKeypress> {
+    let pkt = smiths_core::RtpPacket::decode(rtp_bytes)?;
+    if pkt.payload_type != smiths_core::RFC4733_PAYLOAD_TYPE {
+        return None;
+    }
+    let ev = smiths_core::TelephoneEvent::parse(&pkt.payload)?;
+    // Start timestamp == the RTP timestamp of the first packet of a
+    // keypress. The engine doesn't track presses across multiple RTP
+    // ts values; the detector treats "same (event, ts)" as one press.
+    detector.feed(&ev, pkt.timestamp)
+}
+
+/// PCMU payload type per RFC 3551 §4.5 Table 4 — the only codec the
+/// inband detector decodes today. PCMA / Opus land with their own
+/// decoder once a concrete need arrives.
+const PT_PCMU_FOR_DTMF: u8 = 0;
+
+/// Run the Goertzel inband detector over a PCMU-bearing RTP packet.
+/// Returns every keypress the detector emits while consuming this
+/// packet's audio (usually zero; occasionally one when a tone just
+/// ended inside this frame).
+fn detect_dtmf_inband(
+    rtp_bytes: &[u8],
+    detector: &mut smiths_core::InbandDtmfDetector,
+) -> Vec<smiths_core::DtmfKeypress> {
+    let Some(pkt) = smiths_core::RtpPacket::decode(rtp_bytes) else {
+        return Vec::new();
+    };
+    if pkt.payload_type != PT_PCMU_FOR_DTMF {
+        return Vec::new();
+    }
+    detector.feed_pcmu(&pkt.payload)
 }
 
 /// Fire an RTCP Sender Report on each tick.
@@ -757,6 +871,8 @@ mod tests {
             &BridgeConfig {
                 rtcp_interval: Some(Duration::from_millis(100)),
                 metrics: None,
+                dtmf_sink: None,
+                inband_dtmf: false,
             },
         );
 

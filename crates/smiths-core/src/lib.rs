@@ -27,6 +27,8 @@ pub mod codec;
 pub mod config;
 pub mod drain;
 pub mod dtls;
+pub mod dtmf;
+pub mod dtmf_inband;
 pub mod error;
 pub mod event;
 pub mod media;
@@ -34,21 +36,31 @@ pub mod metrics;
 pub mod rtp;
 pub mod sdp;
 pub mod shutdown;
+pub mod storage;
 
 pub use ai::{
-    AiProvider, AiRegistry, CapabilityDescriptor, ConcurrencyHint, LatencyHint, ProviderError,
-    ValidationError, validate_controls,
+    AiProvider, AiRegistry, CapabilityDescriptor, ConcurrencyHint, LatencyHint,
+    MEDIA_STREAMING_RTP, ProviderError, ValidationError, validate_controls,
 };
 pub use bus::EventBus;
-pub use call::{CallError, CallLookup, CallOriginator, DialogKey, DialogRecord, DialogState};
+pub use call::{
+    CallError, CallLookup, CallOriginator, DialogKey, DialogRecord, DialogState,
+    RegistrationSnapshot, RegistrationView,
+};
 pub use codec::{linear_to_ulaw, pcm16_to_pcmu, pcmu_to_pcm16, ulaw_to_linear};
 pub use config::{
-    A2aConfig, BindSpec, BindSpecError, Config, CoreConfig, LogFormat, McpConfig,
-    ObservabilityConfig, PluginsConfig, RateLimitConfig, SandboxConfig, SeccompPolicy, SipConfig,
-    SipRateLimit, SipTransport,
+    A2aConfig, AuthBackend, AuthConfig, BindSpec, BindSpecError, Config, CoreConfig,
+    HttpAuthConfig, HttpFailureMode, LogFormat, McpConfig, MediaConfig, ObservabilityConfig,
+    PluginsConfig, RateLimitConfig, SandboxConfig, SeccompPolicy, SipConfig, SipRateLimit,
+    SipTransport, SqliteAuthConfig, SqliteStorageConfig, StorageBackend, StorageConfig,
 };
 pub use drain::Drain;
 pub use dtls::{DtlsCertError, SelfSignedCert};
+pub use dtmf::{
+    BusDtmfSink, DtmfDetector, DtmfKeypress, DtmfSink, RFC4733_PAYLOAD_TYPE, TelephoneEvent,
+    digit_to_event_code, event_code_to_digit,
+};
+pub use dtmf_inband::{InbandDtmfDetector, synthesize_tone as synthesize_dtmf_tone};
 pub use error::Error;
 pub use event::{Event, MediaSecurityFailure, PluginEvent, SipEvent, SystemEvent};
 pub use media::{
@@ -59,3 +71,4 @@ pub use metrics::Metrics;
 pub use rtp::RtpPacket;
 pub use sdp::{NegotiationOutcome, SdpNegotiator, SrtpKeys};
 pub use shutdown::Shutdown;
+pub use storage::{CallDetailRecord, CdrFilter, CdrStore, KvStore, StorageError};

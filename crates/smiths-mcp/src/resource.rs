@@ -128,6 +128,7 @@ pub fn builtin_registry() -> ResourceRegistry {
     reg.register(HealthResource);
     reg.register(CallsResource);
     reg.register(CurrentConfigResource);
+    reg.register(RegistrationsResource);
     reg
 }
 
@@ -178,6 +179,37 @@ impl Resource for CallsResource {
         ResourceContent::json(&json!({
             "count": calls.len(),
             "calls": calls,
+        }))
+    }
+}
+
+/// `sip://registrations` — live subscriber-DB bindings (slice 2.1).
+///
+/// Returns an empty snapshot when no [`smiths_core::RegistrationView`]
+/// is wired into the context. Operators can distinguish
+/// "registrar disabled" from "idle registrar" by cross-referencing
+/// `[auth] backend` on `config://current`.
+pub struct RegistrationsResource;
+
+#[async_trait]
+impl Resource for RegistrationsResource {
+    fn uri(&self) -> &'static str {
+        "sip://registrations"
+    }
+    fn description(&self) -> &'static str {
+        "Live SIP subscriber-DB registrations (AOR → contact bindings)."
+    }
+    async fn read(&self, ctx: &ToolContext) -> Result<ResourceContent, ToolError> {
+        let (count, bindings) = match ctx.registrations.as_ref() {
+            Some(view) => {
+                let bs = view.snapshot();
+                (bs.len(), bs)
+            }
+            None => (0, Vec::new()),
+        };
+        ResourceContent::json(&json!({
+            "count": count,
+            "bindings": bindings,
         }))
     }
 }

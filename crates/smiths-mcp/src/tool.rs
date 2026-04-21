@@ -14,8 +14,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 use smiths_core::Config;
 use smiths_core::ai::AiRegistry;
-use smiths_core::call::CallOriginator;
+use smiths_core::call::{CallOriginator, RegistrationView};
 use smiths_core::media::MediaFabric;
+use smiths_core::storage::CdrStore;
 use thiserror::Error;
 
 use crate::control::ControlState;
@@ -42,6 +43,14 @@ pub struct ToolContext {
     /// UAS-only — tools that depend on it (`make_call`, `end_call`)
     /// return a clean `NotFound` instead of panicking.
     pub originator: Option<Arc<dyn CallOriginator>>,
+    /// Read-only view over the subscriber DB's live registrations
+    /// (slice 2.1). `None` when no backend is wired (e.g.
+    /// `[auth] backend = "none"`); `sip://registrations` returns an
+    /// empty snapshot in that case rather than 404-ing.
+    pub registrations: Option<Arc<dyn RegistrationView>>,
+    /// CDR store (slice 2.3). `None` when `[storage] backend =
+    /// "none"`; `list_cdr` returns an empty page in that case.
+    pub cdr: Option<Arc<dyn CdrStore>>,
 }
 
 impl ToolContext {
@@ -59,6 +68,8 @@ impl ToolContext {
             config,
             media,
             originator: None,
+            registrations: None,
+            cdr: None,
         }
     }
 
@@ -67,6 +78,27 @@ impl ToolContext {
     #[must_use]
     pub fn with_originator(mut self, originator: Arc<dyn CallOriginator>) -> Self {
         self.originator = Some(originator);
+        self
+    }
+
+    /// Attach a [`RegistrationView`] so the `sip://registrations`
+    /// resource can render live subscriber bindings. Without it the
+    /// resource returns an empty snapshot — callers can still
+    /// differentiate "registrar disabled" from "registered but idle"
+    /// by checking `[auth] backend` in `config://current`.
+    #[must_use]
+    pub fn with_registrations(mut self, view: Arc<dyn RegistrationView>) -> Self {
+        self.registrations = Some(view);
+        self
+    }
+
+    /// Attach a [`CdrStore`] so `list_cdr` returns live data. Without
+    /// it the tool returns `{count: 0, rows: []}` — callers can
+    /// tell the difference by reading `[storage] backend` from
+    /// `config://current`.
+    #[must_use]
+    pub fn with_cdr(mut self, store: Arc<dyn CdrStore>) -> Self {
+        self.cdr = Some(store);
         self
     }
 }

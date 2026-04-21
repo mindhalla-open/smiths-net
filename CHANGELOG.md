@@ -5,6 +5,260 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0] - 2026-04-21
+
+Slice 2.5 — Inband DTMF via Goertzel. Covers legs that never
+negotiated RFC 4733 (PSTN gateway crossings) — same `DtmfSink`
+contract as slice 2.4, same `SipEvent::Dtmf` bus event.
+
+### Added
+
+- **`smiths-core::dtmf_inband`** — second-order Goertzel detector:
+  - `InbandDtmfDetector::new(leg_id)` + `with_config(...)` for
+    tighter tunings.
+  - `feed_pcm16` / `feed_pcmu` — PCMU decode built-in so the bridge
+    hot path doesn't re-parse.
+  - `synthesize_tone(digit, ms, rate)` — ground-truth generator
+    used by the accuracy benchmark + tests.
+  - Constants: 8 kHz default clock, 20 ms frame (160 samples),
+    0.3 magnitude threshold, 40 ms debounce, co-channel 4× runner-
+    up ratio.
+- **Bridge integration** — `BridgeConfig::inband_dtmf` bool opts
+  in; forwarder runs both RFC 4733 and Goertzel detectors against
+  the same plaintext RTP stream, delivering through the existing
+  `DtmfSink` seam. Zero overhead when off.
+- **`UdpMediaFabric::with_inband_dtmf(bool)`** builder.
+- **`[media]` config section** — `inband_dtmf = false` by default
+  so existing deployments don't pay the FLOPs.
+- **`MEDIA_STREAMING_RTP = "media.streaming_rtp"` capability**
+  recognized in the plugin manifest validator. Namespaces are now
+  `ai.*` **and** `media.*`. Declares the plugin-tier contract for
+  a future sidecar that consumes per-packet RTP — `dtmf-inband`
+  (Python + scipy) is the intended reference but deferred.
+- **Tests** — 8 unit tests on the detector (every DTMF digit
+  round-trips, silence is silent, debounce works both ways, PCMU
+  feed matches PCM16, synthesize duration accurate, **accuracy
+  benchmark pass-all on clean synthesized audio**), 1 unit test
+  on the plugin validator accepting `media.streaming_rtp`, and
+  `dtmf_inband_bus.rs` end-to-end: synthesized tones over PCMU
+  through `UdpMediaFabric` → live `EventBus` subscriber.
+
+### Notes
+
+The Python sidecar listed in the slice plan (numpy + Goertzel) is
+deferred — running a detector across a JSON-RPC boundary at 50
+packets/sec/leg is absurd for a hot-path workload. The engine-side
+pure-Rust detector covers the acceptance target (≥ 95% accuracy on
+clean audio; bench passes 100%). A plugin-tier consumer will slot
+in later behind the new `media.streaming_rtp` capability without
+engine changes.
+
+## [0.36.0] - 2026-04-21
+
+Slice 2.4 — DTMF via RFC 4733 (a.k.a. RFC 2833). DTMF keypresses
+detected on the media bridge now land on the engine's event bus as
+`SipEvent::Dtmf` + are emittable from the control plane via
+`send_dtmf`.
+
+### Added
+
+- **`smiths-core::dtmf` module** —
+  - `TelephoneEvent::parse` / `encode` (RFC 4733 §2.3 wire format).
+  - `event_code_to_digit` / `digit_to_event_code` — §3.2 Table 1
+    mapping (0–9, *, #, A–D, flash).
+  - `DtmfDetector` — stateful decoder. Dedupes the §2.5.1.3
+    three-end retransmits and emits exactly one `DtmfKeypress` per
+    press with a wall-clock `duration_ms`.
+  - `DtmfSink` trait + `BusDtmfSink` adapter that publishes presses
+    onto an `EventBus` as `SipEvent::Dtmf`. Non-blocking —
+    bridge-forwarder hot-path safe.
+  - `generate_keypress` transmit helper: builds the full start +
+    intermediates + three-end packet stream for a digit.
+- **`SipEvent::Dtmf { call_id, keypress }`** variant — typed
+  first-class event for dashboards + MCP subscribers.
+- **Bridge DTMF detection on the hot path** —
+  `BridgeConfig::dtmf_sink` + per-direction `DtmfDetector`. When
+  the sink is `None` (default) forwarders pay no extra cost; when
+  wired, each packet with PT 101 gets parsed and the resulting
+  keypress delivered.
+- **`UdpMediaFabric::with_dtmf_sink`** — builder that plumbs a
+  shared sink into every subsequently-spawned bridge. The CLI
+  wires a `BusDtmfSink` here so RFC 4733 keypresses surface on the
+  engine-wide bus.
+- **`send_dtmf` MCP tool** — takes `{call_id, digits, duration_ms}`,
+  emits the full RFC 4733 stream into the call's media leg (20 ms
+  frame cadence, 40 ms inter-digit gap, three end-retransmits).
+  Validates every digit up-front so a typo can't partial-send.
+- **`smiths-testkit::dtmf_gen`** — re-export of the core transmit
+  helper so tests keep the historical import path.
+- **Integration tests** (`smiths-media/tests/`):
+  - `dtmf_bridge.rs` — raw `Bridge` with a `DtmfSink` trait object.
+  - `dtmf_bus.rs` — end-to-end through `UdpMediaFabric` +
+    `BusDtmfSink` to a live `EventBus` subscriber.
+  - 8 unit tests on the parse/encode/detector cycle + 3 on the
+    generator.
+
+### Notes
+
+The plugin-tier version (`dtmf-2833` as a WASM plugin under
+`plugins/examples/`) is deferred — the engine-side detection path
+covers the acceptance scenario (MCP subscriber observes DTMF inside
+100 ms of the tone), and landing the reference plugin is a pure
+follow-on behind the same `DtmfSink` trait.
+
+## [0.35.0] - 2026-04-21
+
+Slice 2.3 — Pluggable storage MVP (P23). Formalizes the persistence
+surface every post-MVP feature (HA, recording, RAG, presence) now
+targets. CDR recording wired end-to-end.
+
+### Added
+
+- **`smiths-core::storage` module** — three new traits:
+  - [`CdrStore`] with [`CallDetailRecord`] DTO and [`CdrFilter`]
+    for bounded queries (time range, From/To substring, result,
+    required `limit`, newest-first ordering).
+  - [`KvStore`] — opaque key/value for session state + hot-reload
+    snapshots. `get` / `put` / `delete` / `list_prefix`.
+  - [`StorageError`] — backend-agnostic error type.
+  (The existing `smiths-sip::auth::CredentialStore` stays in the
+  SIP crate; it's RFC-2617-shaped and this slice adds the generic
+  companions rather than shuffle the auth seam.)
+- **`[storage]` config section** — `backend = "none" | "sqlite"`,
+  `[storage.sqlite] path`. Defaults to `none` so fresh configs
+  stay silent until operators opt in.
+- **`SqliteAuthStore` v2 schema** — adds `cdr` + `kv` tables in a
+  second, idempotent migration. Same store now serves
+  `CredentialStore` + `RegistrationStore` + `CdrStore` + `KvStore`;
+  operators typically point `[auth.sqlite]` and `[storage.sqlite]`
+  at the same DB file. Indexes: `cdr(started_at_unix DESC)`,
+  `cdr(result)`.
+- **UAS CDR emission** — `handle_invite` stashes From/To + start
+  time in a per-dialog side table at 200 OK; `handle_bye` emits a
+  `CallDetailRecord` with `result = "answered"` and
+  `duration_secs` computed from wall-clock deltas. Silent no-op
+  when no `CdrStore` is wired (default).
+- **`list_cdr` MCP tool** — bounded query exposed through the
+  control plane. Returns `{count, rows}`; empty page when no
+  backend is wired.
+- **`UasServer::with_cdr_store`** + `ToolContext::with_cdr`
+  builders — same pattern as the slice-2.1 registration wiring.
+- **12 new tests** in `sqlite_store`: CDR record / list / filter
+  (result, since, substring) / upsert-on-conflict / zero-limit
+  rejection / truncate, plus KV round-trip / delete semantics /
+  prefix listing / wildcard-escape. Plus `cdr_record.rs`
+  integration: full INVITE→ACK→BYE produces exactly one CDR row
+  with the right From / To / duration.
+
+### Notes
+
+The Postgres sidecar adapter listed in the slice plan is deferred
+— no concrete operator ask yet, and the generic trait shape means
+it's a pure addition when it lands.
+
+## [0.34.0] - 2026-04-21
+
+Slice 2.2 — HTTP webhook subscriber-DB backend (P8, second half).
+Operators with existing IAM / HR systems can now delegate
+credential lookup to an HTTPS endpoint without exposing plaintext
+passwords to the engine.
+
+### Added
+
+- **`smiths-sip::auth::http_store::HttpAuthStore`** —
+  `CredentialStore` impl that `POST`s `{realm, username, algorithm}`
+  to an operator-provided webhook and expects
+  `{"status":"accept","ha1":"<hex>"}` or `{"status":"deny"}` back.
+  Built on `reqwest` with `rustls-tls` so musl static builds stay
+  self-contained. Behind the `auth-http` feature (on by default).
+- **Pre-computed HA1 path** — `Credentials` gained an optional
+  `ha1` field + `from_ha1` constructor. The registrar uses it when
+  set, skipping the on-demand hash; plaintext passwords never cross
+  the webhook boundary.
+- **Circuit breaker** — per-store state with Closed / Open /
+  HalfOpen semantics. After `breaker_threshold` consecutive
+  failures (default 5) the breaker trips Open; after
+  `breaker_cooldown_secs` (default 30) one probe is allowed; a
+  successful probe closes it. Open-state behaviour selectable via
+  `FailureMode::FailClosed` (default, safe) vs `FailOpen`
+  (UnknownUser-equivalent, dev only).
+- **Bearer auth** — `Authorization: Bearer <token>` on every
+  webhook request so the backend can authenticate the engine.
+  Config: `[auth.http] bearer_token`.
+- **`[auth.http]` config section** — `endpoint`, `timeout_ms`,
+  `retries`, `bearer_token`, `breaker_threshold`,
+  `breaker_cooldown_secs`, `failure_mode`. `[auth] backend` grew a
+  `"http"` variant.
+- **Integration test** (`tests/register_http.rs`) — 5 scenarios
+  against an in-process `axum` mock: accept / deny / breaker trip
+  (asserts the wire isn't hit while Open) / bearer token plumbed
+  correctly / missing bearer surfaces as deny.
+- **Async entry point** — `HttpAuthStore::authenticate()` is
+  awaitable directly for callers that already live in async code;
+  the sync `CredentialStore::lookup` bridge uses
+  `tokio::task::block_in_place` + `Handle::block_on` (requires a
+  multi-thread runtime, which is our default).
+
+### Changed
+
+- `Credentials` has a new required field (`ha1: Option<String>`);
+  every construction site migrated to `Credentials::new(...)` or
+  `::from_ha1(...)`. Existing behaviour is unchanged when `ha1` is
+  `None`.
+
+## [0.33.0] - 2026-04-21
+
+Slice 2.1 — SQLite subscriber DB (P8, first half). Unblocks
+production REGISTER with persisted credentials + contact bindings.
+
+### Added
+
+- **`smiths-sip::auth::sqlite_store::SqliteAuthStore`** — embedded
+  `SQLite` backend (via `rusqlite` with `bundled` — no system
+  libsqlite3 required). Implements both `CredentialStore` (for
+  digest auth) and the new `RegistrationStore` trait (for Contact
+  bindings). Single impl, two trait objects — callers
+  `Arc::clone` the store into both seats.
+- **3-table v1 schema**: `realms`, `users` (FK → realms, unique
+  `(realm_id, username)`), `contacts` (unique `(aor, contact)`).
+  Indexes on `contacts.aor` + `contacts.expires_at_unix` for the
+  hot paths.
+- **`MigrationRunner`** — idempotent. Opening an empty DB installs
+  v1; reopening a populated DB is a no-op; opening a DB newer than
+  this binary understands fails fast with
+  `SchemaTooNew { found, max_supported }`. Each step logs at
+  `info!` when applied.
+- **`auth::RegistrationStore` trait + `Binding` DTO** — pluggable
+  persistence surface for per-AOR contact bindings. In-memory
+  default (`InMemoryRegistrationStore`) plus the SQLite impl
+  above. Expired rows are filtered out of `snapshot()` /
+  `lookup_bindings()`; `gc_expired()` hard-deletes them.
+- **`[auth]` config section** — `backend = "none" | "sqlite"` (new
+  default `"none"` keeps pre-v0.33.0 behavior), `realm`, plus
+  `[auth.sqlite] path` when `backend = "sqlite"`.
+- **UAS REGISTER Contact persistence** — `handle_register` parses
+  `Contact:` + `Expires:`, computes the AOR as `sip:user@realm`,
+  and calls `RegistrationStore::bind` on success. `Expires: 0`
+  unbinds per RFC 3261 §10.3.7. Silent no-op when no store is
+  wired.
+- **`smiths_core::RegistrationView` + `RegistrationSnapshot`** —
+  read-only observability trait; surfaced to the MCP control
+  plane without a cross-crate dep on `smiths-sip`.
+- **`sip://registrations` MCP resource** — serialises every live
+  binding as `{count, bindings: [...]}`. Empty snapshot when no
+  backend is wired; operators distinguish "disabled" from "idle"
+  via `config://current`.
+- **Integration test** (`tests/register_sqlite.rs`) — full
+  challenge → authenticate → bind → unbind flow against a tempfile
+  DB. Asserts the contact lands in the contacts table after 200
+  OK, and that `Expires: 0` removes it.
+
+### Changed
+
+- `auth.rs` is now `auth/mod.rs`; new `sqlite_store` submodule
+  gated behind the `auth-sqlite` feature (on by default for
+  `smiths-sip`).
+
 ## [0.32.0] - 2026-04-20
 
 Closes **prod-readiness Phase 6** — full e2e + perf validation.

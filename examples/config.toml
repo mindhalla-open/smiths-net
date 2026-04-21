@@ -29,6 +29,49 @@ transports = ["udp"]
 # Grace period (seconds) to finish in-flight transactions on shutdown.
 drain_timeout_secs = 10
 
+# Subscriber DB + digest-auth realm (P8 / slice 2.1).
+# `backend = "none"` (default) keeps pre-v0.33.0 behaviour — REGISTER
+# blindly 200s. `backend = "sqlite"` enables the embedded SQLite
+# store; provision users out-of-band via `SqliteAuthStore::upsert_user`
+# (CLI subcommand lands in a follow-on slice).
+[auth]
+backend = "none"          # "none" | "sqlite" | "http"
+realm   = "smiths.local"
+
+# [auth.sqlite]
+# path = "/var/lib/smiths-net/auth.db"
+
+# HTTP webhook backend (P8 / slice 2.2). The engine posts
+# `{"realm","username","algorithm"}` to `endpoint`; the webhook
+# returns `{"status":"accept","ha1":"<hex>"}` or `{"status":"deny"}`.
+# `failure_mode = "fail_closed"` (default) denies every lookup while
+# the circuit breaker is open; `"fail_open"` returns UnknownUser
+# instead (suitable only when auth is optional).
+# [auth.http]
+# endpoint              = "https://iam.example.com/sip-auth"
+# timeout_ms            = 2000
+# retries               = 1
+# bearer_token          = "s3cret-engine-token"
+# breaker_threshold     = 5
+# breaker_cooldown_secs = 30
+# failure_mode          = "fail_closed"
+
+# Pluggable storage (P23 / slice 2.3) — CDR + KV surfaces. Point at
+# the same DB file as `[auth.sqlite]` to share one store across auth
+# + registrations + call-detail-records + opaque KV.
+[storage]
+backend = "none"   # "none" | "sqlite"
+
+# [storage.sqlite]
+# path = "/var/lib/smiths-net/storage.db"
+
+# Media-plane tunings. `inband_dtmf` (slice 2.5) runs the Goertzel
+# detector on plaintext PCMU frames and surfaces keypresses on the
+# bus as `SipEvent::Dtmf` alongside the always-on RFC 4733 path.
+# Costs ~3k FLOPs per 20 ms frame per leg — off by default.
+[media]
+inband_dtmf = false
+
 [plugins]
 # Directory the loader scans at startup. Each subdirectory with a
 # `plugin.toml` becomes one sidecar or WASM plugin. Defaults to
