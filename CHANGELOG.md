@@ -5,6 +5,85 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.0] - 2026-04-21
+
+Slice 4.1 — Embedded DSL runtime (Rhai). The `smiths-script` crate
+gains a working Rhai-backed `ScriptRuntime` with op-count +
+wall-clock budgets; the plugin loader wires `type = "script"` into
+the same `AiProvider` seam that sidecars + WASM guests use. Hot
+reload with automatic rollback and a `put_script` MCP tool close
+out the slice.
+
+### Added
+
+- **`smiths-script::ScriptRuntime`** — compiles Rhai source at load
+  time, serves every invocation through the hot `Engine` + `AST`,
+  enforces `max_operations` (1M default) and `wall_clock` (500 ms
+  default) per call. JSON ↔ Rhai bridge (object, array, bool,
+  int, float, string, null) lets scripts take the same
+  `serde_json::Value` params sidecars already handle.
+- **`ScriptEngineKind`** enum + `ScriptEngine` async trait so Lua /
+  Starlark variants can slot in behind the same shape; Rhai is
+  the only impl today.
+- **`smiths-plugin::ScriptProvider`** — `AiProvider` adapter around
+  the runtime. Atomic hot-swap (`swap_runtime`), auto-rollback
+  (`rollback()` after `ROLLBACK_AFTER = 5` consecutive errors),
+  reuses the existing `plugin_invocations` + `plugin_invoke_duration`
+  metrics.
+- **Manifest extension** — `type = "script"` now loads via the
+  loader. New optional fields: `script_engine = "rhai"` (default),
+  `script_max_operations`, `script_wall_clock_ms`.
+- **Capability namespace `routing.*`** — joins `ai.*` / `media.*` /
+  `storage.*` on the plugin validator. The reference dialplan
+  advertises `routing.dialplan`.
+- **`plugins/examples/route-rhai/`** — reference Rhai dialplan:
+  small in-script lookup table routes `sip:support@…`,
+  `sip:sales@…`, `sip:voicebot@…` to queue pools; everything else
+  falls through to the UAS default. Tight manifest budgets
+  (200k ops / 50 ms) so a sloppy edit can't pin a worker slice.
+- **Hot-reload with rollback** — `smiths_plugin::watcher` already
+  fires on entry-file changes; the `AiRegistry::reload` path now
+  routes scripts through an in-place atomic swap (preserving the
+  previous runtime for rollback) instead of the sidecar drop-and-
+  respawn pattern. A compile failure leaves the running script
+  untouched; a five-error streak after a swap restores the prior
+  version. Capability changes refuse the swap (treated as a
+  manifest change, not hot reload).
+- **MCP tool `put_script(name, source, engine)`** — writes the new
+  body atomically (tempfile + rename) into the loaded plugin's
+  entry file and fires the same hot-reload path as a file-system
+  edit. Only `engine = "rhai"` is accepted today. `NotFound` when
+  the named plugin isn't loaded / isn't script-backed.
+- **`AiRegistry::reload_script_source`** — new default-impl trait
+  method on `smiths_core::ai::AiRegistry`. Returns "not supported"
+  on registries that don't host scripts so old impls stay
+  compatible; the plugin-crate impl performs the atomic write +
+  reload.
+- **Tests** — 6 unit tests on `smiths_script` (describe,
+  round-trip JSON in+out, missing-method error, op-budget trip,
+  compile-error surfacing, JSON↔Rhai round trip); 2 integration
+  tests on `smiths-plugin` (`route-rhai` loaded through the
+  standard loader + invoked through the `AiProvider` trait;
+  rollback restores the good runtime after 5 consecutive errors);
+  2 tool tests on the new `put_script` surface.
+
+### Notes
+
+Hot-reload today refuses to change the advertised capability set
+— a script whose new `describe_capabilities` returns a different
+set is treated as a manifest change, not a script edit. Operators
+pick up the new contract by restarting the engine (or by removing
+and re-adding the plugin directory, which triggers the ordinary
+loader path).
+
+Rhai's engine is synchronous; invocations run on a
+`tokio::task::spawn_blocking` worker. This keeps each call
+isolated from the tokio scheduler but means the effective
+concurrency per script is bounded by the blocking pool. Scripts
+that genuinely need parallelism should stay short — the dialplan
+shape is a good fit; long-form RAG routing should stay in a
+sidecar.
+
 ## [0.42.0] - 2026-04-21
 
 Slice 3.5 — Proxy/VPN transports. SIP-over-TCP and SIP-over-TLS can

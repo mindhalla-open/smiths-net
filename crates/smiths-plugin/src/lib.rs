@@ -23,6 +23,7 @@ pub mod error;
 pub mod loader;
 pub mod manifest;
 pub mod registry;
+pub mod script_provider;
 pub mod wasm_provider;
 pub mod watcher;
 
@@ -42,7 +43,8 @@ pub use smiths_core::ai::{
 pub use dispatcher::{Dispatcher, Hook, HookReport, MemoryDispatcher};
 pub use error::Error;
 pub use loader::{LoadReport, LoaderOpts, load_plugins};
-pub use manifest::{Manifest, PluginType};
+pub use manifest::{Manifest, PluginType, ScriptEngine};
 pub use registry::{AiRegistry, PluginEntry};
+pub use script_provider::{ROLLBACK_AFTER, ScriptProvider};
 pub use wasm_provider::WasmProvider;
 pub use watcher::{WatcherHandle, spawn as spawn_watcher};

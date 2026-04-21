@@ -6,7 +6,7 @@ exclude  = ["fuzz"]
 [workspace.package]
 edition      = "2024"
 rust-version = "1.85"
-version      = "0.42.0"
+version      = "0.43.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
@@ -152,6 +152,12 @@ smiths-script  = { path = "crates/smiths-script" }
 smiths-sidecar = { path = "crates/smiths-sidecar" }
 smiths-mcp     = { path = "crates/smiths-mcp" }
 smiths-testkit = { path = "crates/smiths-testkit" }
+
+# Embedded DSL (slice 4.1 / P24). Rhai is a tiny scripting language
+# designed for embedding into Rust hosts — no unsafe, no FFI, a
+# native op-count budget knob that lets the engine bound a
+# malformed / adversarial script.
+rhai           = { version = "1.18", features = ["sync"] }
 
 [profile.release]
 lto           = "thin"

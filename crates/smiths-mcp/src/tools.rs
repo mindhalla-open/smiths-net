@@ -49,7 +49,90 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(TranscribeCallTool);
     reg.register(SummarizeCallTool);
     reg.register(SearchCallsSemanticTool);
+    reg.register(PutScriptTool);
     reg
+}
+
+/// `put_script(name, source, engine)` — slice 4.1. Pushes a new
+/// script into a loaded script-tier plugin's directory and kicks a
+/// reload. Scoped narrowly: `name` must match a plugin already
+/// loaded; the engine writes the new body to the plugin's entry
+/// file atomically (tempfile + rename) and fires the standard
+/// hot-reload path — the same one file-watcher edits go through,
+/// so a failing swap surfaces the ordinary rollback.
+pub struct PutScriptTool;
+
+#[async_trait]
+impl Tool for PutScriptTool {
+    fn name(&self) -> &'static str {
+        "put_script"
+    }
+
+    fn description(&self) -> &'static str {
+        "Push a new script body into a loaded script-tier plugin. \
+         The engine writes atomically to the plugin's entry file and \
+         reloads; the previous version is retained for auto-rollback \
+         on 5 consecutive errors."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name":   { "type": "string", "description": "Plugin name (must already be loaded)." },
+                "source": { "type": "string", "description": "New script body." },
+                "engine": {
+                    "type": "string",
+                    "enum": ["rhai"],
+                    "description": "DSL engine. Only `rhai` today."
+                }
+            },
+            "required": ["name", "source"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("name required".into()))?;
+        let source = args
+            .get("source")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("source required".into()))?;
+        let engine = args.get("engine").and_then(Value::as_str).unwrap_or("rhai");
+        if engine != "rhai" {
+            return Err(ToolError::InvalidArguments(format!(
+                "unsupported engine `{engine}`; only `rhai` is wired today"
+            )));
+        }
+
+        let entry = ctx.plugins.reload_script_source(name, source).await;
+        match entry {
+            Ok(()) => Ok(json!({
+                "name":   name,
+                "engine": engine,
+                "status": "reloaded"
+            })),
+            Err(e) => {
+                let msg = e.to_string();
+                // The plugin crate phrases "plugin not loaded or not
+                // script-backed" / "not supported by this registry"
+                // — both mean the resource the caller asked for
+                // isn't there, which is `NotFound` rather than an
+                // internal error.
+                let missing = msg.contains("not loaded")
+                    || msg.contains("not script")
+                    || msg.contains("not supported");
+                if missing {
+                    Err(ToolError::NotFound(msg))
+                } else {
+                    Err(ToolError::Internal(msg))
+                }
+            }
+        }
+    }
 }
 
 /// `search_calls_semantic(query, k)` — slice 3.4. Embeds the
@@ -1732,7 +1815,7 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 19);
+        assert_eq!(reg.len(), 20);
         for name in [
             "list_calls",
             "get_call_status",
@@ -1753,9 +1836,36 @@ mod tests {
             "transcribe_call",
             "summarize_call",
             "search_calls_semantic",
+            "put_script",
         ] {
             assert!(reg.get(name).is_some(), "missing tool: {name}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_script_without_script_plugin_is_not_found() {
+        let (ctx, _c) = ctx_with_state();
+        let err = PutScriptTool
+            .call(
+                json!({"name": "route-rhai", "source": "fn describe_capabilities(){[]}", "engine": "rhai"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_script_rejects_unknown_engine() {
+        let (ctx, _c) = ctx_with_state();
+        let err = PutScriptTool
+            .call(
+                json!({"name": "x", "source": "y", "engine": "javascript"}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

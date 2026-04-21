@@ -125,7 +125,7 @@ impl CapabilityDescriptor {
     /// Validate common-envelope invariants. Returns a descriptive
     /// error when the plugin is confused.
     ///
-    /// Capabilities live in one of three namespaces today:
+    /// Capabilities live in one of four namespaces today:
     ///
     /// - `ai.*` — AI providers (LLM, TTS, ASR, embed). The original
     ///   plugin tier.
@@ -138,6 +138,10 @@ impl CapabilityDescriptor {
     ///   `search_calls_semantic`; `storage.recording` backs audio
     ///   retention. See [`STORAGE_VECTOR`] and
     ///   [`STORAGE_RECORDING`].
+    /// - `routing.*` — dialplan / route-selection plugins (slice
+    ///   4.1 + 4.2). Scripts (Rhai) typically advertise
+    ///   `routing.dialplan` and export a `route(req) -> target`
+    ///   method the UAS calls on INVITE.
     pub fn validate(&self) -> Result<(), String> {
         if self.capability.is_empty() {
             return Err("capability is empty".into());
@@ -145,9 +149,10 @@ impl CapabilityDescriptor {
         if !self.capability.starts_with("ai.")
             && !self.capability.starts_with("media.")
             && !self.capability.starts_with("storage.")
+            && !self.capability.starts_with("routing.")
         {
             return Err(format!(
-                "capability `{}` is outside the `ai.*` / `media.*` / `storage.*` namespaces",
+                "capability `{}` is outside the `ai.*` / `media.*` / `storage.*` / `routing.*` namespaces",
                 self.capability
             ));
         }
@@ -419,6 +424,16 @@ pub trait AiRegistry: Send + Sync {
     async fn reload(&self, _name: &str) -> Result<(), ProviderError> {
         Err(ProviderError(
             "reload not supported by this registry".into(),
+        ))
+    }
+    /// Overwrite a script-tier plugin's entry source and trigger a
+    /// hot reload (slice 4.1). The implementation writes atomically
+    /// so an in-flight `describe_capabilities` never sees a partial
+    /// file. Default impl responds "not supported" so registries
+    /// that don't host scripts stay trait-compatible.
+    async fn reload_script_source(&self, _name: &str, _source: &str) -> Result<(), ProviderError> {
+        Err(ProviderError(
+            "reload_script_source not supported by this registry".into(),
         ))
     }
 }

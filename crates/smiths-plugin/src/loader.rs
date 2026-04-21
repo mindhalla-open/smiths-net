@@ -18,6 +18,7 @@ use tracing::{debug, info, instrument, warn};
 use crate::error::Error;
 use crate::manifest::{Manifest, PluginType};
 use crate::registry::{AiRegistry, PluginEntry};
+use crate::script_provider::ScriptProvider;
 use crate::wasm_provider::WasmProvider;
 
 /// Summary of one plugin-load pass.
@@ -129,10 +130,7 @@ pub(crate) async fn load_one(
             );
         }
         PluginType::Script => {
-            return Err(Error::Load {
-                plugin: name,
-                reason: "plugin type `Script` not yet supported".into(),
-            });
+            return load_script(dir, manifest, opts.metrics.clone(), registry).await;
         }
     }
 
@@ -181,6 +179,68 @@ pub(crate) async fn load_one(
         capabilities,
         metrics: opts.metrics.clone(),
     });
+    Ok(name)
+}
+
+/// Load a `type = "script"` manifest (slice 4.1): compile the source
+/// via `smiths_script`, run `describe_capabilities`, and register a
+/// `ScriptProvider`. Rhai is the only DSL today — other engines slot
+/// in here behind a match on `manifest.script_engine`.
+async fn load_script(
+    dir: &Path,
+    manifest: Manifest,
+    metrics: Option<Arc<Metrics>>,
+    registry: &AiRegistry,
+) -> Result<String, Error> {
+    let name = manifest.name.clone();
+    let entry_path: std::path::PathBuf = if manifest.entry.is_absolute() {
+        manifest.entry.clone()
+    } else {
+        dir.join(&manifest.entry)
+    };
+
+    let mut limits = smiths_script::ScriptLimits::default();
+    if manifest.script_max_operations > 0 {
+        limits.max_operations = manifest.script_max_operations;
+    }
+    if manifest.script_wall_clock_ms > 0 {
+        limits.wall_clock = std::time::Duration::from_millis(manifest.script_wall_clock_ms);
+    }
+
+    let runtime = match manifest.script_engine {
+        crate::manifest::ScriptEngine::Rhai => {
+            smiths_script::ScriptRuntime::load_rhai(&name, &entry_path, limits).map_err(|e| {
+                Error::Load {
+                    plugin: name.clone(),
+                    reason: format!("script compile: {e}"),
+                }
+            })?
+        }
+    };
+
+    let raw = runtime.describe().await.map_err(|e| Error::Load {
+        plugin: name.clone(),
+        reason: format!("describe_capabilities: {e}"),
+    })?;
+    let capabilities = smiths_core::ai::parse_descriptors(raw)
+        .map_err(|reason| Error::Load {
+            plugin: name.clone(),
+            reason,
+        })
+        .and_then(|descs| bind_and_check(descs, &name, &manifest.provides))?;
+
+    let provider = ScriptProvider::new(
+        name.clone(),
+        manifest.version.clone(),
+        manifest.description.clone(),
+        manifest.abi.clone(),
+        capabilities,
+        runtime,
+        dir.to_path_buf(),
+        limits,
+        metrics,
+    );
+    registry.insert_script(Arc::new(provider));
     Ok(name)
 }
 
