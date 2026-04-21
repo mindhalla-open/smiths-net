@@ -1,0 +1,7 @@
+name        = "dialplan-yaml"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["routing.dialplan"]
+abi         = "1.0"
+description = "YAML-driven dialplan — matches inbound INVITEs on `from` / `to` URI + time-of-day and rewrites to a target. Sits alongside route-rhai so operators can pick YAML or Rhai for the same `routing.dialplan` seam."

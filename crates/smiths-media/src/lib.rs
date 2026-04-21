@@ -14,6 +14,7 @@ pub mod fabric;
 #[cfg(feature = "pcap")]
 pub mod pcap;
 pub mod port_allocator;
+pub mod prompts;
 pub mod rtcp;
 pub mod rtp_stats;
 pub mod srtp;
@@ -21,6 +22,7 @@ pub mod srtp;
 pub use bridge::{Bridge, BridgeConfig, DtmfSink, Leg, RtcpLeg};
 pub use fabric::UdpMediaFabric;
 pub use port_allocator::{PortPair, allocate_rtp_rtcp_pair};
+pub use prompts::{Prompt, PromptError, PromptLibrary, encode_wav};
 pub use rtp_stats::{StreamStats, StreamStatsSnapshot};
 pub use srtp::AesCmHmacSha1_80Transform;
 

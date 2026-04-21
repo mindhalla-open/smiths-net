@@ -113,6 +113,15 @@ retention_days = 0        # 0 disables the hourly sweeper; >0 deletes blobs olde
 [media]
 inband_dtmf = false
 
+# IVR prompt library (slice 4.2 / P9). Point `root` at a directory
+# of WAV files (PCM16 LE, mono) — IVR scripts reference prompts
+# relative to this root (`prompts/welcome.wav`). Leave the root
+# empty to disable the library; `record_prompt` returns NotFound
+# in that case.
+[media.prompts]
+root     = ""
+# capacity = 128
+
 # Cloud-AI secrets (slice 3.2 / P22). All fields optional — sidecars
 # read their own API keys from environment variables (`OPENAI_API_KEY`,
 # `ANTHROPIC_API_KEY`). This block exists so operators have one

@@ -92,6 +92,33 @@ pub struct MediaConfig {
     /// softphones. Enable when legs that never negotiate 4733
     /// (PSTN gateway crossings) need DTMF too.
     pub inband_dtmf: bool,
+    /// IVR prompt library (slice 4.2). Points at a directory of
+    /// WAV files (`prompts/welcome.wav`, etc.) that IVR scripts
+    /// refer to by relative path. When the path is empty, the
+    /// `record_prompt` MCP tool returns `NotFound` — operators
+    /// opt in by setting a concrete directory.
+    pub prompts: PromptsConfig,
+}
+
+/// `[media.prompts]` — IVR prompt-library settings.
+///
+/// ```toml
+/// [media.prompts]
+/// root     = "/var/lib/smiths-net/prompts"
+/// capacity = 128             # LRU size (default 64)
+/// ```
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PromptsConfig {
+    /// Root directory the library resolves relative paths against.
+    /// Empty string disables the library — `record_prompt` then
+    /// surfaces a clean "not wired" error instead of writing
+    /// somewhere surprising.
+    pub root: String,
+    /// Maximum number of decoded prompts kept hot in the LRU.
+    /// `0` falls back to the library's built-in default.
+    #[serde(default)]
+    pub capacity: usize,
 }
 
 /// `[storage]` TOML block — CDR + KV backend selection.

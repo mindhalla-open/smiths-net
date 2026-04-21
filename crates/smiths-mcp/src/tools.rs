@@ -50,7 +50,127 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(SummarizeCallTool);
     reg.register(SearchCallsSemanticTool);
     reg.register(PutScriptTool);
+    reg.register(RecordPromptTool);
     reg
+}
+
+/// `record_prompt(call_id, audio_base64, path)` — slice 4.2.
+/// Writes a provided PCM16 LE audio blob as a mono WAV under the
+/// operator-configured prompt root. The IVR plugin (`ivr-kit`) then
+/// references the path as `prompts/<basename>.wav` on its next
+/// playback action.
+///
+/// Scope today: the engine doesn't yet tap a live call's media
+/// stream on demand, so the tool takes `audio_base64` inline — the
+/// typical flow is a `synthesize`-then-`record_prompt` pair, or an
+/// upload from the operator's side. A follow-on slice that wires
+/// the bridge's capture hook will flip the `audio_base64` field to
+/// optional + resolve from the recording store.
+pub struct RecordPromptTool;
+
+#[async_trait]
+impl Tool for RecordPromptTool {
+    fn name(&self) -> &'static str {
+        "record_prompt"
+    }
+
+    fn description(&self) -> &'static str {
+        "Write a PCM16 LE audio blob as a WAV prompt under the \
+         engine's configured prompt root. Returns the resolved path \
+         + duration so the caller can reference it from an IVR \
+         script's `prompt:` field."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "call_id":      { "type": "string", "description": "Call-ID for provenance / audit logs." },
+                "audio_base64": { "type": "string", "description": "PCM16 LE bytes, base64-encoded." },
+                "sample_rate":  { "type": "integer", "minimum": 8000, "maximum": 48000,
+                                   "description": "Sample rate of the audio (default 8000)." },
+                "path":         { "type": "string",
+                                   "description": "Relative path under the prompt root, e.g. `prompts/welcome.wav`." }
+            },
+            "required": ["call_id", "audio_base64", "path"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        use base64::Engine as _;
+
+        let call_id = args
+            .get("call_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("call_id required".into()))?;
+        let audio_b64 = args
+            .get("audio_base64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("audio_base64 required".into()))?;
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("path required".into()))?;
+        let sample_rate = u32::try_from(
+            args.get("sample_rate")
+                .and_then(Value::as_u64)
+                .unwrap_or(8000),
+        )
+        .map_err(|_| ToolError::InvalidArguments("sample_rate out of range".into()))?;
+
+        let Some(library) = &ctx.prompts else {
+            return Err(ToolError::NotFound(
+                "no prompt library is wired; configure `[media.prompts] root` \
+                 to enable record_prompt"
+                    .into(),
+            ));
+        };
+        if path.contains("..") || std::path::Path::new(path).is_absolute() {
+            return Err(ToolError::InvalidArguments(
+                "path must be relative and contain no `..` segments".into(),
+            ));
+        }
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(audio_b64)
+            .map_err(|e| ToolError::InvalidArguments(format!("audio_base64: {e}")))?;
+        if bytes.len() % 2 != 0 {
+            return Err(ToolError::InvalidArguments(
+                "audio_base64 must decode to an even number of bytes (PCM16 LE)".into(),
+            ));
+        }
+        let samples: Vec<i16> = bytes
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+
+        let abs = if library.root().as_os_str().is_empty() {
+            std::path::PathBuf::from(path)
+        } else {
+            library.root().join(path)
+        };
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ToolError::Internal(format!("create prompt dir `{}`: {e}", parent.display()))
+            })?;
+        }
+        let wav = smiths_media::encode_wav(sample_rate, &samples);
+        std::fs::write(&abs, &wav)
+            .map_err(|e| ToolError::Internal(format!("write `{}`: {e}", abs.display())))?;
+        library.insert_raw(path, sample_rate, samples.clone());
+
+        let duration_ms =
+            u64::try_from(samples.len()).unwrap_or(u64::MAX) * 1000 / u64::from(sample_rate.max(1));
+        Ok(json!({
+            "call_id":     call_id,
+            "path":        path,
+            "absolute":    abs.display().to_string(),
+            "sample_rate": sample_rate,
+            "bytes":       wav.len(),
+            "duration_ms": duration_ms,
+        }))
+    }
 }
 
 /// `put_script(name, source, engine)` — slice 4.1. Pushes a new
@@ -1815,7 +1935,7 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 20);
+        assert_eq!(reg.len(), 21);
         for name in [
             "list_calls",
             "get_call_status",
@@ -1837,9 +1957,99 @@ mod tests {
             "summarize_call",
             "search_calls_semantic",
             "put_script",
+            "record_prompt",
         ] {
             assert!(reg.get(name).is_some(), "missing tool: {name}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn record_prompt_without_library_is_not_found() {
+        use base64::Engine as _;
+        let (ctx, _c) = ctx_with_state();
+        let audio = base64::engine::general_purpose::STANDARD.encode([0u8, 0u8, 0u8, 0u8]);
+        let err = RecordPromptTool
+            .call(
+                json!({
+                    "call_id": "x",
+                    "audio_base64": audio,
+                    "path": "prompts/x.wav",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn record_prompt_rejects_absolute_and_dotdot_paths() {
+        use base64::Engine as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let (ctx, _c) = ctx_with_state();
+        let ctx = ctx.with_prompts(smiths_media::PromptLibrary::with_root(tmp.path()));
+        let audio = base64::engine::general_purpose::STANDARD.encode([0u8, 0u8]);
+
+        let abs_err = RecordPromptTool
+            .call(
+                json!({
+                    "call_id": "x",
+                    "audio_base64": audio.clone(),
+                    "path": "/etc/passwd",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(abs_err, ToolError::InvalidArguments(_)));
+
+        let dotdot_err = RecordPromptTool
+            .call(
+                json!({
+                    "call_id": "x",
+                    "audio_base64": audio,
+                    "path": "../outside.wav",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(dotdot_err, ToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn record_prompt_writes_wav_and_caches_it() {
+        use base64::Engine as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = smiths_media::PromptLibrary::with_root(tmp.path());
+        let (ctx, _c) = ctx_with_state();
+        let ctx = ctx.with_prompts(lib.clone());
+
+        // Two samples of PCM16 LE = 4 bytes.
+        let raw = [0u8, 0u8, 0u8, 0u8];
+        let audio = base64::engine::general_purpose::STANDARD.encode(raw);
+        let out = RecordPromptTool
+            .call(
+                json!({
+                    "call_id": "c1",
+                    "audio_base64": audio,
+                    "sample_rate": 8000,
+                    "path": "prompts/hello.wav",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["sample_rate"], 8000);
+        let path_on_disk = tmp.path().join("prompts/hello.wav");
+        assert!(path_on_disk.exists(), "wav not written");
+
+        // The library should immediately serve it from cache
+        // (without hitting disk), and the decoded sample count
+        // should match.
+        let prompt = lib.get("prompts/hello.wav").unwrap();
+        assert_eq!(prompt.sample_rate, 8000);
+        assert_eq!(prompt.samples.len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]

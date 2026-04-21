@@ -5,6 +5,77 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.44.0] - 2026-04-21
+
+Slice 4.2 — Dialplan + IVR kit. Two more reference plugins land
+on the `routing.*` namespace: `dialplan-yaml` (YAML-authored
+from/to/hour-of-day matchers) and `ivr-kit` (Rhai state machine
+driving `play_prompt` / `transfer` / `hangup`). A prompt library
++ `record_prompt` MCP tool close out the authoring loop.
+
+### Added
+
+- **`plugins/examples/dialplan-yaml/`** — stdlib-only Python
+  sidecar advertising `routing.dialplan`. Reads a shipped
+  `rules.yaml`, evaluates each incoming `route(req)` through a
+  from / to / hour_range matcher, returns the first match as
+  `{target, reason}`. Includes a tiny YAML-subset parser so
+  operators don't need `PyYAML`; swap in `yaml.safe_load` for
+  full YAML 1.2. Dedicated `reload_rules` RPC method reloads the
+  rule file without respawning the process.
+- **`plugins/examples/ivr-kit/`** — reference IVR state machine
+  in Rhai. Exports `describe_capabilities`, `greet(session)`, and
+  `on_dtmf(session)`; returns `{action, prompt?, target?, state,
+  done}` per press. Ships a press-1-for-sales / press-2-for-
+  support / press-3-record-a-message tree with `*` to replay and
+  `#` to hang up. Capability `routing.ivr`.
+- **`smiths-media::PromptLibrary`** — LRU of decoded PCM16 LE
+  mono WAVs keyed by path. Stdlib WAV parser (RIFF/WAVE chunks,
+  format_tag = 1, 16-bit mono); `encode_wav(rate, samples)`
+  helper for the inverse. `insert_raw` sidesteps disk so the
+  `record_prompt` tool can make the just-written audio
+  immediately hot without a round trip through `load_from_disk`.
+- **`[media.prompts]` config** — `root` + `capacity`. Empty
+  `root` disables the library; `record_prompt` returns a clean
+  `NotFound` in that case.
+- **MCP tool `record_prompt(call_id, audio_base64, path)`** —
+  decodes the provided PCM16 LE audio, refuses absolute or
+  `..`-containing paths, writes a mono WAV under the library
+  root, seeds the cache. Returns `{path, absolute, sample_rate,
+  bytes, duration_ms}`.
+- **`ToolContext::with_prompts`** — engine threads the wired
+  `PromptLibrary` onto tools through the existing `ToolContext`
+  seam.
+- **Tests** — 6 unit tests on `PromptLibrary` (encode/decode
+  round-trip, rejects non-mono, LRU eviction, caching, raw
+  insert, missing-file `NotFound`); 3 MCP tool tests on
+  `record_prompt` (NotFound when the library is unwired,
+  rejection of absolute + `..` paths, write-and-cache on the
+  happy path); `ivr_state_machine.rs` integration test loads the
+  reference `ivr-kit` plugin via the standard loader and drives
+  every press-path the script handles (`1` → sales, `2` →
+  support, `9` → replay, `#` → hangup, `3` → record submenu,
+  submenu `#` → hangup).
+
+### Notes
+
+The IVR runtime seam — the glue that pushes live-call DTMF into
+`on_dtmf` and has the UAS act on a returned `transfer` /
+`hangup` mid-dialog — is a dedicated follow-on. The Rhai
+contract in `ivr-kit` is stable; today the state machine is
+driven synchronously by tests + tools that build a session
+directly. Once the bridge exposes a per-call "IVR session"
+control surface, the plugin switches from "test-driven" to
+"engine-driven" with no script changes.
+
+The dialplan sidecar ships without a native engine-side adapter
+that plugs it in behind a route-selection trait — scripts and
+sidecars alike are reachable via `AiProvider::invoke("route", …)`
+on the plugin registry, and the SIP UAS calls into that surface
+on INVITE. A dedicated `routing::Router` facade that lets
+operators chain multiple `routing.dialplan` plugins (YAML first,
+Rhai fallback, etc.) is a small follow-on.
+
 ## [0.43.0] - 2026-04-21
 
 Slice 4.1 — Embedded DSL runtime (Rhai). The `smiths-script` crate

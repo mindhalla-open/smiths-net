@@ -8,6 +8,7 @@ description  = "Control plane: Tool/Resource traits plus MCP (stdio) and A2A (HT
 
 [dependencies]
 smiths-core   = { workspace = true }
+smiths-media  = { workspace = true }
 base64        = { workspace = true }
 sha2          = { workspace = true }
 hex           = { workspace = true }
@@ -24,7 +25,6 @@ axum          = { workspace = true }
 dashmap       = { workspace = true }
 
 [dev-dependencies]
-smiths-media      = { workspace = true }
 smiths-plugin     = { workspace = true }
 smiths-sdp        = { workspace = true }
 smiths-sip        = { workspace = true }

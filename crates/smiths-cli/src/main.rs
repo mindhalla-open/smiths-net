@@ -280,6 +280,22 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Slice 4.2: IVR prompt library. When the operator sets a
+    // non-empty root, wire the library so `record_prompt` writes
+    // there + caches decoded WAVs.
+    if !config_snapshot.media.prompts.root.is_empty() {
+        let mut library =
+            smiths_media::PromptLibrary::with_root(&config_snapshot.media.prompts.root);
+        if config_snapshot.media.prompts.capacity > 0 {
+            library = library.with_capacity(config_snapshot.media.prompts.capacity);
+        }
+        tool_ctx = tool_ctx.with_prompts(library);
+        tracing::info!(
+            root = %config_snapshot.media.prompts.root,
+            "IVR prompt library wired"
+        );
+    }
+
     // Slice 3.5: embedded WireGuard lives behind the `wireguard`
     // Cargo feature. 0.42.0 ships the config surface only; the
     // runtime device (boringtun + tun/tap) lands in a follow-on.
