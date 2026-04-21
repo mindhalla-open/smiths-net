@@ -5,6 +5,63 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.42.0] - 2026-04-21
+
+Slice 3.5 — Proxy/VPN transports. SIP-over-TCP and SIP-over-TLS can
+now tunnel outbound connects through a SOCKS5 or HTTP-CONNECT
+proxy. A WireGuard deployment guide lands alongside, plus a
+feature-flag scaffold for the embedded `boringtun` path. Ingress
+is untouched — operators who need it terminate TLS or put a
+reverse proxy in front of the engine as before.
+
+### Added
+
+- **`ProxyConnector` trait** in `smiths-sip::transport::proxy`,
+  with three impls: `DirectConnector` (default, = plain
+  `TcpStream::connect`), `Socks5Connector` (RFC 1928 + RFC 1929
+  user/password), `HttpConnectConnector` (HTTP/1.1 CONNECT +
+  `Proxy-Authorization: Basic`). Every connector returns a
+  `TcpStream` positioned at the first app-data byte; the rest of
+  the SIP pipeline is unaffected.
+- **`TcpTransport::with_proxy`** — builder that swaps the
+  outbound-connect shim. `DirectConnector` remains the default so
+  existing callers pay zero cost.
+- **`[sip.proxy]` config** — `mode = "none"|"socks5"|"http-connect"`,
+  `address`, `username`, `password`. Redacted at
+  `sip.proxy.password` in `config://current`.
+- **`[sip.vpn]` config + `wireguard` Cargo feature** on
+  `smiths-cli`. Accepts `private_key`, `peer_public_key`,
+  `peer_endpoint`, `allowed_ips`, `interface_ip`. Runtime device
+  is a follow-on: 0.42.0 logs a clear warning at startup when
+  `mode = "wireguard"` so operators aren't surprised by the
+  deferral. `sip.vpn.private_key` joins the redaction list.
+- **`docs/deployment/vpn.md`** — sidecar-vs-embedded tradeoffs,
+  host / Kubernetes setup, verification ladder for tunnel issues.
+- **Tests** — 7 unit tests on the proxy module: SOCKS5 no-auth
+  handshake + app-data streaming, SOCKS5 user/pass round trip,
+  SOCKS5 `0xFF` refusal path, HTTP-CONNECT 200 tunnel + basic-auth
+  header presence + 407 error surfacing, and
+  `connector_from_config` covering every mode. Integration test
+  `proxy_socks5_tor.rs` runs end-to-end through a real SOCKS5
+  proxy when `TOR_SOCKS_PROXY=host:port` is set in the env;
+  silently no-ops otherwise so CI images without a proxy still
+  pass.
+
+### Notes
+
+The proxy shim applies only to the outbound-connect path on
+TCP-based SIP transports (today: `TcpTransport`; TLS is
+listener-only in 0.42.0). UDP is a connectionless protocol that
+can't tunnel through a stream-oriented CONNECT proxy — the UDP
+transport ignores `[sip.proxy]` with no warning, mirroring how
+curl handles the same mismatch.
+
+Embedded `boringtun` is feature-flagged + config-scaffolded in
+this release; the tun-interface-creation + SIP-binding plumbing
+lands in a dedicated follow-on. For production deployments today
+the sidecar WireGuard pattern documented in
+`docs/deployment/vpn.md` is the supported path.
+
 ## [0.41.0] - 2026-04-21
 
 Slice 3.4 — Vector + Recording storage. Two new pluggable storage

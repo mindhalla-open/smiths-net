@@ -242,6 +242,8 @@ fn redact_secrets(v: &mut Value) {
         &["a2a", "bearer_token"],
         &["ai", "openai_api_key"],
         &["ai", "anthropic_api_key"],
+        &["sip", "proxy", "password"],
+        &["sip", "vpn", "private_key"],
     ];
     for path in SECRET_PATHS {
         if let Some(leaf) = walk_mut(v, path)
@@ -269,12 +271,15 @@ mod tests {
         let mut v = json!({
             "a2a":   { "bearer_token": "supersecret" },
             "ai":    { "openai_api_key": "sk-abc", "anthropic_api_key": "sk-ant-xyz" },
+            "sip":   { "proxy": { "password": "proxypass", "username": "alice" } },
             "other": { "not_a_secret": "visible" },
         });
         redact_secrets(&mut v);
         assert_eq!(v["a2a"]["bearer_token"], "***");
         assert_eq!(v["ai"]["openai_api_key"], "***");
         assert_eq!(v["ai"]["anthropic_api_key"], "***");
+        assert_eq!(v["sip"]["proxy"]["password"], "***");
+        assert_eq!(v["sip"]["proxy"]["username"], "alice");
         assert_eq!(v["other"]["not_a_secret"], "visible");
     }
 

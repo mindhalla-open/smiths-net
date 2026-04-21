@@ -29,6 +29,27 @@ transports = ["udp"]
 # Grace period (seconds) to finish in-flight transactions on shutdown.
 drain_timeout_secs = 10
 
+# Outbound-connect proxy for SIP over TCP / TLS (slice 3.5 / P16).
+# SOCKS5 and HTTP-CONNECT are stream protocols, so UDP can't ride
+# them — UDP transports ignore this block.
+[sip.proxy]
+mode    = "none"              # "none" | "socks5" | "http-connect"
+# address  = "127.0.0.1:9050"
+# username = "alice"
+# password = "s3cret"         # redacted in config://current
+
+# Embedded WireGuard (slice 3.5 / feature `wireguard`). See
+# docs/deployment/vpn.md for sidecar-vs-embedded tradeoffs. The
+# runtime device is a follow-on; 0.42.0 accepts the config and
+# logs a clear warning at startup so operators aren't surprised.
+[sip.vpn]
+mode = "none"                 # "none" | "wireguard"
+# private_key     = "..."      # redacted in config://current
+# peer_public_key = "..."
+# peer_endpoint   = "203.0.113.7:51820"
+# allowed_ips     = ["10.42.0.0/24"]
+# interface_ip    = "10.42.0.5/24"
+
 # Subscriber DB + digest-auth realm (P8 / slice 2.1).
 # `backend = "none"` (default) keeps pre-v0.33.0 behaviour — REGISTER
 # blindly 200s. `backend = "sqlite"` enables the embedded SQLite

@@ -280,6 +280,29 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Slice 3.5: embedded WireGuard lives behind the `wireguard`
+    // Cargo feature. 0.42.0 ships the config surface only; the
+    // runtime device (boringtun + tun/tap) lands in a follow-on.
+    // Warn clearly when operators opt in so the "nothing happens"
+    // isn't mistaken for "everything works".
+    match config_snapshot.sip.vpn.mode {
+        smiths_core::VpnMode::None => {}
+        smiths_core::VpnMode::Wireguard => {
+            if cfg!(feature = "wireguard") {
+                tracing::warn!(
+                    "sip.vpn.mode = wireguard: runtime device not yet wired; \
+                     config accepted but no tunnel will come up. \
+                     See docs/deployment/vpn.md for the host-sidecar alternative."
+                );
+            } else {
+                tracing::warn!(
+                    "sip.vpn.mode = wireguard but binary built without \
+                     --features wireguard; falling back to mode=none."
+                );
+            }
+        }
+    }
+
     // MCP stdio is now additive: it runs alongside SIP / health / A2A
     // rather than replacing them, so agents can receive push
     // notifications about calls the engine is serving.
@@ -336,6 +359,7 @@ async fn main() -> anyhow::Result<()> {
                 drain.clone(),
                 sip_rate_limit.clone(),
                 registrar.clone(),
+                &config_snapshot.sip.proxy,
             )
             .await
             {
@@ -649,10 +673,21 @@ async fn spawn_sip_tcp(
     drain: smiths_core::Drain,
     rate_limit: smiths_sip::SipRateLimiter,
     registrar: Option<smiths_sip::auth::digest::Registrar>,
+    proxy_cfg: &smiths_core::SipProxyConfig,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
-    let transport = TcpTransport::bind(bind)
+    let mut transport = TcpTransport::bind(bind)
         .await
         .with_context(|| format!("binding TCP on {bind}"))?;
+    // Slice 3.5: wrap outbound connects in an operator-configured
+    // proxy. Inbound accepts are untouched — only the `send` path
+    // changes shape.
+    let connector = smiths_sip::transport::proxy::connector_from_config(proxy_cfg)
+        .with_context(|| "building sip.proxy connector")?;
+    let label = connector.label();
+    transport = transport.with_proxy(connector);
+    if label != "direct" {
+        info!(mode = label, ?proxy_cfg.address, "sip outbound proxy engaged");
+    }
     let local = transport.local_addr()?;
     let transport = Arc::new(transport);
 

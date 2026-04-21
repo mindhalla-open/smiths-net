@@ -454,6 +454,123 @@ pub struct SipConfig {
     pub tls_key_path: Option<std::path::PathBuf>,
     /// Per-source-IP rate limit on inbound SIP datagrams.
     pub rate_limit: SipRateLimit,
+    /// Outbound proxy / VPN shim (slice 3.5). Applies to the
+    /// TCP-based SIP transports (TCP, TLS inner TCP) — SOCKS5 and
+    /// HTTP-CONNECT are stream protocols so UDP can't ride them.
+    /// The UDP path ignores this block.
+    pub proxy: SipProxyConfig,
+    /// Optional embedded-`WireGuard` device (slice 3.5 / feature
+    /// `wireguard`). Operators who run `WireGuard` as a host sidecar
+    /// leave this `mode = "none"`; operators on appliance-style
+    /// hosts enable it to bring up the tunnel in-process.
+    pub vpn: SipVpnConfig,
+}
+
+/// `[sip.vpn]` — embedded userspace `WireGuard` device. Gated behind
+/// the `smiths-cli/wireguard` Cargo feature at runtime. See
+/// `docs/deployment/vpn.md` for the full deployment story.
+///
+/// ```toml
+/// [sip.vpn]
+/// mode            = "wireguard"       # "none" | "wireguard"
+/// private_key     = "..."              # base64 Curve25519 private key
+/// peer_public_key = "..."
+/// peer_endpoint   = "203.0.113.7:51820"
+/// allowed_ips     = ["10.42.0.0/24"]
+/// interface_ip    = "10.42.0.5/24"
+/// ```
+///
+/// The runtime plumbing (creating the tun interface, binding SIP
+/// against it) is a follow-on — the 0.42.0 release ships only the
+/// config surface. An engine built with `features = ["wireguard"]`
+/// and `mode = "wireguard"` warns at startup and falls back to
+/// `mode = "none"` until the runtime lands.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SipVpnConfig {
+    /// Which VPN mode to activate.
+    pub mode: VpnMode,
+    /// Base64 Curve25519 private key for this engine's WG device.
+    /// Redacted in `config://current`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    /// Base64 Curve25519 peer public key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_public_key: Option<String>,
+    /// Remote peer endpoint (`host:port`) the local device dials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_endpoint: Option<String>,
+    /// CIDR ranges routed into the tunnel.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_ips: Vec<String>,
+    /// Local IP (with prefix) to assign to the in-process interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_ip: Option<String>,
+}
+
+/// Embedded-VPN mode selector.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum VpnMode {
+    /// No embedded VPN. Operators either run `WireGuard` as a host
+    /// sidecar or don't need a tunnel at all.
+    #[default]
+    None,
+    /// Embedded `boringtun` device. Only honored when the binary
+    /// was built with `--features wireguard`; otherwise the engine
+    /// falls back to `None` with a warning log.
+    Wireguard,
+}
+
+/// `[sip.proxy]` — outbound-connection shim for TCP-based SIP
+/// transports. Mirrors how curl / aws-cli expose the same knobs
+/// operators already know.
+///
+/// ```toml
+/// [sip.proxy]
+/// mode = "socks5"                       # "none" | "socks5" | "http-connect"
+/// address = "127.0.0.1:9050"            # proxy host:port
+/// username = "circuit-a"                # optional for socks5 / http-connect
+/// password = "secret"                   # optional; redacted in config://current
+/// ```
+///
+/// The proxy is applied at outbound-connect time (the `send` path
+/// opens a fresh TCP connection to a peer). Listener binds are
+/// unaffected — operators wanting ingress protection terminate TLS
+/// or run a reverse proxy in front of the engine.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SipProxyConfig {
+    /// Which proxy protocol to wrap outbound TCP connects in.
+    pub mode: ProxyMode,
+    /// Proxy host:port. Required when `mode != "none"`; ignored
+    /// otherwise. Parsed as `SocketAddr` at config-load time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<SocketAddr>,
+    /// Optional username for `socks5` (RFC 1929) or HTTP-CONNECT
+    /// `Proxy-Authorization: Basic` auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Optional password paired with `username`. Redacted in the
+    /// `config://current` MCP resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+/// Outbound-proxy protocol selector.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyMode {
+    /// No proxy. Outbound TCP connects go direct.
+    #[default]
+    None,
+    /// RFC 1928 SOCKS5 CONNECT. Supports RFC 1929 user/password auth
+    /// when `username` + `password` are set; otherwise the `no-auth`
+    /// method is offered.
+    Socks5,
+    /// HTTP/1.1 CONNECT tunnel (RFC 9110 §9.3.6). `username` +
+    /// `password` flow as `Proxy-Authorization: Basic ...`.
+    HttpConnect,
 }
 
 /// Token-bucket rate limit applied per source IP at UAS ingress.
@@ -485,6 +602,8 @@ impl Default for SipConfig {
             tls_cert_path: None,
             tls_key_path: None,
             rate_limit: SipRateLimit::default(),
+            proxy: SipProxyConfig::default(),
+            vpn: SipVpnConfig::default(),
         }
     }
 }
