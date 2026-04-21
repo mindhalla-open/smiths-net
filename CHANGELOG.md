@@ -5,6 +5,65 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.47.0] - 2026-04-21
+
+Slice 4.5 — IoT bridges. Two reference sidecars land on the new
+`bridge.*` capability namespace (Home Assistant + generic MQTT
+3.1.1) with documented event-mapping patterns, a doorbell demo,
+and an operator runbook for outbound `call.ended` publishing.
+
+### Added
+
+- **`bridge.*` capability namespace** — joins `ai.*` / `media.*`
+  / `storage.*` / `routing.*` on the plugin validator. Tokens:
+  `BRIDGE_HA = "bridge.ha"`, `BRIDGE_MQTT = "bridge.mqtt"`.
+- **`plugins/examples/ha-bridge/`** — stdlib-only Python sidecar
+  against Home Assistant's REST API. Three methods:
+  - `emit_event(event_type, data)` → `POST /api/events/<type>`
+  - `get_state(entity_id)` → `GET /api/states/<entity>`
+  - `call_service(domain, service, data)` → `POST
+    /api/services/<domain>/<service>`
+  Env-configured (`HA_BASE_URL`, `HA_TOKEN`, `HA_TIMEOUT_SECS`);
+  every HTTP failure surfaces as a JSON-RPC error the
+  dispatcher can fail over.
+- **`plugins/examples/mqtt-bridge/`** — stdlib-only MQTT 3.1.1
+  publisher. Ships its own CONNECT / PUBLISH / DISCONNECT
+  encoder (~100 LOC) so no `paho-mqtt` dep is required.
+  Short-lived TCP socket per call; QoS 0 and 1; `payload`
+  accepts string, object, array, or null (objects/arrays
+  auto-JSON-encode). Env: `MQTT_HOST`, `MQTT_PORT`,
+  `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_CLIENT_ID`,
+  `MQTT_TIMEOUT_SECS`.
+- **`docs/deployment/iot.md`** — event-flow diagrams,
+  doorbell-triggers-SIP-call demo end-to-end, agent-side
+  `call.ended` publish pattern, event-mapping table (which
+  MCP notification maps to which typical outbound action),
+  security notes, limits + follow-ons.
+- **Tests** — 1 new unit test on `CapabilityDescriptor`
+  (`accepts_bridge_ha_and_mqtt_capabilities`) covering both
+  new tokens round-tripping through the validator.
+
+### Notes
+
+Inbound automation (HA → smiths-net) flows through the webhook
+adapter (slice 4.4 / P20). The `ha-bridge` sidecar covers only
+the outbound direction (engine → HA) because the plugin
+protocol doesn't yet push events from engine to plugin — a
+dedicated "event subscriber" capability is a follow-on slice.
+
+The MQTT bridge is publish-only; `subscribe` needs a
+persistent-connection lifecycle that doesn't fit the sidecar
+JSON-RPC model as it stands. Operators who need subscription-
+driven flows run a dedicated MQTT consumer outside the plugin
+tier and invoke smiths-net's webhook adapter from there.
+
+No engine-host adapter wires these sidecars into named tools
+today — agents invoke them via the generic `ai_invoke` path
+(`{plugin, method, params}`). Adding dedicated MCP tool
+wrappers (`bridge_emit_ha`, `bridge_mqtt_publish`) for better
+discoverability is a small follow-on; the plumbing is already
+in place via the standard dispatcher.
+
 ## [0.46.0] - 2026-04-21
 
 Slice 4.4 — A2A protocols. The control plane learns a fourth

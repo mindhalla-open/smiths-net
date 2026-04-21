@@ -125,7 +125,7 @@ impl CapabilityDescriptor {
     /// Validate common-envelope invariants. Returns a descriptive
     /// error when the plugin is confused.
     ///
-    /// Capabilities live in one of four namespaces today:
+    /// Capabilities live in one of five namespaces today:
     ///
     /// - `ai.*` — AI providers (LLM, TTS, ASR, embed). The original
     ///   plugin tier.
@@ -142,6 +142,10 @@ impl CapabilityDescriptor {
     ///   4.1 + 4.2). Scripts (Rhai) typically advertise
     ///   `routing.dialplan` and export a `route(req) -> target`
     ///   method the UAS calls on INVITE.
+    /// - `bridge.*` — `IoT` / integration plugins (slice 4.5).
+    ///   `bridge.ha` (Home Assistant), `bridge.mqtt` (MQTT
+    ///   broker), and future add-ons like `Slack` / `Teams` / `PagerDuty`
+    ///   live here. See [`BRIDGE_HA`] and [`BRIDGE_MQTT`].
     pub fn validate(&self) -> Result<(), String> {
         if self.capability.is_empty() {
             return Err("capability is empty".into());
@@ -150,9 +154,10 @@ impl CapabilityDescriptor {
             && !self.capability.starts_with("media.")
             && !self.capability.starts_with("storage.")
             && !self.capability.starts_with("routing.")
+            && !self.capability.starts_with("bridge.")
         {
             return Err(format!(
-                "capability `{}` is outside the `ai.*` / `media.*` / `storage.*` / `routing.*` namespaces",
+                "capability `{}` is outside the `ai.*` / `media.*` / `storage.*` / `routing.*` / `bridge.*` namespaces",
                 self.capability
             ));
         }
@@ -195,6 +200,16 @@ pub const STORAGE_VECTOR: &str = "storage.vector";
 /// an S3-compatible sidecar route through this seam. The reference
 /// sidecar is `store-s3-recording`.
 pub const STORAGE_RECORDING: &str = "storage.recording";
+
+/// Capability token declaring a Home Assistant integration
+/// sidecar (slice 4.5 / P21). Methods: `emit_event`, `get_state`,
+/// `call_service`. The reference sidecar is `ha-bridge`.
+pub const BRIDGE_HA: &str = "bridge.ha";
+
+/// Capability token declaring a generic MQTT broker integration
+/// (slice 4.5 / P21). Methods: `publish`, `subscribe`. The
+/// reference sidecar is `mqtt-bridge`.
+pub const BRIDGE_MQTT: &str = "bridge.mqtt";
 
 // ---------------------------------------------------------------------
 // Control-schema validation
@@ -823,6 +838,27 @@ mod tests {
             extra: BTreeMap::new(),
         };
         d.validate().expect("storage.recording must validate");
+    }
+
+    #[test]
+    fn accepts_bridge_ha_and_mqtt_capabilities() {
+        // Slice 4.5: `bridge.*` joins the whitelist for IoT / home-
+        // automation / pager / messaging sidecars.
+        for cap in [BRIDGE_HA, BRIDGE_MQTT] {
+            let d = CapabilityDescriptor {
+                capability: cap.into(),
+                plugin: "bridge-test".into(),
+                model_id: String::new(),
+                abi: "1.0".into(),
+                description: "test".into(),
+                latency_ms: None,
+                concurrency: None,
+                priority: DEFAULT_PRIORITY,
+                extra: BTreeMap::new(),
+            };
+            d.validate()
+                .unwrap_or_else(|e| panic!("{cap} must validate: {e}"));
+        }
     }
 
     #[test]

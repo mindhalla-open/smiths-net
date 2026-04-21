@@ -1,0 +1,7 @@
+name        = "ha-bridge"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["bridge.ha"]
+abi         = "1.0"
+description = "Home Assistant bridge. Talks to the HA REST API (long-lived access token): `emit_event` publishes custom events, `get_state` reads entity state, `call_service` triggers HA services (lights, switches, media_players)."

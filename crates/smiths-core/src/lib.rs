@@ -39,9 +39,10 @@ pub mod shutdown;
 pub mod storage;
 
 pub use ai::{
-    AiDispatcher, AiProvider, AiRegistry, CapabilityDescriptor, ConcurrencyHint, DEFAULT_PRIORITY,
-    DispatchError, DispatchPolicy, LatencyHint, MEDIA_STREAMING_RTP, ProviderError,
-    STORAGE_RECORDING, STORAGE_VECTOR, ValidationError, validate_controls,
+    AiDispatcher, AiProvider, AiRegistry, BRIDGE_HA, BRIDGE_MQTT, CapabilityDescriptor,
+    ConcurrencyHint, DEFAULT_PRIORITY, DispatchError, DispatchPolicy, LatencyHint,
+    MEDIA_STREAMING_RTP, ProviderError, STORAGE_RECORDING, STORAGE_VECTOR, ValidationError,
+    validate_controls,
 };
 pub use bus::EventBus;
 pub use call::{
