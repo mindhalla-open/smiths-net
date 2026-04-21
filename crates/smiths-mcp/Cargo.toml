@@ -6,8 +6,20 @@ version      = { workspace = true }
 license      = { workspace = true }
 description  = "Control plane: Tool/Resource traits plus MCP (stdio) and A2A (HTTP) adapters."
 
+[features]
+# Slice 4.3 / P17: HTTP/3 (quinn + h3) transport for the MCP HTTP
+# adapter. Off by default; the 0.45.0 release ships the config
+# surface + a scaffold advertisement — the runtime QUIC listener
+# lands in a dedicated follow-on once the ALPN + cert story has
+# a concrete operator ask. Enabling the feature today flips
+# `--version` to include `h3` in the protocol list + lets a
+# `[mcp.http3]` config block parse; it does NOT open a listener.
+default   = []
+mcp-http3 = []
+
 [dependencies]
 smiths-core   = { workspace = true }
+smiths-media  = { workspace = true }
 base64        = { workspace = true }
 sha2          = { workspace = true }
 hex           = { workspace = true }
@@ -24,7 +36,6 @@ axum          = { workspace = true }
 dashmap       = { workspace = true }
 
 [dev-dependencies]
-smiths-media      = { workspace = true }
 smiths-plugin     = { workspace = true }
 smiths-sdp        = { workspace = true }
 smiths-sip        = { workspace = true }

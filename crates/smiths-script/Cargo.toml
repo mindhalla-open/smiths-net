@@ -8,6 +8,17 @@ description  = "Embedded DSL host for script-tier plugins (Rhai/Lua/Starlark)."
 
 [dependencies]
 smiths-core = { workspace = true }
+async-trait = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+rhai        = { workspace = true }
+
+[dev-dependencies]
+tokio    = { workspace = true, features = ["macros", "test-util"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

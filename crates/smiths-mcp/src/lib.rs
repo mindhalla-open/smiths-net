@@ -21,6 +21,7 @@
 pub mod a2a;
 pub mod audit;
 pub mod control;
+pub mod control_protocol;
 pub mod dispatch;
 pub mod mcp;
 pub mod mcp_http;
@@ -28,8 +29,13 @@ pub mod rate_limit;
 pub mod resource;
 pub mod tool;
 pub mod tools;
+pub mod webhook;
 
 pub use control::ControlState;
+pub use control_protocol::{
+    A2aHttpProtocol, ControlOutcome, ControlProtocol, McpStdioProtocol, ProtocolDispatch,
+    WebhookHttpProtocol, agent_card,
+};
 pub use rate_limit::RateLimiter;
 pub use resource::{
     Resource, ResourceContent, ResourceRegistry, builtin_registry as builtin_resources,

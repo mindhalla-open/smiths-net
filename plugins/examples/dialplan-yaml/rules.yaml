@@ -1,0 +1,42 @@
+# Example rules file — the sidecar loads `rules.yaml` from its own
+# directory at boot. Edit + restart the plugin (or use the
+# `reload_plugin` MCP tool) to pick up changes. Format:
+#
+#   rules:
+#     - match:                # every field optional; omitted = matches
+#         from: "regex"       # Python re.search() on the From URI
+#         to: "regex"         # Python re.search() on the To URI
+#         hour_range: [9, 18] # local-time hour window, inclusive start
+#                              #                       exclusive end
+#       rewrite:
+#         target: "sip:dest@host[:port]"
+#         reason: "matched support during business hours"
+#
+# Rules are evaluated top-to-bottom; first match wins. No match →
+# empty response → engine falls back to its default routing.
+
+rules:
+  - match:
+      to: "^sip:support@"
+      hour_range: [9, 18]
+    rewrite:
+      target: "sip:queue-support@pbx.internal"
+      reason: "support queue (business hours)"
+
+  - match:
+      to: "^sip:support@"
+    rewrite:
+      target: "sip:voicemail-support@pbx.internal"
+      reason: "support voicemail (after hours)"
+
+  - match:
+      to: "^sip:sales@"
+    rewrite:
+      target: "sip:queue-sales@pbx.internal"
+      reason: "sales queue"
+
+  - match:
+      to: "^sip:voicebot@"
+    rewrite:
+      target: "sip:voicebot@agents.internal"
+      reason: "voicebot rendezvous"

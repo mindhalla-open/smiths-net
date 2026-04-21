@@ -1,0 +1,7 @@
+name        = "mqtt-bridge"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["bridge.mqtt"]
+abi         = "1.0"
+description = "Generic MQTT broker bridge. Publishes QoS 0/1 messages to any MQTT 3.1.1 broker (Mosquitto, HiveMQ, EMQX, AWS IoT Core). Stdlib-only — ships a minimal MQTT 3.1.1 CONNECT/PUBLISH client so operators don't pay the paho-mqtt dep."

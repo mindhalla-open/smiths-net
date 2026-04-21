@@ -22,8 +22,9 @@ health_bind = "127.0.0.1:8080"
 # Socket addresses to bind for SIP. 0.0.0.0 = all interfaces.
 bind = ["0.0.0.0:5060"]
 
-# Enabled transports. Only "udp" is wired in Phase 1; "tcp" and "tls"
-# land in Phase 6.
+# Enabled transports. "udp", "tcp", "tls" are live; "quic" is a
+# slice 4.3 scaffold — requires `--features sip-quic` and logs a
+# "not yet wired" warning at startup.
 transports = ["udp"]
 
 # Grace period (seconds) to finish in-flight transactions on shutdown.
@@ -112,6 +113,15 @@ retention_days = 0        # 0 disables the hourly sweeper; >0 deletes blobs olde
 # Costs ~3k FLOPs per 20 ms frame per leg — off by default.
 [media]
 inband_dtmf = false
+
+# IVR prompt library (slice 4.2 / P9). Point `root` at a directory
+# of WAV files (PCM16 LE, mono) — IVR scripts reference prompts
+# relative to this root (`prompts/welcome.wav`). Leave the root
+# empty to disable the library; `record_prompt` returns NotFound
+# in that case.
+[media.prompts]
+root     = ""
+# capacity = 128
 
 # Cloud-AI secrets (slice 3.2 / P22). All fields optional — sidecars
 # read their own API keys from environment variables (`OPENAI_API_KEY`,

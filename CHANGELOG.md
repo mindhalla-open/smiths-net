@@ -5,6 +5,339 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.47.0] - 2026-04-21
+
+Slice 4.5 — IoT bridges. Two reference sidecars land on the new
+`bridge.*` capability namespace (Home Assistant + generic MQTT
+3.1.1) with documented event-mapping patterns, a doorbell demo,
+and an operator runbook for outbound `call.ended` publishing.
+
+### Added
+
+- **`bridge.*` capability namespace** — joins `ai.*` / `media.*`
+  / `storage.*` / `routing.*` on the plugin validator. Tokens:
+  `BRIDGE_HA = "bridge.ha"`, `BRIDGE_MQTT = "bridge.mqtt"`.
+- **`plugins/examples/ha-bridge/`** — stdlib-only Python sidecar
+  against Home Assistant's REST API. Three methods:
+  - `emit_event(event_type, data)` → `POST /api/events/<type>`
+  - `get_state(entity_id)` → `GET /api/states/<entity>`
+  - `call_service(domain, service, data)` → `POST
+    /api/services/<domain>/<service>`
+  Env-configured (`HA_BASE_URL`, `HA_TOKEN`, `HA_TIMEOUT_SECS`);
+  every HTTP failure surfaces as a JSON-RPC error the
+  dispatcher can fail over.
+- **`plugins/examples/mqtt-bridge/`** — stdlib-only MQTT 3.1.1
+  publisher. Ships its own CONNECT / PUBLISH / DISCONNECT
+  encoder (~100 LOC) so no `paho-mqtt` dep is required.
+  Short-lived TCP socket per call; QoS 0 and 1; `payload`
+  accepts string, object, array, or null (objects/arrays
+  auto-JSON-encode). Env: `MQTT_HOST`, `MQTT_PORT`,
+  `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_CLIENT_ID`,
+  `MQTT_TIMEOUT_SECS`.
+- **`docs/deployment/iot.md`** — event-flow diagrams,
+  doorbell-triggers-SIP-call demo end-to-end, agent-side
+  `call.ended` publish pattern, event-mapping table (which
+  MCP notification maps to which typical outbound action),
+  security notes, limits + follow-ons.
+- **Tests** — 1 new unit test on `CapabilityDescriptor`
+  (`accepts_bridge_ha_and_mqtt_capabilities`) covering both
+  new tokens round-tripping through the validator.
+
+### Notes
+
+Inbound automation (HA → smiths-net) flows through the webhook
+adapter (slice 4.4 / P20). The `ha-bridge` sidecar covers only
+the outbound direction (engine → HA) because the plugin
+protocol doesn't yet push events from engine to plugin — a
+dedicated "event subscriber" capability is a follow-on slice.
+
+The MQTT bridge is publish-only; `subscribe` needs a
+persistent-connection lifecycle that doesn't fit the sidecar
+JSON-RPC model as it stands. Operators who need subscription-
+driven flows run a dedicated MQTT consumer outside the plugin
+tier and invoke smiths-net's webhook adapter from there.
+
+No engine-host adapter wires these sidecars into named tools
+today — agents invoke them via the generic `ai_invoke` path
+(`{plugin, method, params}`). Adding dedicated MCP tool
+wrappers (`bridge_emit_ha`, `bridge_mqtt_publish`) for better
+discoverability is a small follow-on; the plumbing is already
+in place via the standard dispatcher.
+
+## [0.46.0] - 2026-04-21
+
+Slice 4.4 — A2A protocols. The control plane learns a fourth
+adapter (generic HTTP webhook) and gets a new shared trait seam
+(`ControlProtocol` + `ProtocolDispatch` + `ControlOutcome`) so
+operator-authored adapters route through the same auth + rate-
+limit + audit + metrics pipeline as MCP / A2A. No wire changes
+to the existing adapters; everything is additive.
+
+### Added
+
+- **`smiths_mcp::control_protocol`** — adapter-agnostic trait
+  seam. Three types land:
+  - `ControlOutcome` — normalized `Ok | InvalidArguments |
+    NotFound | Forbidden | Internal` verdict. Stable HTTP status
+    + JSON-RPC code mapping on each variant.
+  - `ProtocolDispatch` — thin wrapper over
+    `Arc<ToolRegistry> + Arc<RateLimiter> + Arc<Metrics> +
+    ToolContext` with one `invoke(actor, tool, args)` method
+    that runs the shared `invoke_audited` pipeline and hands
+    back a `ControlOutcome`.
+  - `ControlProtocol` trait + three singleton markers
+    (`McpStdioProtocol`, `A2aHttpProtocol`,
+    `WebhookHttpProtocol`) for discovery / introspection.
+  - `agent_card(dispatch, adapters, endpoint)` helper that
+    builds a unified `.well-known/agent.json` document with a
+    `capabilities.tools` list + `adapters` array so agents can
+    tell at a glance which framings this engine speaks.
+- **`smiths_mcp::webhook`** — generic HTTP webhook adapter.
+  `POST /hook/<tool>` accepts a JSON body of args and returns
+  `{"result": ...}` on success or `{"error": "..."}` with the
+  right HTTP status on failure. Optional bearer-token guard.
+  `/.well-known/agent.json` + `/health` stay public so load
+  balancers and agent registries can still probe. Same
+  `invoke_audited` path as MCP/A2A, so rate limits and audit
+  events apply uniformly.
+- **`docs/tool-authoring.md`** — migration guide: where tools
+  live, the `Tool` trait contract, how to plumb optional
+  dependencies via `ToolContext`, error/outcome classification,
+  the adapter matrix, and what embedders gain from
+  `ProtocolDispatch`.
+- **Tests** — 2 unit tests on `control_protocol`
+  (`outcome_from_result_round_trips`,
+  `builtin_protocols_have_stable_labels`); end-to-end
+  `a2a_make_call.rs` (HTTP client speaks A2A JSON-RPC → stubbed
+  `CallOriginator` → `tools/call` returns the synthesized
+  call-id, unknown-tool path surfaces JSON-RPC `-32601`);
+  5-test `webhook_http.rs` covering the happy path, 404 on
+  unknown tools, 400 on missing required args, agent-card
+  discovery advertising all three adapter labels, and bearer-
+  token gating.
+
+### Notes
+
+The existing MCP + A2A adapters keep their hand-rolled dispatch
+loops for 0.46.0; they already flow through `invoke_audited` so
+wire behaviour is identical. Migrating them to
+`ProtocolDispatch::invoke` is a small follow-on — it removes
+~20 lines of per-adapter error matching without changing any
+externally observable behaviour.
+
+The webhook adapter ships in the crate but is not yet wired
+into the CLI's default binding set. Embedders who want it
+online today call `smiths_mcp::webhook::serve_http(...)` from
+their own binary; a `[webhook]` config section and CLI wiring
+land alongside the MCP/A2A dispatch-loop migration.
+
+## [0.45.0] - 2026-04-21
+
+Slice 4.3 — HTTP/3 MCP + SIP-over-QUIC. MCP HTTP upgrades to
+h1+h2 (free axum feature flip); feature flags + config scaffolds
+land for the h3 listener and SIP-over-QUIC transport. `smiths-net
+--version` now advertises every supported protocol, and
+`docs/architecture/07-http3.md` walks the rollout.
+
+### Added
+
+- **MCP HTTP/2.** Axum workspace dep enables the `http2` feature.
+  TLS-terminated MCP deployments negotiate h2 via ALPN; h1 clients
+  keep working. The MCP HTTP adapter logs the enabled protocols at
+  startup.
+- **`[mcp.http3]` config section** — `enabled` + `bind`. Accepted
+  regardless of feature flags; at startup the CLI warns if the
+  runtime listener isn't wired (0.45.0: never wired) or the binary
+  was built without `--features mcp-http3`.
+- **`sip.transports = ["quic"]`** — valid enum value. Opted in via
+  the `smiths-sip/sip-quic` Cargo feature + `smiths-cli/sip-quic`.
+  Warns at startup that the listener isn't wired in 0.45.0.
+- **`smiths-mcp/mcp-http3` Cargo feature** — no-op scaffold today;
+  flips the `--version` advertisement and lets the config parse.
+- **`smiths-sip/sip-quic` + `smiths-cli/sip-quic` features** —
+  likewise scaffolds.
+- **`smiths-net --version`** — now advertises every wired
+  transport, storage backend, AI reference, and plugin tier;
+  scaffolded protocols are flagged `(scaffold)`. Assembled via
+  `const_format::concatcp!` + `#[cfg]`-gated hint fragments for
+  zero runtime cost.
+- **Perf baseline** — `crates/smiths-sip/tests/tcp_loss_bench.rs`
+  (marked `#[ignore]`): round-trips 100 OPTIONS through the
+  standard `TcpTransport` + a loopback peer, prints p50/p95/mean
+  latency, asserts a sanity ceiling. Same harness will stand up a
+  QUIC listener + rerun the loop once the `sip-quic` runtime
+  lands.
+- **`docs/architecture/07-http3.md`** — what shipped in 0.45.0,
+  what's deferred and why, rollout plan through 0.48.0.
+
+### Notes
+
+The runtime listeners for both `mcp-http3` and `sip-quic` are
+honestly deferred. Reasons:
+
+- h3 needs a TLS 1.3 cert story separate from the DTLS-SRTP path
+  (media cert vs signaling cert shouldn't be the same key).
+- `quinn` + `h3-quinn` + `h3` integrate with axum through
+  `tower::Service`, not `axum::serve` — ~200-400 LOC of graceful-
+  shutdown + 0-RTT replay-safety code that deserves its own
+  slice.
+- `draft-ietf-sipcore-sip-quic` is still evolving; wiring a
+  listener today pins us to a spec version that may shift.
+
+Operators who opt into either feature today get the config shape
+parsed + a clear warning + the `--version` bump — no silent
+binding, no half-wired socket.
+
+## [0.44.0] - 2026-04-21
+
+Slice 4.2 — Dialplan + IVR kit. Two more reference plugins land
+on the `routing.*` namespace: `dialplan-yaml` (YAML-authored
+from/to/hour-of-day matchers) and `ivr-kit` (Rhai state machine
+driving `play_prompt` / `transfer` / `hangup`). A prompt library
++ `record_prompt` MCP tool close out the authoring loop.
+
+### Added
+
+- **`plugins/examples/dialplan-yaml/`** — stdlib-only Python
+  sidecar advertising `routing.dialplan`. Reads a shipped
+  `rules.yaml`, evaluates each incoming `route(req)` through a
+  from / to / hour_range matcher, returns the first match as
+  `{target, reason}`. Includes a tiny YAML-subset parser so
+  operators don't need `PyYAML`; swap in `yaml.safe_load` for
+  full YAML 1.2. Dedicated `reload_rules` RPC method reloads the
+  rule file without respawning the process.
+- **`plugins/examples/ivr-kit/`** — reference IVR state machine
+  in Rhai. Exports `describe_capabilities`, `greet(session)`, and
+  `on_dtmf(session)`; returns `{action, prompt?, target?, state,
+  done}` per press. Ships a press-1-for-sales / press-2-for-
+  support / press-3-record-a-message tree with `*` to replay and
+  `#` to hang up. Capability `routing.ivr`.
+- **`smiths-media::PromptLibrary`** — LRU of decoded PCM16 LE
+  mono WAVs keyed by path. Stdlib WAV parser (RIFF/WAVE chunks,
+  format_tag = 1, 16-bit mono); `encode_wav(rate, samples)`
+  helper for the inverse. `insert_raw` sidesteps disk so the
+  `record_prompt` tool can make the just-written audio
+  immediately hot without a round trip through `load_from_disk`.
+- **`[media.prompts]` config** — `root` + `capacity`. Empty
+  `root` disables the library; `record_prompt` returns a clean
+  `NotFound` in that case.
+- **MCP tool `record_prompt(call_id, audio_base64, path)`** —
+  decodes the provided PCM16 LE audio, refuses absolute or
+  `..`-containing paths, writes a mono WAV under the library
+  root, seeds the cache. Returns `{path, absolute, sample_rate,
+  bytes, duration_ms}`.
+- **`ToolContext::with_prompts`** — engine threads the wired
+  `PromptLibrary` onto tools through the existing `ToolContext`
+  seam.
+- **Tests** — 6 unit tests on `PromptLibrary` (encode/decode
+  round-trip, rejects non-mono, LRU eviction, caching, raw
+  insert, missing-file `NotFound`); 3 MCP tool tests on
+  `record_prompt` (NotFound when the library is unwired,
+  rejection of absolute + `..` paths, write-and-cache on the
+  happy path); `ivr_state_machine.rs` integration test loads the
+  reference `ivr-kit` plugin via the standard loader and drives
+  every press-path the script handles (`1` → sales, `2` →
+  support, `9` → replay, `#` → hangup, `3` → record submenu,
+  submenu `#` → hangup).
+
+### Notes
+
+The IVR runtime seam — the glue that pushes live-call DTMF into
+`on_dtmf` and has the UAS act on a returned `transfer` /
+`hangup` mid-dialog — is a dedicated follow-on. The Rhai
+contract in `ivr-kit` is stable; today the state machine is
+driven synchronously by tests + tools that build a session
+directly. Once the bridge exposes a per-call "IVR session"
+control surface, the plugin switches from "test-driven" to
+"engine-driven" with no script changes.
+
+The dialplan sidecar ships without a native engine-side adapter
+that plugs it in behind a route-selection trait — scripts and
+sidecars alike are reachable via `AiProvider::invoke("route", …)`
+on the plugin registry, and the SIP UAS calls into that surface
+on INVITE. A dedicated `routing::Router` facade that lets
+operators chain multiple `routing.dialplan` plugins (YAML first,
+Rhai fallback, etc.) is a small follow-on.
+
+## [0.43.0] - 2026-04-21
+
+Slice 4.1 — Embedded DSL runtime (Rhai). The `smiths-script` crate
+gains a working Rhai-backed `ScriptRuntime` with op-count +
+wall-clock budgets; the plugin loader wires `type = "script"` into
+the same `AiProvider` seam that sidecars + WASM guests use. Hot
+reload with automatic rollback and a `put_script` MCP tool close
+out the slice.
+
+### Added
+
+- **`smiths-script::ScriptRuntime`** — compiles Rhai source at load
+  time, serves every invocation through the hot `Engine` + `AST`,
+  enforces `max_operations` (1M default) and `wall_clock` (500 ms
+  default) per call. JSON ↔ Rhai bridge (object, array, bool,
+  int, float, string, null) lets scripts take the same
+  `serde_json::Value` params sidecars already handle.
+- **`ScriptEngineKind`** enum + `ScriptEngine` async trait so Lua /
+  Starlark variants can slot in behind the same shape; Rhai is
+  the only impl today.
+- **`smiths-plugin::ScriptProvider`** — `AiProvider` adapter around
+  the runtime. Atomic hot-swap (`swap_runtime`), auto-rollback
+  (`rollback()` after `ROLLBACK_AFTER = 5` consecutive errors),
+  reuses the existing `plugin_invocations` + `plugin_invoke_duration`
+  metrics.
+- **Manifest extension** — `type = "script"` now loads via the
+  loader. New optional fields: `script_engine = "rhai"` (default),
+  `script_max_operations`, `script_wall_clock_ms`.
+- **Capability namespace `routing.*`** — joins `ai.*` / `media.*` /
+  `storage.*` on the plugin validator. The reference dialplan
+  advertises `routing.dialplan`.
+- **`plugins/examples/route-rhai/`** — reference Rhai dialplan:
+  small in-script lookup table routes `sip:support@…`,
+  `sip:sales@…`, `sip:voicebot@…` to queue pools; everything else
+  falls through to the UAS default. Tight manifest budgets
+  (200k ops / 50 ms) so a sloppy edit can't pin a worker slice.
+- **Hot-reload with rollback** — `smiths_plugin::watcher` already
+  fires on entry-file changes; the `AiRegistry::reload` path now
+  routes scripts through an in-place atomic swap (preserving the
+  previous runtime for rollback) instead of the sidecar drop-and-
+  respawn pattern. A compile failure leaves the running script
+  untouched; a five-error streak after a swap restores the prior
+  version. Capability changes refuse the swap (treated as a
+  manifest change, not hot reload).
+- **MCP tool `put_script(name, source, engine)`** — writes the new
+  body atomically (tempfile + rename) into the loaded plugin's
+  entry file and fires the same hot-reload path as a file-system
+  edit. Only `engine = "rhai"` is accepted today. `NotFound` when
+  the named plugin isn't loaded / isn't script-backed.
+- **`AiRegistry::reload_script_source`** — new default-impl trait
+  method on `smiths_core::ai::AiRegistry`. Returns "not supported"
+  on registries that don't host scripts so old impls stay
+  compatible; the plugin-crate impl performs the atomic write +
+  reload.
+- **Tests** — 6 unit tests on `smiths_script` (describe,
+  round-trip JSON in+out, missing-method error, op-budget trip,
+  compile-error surfacing, JSON↔Rhai round trip); 2 integration
+  tests on `smiths-plugin` (`route-rhai` loaded through the
+  standard loader + invoked through the `AiProvider` trait;
+  rollback restores the good runtime after 5 consecutive errors);
+  2 tool tests on the new `put_script` surface.
+
+### Notes
+
+Hot-reload today refuses to change the advertised capability set
+— a script whose new `describe_capabilities` returns a different
+set is treated as a manifest change, not a script edit. Operators
+pick up the new contract by restarting the engine (or by removing
+and re-adding the plugin directory, which triggers the ordinary
+loader path).
+
+Rhai's engine is synchronous; invocations run on a
+`tokio::task::spawn_blocking` worker. This keeps each call
+isolated from the tokio scheduler but means the effective
+concurrency per script is bounded by the blocking pool. Scripts
+that genuinely need parallelism should stay short — the dialplan
+shape is a good fit; long-form RAG routing should stay in a
+sidecar.
+
 ## [0.42.0] - 2026-04-21
 
 Slice 3.5 — Proxy/VPN transports. SIP-over-TCP and SIP-over-TLS can

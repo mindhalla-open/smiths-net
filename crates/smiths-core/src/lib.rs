@@ -39,9 +39,10 @@ pub mod shutdown;
 pub mod storage;
 
 pub use ai::{
-    AiDispatcher, AiProvider, AiRegistry, CapabilityDescriptor, ConcurrencyHint, DEFAULT_PRIORITY,
-    DispatchError, DispatchPolicy, LatencyHint, MEDIA_STREAMING_RTP, ProviderError,
-    STORAGE_RECORDING, STORAGE_VECTOR, ValidationError, validate_controls,
+    AiDispatcher, AiProvider, AiRegistry, BRIDGE_HA, BRIDGE_MQTT, CapabilityDescriptor,
+    ConcurrencyHint, DEFAULT_PRIORITY, DispatchError, DispatchPolicy, LatencyHint,
+    MEDIA_STREAMING_RTP, ProviderError, STORAGE_RECORDING, STORAGE_VECTOR, ValidationError,
+    validate_controls,
 };
 pub use bus::EventBus;
 pub use call::{
@@ -51,11 +52,11 @@ pub use call::{
 pub use codec::{linear_to_ulaw, pcm16_to_pcmu, pcmu_to_pcm16, ulaw_to_linear};
 pub use config::{
     A2aConfig, AiConfig, AuthBackend, AuthConfig, BindSpec, BindSpecError, Config, CoreConfig,
-    FsRecordingConfig, HttpAuthConfig, HttpFailureMode, LogFormat, McpConfig, MediaConfig,
-    ObservabilityConfig, PluginsConfig, ProxyMode, RateLimitConfig, RecordingBackend,
-    RecordingStoreConfig, SandboxConfig, SeccompPolicy, SipConfig, SipProxyConfig, SipRateLimit,
-    SipTransport, SipVpnConfig, SqliteAuthConfig, SqliteStorageConfig, StorageBackend,
-    StorageConfig, VectorBackend, VectorStoreConfig, VpnMode,
+    FsRecordingConfig, HttpAuthConfig, HttpFailureMode, LogFormat, McpConfig, McpHttp3Config,
+    MediaConfig, ObservabilityConfig, PluginsConfig, PromptsConfig, ProxyMode, RateLimitConfig,
+    RecordingBackend, RecordingStoreConfig, SandboxConfig, SeccompPolicy, SipConfig,
+    SipProxyConfig, SipRateLimit, SipTransport, SipVpnConfig, SqliteAuthConfig,
+    SqliteStorageConfig, StorageBackend, StorageConfig, VectorBackend, VectorStoreConfig, VpnMode,
 };
 pub use drain::Drain;
 pub use dtls::{DtlsCertError, SelfSignedCert};

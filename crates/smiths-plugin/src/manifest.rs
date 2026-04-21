@@ -39,6 +39,29 @@ pub struct Manifest {
     /// Free-form human-readable description shown in `list_ai_providers`.
     #[serde(default)]
     pub description: String,
+    /// Which DSL engine a `type = "script"` plugin targets. Ignored
+    /// for every other plugin type. Default is `"rhai"` so a
+    /// minimal manifest works out of the box.
+    #[serde(default)]
+    pub script_engine: ScriptEngine,
+    /// Optional per-invocation op-count cap for script plugins.
+    /// `0` means "use the engine default" (1M). Ignored for every
+    /// other plugin type.
+    #[serde(default)]
+    pub script_max_operations: u64,
+    /// Optional per-invocation wall-clock cap in ms for script
+    /// plugins. `0` means "use the engine default" (500 ms).
+    #[serde(default)]
+    pub script_wall_clock_ms: u64,
+}
+
+/// Which DSL engine a `type = "script"` manifest selects.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ScriptEngine {
+    /// Rhai 1.x — the default.
+    #[default]
+    Rhai,
 }
 
 fn default_abi() -> String {

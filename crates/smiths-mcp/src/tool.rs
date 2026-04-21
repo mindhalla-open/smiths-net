@@ -18,6 +18,7 @@ use smiths_core::ai::AiRegistry;
 use smiths_core::call::{CallOriginator, RegistrationView};
 use smiths_core::media::MediaFabric;
 use smiths_core::storage::{CdrStore, RecordingStore, VectorStore};
+use smiths_media::PromptLibrary;
 use thiserror::Error;
 
 use crate::control::ControlState;
@@ -65,6 +66,10 @@ pub struct ToolContext {
     /// backend = "none"`; `transcribe_call` / `summarize_call` then
     /// require the `audio_base64` argument as before.
     pub recording: Option<Arc<dyn RecordingStore>>,
+    /// IVR prompt library (slice 4.2). `None` when the operator
+    /// hasn't configured a root; `record_prompt` returns a clean
+    /// `NotFound` in that case.
+    pub prompts: Option<PromptLibrary>,
 }
 
 impl ToolContext {
@@ -87,7 +92,16 @@ impl ToolContext {
             metrics: None,
             vector: None,
             recording: None,
+            prompts: None,
         }
+    }
+
+    /// Attach a [`PromptLibrary`] so `record_prompt` can write
+    /// prompts to disk + cache decoded WAVs for IVR playback.
+    #[must_use]
+    pub fn with_prompts(mut self, library: PromptLibrary) -> Self {
+        self.prompts = Some(library);
+        self
     }
 
     /// Attach a [`VectorStore`] so `search_calls_semantic` is live.

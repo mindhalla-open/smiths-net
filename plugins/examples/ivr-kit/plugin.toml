@@ -1,0 +1,12 @@
+name        = "ivr-kit"
+version     = "0.1.0"
+type        = "script"
+entry       = "./main.rhai"
+provides    = ["routing.ivr"]
+abi         = "1.0"
+description = "Reference IVR state machine in Rhai. Consumes DTMF events (`on_dtmf(session, digit)`) and emits routing decisions the UAS acts on. Sliced 4.2 / P9."
+
+# IVR scripts can hit more ops than a dialplan (lookup tables +
+# per-digit branches) — give them a bit more headroom.
+script_max_operations = 400000
+script_wall_clock_ms  = 80

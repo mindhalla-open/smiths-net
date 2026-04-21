@@ -1,0 +1,13 @@
+name        = "route-rhai"
+version     = "0.1.0"
+type        = "script"
+entry       = "./main.rhai"
+provides    = ["routing.dialplan"]
+abi         = "1.0"
+description = "Reference Rhai dialplan — routes inbound SIP by `to` URI. See main.rhai; hot-reloadable."
+
+# Slice 4.1: tight budgets by default so a sloppy edit can't pin a
+# worker thread. Scripts that genuinely need more can raise them
+# (or the operator tunes them at load time).
+script_max_operations = 200000
+script_wall_clock_ms  = 50

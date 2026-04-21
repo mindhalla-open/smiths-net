@@ -20,11 +20,13 @@ tokio       = { workspace = true }
 tokio-util  = { workspace = true }
 async-trait = { workspace = true }
 dashmap     = { workspace = true }
+thiserror   = { workspace = true }
 tracing     = { workspace = true }
 webrtc-srtp = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "test-util"] }
+tokio    = { workspace = true, features = ["macros", "test-util"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
