@@ -22,8 +22,18 @@ path = "src/main.rs"
 default   = []
 wireguard = []
 
+# Slice 4.3 / P17 scaffolds. Enabling these flips `--version` to
+# advertise the protocol + lets the matching config section parse.
+# Runtime listeners (QUIC for SIP-over-QUIC, quinn+h3 for MCP h3)
+# land in follow-on slices; the config surface + version bump ship
+# now so operators can pin the intended shape and CI matrices can
+# start exercising the feature builds.
+mcp-http3 = ["smiths-mcp/mcp-http3"]
+sip-quic  = ["smiths-sip/sip-quic"]
+
 [dependencies]
 smiths-core        = { workspace = true }
+const_format       = "0.2"
 smiths-sip         = { workspace = true }
 smiths-sdp         = { workspace = true }
 smiths-media       = { workspace = true }

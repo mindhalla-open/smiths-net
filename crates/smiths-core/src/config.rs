@@ -749,6 +749,13 @@ pub enum SipTransport {
     Tcp,
     /// RFC 5630 SIP over TLS. Not yet wired in Phase 1.
     Tls,
+    /// SIP-over-QUIC per `draft-ietf-sipcore-sip-quic` (slice 4.3 /
+    /// P17). Requires the `smiths-sip/sip-quic` Cargo feature; the
+    /// runtime listener is a dedicated follow-on. Selecting this
+    /// transport today with the feature off is a config error;
+    /// selecting it with the feature on logs a clear "not yet
+    /// wired" warning at bind.
+    Quic,
 }
 
 /// MCP (Model Context Protocol) server settings.
@@ -770,6 +777,41 @@ pub struct McpConfig {
     pub http_bind: SocketAddr,
     /// Token-bucket rate limit applied to tool invocations.
     pub rate_limit: RateLimitConfig,
+    /// HTTP/3 (QUIC) bind for MCP (slice 4.3 / P17). Requires the
+    /// `smiths-mcp/mcp-http3` Cargo feature; off by default. The
+    /// runtime listener is a dedicated follow-on — 0.45.0 accepts
+    /// the config + advertises `h3` in `--version` so operators
+    /// aren't surprised later.
+    pub http3: McpHttp3Config,
+}
+
+/// `[mcp.http3]` — HTTP/3 bind for the MCP adapter.
+///
+/// ```toml
+/// [mcp.http3]
+/// enabled = true                  # requires --features mcp-http3
+/// bind    = "127.0.0.1:7879"
+/// ```
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpHttp3Config {
+    /// Enable the h3 listener. Ignored when the binary was built
+    /// without `--features mcp-http3`; the CLI logs a clear warning
+    /// in that case.
+    pub enabled: bool,
+    /// UDP bind for the QUIC listener. Distinct port from the TCP
+    /// `http_bind` so operators can front only h3 with a public
+    /// load-balancer while keeping h1/h2 on loopback.
+    pub bind: SocketAddr,
+}
+
+impl Default for McpHttp3Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7879),
+        }
+    }
 }
 
 impl Default for McpConfig {
@@ -778,6 +820,7 @@ impl Default for McpConfig {
             enabled_http: false,
             http_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7878),
             rate_limit: RateLimitConfig::default(),
+            http3: McpHttp3Config::default(),
         }
     }
 }

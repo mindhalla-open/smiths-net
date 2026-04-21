@@ -37,11 +37,51 @@ enum McpMode {
     Stdio,
 }
 
+/// Build a protocol / feature advertisement for `--version` output
+/// (slice 4.3 / P17 / Small 2). Operators can run `smiths-net
+/// --version` and tell at a glance what transports + features the
+/// binary was compiled with. Assembled via `#[cfg]`-toggled `const`
+/// fragments + `concat!` so there's zero runtime cost and the
+/// string lives as `'static` for clap's API.
+#[cfg(feature = "wireguard")]
+const WG_HINT: &str = " + wireguard (scaffold)";
+#[cfg(not(feature = "wireguard"))]
+const WG_HINT: &str = "";
+
+#[cfg(feature = "sip-quic")]
+const QUIC_HINT: &str = ", quic (scaffold)";
+#[cfg(not(feature = "sip-quic"))]
+const QUIC_HINT: &str = "";
+
+#[cfg(feature = "mcp-http3")]
+const H3_HINT: &str = ", h3 (scaffold)";
+#[cfg(not(feature = "mcp-http3"))]
+const H3_HINT: &str = "";
+
+const LONG_VERSION: &str = const_format::concatcp!(
+    env!("CARGO_PKG_VERSION"),
+    "\n",
+    "sip transports: udp, tcp, tls",
+    WG_HINT,
+    ", proxy: socks5 + http-connect",
+    QUIC_HINT,
+    "\n",
+    "mcp adapters: stdio, http/1.1, http/2",
+    H3_HINT,
+    "\n",
+    "storage: cdr+kv (sqlite), vector (memory), recording (fs), auth (sqlite+http)",
+    "\n",
+    "ai: dispatcher, ollama/openai/anthropic refs, whisper.cpp ref, piper ref",
+    "\n",
+    "plugin tiers: sidecar, wasm, script (rhai)"
+);
+
 /// CLI flags.
 #[derive(Debug, Parser)]
 #[command(
     name = "smiths-net",
     version,
+    long_version = LONG_VERSION,
     about = "Lightweight AI-first SIP engine"
 )]
 struct Cli {
@@ -182,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
     let udp_enabled = config.sip.transports.contains(&SipTransport::Udp);
     let tcp_enabled = config.sip.transports.contains(&SipTransport::Tcp);
     let tls_enabled = config.sip.transports.contains(&SipTransport::Tls);
+    let quic_requested = config.sip.transports.contains(&SipTransport::Quic);
     if !udp_enabled && !tcp_enabled && !tls_enabled {
         warn!("no SIP transports configured; signaling disabled");
     }
@@ -189,6 +230,23 @@ async fn main() -> anyhow::Result<()> {
         warn!(
             "sip.transports includes `tls` but tls_cert_path/tls_key_path are unset; disabling TLS"
         );
+    }
+    // Slice 4.3 / P17: SIP-over-QUIC. Config surface + feature
+    // flag land now; runtime listener is a dedicated follow-on.
+    // Honest behaviour: warn loudly when the operator opts in so
+    // "nothing happens" is never mistaken for "it just works".
+    if quic_requested {
+        if cfg!(feature = "sip-quic") {
+            warn!(
+                "sip.transports includes `quic`: runtime listener not yet wired. \
+                 Config accepted; no QUIC port will open in 0.45.0."
+            );
+        } else {
+            warn!(
+                "sip.transports includes `quic` but binary built without \
+                 --features sip-quic; ignoring."
+            );
+        }
     }
 
     // Build the UAC from the first configured UDP bind. The UAC shares
@@ -465,6 +523,26 @@ async fn main() -> anyhow::Result<()> {
                 warn!(%bind, ?e, "MCP HTTP server error");
             }
         }));
+        info!("MCP HTTP adapter: http/1.1 + http/2 negotiated via ALPN when TLS-terminated");
+    }
+
+    // Slice 4.3 / P17: mcp-http3 scaffold — feature gate + config
+    // accepted, runtime listener deferred. Warn clearly so a mis-
+    // set `enabled = true` never looks like success.
+    if config.mcp.http3.enabled {
+        if cfg!(feature = "mcp-http3") {
+            warn!(
+                bind = %config.mcp.http3.bind,
+                "mcp.http3.enabled = true: runtime quinn+h3 listener not yet wired in 0.45.0. \
+                 Config accepted; no QUIC port will open. \
+                 See docs/architecture/07-http3.md for the rollout plan."
+            );
+        } else {
+            warn!(
+                "mcp.http3.enabled = true but binary built without \
+                 --features mcp-http3; ignoring."
+            );
+        }
     }
 
     if let Err(err) = bus.publish(Event::System(SystemEvent::Ready)) {

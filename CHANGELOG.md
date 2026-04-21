@@ -5,6 +5,63 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.45.0] - 2026-04-21
+
+Slice 4.3 — HTTP/3 MCP + SIP-over-QUIC. MCP HTTP upgrades to
+h1+h2 (free axum feature flip); feature flags + config scaffolds
+land for the h3 listener and SIP-over-QUIC transport. `smiths-net
+--version` now advertises every supported protocol, and
+`docs/architecture/07-http3.md` walks the rollout.
+
+### Added
+
+- **MCP HTTP/2.** Axum workspace dep enables the `http2` feature.
+  TLS-terminated MCP deployments negotiate h2 via ALPN; h1 clients
+  keep working. The MCP HTTP adapter logs the enabled protocols at
+  startup.
+- **`[mcp.http3]` config section** — `enabled` + `bind`. Accepted
+  regardless of feature flags; at startup the CLI warns if the
+  runtime listener isn't wired (0.45.0: never wired) or the binary
+  was built without `--features mcp-http3`.
+- **`sip.transports = ["quic"]`** — valid enum value. Opted in via
+  the `smiths-sip/sip-quic` Cargo feature + `smiths-cli/sip-quic`.
+  Warns at startup that the listener isn't wired in 0.45.0.
+- **`smiths-mcp/mcp-http3` Cargo feature** — no-op scaffold today;
+  flips the `--version` advertisement and lets the config parse.
+- **`smiths-sip/sip-quic` + `smiths-cli/sip-quic` features** —
+  likewise scaffolds.
+- **`smiths-net --version`** — now advertises every wired
+  transport, storage backend, AI reference, and plugin tier;
+  scaffolded protocols are flagged `(scaffold)`. Assembled via
+  `const_format::concatcp!` + `#[cfg]`-gated hint fragments for
+  zero runtime cost.
+- **Perf baseline** — `crates/smiths-sip/tests/tcp_loss_bench.rs`
+  (marked `#[ignore]`): round-trips 100 OPTIONS through the
+  standard `TcpTransport` + a loopback peer, prints p50/p95/mean
+  latency, asserts a sanity ceiling. Same harness will stand up a
+  QUIC listener + rerun the loop once the `sip-quic` runtime
+  lands.
+- **`docs/architecture/07-http3.md`** — what shipped in 0.45.0,
+  what's deferred and why, rollout plan through 0.48.0.
+
+### Notes
+
+The runtime listeners for both `mcp-http3` and `sip-quic` are
+honestly deferred. Reasons:
+
+- h3 needs a TLS 1.3 cert story separate from the DTLS-SRTP path
+  (media cert vs signaling cert shouldn't be the same key).
+- `quinn` + `h3-quinn` + `h3` integrate with axum through
+  `tower::Service`, not `axum::serve` — ~200-400 LOC of graceful-
+  shutdown + 0-RTT replay-safety code that deserves its own
+  slice.
+- `draft-ietf-sipcore-sip-quic` is still evolving; wiring a
+  listener today pins us to a spec version that may shift.
+
+Operators who opt into either feature today get the config shape
+parsed + a clear warning + the `--version` bump — no silent
+binding, no half-wired socket.
+
 ## [0.44.0] - 2026-04-21
 
 Slice 4.2 — Dialplan + IVR kit. Two more reference plugins land

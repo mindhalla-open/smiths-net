@@ -22,8 +22,9 @@ health_bind = "127.0.0.1:8080"
 # Socket addresses to bind for SIP. 0.0.0.0 = all interfaces.
 bind = ["0.0.0.0:5060"]
 
-# Enabled transports. Only "udp" is wired in Phase 1; "tcp" and "tls"
-# land in Phase 6.
+# Enabled transports. "udp", "tcp", "tls" are live; "quic" is a
+# slice 4.3 scaffold — requires `--features sip-quic` and logs a
+# "not yet wired" warning at startup.
 transports = ["udp"]
 
 # Grace period (seconds) to finish in-flight transactions on shutdown.

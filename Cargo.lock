@@ -598,6 +598,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "const_format"
+version = "0.2.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4481a617ad9a412be3b97c5d403fef8ed023103368908b9c50af598ff467cc1e"
+dependencies = [
+ "const_format_proc_macros",
+ "konst",
+]
+
+[[package]]
+name = "const_format_proc_macros"
+version = "0.2.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d57c2eccfb16dbac1f4e61e206105db5820c9d26c3c472bc17c774259ef7744"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-xid",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1369,6 +1390,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1503,6 +1543,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -1817,6 +1858,21 @@ dependencies = [
  "once_cell",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "konst"
+version = "0.2.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "128133ed7824fcd73d6e7b17957c5eb7bacb885649bd8c69708b2331a10bcefb"
+dependencies = [
+ "konst_macro_rules",
+]
+
+[[package]]
+name = "konst_macro_rules"
+version = "0.2.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "kqueue"
@@ -3289,11 +3345,12 @@ dependencies = [
 
 [[package]]
 name = "smiths-cli"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "const_format",
  "prometheus-client",
  "serde_json",
  "smiths-core",
@@ -3311,7 +3368,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-core"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "async-trait",
  "figment",
@@ -3330,7 +3387,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-dtls"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "async-trait",
  "rustls",
@@ -3346,7 +3403,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-ice"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "bytes",
  "rand 0.10.1",
@@ -3361,7 +3418,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-mcp"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3390,7 +3447,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-media"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3405,7 +3462,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-plugin"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -3429,14 +3486,14 @@ dependencies = [
 
 [[package]]
 name = "smiths-proto"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "prost",
 ]
 
 [[package]]
 name = "smiths-script"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "async-trait",
  "rhai",
@@ -3451,7 +3508,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sdp"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "base64",
  "rand 0.10.1",
@@ -3462,7 +3519,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sidecar"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "rustix",
  "seccompiler",
@@ -3478,7 +3535,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sip"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3510,7 +3567,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-testkit"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "smiths-core",
  "smiths-media",
@@ -3524,7 +3581,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-wasm"
-version = "0.44.0"
+version = "0.45.0"
 dependencies = [
  "anyhow",
  "async-trait",

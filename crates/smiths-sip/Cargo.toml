@@ -17,6 +17,14 @@ auth-sqlite  = ["dep:rusqlite"]
 # Enables `auth::http_store::HttpAuthStore`, a `CredentialStore`
 # backed by an operator-provided HTTPS webhook.
 auth-http    = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+# Slice 4.3 / P17: SIP-over-QUIC transport scaffold. Off by
+# default; 0.45.0 ships the config surface + a `Transport`
+# skeleton that logs a clear "not yet wired" warning at bind.
+# The runtime (`quinn` listener, per-peer stream management) is
+# a dedicated follow-on — turning the flag on today gives
+# operators a supported config shape + `--version` advertisement
+# without silently binding anywhere.
+sip-quic     = []
 
 [dependencies]
 smiths-core    = { workspace = true }

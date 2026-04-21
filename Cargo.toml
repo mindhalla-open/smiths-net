@@ -6,7 +6,7 @@ exclude  = ["fuzz"]
 [workspace.package]
 edition      = "2024"
 rust-version = "1.85"
-version      = "0.44.0"
+version      = "0.45.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
@@ -46,7 +46,12 @@ tokio-util  = { version = "0.7",  features = ["rt"] }
 async-trait = "0.1"
 
 # web framework (health endpoint, later MCP/HTTP)
-axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
+# HTTP/1.1 + HTTP/2 both on by default (slice 4.3 / P17). The h2
+# feature brings in `h2` + friends; cost is ~150 KiB of code. When
+# the operator fronts the MCP HTTP adapter with a TLS-terminator
+# that negotiates ALPN (nginx / Envoy / Caddy), connections upgrade
+# transparently. No client-side changes needed for h1-only agents.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "tokio", "json"] }
 
 # config
 figment = { version = "0.10", features = ["toml", "env"] }
