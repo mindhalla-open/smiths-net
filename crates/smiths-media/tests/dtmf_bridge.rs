@@ -72,6 +72,7 @@ async fn dtmf_stream_on_leg_a_emits_one_keypress() {
             rtcp_interval: None,
             metrics: None,
             dtmf_sink: Some(Arc::new(sink.clone())),
+            inband_dtmf: false,
         },
     );
 

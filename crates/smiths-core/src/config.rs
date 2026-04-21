@@ -39,6 +39,26 @@ pub struct Config {
     /// backends share this section; auth has its own `[auth]`
     /// because its lifetime + security story differs.
     pub storage: StorageConfig,
+    /// Media-plane tunings (DTMF inband detection, later: jitter
+    /// buffer depth, comfort-noise on silence).
+    pub media: MediaConfig,
+}
+
+/// `[media]` TOML block — per-leg media-plane tunings.
+///
+/// ```toml
+/// [media]
+/// inband_dtmf = true    # run the Goertzel detector on every bridge
+/// ```
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MediaConfig {
+    /// Opt every bridge into the Goertzel inband DTMF detector
+    /// (slice 2.5). Off by default — the RFC 4733 telephone-event
+    /// path (always on when a DTMF sink is wired) covers most
+    /// softphones. Enable when legs that never negotiate 4733
+    /// (PSTN gateway crossings) need DTMF too.
+    pub inband_dtmf: bool,
 }
 
 /// `[storage]` TOML block — CDR + KV backend selection.

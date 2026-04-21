@@ -5,6 +5,54 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0] - 2026-04-21
+
+Slice 2.5 — Inband DTMF via Goertzel. Covers legs that never
+negotiated RFC 4733 (PSTN gateway crossings) — same `DtmfSink`
+contract as slice 2.4, same `SipEvent::Dtmf` bus event.
+
+### Added
+
+- **`smiths-core::dtmf_inband`** — second-order Goertzel detector:
+  - `InbandDtmfDetector::new(leg_id)` + `with_config(...)` for
+    tighter tunings.
+  - `feed_pcm16` / `feed_pcmu` — PCMU decode built-in so the bridge
+    hot path doesn't re-parse.
+  - `synthesize_tone(digit, ms, rate)` — ground-truth generator
+    used by the accuracy benchmark + tests.
+  - Constants: 8 kHz default clock, 20 ms frame (160 samples),
+    0.3 magnitude threshold, 40 ms debounce, co-channel 4× runner-
+    up ratio.
+- **Bridge integration** — `BridgeConfig::inband_dtmf` bool opts
+  in; forwarder runs both RFC 4733 and Goertzel detectors against
+  the same plaintext RTP stream, delivering through the existing
+  `DtmfSink` seam. Zero overhead when off.
+- **`UdpMediaFabric::with_inband_dtmf(bool)`** builder.
+- **`[media]` config section** — `inband_dtmf = false` by default
+  so existing deployments don't pay the FLOPs.
+- **`MEDIA_STREAMING_RTP = "media.streaming_rtp"` capability**
+  recognized in the plugin manifest validator. Namespaces are now
+  `ai.*` **and** `media.*`. Declares the plugin-tier contract for
+  a future sidecar that consumes per-packet RTP — `dtmf-inband`
+  (Python + scipy) is the intended reference but deferred.
+- **Tests** — 8 unit tests on the detector (every DTMF digit
+  round-trips, silence is silent, debounce works both ways, PCMU
+  feed matches PCM16, synthesize duration accurate, **accuracy
+  benchmark pass-all on clean synthesized audio**), 1 unit test
+  on the plugin validator accepting `media.streaming_rtp`, and
+  `dtmf_inband_bus.rs` end-to-end: synthesized tones over PCMU
+  through `UdpMediaFabric` → live `EventBus` subscriber.
+
+### Notes
+
+The Python sidecar listed in the slice plan (numpy + Goertzel) is
+deferred — running a detector across a JSON-RPC boundary at 50
+packets/sec/leg is absurd for a hot-path workload. The engine-side
+pure-Rust detector covers the acceptance target (≥ 95% accuracy on
+clean audio; bench passes 100%). A plugin-tier consumer will slot
+in later behind the new `media.streaming_rtp` capability without
+engine changes.
+
 ## [0.36.0] - 2026-04-21
 
 Slice 2.4 — DTMF via RFC 4733 (a.k.a. RFC 2833). DTMF keypresses

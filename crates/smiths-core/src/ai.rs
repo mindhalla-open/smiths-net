@@ -108,13 +108,22 @@ pub fn parse_descriptors(raw: Value) -> Result<Vec<CapabilityDescriptor>, String
 impl CapabilityDescriptor {
     /// Validate common-envelope invariants. Returns a descriptive
     /// error when the plugin is confused.
+    ///
+    /// Capabilities live in one of two namespaces today:
+    ///
+    /// - `ai.*` — AI providers (LLM, TTS, ASR, embed). The original
+    ///   plugin tier.
+    /// - `media.*` — streaming-RTP consumers. Added in slice 2.5
+    ///   so a sidecar plugin can declare itself as something that
+    ///   receives per-packet RTP from the engine (e.g. the deferred
+    ///   `dtmf-inband` Python sidecar). See [`MEDIA_STREAMING_RTP`].
     pub fn validate(&self) -> Result<(), String> {
         if self.capability.is_empty() {
             return Err("capability is empty".into());
         }
-        if !self.capability.starts_with("ai.") {
+        if !self.capability.starts_with("ai.") && !self.capability.starts_with("media.") {
             return Err(format!(
-                "capability `{}` is outside the `ai.*` namespace",
+                "capability `{}` is outside the `ai.*` / `media.*` namespaces",
                 self.capability
             ));
         }
@@ -127,6 +136,23 @@ impl CapabilityDescriptor {
         Ok(())
     }
 }
+
+/// Capability token declaring a plugin that consumes streaming RTP
+/// from the engine's media fabric (slice 2.5). The engine wires the
+/// bridge's plaintext RTP feed to the plugin's `on_rtp_frame` host
+/// function; the plugin decides what to do with it (DTMF detect,
+/// recording, RAG ingestion).
+///
+/// A plugin with this capability in its manifest opts into the
+/// higher-cost hot-path call cadence — ~50 calls/sec/leg at the
+/// standard 20 ms packetization. Reference consumers:
+///
+/// - **`dtmf-inband`** — Python sidecar wrapping scipy / the
+///   engine's own Goertzel detector. Deferred to a follow-on;
+///   v0.37.0 ships the engine-side detector instead.
+/// - **Recording sidecars** — write each frame to a rolling file
+///   or object store (P23 `storage.recording` follow-on).
+pub const MEDIA_STREAMING_RTP: &str = "media.streaming_rtp";
 
 // ---------------------------------------------------------------------
 // Control-schema validation
@@ -397,6 +423,25 @@ mod tests {
             extra: BTreeMap::new(),
         };
         assert!(d.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_media_streaming_rtp_capability() {
+        // Slice 2.5: `media.*` joins `ai.*` as a recognized plugin
+        // capability namespace so streaming-RTP consumers (DTMF
+        // sidecars, recording sidecars) validate without hacking
+        // around the namespace check.
+        let d = CapabilityDescriptor {
+            capability: MEDIA_STREAMING_RTP.into(),
+            plugin: "dtmf-inband".into(),
+            model_id: String::new(),
+            abi: "1.0".into(),
+            description: "inband DTMF detector".into(),
+            latency_ms: None,
+            concurrency: None,
+            extra: BTreeMap::new(),
+        };
+        d.validate().expect("media.streaming_rtp must validate");
     }
 
     fn declared() -> BTreeMap<String, Value> {
