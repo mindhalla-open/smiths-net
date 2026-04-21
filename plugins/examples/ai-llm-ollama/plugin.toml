@@ -1,0 +1,7 @@
+name        = "ai-llm-ollama"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["ai.llm.chat"]
+abi         = "1.0"
+description = "Ollama-backed `ai.llm.chat` sidecar. Talks to a local Ollama daemon (default http://127.0.0.1:11434). Set OLLAMA_HOST + OLLAMA_MODEL to override. Lower priority than the mock so the dispatcher picks Ollama first when both are loaded."

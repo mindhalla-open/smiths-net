@@ -5,6 +5,79 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.0] - 2026-04-21
+
+Slice 3.1 — AI providers: `AiDispatcher` + fail-over. Agents now
+say `ai_invoke(capability, ...)` and the engine picks the best
+candidate by priority + health; a single flapping plugin no longer
+blocks the whole call. Reference sidecars (`ai-llm-ollama`,
+`ai-tts-piper`) land alongside the canned mocks so operators have a
+"real model talking to a real call" path on day one.
+
+### Added
+
+- **`smiths-core::ai::AiDispatcher`** — capability-routed dispatcher
+  over `AiRegistry`. Selection rule: candidates filtered by
+  `capability` string, sorted by descriptor `priority` (lower wins;
+  ties broken by `latency_ms.p50`, then lexical plugin name),
+  breaker-open plugins partitioned to the tail. `invoke(capability,
+  method, params)` runs the chain with per-attempt timeout + fail-
+  over; returns the first `Ok`, or `DispatchError::AllFailed` with
+  the final error attached.
+- **`DispatchPolicy`** — `per_attempt_timeout` (30 s default),
+  `max_attempts` (4 default). Builder on the dispatcher:
+  `with_policy`, `with_metrics`.
+- **Per-plugin health (`ProviderHealth`)** — simple count-with-
+  cooldown breaker: 3 consecutive failures trip it Open for 30 s;
+  one success closes it. Breaker is internal — the dispatcher still
+  tries Open candidates if nothing else is healthy so a partially-
+  degraded registry doesn't refuse service.
+- **`CapabilityDescriptor.priority: u8`** — optional, defaults to
+  `DEFAULT_PRIORITY = 50`. Reference sidecars (Ollama, Piper)
+  advertise `priority = 20` so the dispatcher prefers them over the
+  canned mocks without the operator having to configure anything.
+- **Metrics** — `smiths_ai_invocations` (one per dispatcher call)
+  and `smiths_ai_failovers` (one per fail-over tick, not per
+  attempt). Labelled by `capability`. Wired via
+  `AiDispatcher::with_metrics`.
+- **MCP tool `translate(text, to)`** — first dispatcher-native tool.
+  Routes through `ai.llm.chat` with a fixed translator system
+  prompt; returns the translated text alongside the raw provider
+  response. Handles Ollama, OpenAI-compat, and flat-`content`
+  shapes. `NotFound` when no `ai.llm.chat` is loaded.
+- **`plugins/examples/ai-llm-ollama/`** — sidecar that shells into a
+  local Ollama daemon (`/api/chat`, `stream=false`). Stdlib-only;
+  env-overridable (`OLLAMA_HOST`, `OLLAMA_MODEL`,
+  `OLLAMA_TIMEOUT_SECS`). README walks the three-command install.
+- **`plugins/examples/ai-tts-piper/`** — sidecar that execs the
+  `piper` binary with `--output_raw` and returns PCM16. Stdlib-only;
+  env-overridable (`PIPER_BIN`, `PIPER_VOICE`, `PIPER_VOICE_ID`,
+  `PIPER_LANG`). Decimates Piper's native 22.05 kHz to 8 / 16 kHz
+  on request.
+- **Tests** — 7 new dispatcher tests in `smiths-core::ai::tests`
+  (candidate ordering, `NoProvider`, fail-over, `AllFailed` surfaces
+  last error, timeout trips fail-over, breaker opens after 3
+  failures, metrics increment on success + fail-over) and 5 new MCP
+  tool tests (`translate` arg validation, `NoProvider` surface, and
+  three `extract_chat_content` shapes: flat, `message.content`,
+  `choices[0].message.content`).
+
+### Notes
+
+Dispatcher metrics are plumbed through `AiDispatcher::with_metrics`
+but the MCP `translate` tool constructs its own dispatcher per
+call and currently runs **without** a metrics handle — engine-level
+wiring (one dispatcher on `ToolContext`, `Arc<Metrics>` threaded
+through) is a small follow-on slice. `smiths_ai_invocations` /
+`smiths_ai_failovers` are still registered on the Prometheus
+registry so they show up at 0 until the wiring lands.
+
+The two reference sidecars assume a healthy local install — Ollama
+daemon up, or `piper` + an ONNX voice on disk. Each sidecar still
+serves `describe_capabilities` when its backend is unreachable, so
+the dispatcher sees the candidate and fails over on `invoke`. That
+keeps `list_ai_providers` honest in both states.
+
 ## [0.37.0] - 2026-04-21
 
 Slice 2.5 — Inband DTMF via Goertzel. Covers legs that never

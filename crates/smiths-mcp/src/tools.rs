@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::{Value, json};
-use smiths_core::ai::{AiProvider, CapabilityDescriptor, validate_controls};
+use smiths_core::ai::{
+    AiDispatcher, AiProvider, CapabilityDescriptor, DispatchError, validate_controls,
+};
 
 use crate::control::CallPhase;
 use crate::tool::{Tool, ToolContext, ToolError};
@@ -43,7 +45,122 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(ReloadPluginTool);
     reg.register(ListCdrTool);
     reg.register(SendDtmfTool);
+    reg.register(TranslateTool);
     reg
+}
+
+/// `translate` — render `text` into language `to` by routing through
+/// the [`AiDispatcher`] at capability `ai.llm.chat` (slice 3.1, P4).
+///
+/// The caller does not pick a plugin; the dispatcher selects the
+/// highest-priority healthy `ai.llm.chat` provider, failing over on
+/// timeout or error. This is the canonical "built on top of the
+/// dispatcher" tool — other multi-plugin helpers should follow the
+/// same shape instead of hand-rolling provider selection.
+pub struct TranslateTool;
+
+#[async_trait]
+impl Tool for TranslateTool {
+    fn name(&self) -> &'static str {
+        "translate"
+    }
+
+    fn description(&self) -> &'static str {
+        "Translate `text` into language `to` (BCP-47 tag or natural name) \
+         via the best-fit `ai.llm.chat` provider. Routes through the AI \
+         dispatcher with automatic fail-over."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "Source text to translate." },
+                "to":   { "type": "string",
+                          "description": "Target language (BCP-47 like `es-MX` or a name like `Spanish`)." },
+                "from": { "type": "string",
+                          "description": "Optional source-language hint. Omit for auto-detect." }
+            },
+            "required": ["text", "to"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let text = args
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("text required".into()))?;
+        let to = args
+            .get("to")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("to required".into()))?;
+        let from = args.get("from").and_then(Value::as_str);
+
+        let source_clause = from.map_or_else(
+            || "Detect the source language.".to_owned(),
+            |f| format!("The source language is {f}."),
+        );
+        let prompt = format!(
+            "{source_clause} Translate the following text into {to}. \
+             Return only the translation — no commentary, no quoting, no \
+             language tags.\n\nText:\n{text}"
+        );
+
+        let dispatcher = AiDispatcher::new(Arc::clone(&ctx.plugins));
+        let params = json!({
+            "messages": [
+                {"role": "system", "content":
+                    "You are a professional translator. Preserve formatting \
+                     and proper nouns. Reply with the translated text only."},
+                {"role": "user", "content": prompt}
+            ]
+        });
+        match dispatcher.invoke("ai.llm.chat", "chat", params).await {
+            Ok(v) => {
+                let translated = extract_chat_content(&v).unwrap_or_else(|| v.to_string());
+                Ok(json!({
+                    "text":         text,
+                    "to":           to,
+                    "from":         from,
+                    "translated":   translated,
+                    "raw":          v,
+                }))
+            }
+            Err(DispatchError::NoProvider(cap)) => Err(ToolError::NotFound(format!(
+                "no `{cap}` provider is loaded — install an ai.llm.chat plugin"
+            ))),
+            Err(e @ DispatchError::AllFailed { .. }) => Err(ToolError::Internal(e.to_string())),
+        }
+    }
+}
+
+/// Pull the assistant's textual reply out of whatever shape the
+/// `ai.llm.chat` plugin returned. Accepts both the direct
+/// `{content: "..."}` and nested `{message: {content: "..."}}` forms —
+/// different backends (Ollama, OpenAI-compat) normalize differently.
+fn extract_chat_content(v: &Value) -> Option<String> {
+    if let Some(s) = v.get("content").and_then(Value::as_str) {
+        return Some(s.to_owned());
+    }
+    if let Some(s) = v
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+    {
+        return Some(s.to_owned());
+    }
+    if let Some(s) = v
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+    {
+        return Some(s.to_owned());
+    }
+    None
 }
 
 /// `list_cdr` — bounded query over the CDR store (slice 2.3, P23).
@@ -1248,7 +1365,7 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 15);
+        assert_eq!(reg.len(), 16);
         for name in [
             "list_calls",
             "get_call_status",
@@ -1265,9 +1382,54 @@ mod tests {
             "reload_plugin",
             "list_cdr",
             "send_dtmf",
+            "translate",
         ] {
             assert!(reg.get(name).is_some(), "missing tool: {name}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn translate_without_provider_is_not_found() {
+        let (ctx, _c) = ctx_with_state();
+        let err = TranslateTool
+            .call(json!({"text": "hello", "to": "es"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn translate_rejects_missing_target() {
+        let (ctx, _c) = ctx_with_state();
+        let err = TranslateTool
+            .call(json!({"text": "hello"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn translate_extracts_from_flat_content() {
+        let v = json!({"content": "hola"});
+        assert_eq!(extract_chat_content(&v).as_deref(), Some("hola"));
+    }
+
+    #[test]
+    fn translate_extracts_from_nested_message() {
+        // Ollama-style response.
+        let v = json!({"message": {"role": "assistant", "content": "hola"}});
+        assert_eq!(extract_chat_content(&v).as_deref(), Some("hola"));
+    }
+
+    #[test]
+    fn translate_extracts_from_choices() {
+        // OpenAI-compatible response.
+        let v = json!({
+            "choices": [
+                {"message": {"role": "assistant", "content": "hola"}}
+            ]
+        });
+        assert_eq!(extract_chat_content(&v).as_deref(), Some("hola"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

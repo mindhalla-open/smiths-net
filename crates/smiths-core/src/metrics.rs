@@ -72,6 +72,15 @@ pub struct PluginOutcomeLabel {
     pub outcome: String,
 }
 
+/// `smiths_ai_failovers_total{capability="..."}` label (slice 3.1).
+/// One increment per dispatcher fail-over — the first-choice provider
+/// errored out and the dispatcher moved to the next candidate.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AiCapabilityLabel {
+    /// Capability the dispatcher was routing — e.g. `"ai.llm.chat"`.
+    pub capability: String,
+}
+
 /// `plugin_invoke_duration_seconds{plugin="..."}` / other per-plugin
 /// histograms and counters that only need the plugin-name dimension.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -128,12 +137,24 @@ pub struct Metrics {
     pub plugin_invoke_duration: Family<PluginLabel, Histogram, fn() -> Histogram>,
     /// Sidecar supervisor respawns, keyed by plugin name.
     pub sidecar_restarts: Family<PluginLabel, Counter>,
+    /// Dispatcher fail-overs (slice 3.1): cumulative count of times
+    /// the AI dispatcher fell through to the next candidate because
+    /// the first-choice provider timed out, errored, or was
+    /// breaker-open. Keyed by capability so operators can tell LLM
+    /// failures from TTS failures at a glance.
+    pub ai_failovers: Family<AiCapabilityLabel, Counter>,
+    /// Dispatcher invocations (slice 3.1): one increment per
+    /// `AiDispatcher::invoke` call, keyed by capability. Divide
+    /// `ai_failovers / ai_invocations` for the per-capability
+    /// failure-rate.
+    pub ai_invocations: Family<AiCapabilityLabel, Counter>,
 }
 
 impl Metrics {
     /// Register every metric on `registry` and return a cheaply-
     /// clonable handle.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn register(registry: &mut Registry) -> Arc<Self> {
         let sip_requests = Family::<SipMethodLabel, Counter>::default();
         let sip_responses = Family::<SipCodeLabel, Counter>::default();
@@ -151,6 +172,8 @@ impl Metrics {
         let plugin_invoke_duration: Family<PluginLabel, Histogram, fn() -> Histogram> =
             Family::new_with_constructor(default_histogram);
         let sidecar_restarts = Family::<PluginLabel, Counter>::default();
+        let ai_failovers = Family::<AiCapabilityLabel, Counter>::default();
+        let ai_invocations = Family::<AiCapabilityLabel, Counter>::default();
 
         registry.register(
             "sip_requests",
@@ -220,6 +243,16 @@ impl Metrics {
             "Sidecar supervisor respawns, per plugin",
             sidecar_restarts.clone(),
         );
+        registry.register(
+            "smiths_ai_failovers",
+            "AI dispatcher fail-overs, per capability",
+            ai_failovers.clone(),
+        );
+        registry.register(
+            "smiths_ai_invocations",
+            "AI dispatcher invocations, per capability",
+            ai_invocations.clone(),
+        );
 
         Arc::new(Self {
             sip_requests,
@@ -236,6 +269,8 @@ impl Metrics {
             plugin_invocations,
             plugin_invoke_duration,
             sidecar_restarts,
+            ai_failovers,
+            ai_invocations,
         })
     }
 
