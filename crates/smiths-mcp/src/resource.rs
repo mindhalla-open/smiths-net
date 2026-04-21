@@ -235,9 +235,14 @@ impl Resource for CurrentConfigResource {
 }
 
 /// Walk the config JSON and replace known secret fields with `"***"`.
-/// Today: `a2a.bearer_token`. Extend as new secrets land.
+/// Today: `a2a.bearer_token` + the `[ai]` API-key block (slice 3.2).
+/// Extend as new secrets land.
 fn redact_secrets(v: &mut Value) {
-    const SECRET_PATHS: &[&[&str]] = &[&["a2a", "bearer_token"]];
+    const SECRET_PATHS: &[&[&str]] = &[
+        &["a2a", "bearer_token"],
+        &["ai", "openai_api_key"],
+        &["ai", "anthropic_api_key"],
+    ];
     for path in SECRET_PATHS {
         if let Some(leaf) = walk_mut(v, path)
             && !leaf.is_null()
@@ -253,4 +258,43 @@ fn walk_mut<'a>(root: &'a mut Value, path: &[&str]) -> Option<&'a mut Value> {
         cur = cur.as_object_mut()?.get_mut(*seg)?;
     }
     Some(cur)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_scrubs_known_secret_paths() {
+        let mut v = json!({
+            "a2a":   { "bearer_token": "supersecret" },
+            "ai":    { "openai_api_key": "sk-abc", "anthropic_api_key": "sk-ant-xyz" },
+            "other": { "not_a_secret": "visible" },
+        });
+        redact_secrets(&mut v);
+        assert_eq!(v["a2a"]["bearer_token"], "***");
+        assert_eq!(v["ai"]["openai_api_key"], "***");
+        assert_eq!(v["ai"]["anthropic_api_key"], "***");
+        assert_eq!(v["other"]["not_a_secret"], "visible");
+    }
+
+    #[test]
+    fn redact_is_a_noop_on_null_secrets() {
+        let mut v = json!({
+            "a2a": { "bearer_token": null },
+            "ai":  { "openai_api_key": null },
+        });
+        redact_secrets(&mut v);
+        // Nulls stay null — operator can tell "unset" from "set but
+        // redacted" at a glance.
+        assert!(v["a2a"]["bearer_token"].is_null());
+        assert!(v["ai"]["openai_api_key"].is_null());
+    }
+
+    #[test]
+    fn redact_tolerates_missing_paths() {
+        let mut v = json!({ "other": 1 });
+        redact_secrets(&mut v);
+        assert_eq!(v["other"], 1);
+    }
 }

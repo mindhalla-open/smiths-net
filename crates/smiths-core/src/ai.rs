@@ -637,6 +637,7 @@ impl AiDispatcher {
             match attempt {
                 Ok(Ok(v)) => {
                     health.record_success();
+                    self.credit_tokens(provider.name(), &v);
                     return Ok(v);
                 }
                 Ok(Err(e)) => {
@@ -665,6 +666,36 @@ impl AiDispatcher {
             tried,
             last: last_err.unwrap_or_else(|| ProviderError("no attempts recorded".into())),
         })
+    }
+
+    /// Scrape `usage.{input,output}_tokens` off a successful response
+    /// and credit `smiths_ai_tokens_total`. Accepts both the flat shape
+    /// (`{"usage": {"input_tokens": N, "output_tokens": M}}`, which is
+    /// what the reference sidecars emit) and a nested `message.usage`
+    /// shape for providers that wrap the assistant reply. Silently
+    /// no-ops when no metrics handle is attached or the shape doesn't
+    /// match — the metric is best-effort, not load-bearing.
+    fn credit_tokens(&self, provider: &str, response: &Value) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let usage = response
+            .get("usage")
+            .or_else(|| response.get("message").and_then(|m| m.get("usage")));
+        let Some(usage) = usage else { return };
+        for (key, dir) in [("input_tokens", "input"), ("output_tokens", "output")] {
+            if let Some(n) = usage.get(key).and_then(Value::as_u64)
+                && n > 0
+            {
+                metrics
+                    .ai_tokens
+                    .get_or_create(&crate::metrics::AiTokensLabel {
+                        provider: provider.to_owned(),
+                        dir: dir.to_owned(),
+                    })
+                    .inc_by(n);
+            }
+        }
     }
 
     fn health_for(&self, plugin: &str) -> Arc<ProviderHealth> {
@@ -883,6 +914,10 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     Err(ProviderError("still slow".into()))
                 }
+                "usage" => Ok(json!({
+                    "who": self.name,
+                    "usage": { "input_tokens": 12, "output_tokens": 34 },
+                })),
                 other => Err(ProviderError(format!("unknown verdict `{other}`"))),
             }
         }
@@ -1022,5 +1057,45 @@ mod tests {
         };
         assert_eq!(metrics.ai_invocations.get_or_create(&lbl).get(), 2);
         assert_eq!(metrics.ai_failovers.get_or_create(&lbl).get(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tokens_metric_credits_input_and_output_on_success() {
+        let a: Arc<MockProvider> = MockProvider::new("a", "ai.llm.chat", 10);
+        a.script(&["usage", "usage"]);
+        let metrics = crate::Metrics::noop();
+        let dp: Arc<dyn AiProvider> = a;
+        let d = AiDispatcher::new(registry(vec![dp])).with_metrics(metrics.clone());
+
+        // Two calls, each credits 12 input + 34 output.
+        d.invoke("ai.llm.chat", "chat", json!({})).await.unwrap();
+        d.invoke("ai.llm.chat", "chat", json!({})).await.unwrap();
+
+        let input_label = crate::metrics::AiTokensLabel {
+            provider: "a".into(),
+            dir: "input".into(),
+        };
+        let output_label = crate::metrics::AiTokensLabel {
+            provider: "a".into(),
+            dir: "output".into(),
+        };
+        assert_eq!(metrics.ai_tokens.get_or_create(&input_label).get(), 24);
+        assert_eq!(metrics.ai_tokens.get_or_create(&output_label).get(), 68);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tokens_metric_silent_when_usage_absent() {
+        let a: Arc<MockProvider> = MockProvider::new("a", "ai.llm.chat", 10);
+        a.script(&["ok"]);
+        let metrics = crate::Metrics::noop();
+        let dp: Arc<dyn AiProvider> = a;
+        let d = AiDispatcher::new(registry(vec![dp])).with_metrics(metrics.clone());
+        d.invoke("ai.llm.chat", "chat", json!({})).await.unwrap();
+        // No usage block → no credit, no fresh label entry observed.
+        let lbl = crate::metrics::AiTokensLabel {
+            provider: "a".into(),
+            dir: "input".into(),
+        };
+        assert_eq!(metrics.ai_tokens.get_or_create(&lbl).get(), 0);
     }
 }

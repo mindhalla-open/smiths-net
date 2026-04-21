@@ -42,6 +42,39 @@ pub struct Config {
     /// Media-plane tunings (DTMF inband detection, later: jitter
     /// buffer depth, comfort-noise on silence).
     pub media: MediaConfig,
+    /// AI-provider configuration (P22 / slice 3.2). Keys here are
+    /// secrets — the `config://current` resource redacts them on
+    /// render. Sidecars read their own API keys from environment
+    /// variables; the operator threads them through here for
+    /// single-source-of-truth deployments.
+    pub ai: AiConfig,
+}
+
+/// `[ai]` TOML block — cloud-provider secrets for the reference
+/// sidecars. All fields are optional.
+///
+/// ```toml
+/// [ai]
+/// openai_api_key    = "sk-..."
+/// anthropic_api_key = "sk-ant-..."
+/// ```
+///
+/// Keys are redacted in `config://current` via the MCP resource
+/// layer. Today the engine does **not** forward these to sidecar
+/// child processes automatically — operators set the corresponding
+/// env vars (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) in the engine's
+/// own environment, and the sidecars inherit them. This section
+/// exists so the secrets have one canonical home on disk + a
+/// redaction-tested surface.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AiConfig {
+    /// `OpenAI` API key — consumed by `ai-llm-openai`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_api_key: Option<String>,
+    /// `Anthropic` API key — consumed by `ai-llm-anthropic`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_api_key: Option<String>,
 }
 
 /// `[media]` TOML block — per-leg media-plane tunings.

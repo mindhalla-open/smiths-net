@@ -81,6 +81,19 @@ pub struct AiCapabilityLabel {
     pub capability: String,
 }
 
+/// `smiths_ai_tokens_total{provider, dir}` label (slice 3.2). The
+/// dispatcher scrapes `usage.{input,output}_tokens` off the plugin's
+/// response and credits the counters — zero-cost when a plugin
+/// doesn't report usage. Operators divide by wall-clock to get
+/// tokens/sec; multiply by the vendor rate card to get `$/day`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AiTokensLabel {
+    /// Plugin name as declared in its manifest (e.g. `"ai-llm-openai"`).
+    pub provider: String,
+    /// `"input"` (prompt tokens) or `"output"` (completion tokens).
+    pub dir: String,
+}
+
 /// `plugin_invoke_duration_seconds{plugin="..."}` / other per-plugin
 /// histograms and counters that only need the plugin-name dimension.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -148,6 +161,12 @@ pub struct Metrics {
     /// `ai_failovers / ai_invocations` for the per-capability
     /// failure-rate.
     pub ai_invocations: Family<AiCapabilityLabel, Counter>,
+    /// AI token consumption (slice 3.2), credited on every
+    /// dispatcher invocation that returns with a `usage.*_tokens`
+    /// block. Labelled by `provider` (plugin name) and `dir` (`input`
+    /// / `output`). Zero-cost for providers that don't report usage
+    /// — the counter simply stays at 0 for that label combination.
+    pub ai_tokens: Family<AiTokensLabel, Counter>,
 }
 
 impl Metrics {
@@ -174,6 +193,7 @@ impl Metrics {
         let sidecar_restarts = Family::<PluginLabel, Counter>::default();
         let ai_failovers = Family::<AiCapabilityLabel, Counter>::default();
         let ai_invocations = Family::<AiCapabilityLabel, Counter>::default();
+        let ai_tokens = Family::<AiTokensLabel, Counter>::default();
 
         registry.register(
             "sip_requests",
@@ -253,6 +273,11 @@ impl Metrics {
             "AI dispatcher invocations, per capability",
             ai_invocations.clone(),
         );
+        registry.register(
+            "smiths_ai_tokens",
+            "AI token consumption, per provider and direction (input / output)",
+            ai_tokens.clone(),
+        );
 
         Arc::new(Self {
             sip_requests,
@@ -271,6 +296,7 @@ impl Metrics {
             sidecar_restarts,
             ai_failovers,
             ai_invocations,
+            ai_tokens,
         })
     }
 

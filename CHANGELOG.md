@@ -5,6 +5,71 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.39.0] - 2026-04-21
+
+Slice 3.2 — Cloud AI parity. `ai-llm-openai` and `ai-llm-anthropic`
+reference sidecars join the local `ai-llm-ollama` at the
+`ai.llm.chat` seam, all behind the same ABI. Streaming partials
+ride the existing plugin-notification rail as `ai.llm.partial`
+frames, and every response that carries `usage.*_tokens` ticks the
+new `smiths_ai_tokens_total` counter.
+
+### Added
+
+- **`plugins/examples/ai-llm-openai/`** — stdlib-only sidecar
+  against `/v1/chat/completions`. Streaming via SSE when
+  `controls.stream = true`; emits one `ai.llm.partial` notification
+  per delta plus a final-marker. `priority = 15` so the dispatcher
+  prefers cloud OpenAI over local Ollama (20) and the mock (50).
+  Env: `OPENAI_API_KEY`, `OPENAI_API_BASE`, `OPENAI_MODEL`,
+  `OPENAI_TIMEOUT_SECS`.
+- **`plugins/examples/ai-llm-anthropic/`** — stdlib-only sidecar
+  against `/v1/messages`. Splits `system` turns into Anthropic's
+  top-level `system` field; streams via SSE
+  (`content_block_delta` → `ai.llm.partial`). `priority = 16` so it
+  fails over behind OpenAI. Env: `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_API_BASE`, `ANTHROPIC_MODEL`, `ANTHROPIC_VERSION`,
+  `ANTHROPIC_MAX_TOKENS`, `ANTHROPIC_TIMEOUT_SECS`.
+- **`[ai]` config section + `AiConfig`** — optional
+  `openai_api_key`, `anthropic_api_key` fields. Redacted in
+  `config://current` via the existing MCP resource layer; the three
+  secret paths now are `a2a.bearer_token`, `ai.openai_api_key`,
+  `ai.anthropic_api_key`.
+- **`smiths_ai_tokens_total{provider, dir}` metric** —
+  dispatcher-credited on every `AiProvider::invoke` success whose
+  response includes `usage.input_tokens` / `usage.output_tokens`
+  (directly or nested under `message.usage`). `provider` = plugin
+  name; `dir` ∈ `{"input", "output"}`. Zero-cost for plugins that
+  don't report usage (counter stays at 0 for that label set).
+- **Streaming partials demo** — the canned `ai-llm-mock` now
+  honors `controls.stream = true`, emitting one `ai.llm.partial`
+  per token plus the final marker. The declared descriptor gains
+  `streaming.supported = true` + a `stream` control so the plugin
+  validator accepts it end-to-end.
+- **Tests** — 3 redaction tests on `resource::redact_secrets`
+  covering the bearer-token + two AI-key paths; 2 dispatcher-token
+  tests (usage credited on success; zero credit when plugin omits
+  usage); `streaming_llm.rs` integration test loading `ai-llm-mock`,
+  invoking `chat` with streaming on, and asserting that
+  `ai.llm.partial` notifications reach the engine's bus as
+  `PluginEvent::Notification`.
+
+### Notes
+
+The engine does **not** auto-forward `[ai]` config secrets into
+sidecar child environments — operators still set `OPENAI_API_KEY` /
+`ANTHROPIC_API_KEY` in the engine's own environment, which the
+sidecars inherit on spawn. The config surface exists so secrets have
+one canonical home on disk + a tested redaction path; an env-
+injection layer ("secrets plumbing") is a small follow-on.
+
+The two cloud sidecars can't be exercised in CI (no API keys on
+CI runners), which is why the streaming-partials test uses the
+extended mock. The mock + the two cloud sidecars emit identical
+wire frames (`ai.llm.partial` shape, final-marker, token accounting
+in the RPC response), so a passing mock test implies the cloud
+path is protocol-correct.
+
 ## [0.38.0] - 2026-04-21
 
 Slice 3.1 — AI providers: `AiDispatcher` + fail-over. Agents now

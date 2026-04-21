@@ -72,6 +72,15 @@ backend = "none"   # "none" | "sqlite"
 [media]
 inband_dtmf = false
 
+# Cloud-AI secrets (slice 3.2 / P22). All fields optional — sidecars
+# read their own API keys from environment variables (`OPENAI_API_KEY`,
+# `ANTHROPIC_API_KEY`). This block exists so operators have one
+# canonical home on disk + a redaction-tested surface. Values here are
+# replaced with `"***"` in the `config://current` MCP resource.
+[ai]
+# openai_api_key    = "sk-..."
+# anthropic_api_key = "sk-ant-..."
+
 [plugins]
 # Directory the loader scans at startup. Each subdirectory with a
 # `plugin.toml` becomes one sidecar or WASM plugin. Defaults to

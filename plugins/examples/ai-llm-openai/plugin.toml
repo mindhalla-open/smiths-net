@@ -1,0 +1,7 @@
+name        = "ai-llm-openai"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["ai.llm.chat"]
+abi         = "1.0"
+description = "OpenAI-backed `ai.llm.chat` sidecar. Talks to /v1/chat/completions (env OPENAI_API_BASE overrides host). Streams partial tokens via `ai.llm.partial` notifications when `controls.stream = true`. Priority 15 — the dispatcher prefers cloud OpenAI over Ollama + mock when all three are loaded and the call budgets cost instead of latency."
