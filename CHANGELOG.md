@@ -5,6 +5,73 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.0] - 2026-04-21
+
+Slice 4.4 — A2A protocols. The control plane learns a fourth
+adapter (generic HTTP webhook) and gets a new shared trait seam
+(`ControlProtocol` + `ProtocolDispatch` + `ControlOutcome`) so
+operator-authored adapters route through the same auth + rate-
+limit + audit + metrics pipeline as MCP / A2A. No wire changes
+to the existing adapters; everything is additive.
+
+### Added
+
+- **`smiths_mcp::control_protocol`** — adapter-agnostic trait
+  seam. Three types land:
+  - `ControlOutcome` — normalized `Ok | InvalidArguments |
+    NotFound | Forbidden | Internal` verdict. Stable HTTP status
+    + JSON-RPC code mapping on each variant.
+  - `ProtocolDispatch` — thin wrapper over
+    `Arc<ToolRegistry> + Arc<RateLimiter> + Arc<Metrics> +
+    ToolContext` with one `invoke(actor, tool, args)` method
+    that runs the shared `invoke_audited` pipeline and hands
+    back a `ControlOutcome`.
+  - `ControlProtocol` trait + three singleton markers
+    (`McpStdioProtocol`, `A2aHttpProtocol`,
+    `WebhookHttpProtocol`) for discovery / introspection.
+  - `agent_card(dispatch, adapters, endpoint)` helper that
+    builds a unified `.well-known/agent.json` document with a
+    `capabilities.tools` list + `adapters` array so agents can
+    tell at a glance which framings this engine speaks.
+- **`smiths_mcp::webhook`** — generic HTTP webhook adapter.
+  `POST /hook/<tool>` accepts a JSON body of args and returns
+  `{"result": ...}` on success or `{"error": "..."}` with the
+  right HTTP status on failure. Optional bearer-token guard.
+  `/.well-known/agent.json` + `/health` stay public so load
+  balancers and agent registries can still probe. Same
+  `invoke_audited` path as MCP/A2A, so rate limits and audit
+  events apply uniformly.
+- **`docs/tool-authoring.md`** — migration guide: where tools
+  live, the `Tool` trait contract, how to plumb optional
+  dependencies via `ToolContext`, error/outcome classification,
+  the adapter matrix, and what embedders gain from
+  `ProtocolDispatch`.
+- **Tests** — 2 unit tests on `control_protocol`
+  (`outcome_from_result_round_trips`,
+  `builtin_protocols_have_stable_labels`); end-to-end
+  `a2a_make_call.rs` (HTTP client speaks A2A JSON-RPC → stubbed
+  `CallOriginator` → `tools/call` returns the synthesized
+  call-id, unknown-tool path surfaces JSON-RPC `-32601`);
+  5-test `webhook_http.rs` covering the happy path, 404 on
+  unknown tools, 400 on missing required args, agent-card
+  discovery advertising all three adapter labels, and bearer-
+  token gating.
+
+### Notes
+
+The existing MCP + A2A adapters keep their hand-rolled dispatch
+loops for 0.46.0; they already flow through `invoke_audited` so
+wire behaviour is identical. Migrating them to
+`ProtocolDispatch::invoke` is a small follow-on — it removes
+~20 lines of per-adapter error matching without changing any
+externally observable behaviour.
+
+The webhook adapter ships in the crate but is not yet wired
+into the CLI's default binding set. Embedders who want it
+online today call `smiths_mcp::webhook::serve_http(...)` from
+their own binary; a `[webhook]` config section and CLI wiring
+land alongside the MCP/A2A dispatch-loop migration.
+
 ## [0.45.0] - 2026-04-21
 
 Slice 4.3 — HTTP/3 MCP + SIP-over-QUIC. MCP HTTP upgrades to
