@@ -20,19 +20,19 @@ What's real here:
   * RTP in and out, μ-law codec (Python).
   * TTS — macOS `say` shells out to a real WAV.
 
-What's mocked (and where real plugins will slot in — see
-`docs/architecture/02-plugin-system.md`):
+### Slice 3.3 — dispatcher-native pipeline tools
 
-  * STT — we don't yet have a plugin system. Stub returns a fixed
-    caller transcript after the audio is collected.
-    Real plan: `ai-asr-whisper` sidecar (post-MVP P22) reads RTP
-    directly off the leg and returns text over MCP.
-  * LLM — stub returns a hard-coded reply. Real plan: `ai-llm-*`
-    sidecar plugin invoked through `ai_invoke("ai.llm.completion", ...)`.
-  * Engine-side TTS — today the Python client synthesises and streams
-    RTP itself. In the target architecture the engine's `ai-tts-piper`
-    plugin takes `speak_text(call_id, text)` over MCP and does the
-    RTP injection in-process.
+Updated in v0.40.0 to exercise the new composite tools:
+
+  * `summarize_call(call_id, audio_base64)` — routes through the AI
+    dispatcher for both `ai.asr` and `ai.llm.chat`. The agent no
+    longer picks a plugin by name; the engine picks the best one.
+  * `translate(text, to)` — the agent translates its reply into the
+    caller's preferred language before TTS, again via the dispatcher.
+
+The `mcp_transcribe` / `mcp_llm_chat` wrappers are kept for
+illustration (they still target specific plugins); the primary
+agent loop uses the dispatcher-backed tools.
 
 Run from the repo root:
 
@@ -262,6 +262,53 @@ def mcp_llm_chat(
     return msg
 
 
+def mcp_summarize_call(
+    mcp: "McpStdioClient",
+    call_id: str,
+    pcmu_wire: bytes,
+    max_sentences: int = 2,
+) -> tuple[str, str]:
+    """Dispatcher-native: engine picks both the ASR provider and the
+    LLM. Returns `(transcript, summary)`. Slice 3.3 (v0.40.0) flagship
+    pipeline — one round trip, no plugin names in the argument set."""
+    import base64
+
+    from smiths_client import pcmu_to_pcm16
+
+    pcm = pcmu_to_pcm16(pcmu_wire)
+    b64 = base64.b64encode(pcm).decode("ascii")
+    result = mcp.call_tool(
+        "summarize_call",
+        {
+            "call_id": call_id,
+            "audio_base64": b64,
+            "sample_rate": 8000,
+            "language": "ru",
+            "max_sentences": max_sentences,
+        },
+        timeout=30.0,
+    )
+    if result.get("isError"):
+        raise RuntimeError(f"summarize_call failed: {result}")
+    payload = result.get("structuredContent") or {}
+    return payload.get("transcript", ""), payload.get("summary", "")
+
+
+def mcp_translate(mcp: "McpStdioClient", text: str, to: str) -> str:
+    """Dispatcher-native: engine picks the best `ai.llm.chat`
+    provider. Introduced in slice 3.1 (v0.38.0); this demo exercises
+    it post-summary."""
+    result = mcp.call_tool(
+        "translate",
+        {"text": text, "to": to},
+        timeout=15.0,
+    )
+    if result.get("isError"):
+        raise RuntimeError(f"translate failed: {result}")
+    payload = result.get("structuredContent") or {}
+    return payload.get("translated", "")
+
+
 def mcp_synthesize(mcp: "McpStdioClient", text: str, voice: str = "irina") -> bytes:
     """Render `text` via the engine's `synthesize` MCP tool.
 
@@ -307,7 +354,9 @@ def locate_binary() -> Path:
 
 
 def run_agent(engine_sip: tuple[str, int], mcp: McpStdioClient) -> None:
-    """Park a UA on the rendezvous key and run STT → LLM → TTS once."""
+    """Park a UA on the rendezvous key. Pipeline (v0.40.0):
+    `summarize_call` (ASR + LLM via dispatcher) → `translate` →
+    synthesize → stream RTP."""
     uac = SipUAC(engine_sip)
     print(
         f"[agent] SIP UA at {uac.sip.getsockname()}, "
@@ -334,26 +383,36 @@ def run_agent(engine_sip: tuple[str, int], mcp: McpStdioClient) -> None:
         uac.close()
         return
 
-    # -------- STT (engine plugin via MCP) --------
+    # -------- ASR + summarize in one dispatcher-native hop --------
+    # Our own Call-ID isn't visible here; use a placeholder — the
+    # slice-3.4 recording store will let this read audio directly
+    # from disk once call_ids can resolve to recordings.
     try:
-        transcript = mcp_transcribe(mcp, received, language="ru")
-    except Exception as e:
-        print(f"[agent] transcribe failed: {e}")
-        uac.close()
-        return
-    print(f"[agent] STT: {transcript!r}")
-
-    # -------- LLM (engine plugin via MCP) --------
-    try:
-        reply_text = mcp_llm_chat(
-            mcp,
-            user_text=transcript,
-            system_prompt="You are Alice, a polite Russian phone operator. Answer briefly.",
+        transcript, summary = mcp_summarize_call(
+            mcp, call_id="voicebot-demo", pcmu_wire=received, max_sentences=2,
         )
     except Exception as e:
-        print(f"[agent] llm_chat failed: {e}")
-        reply_text = AGENT_REPLY_TEXT
-    print(f"[agent] LLM → {reply_text!r}")
+        print(f"[agent] summarize_call failed ({e}); falling back to raw transcribe + canned reply")
+        try:
+            transcript = mcp_transcribe(mcp, received, language="ru")
+        except Exception as e2:
+            print(f"[agent] transcribe failed: {e2}")
+            uac.close()
+            return
+        summary = AGENT_REPLY_TEXT
+    print(f"[agent] STT transcript: {transcript!r}")
+    print(f"[agent] LLM summary   : {summary!r}")
+
+    # -------- Translate summary into caller's locale (demo) -------
+    reply_text = summary or AGENT_REPLY_TEXT
+    try:
+        ru_reply = mcp_translate(mcp, reply_text, to="Russian")
+        if ru_reply:
+            reply_text = ru_reply
+            print(f"[agent] translate → {reply_text!r}")
+    except Exception as e:
+        # Translation is a nice-to-have; proceed with the summary.
+        print(f"[agent] translate failed (non-fatal): {e}")
 
     # -------- TTS (real, via the engine's `ai-tts-mock` plugin) --------
     try:

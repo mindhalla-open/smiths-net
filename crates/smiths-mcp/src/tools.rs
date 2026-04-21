@@ -46,7 +46,233 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(ListCdrTool);
     reg.register(SendDtmfTool);
     reg.register(TranslateTool);
+    reg.register(TranscribeCallTool);
+    reg.register(SummarizeCallTool);
     reg
+}
+
+/// Observe one pipeline's end-to-end wall clock. Falls through to a
+/// fresh `Metrics::noop()` when the context doesn't carry a handle
+/// (older tests construct `ToolContext` without one); the observation
+/// is still recorded, just onto a registry nobody is reading.
+fn observe_pipeline(ctx: &ToolContext, pipeline: &str, elapsed: std::time::Duration) {
+    let target = ctx
+        .metrics
+        .clone()
+        .unwrap_or_else(smiths_core::Metrics::noop);
+    target
+        .ai_pipeline_duration
+        .get_or_create(&smiths_core::metrics::AiPipelineLabel {
+            pipeline: pipeline.to_owned(),
+        })
+        .observe(elapsed.as_secs_f64());
+}
+
+/// `transcribe_call(call_id)` — slice 3.3. Routes through the AI
+/// dispatcher at capability `ai.asr`, so the caller doesn't pick a
+/// plugin. The audio source is the call's recording — which today
+/// is only available when the operator passed `audio_base64` on the
+/// arguments payload. A dedicated recording store (slice 3.4) will
+/// let this tool self-resolve audio from the call id alone.
+pub struct TranscribeCallTool;
+
+#[async_trait]
+impl Tool for TranscribeCallTool {
+    fn name(&self) -> &'static str {
+        "transcribe_call"
+    }
+
+    fn description(&self) -> &'static str {
+        "Transcribe a call's audio via the best-fit `ai.asr` provider. \
+         Pass `audio_base64` alongside `call_id` until the recording \
+         store lands (slice 3.4); routes through the AI dispatcher."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "call_id":      { "type": "string", "description": "SIP Call-ID." },
+                "audio_base64": { "type": "string",
+                                  "description": "PCM16 LE audio bytes, base64-encoded. Required until \
+                                                  the recording store lands." },
+                "sample_rate":  { "type": "integer", "description": "Sample rate of the audio (default 8000)." },
+                "language":     { "type": "string",  "description": "BCP-47 tag or `auto`." },
+                "controls":     { "type": "object",  "description": "Provider-specific controls." }
+            },
+            "required": ["call_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let started = Instant::now();
+        let result = transcribe_call_inner(&args, ctx).await;
+        observe_pipeline(ctx, "transcribe_call", started.elapsed());
+        result
+    }
+}
+
+async fn transcribe_call_inner(args: &Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+    let call_id = args
+        .get("call_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::InvalidArguments("call_id required".into()))?;
+    let Some(audio) = args.get("audio_base64").and_then(Value::as_str) else {
+        return Err(ToolError::NotFound(
+            "call recordings are served by the forthcoming `storage.recording` backend \
+             (slice 3.4); pass `audio_base64` inline until it ships"
+                .into(),
+        ));
+    };
+
+    let dispatcher = smiths_core::AiDispatcher::new(Arc::clone(&ctx.plugins));
+    let params = json!({
+        "audio_base64": audio,
+        "sample_rate":  args.get("sample_rate"),
+        "language":     args.get("language"),
+        "controls":     args.get("controls"),
+    });
+    match dispatcher.invoke("ai.asr", "transcribe", params).await {
+        Ok(v) => {
+            let text = v
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            Ok(json!({
+                "call_id":   call_id,
+                "transcript": text,
+                "raw":        v,
+            }))
+        }
+        Err(smiths_core::DispatchError::NoProvider(cap)) => Err(ToolError::NotFound(format!(
+            "no `{cap}` provider is loaded — install an ai.asr plugin"
+        ))),
+        Err(e @ smiths_core::DispatchError::AllFailed { .. }) => {
+            Err(ToolError::Internal(e.to_string()))
+        }
+    }
+}
+
+/// `summarize_call(call_id)` — slice 3.3 flagship composite tool.
+/// Pipes ASR over the dispatcher's `ai.asr` lane, then hands the
+/// transcript to `ai.llm.chat` with a summary prompt. Returns both
+/// the transcript (so the agent doesn't re-transcribe) and the
+/// summary text.
+pub struct SummarizeCallTool;
+
+#[async_trait]
+impl Tool for SummarizeCallTool {
+    fn name(&self) -> &'static str {
+        "summarize_call"
+    }
+
+    fn description(&self) -> &'static str {
+        "Transcribe a call via `ai.asr`, then summarize the transcript \
+         via `ai.llm.chat`. Returns `{transcript, summary}`. Pass \
+         `audio_base64` until the recording store lands (slice 3.4)."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "call_id":      { "type": "string", "description": "SIP Call-ID." },
+                "audio_base64": { "type": "string",
+                                  "description": "PCM16 LE audio bytes, base64-encoded." },
+                "sample_rate":  { "type": "integer", "description": "Sample rate (default 8000)." },
+                "language":     { "type": "string",  "description": "BCP-47 tag or `auto`." },
+                "max_sentences":{ "type": "integer", "minimum": 1, "maximum": 20,
+                                  "description": "Target summary length (default 3)." }
+            },
+            "required": ["call_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let started = Instant::now();
+        let result = summarize_call_inner(&args, ctx).await;
+        observe_pipeline(ctx, "summarize_call", started.elapsed());
+        result
+    }
+}
+
+async fn summarize_call_inner(args: &Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+    let call_id = args
+        .get("call_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::InvalidArguments("call_id required".into()))?;
+    let Some(audio) = args.get("audio_base64").and_then(Value::as_str) else {
+        return Err(ToolError::NotFound(
+            "call recordings are served by the forthcoming `storage.recording` backend \
+             (slice 3.4); pass `audio_base64` inline until it ships"
+                .into(),
+        ));
+    };
+    let max_sentences = args
+        .get("max_sentences")
+        .and_then(Value::as_u64)
+        .unwrap_or(3);
+
+    let dispatcher = smiths_core::AiDispatcher::new(Arc::clone(&ctx.plugins));
+
+    let asr_params = json!({
+        "audio_base64": audio,
+        "sample_rate":  args.get("sample_rate"),
+        "language":     args.get("language"),
+    });
+    let transcript = match dispatcher.invoke("ai.asr", "transcribe", asr_params).await {
+        Ok(v) => v
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        Err(smiths_core::DispatchError::NoProvider(cap)) => {
+            return Err(ToolError::NotFound(format!(
+                "no `{cap}` provider is loaded — install an ai.asr plugin"
+            )));
+        }
+        Err(e @ smiths_core::DispatchError::AllFailed { .. }) => {
+            return Err(ToolError::Internal(format!("asr failed: {e}")));
+        }
+    };
+    if transcript.trim().is_empty() {
+        return Err(ToolError::Internal(
+            "transcription returned empty text; cannot summarize".into(),
+        ));
+    }
+
+    let system = format!(
+        "You are a concise meeting-note taker. Summarize the following \
+         phone-call transcript in {max_sentences} sentence(s) or fewer. \
+         Preserve action items and proper nouns. Reply with the summary \
+         text only — no preamble."
+    );
+    let llm_params = json!({
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": transcript.clone()},
+        ]
+    });
+    let summary = match dispatcher.invoke("ai.llm.chat", "chat", llm_params).await {
+        Ok(v) => extract_chat_content(&v).unwrap_or_else(|| v.to_string()),
+        Err(smiths_core::DispatchError::NoProvider(cap)) => {
+            return Err(ToolError::NotFound(format!(
+                "no `{cap}` provider is loaded — install an ai.llm.chat plugin"
+            )));
+        }
+        Err(e @ smiths_core::DispatchError::AllFailed { .. }) => {
+            return Err(ToolError::Internal(format!("llm failed: {e}")));
+        }
+    };
+
+    Ok(json!({
+        "call_id":    call_id,
+        "transcript": transcript,
+        "summary":    summary,
+    }))
 }
 
 /// `translate` — render `text` into language `to` by routing through
@@ -1365,7 +1591,7 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 16);
+        assert_eq!(reg.len(), 18);
         for name in [
             "list_calls",
             "get_call_status",
@@ -1383,6 +1609,8 @@ mod tests {
             "list_cdr",
             "send_dtmf",
             "translate",
+            "transcribe_call",
+            "summarize_call",
         ] {
             assert!(reg.get(name).is_some(), "missing tool: {name}");
         }
@@ -1419,6 +1647,47 @@ mod tests {
         // Ollama-style response.
         let v = json!({"message": {"role": "assistant", "content": "hola"}});
         assert_eq!(extract_chat_content(&v).as_deref(), Some("hola"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transcribe_call_requires_audio_until_recording_store_lands() {
+        let (ctx, _c) = ctx_with_state();
+        // call_id alone = NotFound with guidance, not a panic.
+        let err = TranscribeCallTool
+            .call(json!({"call_id": "abc"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transcribe_call_without_asr_provider_is_not_found() {
+        let (ctx, _c) = ctx_with_state();
+        let err = TranscribeCallTool
+            .call(json!({"call_id": "abc", "audio_base64": ""}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn summarize_call_requires_audio() {
+        let (ctx, _c) = ctx_with_state();
+        let err = SummarizeCallTool
+            .call(json!({"call_id": "abc"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn summarize_call_rejects_missing_call_id() {
+        let (ctx, _c) = ctx_with_state();
+        let err = SummarizeCallTool
+            .call(json!({"audio_base64": "AAA"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
     }
 
     #[test]

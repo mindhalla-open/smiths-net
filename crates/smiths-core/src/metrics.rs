@@ -81,6 +81,18 @@ pub struct AiCapabilityLabel {
     pub capability: String,
 }
 
+/// `smiths_ai_pipeline_duration_seconds{pipeline}` label (slice 3.3).
+/// Histogram keyed by a short pipeline name (`"transcribe_call"`,
+/// `"summarize_call"`) — the composite tools observe their own
+/// wall-clock end-to-end. Separate from `tool_duration_seconds` so
+/// operators can grep per-pipeline latency without wading through
+/// every MCP tool's timing.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AiPipelineLabel {
+    /// Pipeline name (`"transcribe_call"` / `"summarize_call"` / …).
+    pub pipeline: String,
+}
+
 /// `smiths_ai_tokens_total{provider, dir}` label (slice 3.2). The
 /// dispatcher scrapes `usage.{input,output}_tokens` off the plugin's
 /// response and credits the counters — zero-cost when a plugin
@@ -167,6 +179,11 @@ pub struct Metrics {
     /// / `output`). Zero-cost for providers that don't report usage
     /// — the counter simply stays at 0 for that label combination.
     pub ai_tokens: Family<AiTokensLabel, Counter>,
+    /// End-to-end wall-clock of composite AI pipelines (slice 3.3)
+    /// like `transcribe_call` and `summarize_call`. Observed
+    /// once per tool invocation regardless of how many dispatcher
+    /// hops the pipeline made.
+    pub ai_pipeline_duration: Family<AiPipelineLabel, Histogram, fn() -> Histogram>,
 }
 
 impl Metrics {
@@ -194,6 +211,8 @@ impl Metrics {
         let ai_failovers = Family::<AiCapabilityLabel, Counter>::default();
         let ai_invocations = Family::<AiCapabilityLabel, Counter>::default();
         let ai_tokens = Family::<AiTokensLabel, Counter>::default();
+        let ai_pipeline_duration: Family<AiPipelineLabel, Histogram, fn() -> Histogram> =
+            Family::new_with_constructor(default_histogram);
 
         registry.register(
             "sip_requests",
@@ -278,6 +297,11 @@ impl Metrics {
             "AI token consumption, per provider and direction (input / output)",
             ai_tokens.clone(),
         );
+        registry.register(
+            "smiths_ai_pipeline_duration_seconds",
+            "End-to-end wall-clock of composite AI pipelines (e.g. transcribe_call, summarize_call).",
+            ai_pipeline_duration.clone(),
+        );
 
         Arc::new(Self {
             sip_requests,
@@ -297,6 +321,7 @@ impl Metrics {
             ai_failovers,
             ai_invocations,
             ai_tokens,
+            ai_pipeline_duration,
         })
     }
 

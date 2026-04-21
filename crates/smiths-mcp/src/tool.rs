@@ -13,6 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 use smiths_core::Config;
+use smiths_core::Metrics;
 use smiths_core::ai::AiRegistry;
 use smiths_core::call::{CallOriginator, RegistrationView};
 use smiths_core::media::MediaFabric;
@@ -51,6 +52,11 @@ pub struct ToolContext {
     /// CDR store (slice 2.3). `None` when `[storage] backend =
     /// "none"`; `list_cdr` returns an empty page in that case.
     pub cdr: Option<Arc<dyn CdrStore>>,
+    /// Engine-wide Prometheus metrics. `None` only in old test
+    /// fixtures; tools that observe histograms (the slice 3.3
+    /// pipeline tools) fall back to `Metrics::noop()` when absent
+    /// so the observe call still goes somewhere reasonable.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 impl ToolContext {
@@ -70,7 +76,17 @@ impl ToolContext {
             originator: None,
             registrations: None,
             cdr: None,
+            metrics: None,
         }
+    }
+
+    /// Attach the engine's metrics handle so pipeline tools can
+    /// observe their histograms. Without it they fall through to a
+    /// scratch `Metrics::noop()` so no code path panics.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Attach a [`CallOriginator`] so `make_call` / `end_call` tools

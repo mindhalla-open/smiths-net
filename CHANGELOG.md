@@ -5,6 +5,73 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.0] - 2026-04-21
+
+Slice 3.3 — ASR + composite AI pipelines. `ai-asr-whisper`
+sidecar (local whisper.cpp) joins the `ai.asr` seam, and two new
+MCP tools — `transcribe_call` and `summarize_call` — route through
+the dispatcher so agents name a capability, not a plugin. The
+summarize tool is the first engine-shipped composite: ASR → LLM,
+both hops failover-aware, end-to-end wall clock observed on a new
+pipeline histogram.
+
+### Added
+
+- **`plugins/examples/ai-asr-whisper/`** — stdlib-only Python
+  sidecar that execs `whisper-cli` (or the legacy `main`) with a
+  local GGML model. Decodes `audio_base64` → temp WAV (crude-
+  upsamples 8 kHz telephony audio to the 16 kHz whisper.cpp
+  expects), invokes the binary with `-oj`, parses the JSON
+  transcript. `priority = 20` so the dispatcher picks Whisper over
+  the canned `ai-asr-mock` (50). Env: `WHISPER_BIN`,
+  `WHISPER_MODEL`, `WHISPER_THREADS`, `WHISPER_LANG`.
+- **MCP tool `transcribe_call(call_id)`** — ASR only, dispatcher-
+  routed at `ai.asr`. Returns `{transcript, raw}`. Accepts an
+  `audio_base64` argument until the recording store lands (slice
+  3.4); a call-id-only invocation returns a clean `NotFound` that
+  names the missing backend.
+- **MCP tool `summarize_call(call_id)`** — flagship composite.
+  Transcribes via `ai.asr`, then summarizes via `ai.llm.chat` with
+  a concise-meeting-notes system prompt; `max_sentences` bounds the
+  output length. Returns `{transcript, summary}`. Same deferral
+  path when the recording store isn't wired.
+- **`smiths_ai_pipeline_duration_seconds{pipeline}` histogram** —
+  one sample per invocation of a composite pipeline tool, keyed by
+  the tool name. Sits alongside `tool_duration_seconds` but scoped
+  to AI compositions so operators can grep end-to-end ASR→LLM
+  latency without mixing in every other MCP tool.
+- **`ToolContext::with_metrics`** — engine threads its
+  `Arc<Metrics>` onto the tool context. Pipeline tools observe
+  histograms through this handle; tools that don't need metrics
+  ignore the field. Older test fixtures keep working (the field
+  defaults to `None` and the pipeline tools fall through to
+  `Metrics::noop()` when absent).
+- **Demo update — `examples/python-client/voice_agent.py`** — the
+  STT + LLM path is now a single `summarize_call` hop; the summary
+  is then routed through `translate` (slice 3.1) into the caller's
+  preferred language before TTS. The old per-plugin wrappers stay
+  as a fallback illustration.
+- **Tests** — 4 new MCP tool tests covering the honest-deferral
+  paths on `transcribe_call` + `summarize_call` (no audio →
+  `NotFound`; no asr provider → `NotFound`; missing `call_id` →
+  `InvalidArguments`). Total MCP tool-unit-test count is now 24.
+
+### Notes
+
+The call-id-only path on `transcribe_call` / `summarize_call` is an
+honest deferral: without a `storage.recording` backend the engine
+has nowhere to pull audio from. Slice 3.4 lands that backend
+(`storage.recording` trait + filesystem default + S3 sidecar); at
+that point both tools will resolve audio from `call_id` alone and
+the `audio_base64` parameter becomes the override, not the
+requirement.
+
+The Whisper sidecar can't be exercised in CI — each invocation
+shells out to the `whisper-cli` binary and loads a 100 MB+ GGML
+model from disk. The tool-level tests use the mock registry and
+prove the dispatcher hookup; the real binary is covered by the
+README's smoke-test recipe.
+
 ## [0.39.0] - 2026-04-21
 
 Slice 3.2 — Cloud AI parity. `ai-llm-openai` and `ai-llm-anthropic`

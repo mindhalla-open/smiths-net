@@ -225,7 +225,8 @@ async fn main() -> anyhow::Result<()> {
         ai_registry_dyn,
         config_snapshot,
         Arc::clone(&media_fabric),
-    );
+    )
+    .with_metrics(Arc::clone(&metrics));
     if let Some(o) = originator.clone() {
         tool_ctx = tool_ctx.with_originator(o);
     }
