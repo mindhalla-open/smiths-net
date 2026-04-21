@@ -5,6 +5,75 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.49.0] - 2026-04-22
+
+Slice 5.2 — FlatBuffers plugin wire format. Two formats now
+share the engine↔plugin channel: protobuf (pre-5.2 default, via
+prost) and a hand-rolled flat binary layout (new, tuned for the
+RTP hot path). Plugin authors opt in per-plugin via a single
+manifest field. The in-tree benchmark measures **3.27× round-
+trip speedup** on a 160-byte PCMU-shaped `RtpFrame` in debug
+builds.
+
+### Added
+
+- **`smiths_proto::WireFormat` trait** — encode/decode for both
+  `Envelope` and the new `RtpFrame`. Impls:
+  - `ProtoWireFormat` — wraps existing prost derives. Default
+    for every manifest that omits `wire_format`.
+  - `FlatbuffersWireFormat` — hand-rolled flat layout, fixed
+    offsets, no per-field tags, no varints. Pure Rust, zero
+    `unsafe`, no `flatc` / build.rs. Behind the `flatbuffers`
+    Cargo feature (on by default).
+- **`smiths_proto::RtpFrame`** — prost-derived per-packet
+  message: `call_id`, `ssrc`, `sequence`, `timestamp`,
+  `payload_type`, `direction`, `payload`. The shape the
+  `media.streaming_rtp` capability (slice 2.5) will hand to
+  plugins.
+- **`smiths_proto::WireFormatKind`** — `Proto | Flatbuffers`
+  with `parse`/`as_str` for manifest round-trips.
+- **`flatbuffers_io::RtpFrameView`** — zero-copy accessor:
+  `view.payload()` returns `&[u8]` borrowed from the backing
+  buffer, no allocation, no copy on the hot path.
+- **`smiths_plugin::manifest::WireFormat`** — manifest field
+  `wire_format = "proto" | "flatbuffers"`. Default `proto`.
+  Unknown tokens fail the manifest parse loudly rather than
+  silently falling back.
+- **Throughput bench** — `crates/smiths-proto/tests/
+  wire_format_throughput.rs` (marked `#[ignore]`). Runs 50k
+  round trips of each format on a 160-byte PCMU-shaped
+  `RtpFrame`, prints ns-per-iter + byte size, asserts the flat
+  path is ≥2× faster than prost. Observed local: `proto
+  2318 ns, flatbuffers 708 ns — 3.27×`.
+- **Tests** — 7 new unit tests on `flatbuffers_io` (`RtpFrame`
+  + `Envelope` round trips, `RtpFrameView` zero-copy proof,
+  truncated + magic-mismatch error paths) + 3 new manifest
+  tests (defaults, explicit `flatbuffers`, unknown-token
+  rejection).
+- **`docs/architecture/10-plugin-wire-format.md`** — format
+  comparison, picking rules, layout tables for both formats,
+  migration checklist.
+
+### Notes
+
+The workspace's `unsafe_code = "deny"` lint rules out the
+official `flatbuffers` crate's raw-table API (which is
+`unsafe`-heavy by design). Rather than carry a scoped
+`#[allow(unsafe_code)]` for it, the crate ships a hand-rolled
+flat binary layout that matches the FlatBuffers philosophy
+(flat, offset-addressable, zero-copy reads) while staying
+unsafe-free. The name is still right; the library is just
+absent. A future slice that genuinely needs the library's
+richer schema (optional metadata tables, unions) can revisit —
+a scoped allow is a one-file change.
+
+The `media.streaming_rtp` runtime — the host function that
+actually hands `RtpFrame` bytes to a loaded plugin — is a
+dedicated follow-on. Today the wire format is ready + proven
+against a micro-benchmark; wiring the engine's bridge to
+stream frames into the plugin needs the per-leg call-id
+routing + frame-rate backpressure story.
+
 ## [0.48.0] - 2026-04-21
 
 Slice 5.1 — Video calls (passthrough). SDP negotiator gains
