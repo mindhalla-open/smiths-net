@@ -42,6 +42,7 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(EndCallTool);
     reg.register(ReloadPluginTool);
     reg.register(ListCdrTool);
+    reg.register(SendDtmfTool);
     reg
 }
 
@@ -921,6 +922,145 @@ fn fresh_seq() -> u16 {
     COUNTER.fetch_add(101, Ordering::Relaxed).wrapping_add(1000)
 }
 
+/// `send_dtmf(call_id, digits)` — emit an RFC 4733 telephone-event
+/// stream over an active call's media leg (slice 2.4, P7).
+///
+/// Each digit becomes a complete cadence: one `start` frame + one
+/// intermediate per 20 ms held + three end-retransmits. An inter-
+/// digit gap of 40 ms follows every digit so the receiver's detector
+/// sees a distinct press.
+pub struct SendDtmfTool;
+
+/// Inter-digit silence so the receiver detector registers distinct
+/// keypresses. 40 ms is conservative (some softphones need 30 ms).
+const DTMF_INTERDIGIT_MS: u64 = 40;
+
+#[async_trait]
+impl Tool for SendDtmfTool {
+    fn name(&self) -> &'static str {
+        "send_dtmf"
+    }
+
+    fn description(&self) -> &'static str {
+        "Send one or more DTMF digits as RFC 4733 telephone-event \
+         packets into a live call's media leg."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "call_id":  { "type": "string", "description": "SIP Call-ID of a live dialog." },
+                "digits":   { "type": "string",
+                              "description": "Digits to send. Allowed: 0–9, *, #, A–D, ! (flash)." },
+                "duration_ms": { "type": "integer", "minimum": 20, "maximum": 2000,
+                                 "description": "Per-digit duration. Default 160 ms (8 × 20 ms frames)." }
+            },
+            "required": ["call_id", "digits"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let call_id = args
+            .get("call_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("call_id required".into()))?;
+        let digits = args
+            .get("digits")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("digits required".into()))?;
+        if digits.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "digits must be non-empty".into(),
+            ));
+        }
+        let duration_ms = args
+            .get("duration_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(160);
+        let duration_ms = u32::try_from(duration_ms)
+            .map_err(|_| ToolError::InvalidArguments("duration_ms out of range".into()))?;
+
+        // Validate every digit before we touch the wire — partial
+        // sends would leave the call in an ambiguous state.
+        for d in digits.chars() {
+            if smiths_core::digit_to_event_code(d).is_none() {
+                return Err(ToolError::InvalidArguments(format!(
+                    "unsupported DTMF digit `{d}`; allowed: 0-9 * # A-D !"
+                )));
+            }
+        }
+
+        let snap = ctx
+            .state
+            .get_call(call_id)
+            .ok_or_else(|| ToolError::NotFound(format!("call {call_id}")))?;
+        if !matches!(snap.phase, CallPhase::Live) {
+            return Err(ToolError::InvalidArguments(format!(
+                "call {call_id} is not live (phase = {:?})",
+                snap.phase
+            )));
+        }
+        let endpoint = snap.media_endpoint.ok_or_else(|| {
+            ToolError::InvalidArguments(format!("call {call_id} has no media endpoint"))
+        })?;
+        let remote = snap.remote_rtp.ok_or_else(|| {
+            ToolError::InvalidArguments(format!("call {call_id} has no remote RTP address"))
+        })?;
+
+        let ssrc = fresh_ssrc();
+        // One contiguous sequence + timestamp stream, bumped
+        // per-packet. RFC 4733 keeps timestamp constant *within* a
+        // keypress; the timestamp advances by `FRAME_SAMPLES * frames
+        // + inter-digit-gap-samples` between successive digits.
+        let mut seq: u16 = fresh_seq();
+        let mut ts: u32 = 0;
+        let mut total_packets = 0usize;
+
+        let digits_vec: Vec<char> = digits.chars().collect();
+        for (i, digit) in digits_vec.iter().enumerate() {
+            let packets = smiths_core::dtmf::generate_keypress(*digit, duration_ms, ssrc, seq, ts);
+            let frames_in_press = u16::try_from(packets.len()).unwrap_or(u16::MAX);
+            seq = seq.wrapping_add(frames_in_press);
+            // Bump ts by the keypress duration + the inter-digit gap.
+            let press_samples = u32::from(
+                smiths_core::dtmf::DTMF_GEN_FRAME_SAMPLES.saturating_mul(
+                    u16::try_from(duration_ms / smiths_core::dtmf::DTMF_GEN_FRAME_MS)
+                        .unwrap_or(u16::MAX),
+                ),
+            );
+            let gap_samples = (smiths_core::dtmf::DTMF_GEN_CLOCK_RATE_HZ / 1_000)
+                .saturating_mul(u32::try_from(DTMF_INTERDIGIT_MS).unwrap_or(0));
+            ts = ts.wrapping_add(press_samples).wrapping_add(gap_samples);
+
+            for pkt in &packets {
+                let bytes = pkt.encode();
+                ctx.media
+                    .send_packet(endpoint, remote, &bytes)
+                    .await
+                    .map_err(|e| ToolError::Internal(format!("send_packet: {e}")))?;
+                total_packets += 1;
+                tokio::time::sleep(Duration::from_millis(u64::from(
+                    smiths_core::dtmf::DTMF_GEN_FRAME_MS,
+                )))
+                .await;
+            }
+            if i + 1 < digits_vec.len() {
+                tokio::time::sleep(Duration::from_millis(DTMF_INTERDIGIT_MS)).await;
+            }
+        }
+
+        Ok(json!({
+            "call_id":       call_id,
+            "digits":        digits,
+            "duration_ms":   duration_ms,
+            "packets_sent":  total_packets,
+            "ssrc":          ssrc,
+        }))
+    }
+}
+
 /// `make_call(target)` — place an outbound SIP INVITE to a remote URI
 /// via the engine's UAC. Returns `{call_id}` once the dialog is
 /// established (200 OK + ACK).
@@ -1108,7 +1248,7 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 14);
+        assert_eq!(reg.len(), 15);
         for name in [
             "list_calls",
             "get_call_status",
@@ -1124,6 +1264,7 @@ mod tests {
             "end_call",
             "reload_plugin",
             "list_cdr",
+            "send_dtmf",
         ] {
             assert!(reg.get(name).is_some(), "missing tool: {name}");
         }

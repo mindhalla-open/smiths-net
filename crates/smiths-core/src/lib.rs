@@ -27,6 +27,7 @@ pub mod codec;
 pub mod config;
 pub mod drain;
 pub mod dtls;
+pub mod dtmf;
 pub mod error;
 pub mod event;
 pub mod media;
@@ -54,6 +55,10 @@ pub use config::{
 };
 pub use drain::Drain;
 pub use dtls::{DtlsCertError, SelfSignedCert};
+pub use dtmf::{
+    BusDtmfSink, DtmfDetector, DtmfKeypress, DtmfSink, RFC4733_PAYLOAD_TYPE, TelephoneEvent,
+    digit_to_event_code, event_code_to_digit,
+};
 pub use error::Error;
 pub use event::{Event, MediaSecurityFailure, PluginEvent, SipEvent, SystemEvent};
 pub use media::{

@@ -138,6 +138,18 @@ pub enum SipEvent {
         /// Human-readable detail, safe to log.
         detail: String,
     },
+    /// DTMF keypress detected on a call leg (RFC 4733 telephone-event
+    /// path, slice 2.4 / P7). `duration_ms` is derived from the RTP
+    /// timestamp delta of the retransmit stream.
+    Dtmf {
+        /// `Call-ID` of the dialog the press belongs to. `None` on
+        /// legs where bridge bookkeeping hasn't associated a dialog
+        /// yet (shouldn't happen in practice; kept optional so the
+        /// bus can't drop a press on the floor).
+        call_id: Option<String>,
+        /// Keypress details — digit, duration, leg.
+        keypress: crate::dtmf::DtmfKeypress,
+    },
 }
 
 /// Media-plane security failure kinds. Stable — operators' dashboards

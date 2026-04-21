@@ -5,6 +5,59 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.0] - 2026-04-21
+
+Slice 2.4 — DTMF via RFC 4733 (a.k.a. RFC 2833). DTMF keypresses
+detected on the media bridge now land on the engine's event bus as
+`SipEvent::Dtmf` + are emittable from the control plane via
+`send_dtmf`.
+
+### Added
+
+- **`smiths-core::dtmf` module** —
+  - `TelephoneEvent::parse` / `encode` (RFC 4733 §2.3 wire format).
+  - `event_code_to_digit` / `digit_to_event_code` — §3.2 Table 1
+    mapping (0–9, *, #, A–D, flash).
+  - `DtmfDetector` — stateful decoder. Dedupes the §2.5.1.3
+    three-end retransmits and emits exactly one `DtmfKeypress` per
+    press with a wall-clock `duration_ms`.
+  - `DtmfSink` trait + `BusDtmfSink` adapter that publishes presses
+    onto an `EventBus` as `SipEvent::Dtmf`. Non-blocking —
+    bridge-forwarder hot-path safe.
+  - `generate_keypress` transmit helper: builds the full start +
+    intermediates + three-end packet stream for a digit.
+- **`SipEvent::Dtmf { call_id, keypress }`** variant — typed
+  first-class event for dashboards + MCP subscribers.
+- **Bridge DTMF detection on the hot path** —
+  `BridgeConfig::dtmf_sink` + per-direction `DtmfDetector`. When
+  the sink is `None` (default) forwarders pay no extra cost; when
+  wired, each packet with PT 101 gets parsed and the resulting
+  keypress delivered.
+- **`UdpMediaFabric::with_dtmf_sink`** — builder that plumbs a
+  shared sink into every subsequently-spawned bridge. The CLI
+  wires a `BusDtmfSink` here so RFC 4733 keypresses surface on the
+  engine-wide bus.
+- **`send_dtmf` MCP tool** — takes `{call_id, digits, duration_ms}`,
+  emits the full RFC 4733 stream into the call's media leg (20 ms
+  frame cadence, 40 ms inter-digit gap, three end-retransmits).
+  Validates every digit up-front so a typo can't partial-send.
+- **`smiths-testkit::dtmf_gen`** — re-export of the core transmit
+  helper so tests keep the historical import path.
+- **Integration tests** (`smiths-media/tests/`):
+  - `dtmf_bridge.rs` — raw `Bridge` with a `DtmfSink` trait object.
+  - `dtmf_bus.rs` — end-to-end through `UdpMediaFabric` +
+    `BusDtmfSink` to a live `EventBus` subscriber.
+  - 8 unit tests on the parse/encode/detector cycle + 3 on the
+    generator.
+
+### Notes
+
+The plugin-tier version (`dtmf-2833` as a WASM plugin under
+`plugins/examples/`) is deferred — the engine-side detection path
+covers the acceptance scenario (MCP subscriber observes DTMF inside
+100 ms of the tone), and landing the reference plugin is a pure
+follow-on behind the same `DtmfSink` trait.
+
 ## [0.35.0] - 2026-04-21
 
 Slice 2.3 — Pluggable storage MVP (P23). Formalizes the persistence
