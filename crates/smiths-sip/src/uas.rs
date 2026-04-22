@@ -660,103 +660,116 @@ impl<T: Transport> UasServer<T> {
         // Allocate a media endpoint first (so we can include its port
         // in the answer), then negotiate. On any failure the endpoint
         // is released so the fabric's table doesn't grow unbounded.
-        let (endpoint, sdp_answer_body, remote_media, srtp_keys) = if has_offer {
-            let endpoint = match self.media_fabric.allocate(self.media_bind_ip).await {
-                Ok(ep) => ep,
-                Err(e) => {
-                    warn!(?e, "failed to allocate media endpoint for INVITE");
-                    self.respond(
-                        req,
-                        500,
-                        "Server Internal Error",
-                        Some(&next_tag()),
-                        &[],
-                        &[],
-                        peer,
-                    )
-                    .await;
-                    return;
-                }
-            };
-            // Safe unwrap: `has_offer` verified Some(body) above.
-            let body = req.body.as_deref().unwrap_or_default();
-            // When the signaling transport is bound to a wildcard
-            // (0.0.0.0 / ::), `media_bind_ip` is unroutable. Ask the
-            // kernel which local address it would use to reach `peer`
-            // and publish *that* in SDP — otherwise the remote UA
-            // tries to sendto(0.0.0.0) and fails.
-            let effective_local_ip = resolve_local_ip_for(self.media_bind_ip, peer).await;
-            // Slice 5.1 / P11: call the multi-stream path with
-            // `video_port = None`. The negotiator preserves m-line
-            // ordering when the offer carries `m=video` by emitting
-            // an RFC 3264 port-0 decline — dual-bridge wiring that
-            // actually relays video is a follow-on, but the
-            // declining answer shape is right today.
-            match self.negotiator.negotiate(
-                body,
-                effective_local_ip,
-                endpoint.local_addr().port(),
-                None,
-            ) {
-                NegotiationOutcome::Accepted {
-                    answer_body,
-                    remote_media,
-                    // Slice 5.1: video endpoint surfaces on the
-                    // outcome; the UAS's dual-bridge wiring is a
-                    // follow-on. Peers that offered video see a
-                    // declining `m=video 0 ...` in the answer, so
-                    // this binding isn't used yet but keeps the
-                    // destructure exhaustive.
-                    video_media: _video_media,
-                    srtp,
-                } => (Some(endpoint), Some(answer_body), remote_media, srtp),
-                NegotiationOutcome::Mismatch => {
-                    self.media_fabric.release_endpoint(endpoint.id()).await;
-                    info!(%peer, "SDP offer had no acceptable codec; 488");
-                    self.respond(
-                        req,
-                        488,
-                        "Not Acceptable Here",
-                        Some(&next_tag()),
-                        &[],
-                        &[],
-                        peer,
-                    )
-                    .await;
-                    return;
-                }
-                NegotiationOutcome::UnsupportedTransport { reason } => {
-                    self.media_fabric.release_endpoint(endpoint.id()).await;
-                    info!(%peer, %reason, "SDP offer used an unsupported transport; 488 + Warning");
-                    // RFC 3261 §20.43: `Warning: <code> <host> "<text>"`.
-                    // Code 399 is the "miscellaneous" catch-all; the
-                    // quoted text carries the human-readable reason so
-                    // the peer sees *why* we rejected.
-                    let warning = format_warning(&reason);
-                    let warning_hdr: [(&str, &str); 1] = [("Warning", warning.as_str())];
-                    self.respond(
-                        req,
-                        488,
-                        "Not Acceptable Here",
-                        Some(&next_tag()),
-                        &warning_hdr,
-                        &[],
-                        peer,
-                    )
-                    .await;
-                    return;
-                }
-                NegotiationOutcome::Malformed(err) => {
-                    self.media_fabric.release_endpoint(endpoint.id()).await;
-                    warn!(%peer, %err, "malformed SDP offer");
-                    self.respond(req, 400, "Bad Request", Some(&next_tag()), &[], &[], peer)
+        let (endpoint, sdp_answer_body, remote_media, srtp_keys, audio_codec, video_codec) =
+            if has_offer {
+                let endpoint = match self.media_fabric.allocate(self.media_bind_ip).await {
+                    Ok(ep) => ep,
+                    Err(e) => {
+                        warn!(?e, "failed to allocate media endpoint for INVITE");
+                        self.respond(
+                            req,
+                            500,
+                            "Server Internal Error",
+                            Some(&next_tag()),
+                            &[],
+                            &[],
+                            peer,
+                        )
                         .await;
-                    return;
+                        return;
+                    }
+                };
+                // Safe unwrap: `has_offer` verified Some(body) above.
+                let body = req.body.as_deref().unwrap_or_default();
+                // When the signaling transport is bound to a wildcard
+                // (0.0.0.0 / ::), `media_bind_ip` is unroutable. Ask the
+                // kernel which local address it would use to reach `peer`
+                // and publish *that* in SDP — otherwise the remote UA
+                // tries to sendto(0.0.0.0) and fails.
+                let effective_local_ip = resolve_local_ip_for(self.media_bind_ip, peer).await;
+                // Slice 5.1 / P11: call the multi-stream path with
+                // `video_port = None`. The negotiator preserves m-line
+                // ordering when the offer carries `m=video` by emitting
+                // an RFC 3264 port-0 decline — dual-bridge wiring that
+                // actually relays video is a follow-on, but the
+                // declining answer shape is right today.
+                match self.negotiator.negotiate(
+                    body,
+                    effective_local_ip,
+                    endpoint.local_addr().port(),
+                    None,
+                ) {
+                    NegotiationOutcome::Accepted {
+                        answer_body,
+                        remote_media,
+                        // Slice 5.1: video endpoint surfaces on the
+                        // outcome; the UAS's dual-bridge wiring is a
+                        // follow-on. Peers that offered video see a
+                        // declining `m=video 0 ...` in the answer, so
+                        // this binding isn't used yet but keeps the
+                        // destructure exhaustive.
+                        video_media: _video_media,
+                        srtp,
+                        // Slice 5.6: per-leg codec goes into
+                        // DialogRecord.per_leg_codec so the
+                        // transcoding router (5.6b) can compare legs.
+                        audio_codec,
+                        video_codec,
+                    } => (
+                        Some(endpoint),
+                        Some(answer_body),
+                        remote_media,
+                        srtp,
+                        audio_codec,
+                        video_codec,
+                    ),
+                    NegotiationOutcome::Mismatch => {
+                        self.media_fabric.release_endpoint(endpoint.id()).await;
+                        info!(%peer, "SDP offer had no acceptable codec; 488");
+                        self.respond(
+                            req,
+                            488,
+                            "Not Acceptable Here",
+                            Some(&next_tag()),
+                            &[],
+                            &[],
+                            peer,
+                        )
+                        .await;
+                        return;
+                    }
+                    NegotiationOutcome::UnsupportedTransport { reason } => {
+                        self.media_fabric.release_endpoint(endpoint.id()).await;
+                        info!(%peer, %reason, "SDP offer used an unsupported transport; 488 + Warning");
+                        // RFC 3261 §20.43: `Warning: <code> <host> "<text>"`.
+                        // Code 399 is the "miscellaneous" catch-all; the
+                        // quoted text carries the human-readable reason so
+                        // the peer sees *why* we rejected.
+                        let warning = format_warning(&reason);
+                        let warning_hdr: [(&str, &str); 1] = [("Warning", warning.as_str())];
+                        self.respond(
+                            req,
+                            488,
+                            "Not Acceptable Here",
+                            Some(&next_tag()),
+                            &warning_hdr,
+                            &[],
+                            peer,
+                        )
+                        .await;
+                        return;
+                    }
+                    NegotiationOutcome::Malformed(err) => {
+                        self.media_fabric.release_endpoint(endpoint.id()).await;
+                        warn!(%peer, %err, "malformed SDP offer");
+                        self.respond(req, 400, "Bad Request", Some(&next_tag()), &[], &[], peer)
+                            .await;
+                        return;
+                    }
                 }
-            }
-        } else {
-            (None, None, None, None)
-        };
+            } else {
+                (None, None, None, None, None, None)
+            };
 
         let local_tag = next_tag();
         let rendezvous = req.ruri_user.clone();
@@ -800,6 +813,24 @@ impl<T: Transport> UasServer<T> {
             }
         }
 
+        // Slice 5.6: populate per-leg codec from the negotiator's
+        // output. `LegId(0)` is the answerer's own leg — that's the
+        // leg whose codec the negotiator just chose. The far-end
+        // leg's codec is learned at bridge time (today's 2-peer
+        // bridge uses the same codec both sides; 5.6b will refine
+        // this when transcoding wires through).
+        let mut per_leg_codec = std::collections::BTreeMap::new();
+        if let Some(c) = audio_codec.clone() {
+            per_leg_codec.insert(smiths_core::LegId(0), c);
+        }
+        if let Some(c) = video_codec.clone() {
+            // Video-leg codec under LegId(0) would collide with the
+            // audio entry; use LegId(1) to keep both entries alive.
+            // The LegId namespace is process-scoped, not
+            // cross-dialog, so collision with a future remote leg
+            // is impossible within this record.
+            per_leg_codec.insert(smiths_core::LegId(1), c);
+        }
         let record = DialogRecord {
             call_id: call_id.clone(),
             local_tag: local_tag.clone(),
@@ -810,6 +841,7 @@ impl<T: Transport> UasServer<T> {
             media: endpoint.as_ref().map(|ep| ep.id()),
             remote_media,
             pending_2xx: None,
+            per_leg_codec,
         };
         self.dialogs.insert(dialog_key.clone(), record);
         self.metrics.dialogs_active.inc();

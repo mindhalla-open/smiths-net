@@ -3365,7 +3365,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-cli"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3388,9 +3388,10 @@ dependencies = [
 
 [[package]]
 name = "smiths-core"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "async-trait",
+ "dashmap",
  "figment",
  "hex",
  "prometheus-client",
@@ -3407,7 +3408,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-dtls"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "async-trait",
  "rustls",
@@ -3423,7 +3424,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-fax"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "async-trait",
  "smiths-core",
@@ -3436,7 +3437,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-ice"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "bytes",
  "rand 0.10.1",
@@ -3451,7 +3452,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-mcp"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3481,11 +3482,12 @@ dependencies = [
 
 [[package]]
 name = "smiths-media"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "async-trait",
  "dashmap",
  "smiths-core",
+ "smiths-transcode",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -3496,7 +3498,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-mixer"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3510,7 +3512,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-plugin"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -3534,14 +3536,14 @@ dependencies = [
 
 [[package]]
 name = "smiths-proto"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "prost",
 ]
 
 [[package]]
 name = "smiths-script"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "async-trait",
  "rhai",
@@ -3556,7 +3558,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sdp"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "base64",
  "rand 0.10.1",
@@ -3567,7 +3569,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sidecar"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "rustix",
  "seccompiler",
@@ -3583,7 +3585,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sip"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3615,7 +3617,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-testkit"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "smiths-core",
  "smiths-media",
@@ -3629,7 +3631,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-transcode"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "opus",
  "prometheus-client",
@@ -3641,7 +3643,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-wasm"
-version = "0.52.0"
+version = "0.54.0"
 dependencies = [
  "anyhow",
  "async-trait",

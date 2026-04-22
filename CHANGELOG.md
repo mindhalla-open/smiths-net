@@ -5,6 +5,121 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.54.0] - 2026-04-22
+
+Slice 5.6b — `TranscodedSession` primitive. Adds the
+`MediaSession` variant that runs a `CallTranscoder` inline on a
+two-leg UDP RTP flow. The UAS doesn't auto-construct it yet —
+that's slice 5.6c (codec-mismatch detection + admission
+plumbing in the INVITE answer path). 5.6b lands the
+production-ready primitive: real UDP sockets, real RTP header
+preservation, real admission integration via `TranscodeLease`,
+end-to-end PCMU↔PCMA test that round-trips bytes through the
+full path.
+
+### Added
+
+- **`smiths-media::TranscodedSession`** — new
+  `MediaSession` impl. Two forwarder tasks (A→B, B→A) share an
+  `Arc<Mutex<CallTranscoder>>`; each task `recv_from`s, splits
+  off the 12-byte RTP header, hands the payload to
+  `transcode_*_to_*`, and `send_to`s `header || transcoded`
+  to the egress peer. Sequence + timestamp + SSRC preserved
+  verbatim from the ingress packet (correct for same-rate
+  codec pairs). Cancellation-driven shutdown via the same
+  `CancellationToken` pattern as `Bridge`.
+- **`smiths-media::TranscodedLeg`** — slim per-leg config
+  (socket + peer address). No SRTP/RTCP slots yet — those are
+  documented out-of-scope for 5.6b in the module doc.
+- **`smiths-transcode` dep** added to `smiths-media` (no
+  cycle: `smiths-transcode` only depends on `smiths-core`).
+- **3 new integration-style tests** in
+  `crates/smiths-media/src/transcoded.rs`: PCMU↔PCMA
+  round-trip with real UDP sockets, `stop()` cancels
+  forwarders, dropping the session releases the admission
+  lease (proves the `TranscodeLease` ownership story holds
+  end-to-end).
+
+### Notes
+
+- **UAS auto-construction is 5.6c.** This slice ships the
+  primitive; wiring the UAS's INVITE answer path to detect
+  `per_leg_codec` mismatch, call `CpuBudget::try_admit`,
+  build a `CallTranscoder`, and install a `TranscodedSession`
+  via `DialogSessions` is a focused follow-on. The split
+  keeps each session manageable.
+- **Cross-rate timestamp scaling deferred.** Opus 48 kHz ↔
+  PCMU 8 kHz needs a per-frame timestamp rewrite that 5.6b's
+  same-rate path doesn't (G.711↔G.711 and Opus↔Opus are both
+  20 ms / same RTP-clock cadence). Module doc marks the
+  deferral; 5.6c lands the scaling because that's when the
+  cross-rate path actually fires through the UAS.
+- **No SRTP / RTCP yet.** The plain `Bridge` path runs both;
+  the transcoded path adds them in 5.6c (or a 5.6d if
+  scope honesty calls for it). Documented loud in the
+  module doc rather than as a silent capability gap.
+
+## [0.53.0] - 2026-04-22
+
+Slice 5.6 (5.6a — data-model refactor) — Multi-session call FSM
+substrate. Lands the type infrastructure + atomic session-swap
+API that slices 5.3 / 5.4 / 5.5 deferred to. The follow-on
+5.6b wires the three deferred primitives (transcoding, T.38
+FAX, conference participant sessions) through this substrate;
+this slice lands the refactor itself, the codec detection on
+the negotiator's output, and the arch doc. The split was
+pre-committed in the slice doc's honest-scope call-out.
+
+### Added
+
+- **`LegId(u64)` + `MediaKindTag` + `SessionKey = (LegId,
+  MediaKindTag)` + `NegotiatedCodec`** in `smiths-core::call`.
+  The data model lets the call FSM track per-leg codec state
+  and address media sessions by `(leg, media_kind)` rather
+  than assuming one session per call.
+- **`DialogRecord::per_leg_codec: BTreeMap<LegId,
+  NegotiatedCodec>`** — serializable, `#[serde(default)]` so
+  pre-5.6 HA snapshots deserialize unchanged. Populated by
+  the UAS at 200 OK INVITE time from the negotiator's output.
+- **`DialogSessions`** (`smiths-core::dialog_sessions`) —
+  process-wide runtime table of `Arc<dyn MediaSession>` keyed
+  by `(DialogKey, SessionKey)`. Cheaply cloneable
+  (`Arc<DashMap>` inside). Exposes `install` / **`swap`** /
+  `remove` / `remove_dialog` / `get` / `keys`.
+  `swap` returns the displaced handle so callers install
+  the new session first, then stop the old one on their own
+  schedule — no forwarding gap mid-swap.
+- **`NegotiationOutcome::Accepted::audio_codec` /
+  `video_codec`** (`Option<NegotiatedCodec>`). The negotiator
+  now surfaces which codec landed in the answer so the UAS
+  can file it under the right leg on `DialogRecord`. Three
+  new unit tests in `smiths-sdp` prove the detection across
+  PCMU-only, audio+video, and video-declined paths.
+- **Arch doc** — `docs/architecture/11-call-fsm.md` covers the
+  data model, swap semantics, re-INVITE decision tree, and
+  the 5.6-vs-5.6b split.
+- **Tests** — 7 new unit tests on `DialogSessions` (install,
+  swap with old-handle return, drop-schedule independence,
+  per-dialog drain, absent-key install-and-return-None, key
+  enumeration) + 4 new `DialogRecord` / codec-enum
+  serialization tests in `smiths-core::call`.
+
+### Notes
+
+- **Wirings deferred to slice 5.6b (v0.54.0).** Transcoding
+  wiring (codec mismatch → `CallTranscoder` via admission),
+  T.38 wiring (audio→image re-INVITE swap to `UdptlSession`),
+  and conferencing wiring (`join_conference` swap to a
+  `ConferenceParticipantSession`) all ride on top of this
+  slice's substrate. The split was pre-committed in the slice
+  doc because each wiring is ~150–200 LOC in its own right
+  and the 1-big-3-small shape won't absorb them together
+  without drift.
+- **`MediaKindTag` is parallel to `smiths_sdp::MediaKind`,
+  not a replacement.** The SDP one belongs to the parse tree;
+  the core one belongs to the call FSM. Conversion is an
+  impl detail of the 5.6b wirings.
+
 ## [0.52.0] - 2026-04-22
 
 Slice 5.5 — N:N audio conferencing. Adds the `smiths-mixer`

@@ -25,6 +25,7 @@ pub mod bus;
 pub mod call;
 pub mod codec;
 pub mod config;
+pub mod dialog_sessions;
 pub mod drain;
 pub mod dtls;
 pub mod dtmf;
@@ -46,8 +47,8 @@ pub use ai::{
 };
 pub use bus::EventBus;
 pub use call::{
-    CallError, CallLookup, CallOriginator, DialogKey, DialogRecord, DialogState,
-    RegistrationSnapshot, RegistrationView,
+    CallError, CallLookup, CallOriginator, DialogKey, DialogRecord, DialogState, LegId,
+    MediaKindTag, NegotiatedCodec, RegistrationSnapshot, RegistrationView, SessionKey,
 };
 pub use codec::{linear_to_ulaw, pcm16_to_pcmu, pcmu_to_pcm16, ulaw_to_linear};
 pub use config::{
@@ -59,6 +60,7 @@ pub use config::{
     SqliteStorageConfig, StorageBackend, StorageConfig, TranscodeConfig, VectorBackend,
     VectorStoreConfig, VpnMode,
 };
+pub use dialog_sessions::DialogSessions;
 pub use drain::Drain;
 pub use dtls::{DtlsCertError, SelfSignedCert};
 pub use dtmf::{

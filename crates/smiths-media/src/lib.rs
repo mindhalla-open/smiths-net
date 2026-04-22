@@ -18,6 +18,7 @@ pub mod prompts;
 pub mod rtcp;
 pub mod rtp_stats;
 pub mod srtp;
+pub mod transcoded;
 
 pub use bridge::{Bridge, BridgeConfig, DtmfSink, Leg, RtcpLeg};
 pub use fabric::UdpMediaFabric;
@@ -25,6 +26,7 @@ pub use port_allocator::{PortPair, allocate_rtp_rtcp_pair};
 pub use prompts::{Prompt, PromptError, PromptLibrary, encode_wav};
 pub use rtp_stats::{StreamStats, StreamStatsSnapshot};
 pub use srtp::AesCmHmacSha1_80Transform;
+pub use transcoded::{TranscodedLeg, TranscodedSession};
 
 // Codec + RTP packet types live in `smiths-core` (pure math, no
 // deps). Re-exported here so existing `smiths-media::*` paths keep

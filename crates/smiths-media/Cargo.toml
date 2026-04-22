@@ -15,8 +15,9 @@ default = []
 pcap = []
 
 [dependencies]
-smiths-core = { workspace = true }
-tokio       = { workspace = true }
+smiths-core      = { workspace = true }
+smiths-transcode = { workspace = true }
+tokio            = { workspace = true }
 tokio-util  = { workspace = true }
 async-trait = { workspace = true }
 dashmap     = { workspace = true }

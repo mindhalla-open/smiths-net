@@ -10,6 +10,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use crate::SrtpSuite;
+use crate::call::NegotiatedCodec;
 
 /// SRTP keying material negotiated via SDES (RFC 4568).
 ///
@@ -76,6 +77,17 @@ pub enum NegotiationOutcome {
         /// `RTP/AVP` passthrough calls. The UAS threads this into the
         /// bridge spawn so each leg runs with the right transform.
         srtp: Option<SrtpKeys>,
+        /// Audio codec both sides agreed on (slice 5.6). `None`
+        /// when the offer had no audio m-line or no common codec
+        /// (but then `Mismatch` would have fired). Recorded on the
+        /// `DialogRecord`'s `per_leg_codec` map — the transcoding
+        /// router (5.6b) compares the two legs' entries to decide
+        /// whether a `CallTranscoder` is needed.
+        audio_codec: Option<NegotiatedCodec>,
+        /// Video codec (slice 5.6). Populated only when the
+        /// negotiator accepted a `m=video` block; `None` when
+        /// video was declined or absent.
+        video_codec: Option<NegotiatedCodec>,
     },
     /// No common codec — responder should send `488 Not Acceptable Here`.
     Mismatch,

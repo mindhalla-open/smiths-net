@@ -364,14 +364,19 @@ impl SdpNegotiator for Negotiator {
         let mut scoped = self.clone();
         scoped.local_ip = local_ip;
         match scoped.answer(&offer, local_rtp_port) {
-            NegotiationResult::Answer { sdp, srtp } => NegotiationOutcome::Accepted {
-                answer_body: sdp.to_string(),
-                remote_media,
-                // `negotiate_audio` is the audio-only path; video
-                // handling lives on the `negotiate` override below.
-                video_media: None,
-                srtp,
-            },
+            NegotiationResult::Answer { sdp, srtp } => {
+                let audio_codec = first_codec_of_kind(&sdp, &MediaKind::Audio);
+                NegotiationOutcome::Accepted {
+                    answer_body: sdp.to_string(),
+                    remote_media,
+                    // `negotiate_audio` is the audio-only path; video
+                    // handling lives on the `negotiate` override below.
+                    video_media: None,
+                    srtp,
+                    audio_codec,
+                    video_codec: None,
+                }
+            }
             NegotiationResult::Mismatch => NegotiationOutcome::Mismatch,
         }
     }
@@ -401,12 +406,18 @@ impl SdpNegotiator for Negotiator {
         let mut scoped = self.clone();
         scoped.local_ip = local_ip;
         match scoped.answer_with_video(&offer, local_audio_port, local_video_port) {
-            NegotiationResult::Answer { sdp, srtp } => NegotiationOutcome::Accepted {
-                answer_body: sdp.to_string(),
-                remote_media,
-                video_media,
-                srtp,
-            },
+            NegotiationResult::Answer { sdp, srtp } => {
+                let audio_codec = first_codec_of_kind(&sdp, &MediaKind::Audio);
+                let video_codec = first_codec_of_kind(&sdp, &MediaKind::Video);
+                NegotiationOutcome::Accepted {
+                    answer_body: sdp.to_string(),
+                    remote_media,
+                    video_media,
+                    srtp,
+                    audio_codec,
+                    video_codec,
+                }
+            }
             NegotiationResult::Mismatch => NegotiationOutcome::Mismatch,
         }
     }
@@ -473,6 +484,26 @@ fn first_video_endpoint(sdp: &SessionDescription) -> Option<SocketAddr> {
     }
     let conn = video.connection.as_ref().or(sdp.connection.as_ref())?;
     Some(SocketAddr::new(conn.address, video.port))
+}
+
+/// First codec on a given media kind's answer block (slice 5.6).
+///
+/// Returns the codec that landed in the answer's `a=rtpmap:` entry
+/// for the requested `kind`. Produces `None` when the media block
+/// is absent, was declined (port 0 ⇒ no rtpmap emitted), or
+/// exists only as a transport-line placeholder. The UAS reads this
+/// into the `DialogRecord`'s `per_leg_codec` map — the two legs'
+/// codecs compare equal iff the call can run passthrough.
+fn first_codec_of_kind(
+    sdp: &SessionDescription,
+    kind: &MediaKind,
+) -> Option<smiths_core::NegotiatedCodec> {
+    let m = sdp.media.iter().find(|m| &m.kind == kind)?;
+    if m.port == 0 {
+        return None;
+    }
+    let token = m.rtpmap.first().map(|r| r.codec.as_str())?;
+    Some(smiths_core::NegotiatedCodec::parse(token))
 }
 
 /// `true` if the media profile names DTLS-SRTP (RFC 5764 §8).
@@ -885,5 +916,83 @@ mod tests {
             video_media.is_none(),
             "negotiate_audio must not expose video endpoint"
         );
+    }
+
+    // ---- Slice 5.6: codec detection on the accepted outcome ----
+
+    #[test]
+    fn negotiate_audio_exposes_pcmu_on_pcmu_offer() {
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let offer = offer_with(
+            vec![0],
+            vec![RtpMap {
+                payload_type: 0,
+                codec: "PCMU".into(),
+                clock_rate: 8_000,
+                channels: None,
+            }],
+        );
+        let outcome =
+            neg.negotiate_audio(&offer.to_string(), IpAddr::V4(Ipv4Addr::LOCALHOST), 16_384);
+        let smiths_core::NegotiationOutcome::Accepted {
+            audio_codec,
+            video_codec,
+            ..
+        } = outcome
+        else {
+            panic!("expected Accepted");
+        };
+        assert_eq!(audio_codec, Some(smiths_core::NegotiatedCodec::Pcmu));
+        assert_eq!(
+            video_codec, None,
+            "audio-only path must not claim a video codec"
+        );
+    }
+
+    #[test]
+    fn negotiate_exposes_both_codecs_on_audio_plus_video_offer() {
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let offer = audio_video_offer(49_170, 49_172);
+        let outcome = neg.negotiate(
+            &offer.to_string(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            16_384,
+            Some(16_386),
+        );
+        let smiths_core::NegotiationOutcome::Accepted {
+            audio_codec,
+            video_codec,
+            ..
+        } = outcome
+        else {
+            panic!("expected Accepted");
+        };
+        assert_eq!(audio_codec, Some(smiths_core::NegotiatedCodec::Pcmu));
+        assert_eq!(video_codec, Some(smiths_core::NegotiatedCodec::H264));
+    }
+
+    #[test]
+    fn negotiate_declined_video_leaves_video_codec_none() {
+        // Video offered, negotiator declines via `video_port = None`
+        // → answer carries `m=video 0 ...`, so video_codec must be
+        // None (we didn't accept any codec).
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let offer = audio_video_offer(49_170, 49_172);
+        let outcome = neg.negotiate(
+            &offer.to_string(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            16_384,
+            None,
+        );
+        let smiths_core::NegotiationOutcome::Accepted {
+            audio_codec,
+            video_codec,
+            ..
+        } = outcome
+        else {
+            panic!("expected Accepted");
+        };
+        assert_eq!(audio_codec, Some(smiths_core::NegotiatedCodec::Pcmu));
+        assert_eq!(video_codec, None);
     }
 }

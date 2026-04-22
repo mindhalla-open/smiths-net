@@ -15,7 +15,7 @@
 //! budget, frame-by-frame encode+decode — catches the admission
 //! invariants regardless of which codec runs underneath.
 
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -42,12 +42,28 @@ fn admission_never_exceeds_cap_under_parallel_pressure() {
     let budget = CpuBudget::new(CpuBudgetConfig::from(&cfg), Arc::clone(&metrics));
 
     let attempts = 40;
+    // Two barriers force real contention. Without them G.711 is fast
+    // enough that threads can admit, encode 50 frames, and drop the
+    // lease before a sibling ever calls `try_admit` — so 40 attempts
+    // trickle through an 8-slot budget sequentially with zero refusals
+    // and the cap-under-pressure invariant goes untested.
+    //
+    // `start` releases every thread into `try_admit` together; `decided`
+    // holds the admitted leases until every thread has a verdict, so
+    // the 32 losers cannot see slots vacated by early drops.
+    let start = Arc::new(Barrier::new(attempts));
+    let decided = Arc::new(Barrier::new(attempts));
     let mut handles = Vec::with_capacity(attempts);
     for _ in 0..attempts {
         let b = budget.clone();
         let m = Arc::clone(&metrics);
+        let start = Arc::clone(&start);
+        let decided = Arc::clone(&decided);
         handles.push(thread::spawn(move || {
-            match b.try_admit() {
+            start.wait();
+            let admit = b.try_admit();
+            decided.wait();
+            match admit {
                 Ok(lease) => {
                     let mut t = CallTranscoder::new(
                         Box::new(G711Codec::new(G711Variant::Pcmu)),
@@ -60,8 +76,6 @@ fn admission_never_exceeds_cap_under_parallel_pressure() {
                         let re = t.transcode_a_to_b(&frame).unwrap();
                         let _ = t.transcode_b_to_a(&re).unwrap();
                     }
-                    // The active count while we're alive must never
-                    // breach the cap. Sample it once before drop.
                     assert!(
                         b.active() <= cfg.max_concurrent_calls,
                         "active breached cap: {} > {}",
@@ -85,15 +99,14 @@ fn admission_never_exceeds_cap_under_parallel_pressure() {
         }
     }
     assert_eq!(admitted + refused, attempts);
-    // At *least* one call had to be refused: 40 attempts into an
-    // 8-slot budget means the first 8 to race through get in, and a
-    // sizeable fraction of the remainder race into a refusal. Exact
-    // split depends on the scheduler, but the structural invariant
-    // is "not all 40 got in".
-    assert!(
-        admitted <= cfg.max_concurrent_calls || refused > 0,
-        "admission cap breached: {admitted} admitted, {refused} refused",
+    // With the barriers in place the split is deterministic: the first
+    // `max_concurrent_calls` CAS winners get in, everyone else sees the
+    // cap filled and is refused.
+    assert_eq!(
+        admitted, cfg.max_concurrent_calls,
+        "expected exactly cap admitted, got {admitted} (refused={refused})",
     );
+    assert_eq!(refused, attempts - cfg.max_concurrent_calls);
 
     // Every thread has joined, so every lease has dropped.
     assert_eq!(budget.active(), 0, "budget slots leaked");
