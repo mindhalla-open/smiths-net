@@ -1,0 +1,22 @@
+[package]
+name         = "smiths-fax"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+license      = { workspace = true }
+description  = "T.38 FAX-over-IP (slice 5.4 / P13): UDPTL framing + UdptlSession + SDP renegotiation helpers."
+
+[dependencies]
+smiths-core = { workspace = true }
+smiths-sdp  = { workspace = true }
+async-trait = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { workspace = true, features = ["net", "rt", "sync", "macros"] }
+tokio-util  = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[lints]
+workspace = true

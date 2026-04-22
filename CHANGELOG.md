@@ -5,6 +5,71 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.51.0] - 2026-04-22
+
+Slice 5.4 — T.38 FAX-over-IP. Adds a UDPTL relay
+(`smiths-fax::UdptlSession`) plus the SDP surface needed to
+negotiate `m=image <port> udptl t38` and the re-INVITE helper that
+switches an active audio call into T.38 mid-dialog. The engine's
+role is a bytes-mover between two fax-capable endpoints; IFP
+parsing, fax FSMs, and audio↔T.38 transcoding stay out of scope
+(deferred to gateways, which are a separate product).
+
+### Added
+
+- **`smiths-fax` crate** — new workspace member:
+  - **`UdptlPacket`** — T.38 Annex A framer. Parses + encodes
+    the sequence number, primary IFP payload, and
+    secondary-packet redundancy field. Handles both the short
+    (≤127 byte) and long (≤16383 byte) length-prefix forms.
+    Tolerates trailing pad bytes real gateways emit.
+  - **`UdptlSession: MediaSession`** — two-leg UDP relay with
+    forwarder-per-direction, cancellation-driven shutdown, and
+    optional per-datagram sequence tracing at `debug`.
+  - **`T38Params`** — typed view of `a=T38FaxVersion`,
+    `a=T38MaxBitRate`, `a=T38FaxRateManagement`,
+    `a=T38FaxMaxBuffer`, `a=T38FaxMaxDatagram`,
+    `a=T38FaxUdpEC`. Round-trips through
+    `parse_attrs` / `render_attrs`; `sensible_offer()` emits the
+    knobs most soft-PBXs expect.
+  - **`offer_fax` / `answer_fax_offer` / `find_fax_media` /
+    `is_t38_media`** — SDP construction + detection helpers.
+    Answer composition declines audio (port 0, `a=inactive`)
+    per RFC 3264 §6 when the offer mixes audio + T.38.
+  - **`fax_renegotiate`** — builds a re-INVITE SDP that
+    downgrades audio and appends a fresh T.38 block. Bumps
+    `origin.session_version` so the answerer treats the SDP
+    as changed per RFC 3264 §5.
+- **`MediaKind::Image`** — new variant on
+  `smiths_sdp::types::MediaKind`. `"image"` on an `m=` line now
+  round-trips through a typed enum instead of falling into
+  `Other("image")`.
+- **Reference flow integration test** —
+  `crates/smiths-fax/tests/reference_flow.rs` drives a 20-packet
+  synthetic T.38 stream (primary + 2-deep redundancy, shaped
+  like what spandsp would emit for a V.17 page) through a
+  live `UdptlSession` and asserts byte-identity + sequence
+  continuity + redundancy preservation on the far side.
+- **Architecture doc** — `docs/architecture/08-fax.md` covers
+  what the engine does, what it deliberately doesn't do (IFP
+  parsing, fax FSM, transcoding), UDPTL wire format, and the
+  honest-deferral on bridge integration.
+
+### Notes
+
+- **No spandsp FFI.** The canonical C fax library is `unsafe` at
+  the FFI boundary; pulling it in conflicts with the workspace's
+  `unsafe_code = "deny"` policy. The reference test uses canned
+  fixture bytes — the relay is a bytes-mover, so what actually
+  produced the bytes (terminal, gateway, fixture script) doesn't
+  change the test's signal.
+- **Bridge integration deferred.** Wiring a `UdptlSession` into
+  the UAS re-INVITE path (atomic session swap, BYE propagation
+  across the new session type) is the same call-FSM refactor
+  the slice 5.1 video dual-bridge and slice 5.3 transcoding are
+  queued behind. Primitives land here; wiring lands with the
+  FSM refactor.
+
 ## [0.50.0] - 2026-04-21
 
 Slice 5.3 — Audio transcoding + CPU budget. Introduces the

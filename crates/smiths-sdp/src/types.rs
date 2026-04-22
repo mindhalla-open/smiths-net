@@ -207,6 +207,9 @@ pub enum MediaKind {
     Video,
     /// `application`
     Application,
+    /// `image` — T.38 FAX-over-IP uses `m=image ... udptl t38`
+    /// (slice 5.4).
+    Image,
     /// Anything else, preserved verbatim.
     Other(String),
 }
@@ -219,6 +222,7 @@ impl MediaKind {
             "audio" => Self::Audio,
             "video" => Self::Video,
             "application" => Self::Application,
+            "image" => Self::Image,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -230,6 +234,7 @@ impl MediaKind {
             Self::Audio => "audio",
             Self::Video => "video",
             Self::Application => "application",
+            Self::Image => "image",
             Self::Other(s) => s,
         }
     }
