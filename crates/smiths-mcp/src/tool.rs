@@ -19,6 +19,7 @@ use smiths_core::call::{CallOriginator, RegistrationView};
 use smiths_core::media::MediaFabric;
 use smiths_core::storage::{CdrStore, RecordingStore, VectorStore};
 use smiths_media::PromptLibrary;
+use smiths_mixer::ConferenceRegistry;
 use thiserror::Error;
 
 use crate::control::ControlState;
@@ -70,6 +71,10 @@ pub struct ToolContext {
     /// hasn't configured a root; `record_prompt` returns a clean
     /// `NotFound` in that case.
     pub prompts: Option<PromptLibrary>,
+    /// Conference registry (slice 5.5). `None` when no mixer fabric
+    /// is wired; `create_conference` / `join_conference` /
+    /// `leave_conference` return a clean `NotFound` in that case.
+    pub conferences: Option<Arc<dyn ConferenceRegistry>>,
 }
 
 impl ToolContext {
@@ -93,7 +98,16 @@ impl ToolContext {
             vector: None,
             recording: None,
             prompts: None,
+            conferences: None,
         }
+    }
+
+    /// Attach a [`ConferenceRegistry`] so the conferencing MCP tools
+    /// become live. Without it they return a clean `NotFound`.
+    #[must_use]
+    pub fn with_conferences(mut self, registry: Arc<dyn ConferenceRegistry>) -> Self {
+        self.conferences = Some(registry);
+        self
     }
 
     /// Attach a [`PromptLibrary`] so `record_prompt` can write

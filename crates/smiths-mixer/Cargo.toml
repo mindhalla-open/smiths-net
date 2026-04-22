@@ -1,0 +1,23 @@
+[package]
+name         = "smiths-mixer"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+license      = { workspace = true }
+description  = "N:N audio conferencing mixer (slice 5.5 / P14): leave-one-out sum + AGC + VAD + MixerFabric."
+
+[dependencies]
+smiths-core  = { workspace = true }
+smiths-media = { workspace = true }
+async-trait  = { workspace = true }
+dashmap      = { workspace = true }
+thiserror    = { workspace = true }
+tokio        = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+tokio-util   = { workspace = true }
+tracing      = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[lints]
+workspace = true

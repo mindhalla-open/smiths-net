@@ -6,7 +6,7 @@ exclude  = ["fuzz"]
 [workspace.package]
 edition      = "2024"
 rust-version = "1.85"
-version      = "0.51.0"
+version      = "0.52.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
@@ -159,6 +159,7 @@ smiths-mcp       = { path = "crates/smiths-mcp" }
 smiths-testkit   = { path = "crates/smiths-testkit" }
 smiths-transcode = { path = "crates/smiths-transcode" }
 smiths-fax       = { path = "crates/smiths-fax" }
+smiths-mixer     = { path = "crates/smiths-mixer" }
 
 # Embedded DSL (slice 4.1 / P24). Rhai is a tiny scripting language
 # designed for embedding into Rust hosts — no unsafe, no FFI, a

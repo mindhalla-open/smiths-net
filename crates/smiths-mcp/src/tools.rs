@@ -51,6 +51,9 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(SearchCallsSemanticTool);
     reg.register(PutScriptTool);
     reg.register(RecordPromptTool);
+    reg.register(CreateConferenceTool);
+    reg.register(JoinConferenceTool);
+    reg.register(LeaveConferenceTool);
     reg
 }
 
@@ -1835,6 +1838,170 @@ impl Tool for EndCallTool {
     }
 }
 
+// ---- Conferencing (slice 5.5) --------------------------------------
+
+/// `create_conference()` — allocate a fresh N-participant mixer.
+///
+/// Returns the new conference id. Subsequent `join_conference` calls
+/// attach participants.
+pub struct CreateConferenceTool;
+
+#[async_trait]
+impl Tool for CreateConferenceTool {
+    fn name(&self) -> &'static str {
+        "create_conference"
+    }
+
+    fn description(&self) -> &'static str {
+        "Create a new audio conference (leave-one-out N:N mixer with \
+         per-participant AGC + VAD-based dominant-speaker selection). \
+         Returns the conference id to pass to `join_conference`."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, _args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let reg = ctx.conferences.as_ref().ok_or_else(|| {
+            ToolError::NotFound("no conference registry wired; enable the mixer fabric".into())
+        })?;
+        let id = reg.create(smiths_mixer::ConferenceConfig::default()).await;
+        Ok(json!({ "conference_id": id.0 }))
+    }
+}
+
+/// `join_conference(conference_id)` — attach a participant.
+///
+/// The RTP-level wiring (binding a participant's media to the
+/// mixer's ingress/egress channels) is the slice-level follow-on
+/// shared with slices 5.1 / 5.3 / 5.4. For now the tool returns the
+/// new participant id so downstream orchestration can track the
+/// attachment; the bridge wiring activates once the FSM refactor
+/// lands.
+pub struct JoinConferenceTool;
+
+#[async_trait]
+impl Tool for JoinConferenceTool {
+    fn name(&self) -> &'static str {
+        "join_conference"
+    }
+
+    fn description(&self) -> &'static str {
+        "Attach a participant to an existing conference. Returns the \
+         participant id. RTP wiring to the mixer's ingress/egress \
+         channels ships with the shared bridge-integration follow-on."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "conference_id": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Id returned by `create_conference`."
+                }
+            },
+            "required": ["conference_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let conf_id = args
+            .get("conference_id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ToolError::InvalidArguments("conference_id required".into()))?;
+        let reg = ctx.conferences.as_ref().ok_or_else(|| {
+            ToolError::NotFound("no conference registry wired; enable the mixer fabric".into())
+        })?;
+        let (pid, _egress) = reg
+            .join(smiths_mixer::ConferenceId(conf_id))
+            .await
+            .map_err(map_conference_error)?;
+        // The egress Receiver is dropped here on purpose: until the
+        // bridge-integration follow-on wires it to an RTP payloader
+        // task, there's no consumer for the frames. Returning the
+        // participant id lets orchestration track the attachment
+        // without plumbing a channel through the control plane.
+        Ok(json!({
+            "conference_id": conf_id,
+            "participant_id": pid.0,
+        }))
+    }
+}
+
+/// `leave_conference(conference_id, participant_id)` — detach a
+/// participant; closes their ingress/egress channels.
+pub struct LeaveConferenceTool;
+
+#[async_trait]
+impl Tool for LeaveConferenceTool {
+    fn name(&self) -> &'static str {
+        "leave_conference"
+    }
+
+    fn description(&self) -> &'static str {
+        "Detach a participant from a conference. Idempotent across \
+         unknown participant ids via a clean `NotFound`."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "conference_id": { "type": "integer", "minimum": 0 },
+                "participant_id": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["conference_id", "participant_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let conf_id = args
+            .get("conference_id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ToolError::InvalidArguments("conference_id required".into()))?;
+        let part_id = args
+            .get("participant_id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ToolError::InvalidArguments("participant_id required".into()))?;
+        let reg = ctx.conferences.as_ref().ok_or_else(|| {
+            ToolError::NotFound("no conference registry wired; enable the mixer fabric".into())
+        })?;
+        reg.leave(
+            smiths_mixer::ConferenceId(conf_id),
+            smiths_mixer::ParticipantId(part_id),
+        )
+        .await
+        .map_err(map_conference_error)?;
+        Ok(json!({
+            "conference_id": conf_id,
+            "participant_id": part_id,
+            "status": "left",
+        }))
+    }
+}
+
+fn map_conference_error(e: smiths_mixer::ConferenceRegistryError) -> ToolError {
+    use smiths_mixer::ConferenceRegistryError as E;
+    match e {
+        E::UnknownConference(id) => ToolError::NotFound(format!("unknown conference: {id}")),
+        E::Conference(c) => match c {
+            smiths_mixer::ConferenceError::UnknownParticipant(p) => {
+                ToolError::NotFound(format!("unknown participant: {p}"))
+            }
+            other => ToolError::Internal(other.to_string()),
+        },
+    }
+}
+
 /// Translate a `CallError` into a `ToolError` the adapters already
 /// know how to wire.
 fn map_call_error(e: smiths_core::call::CallError) -> ToolError {
@@ -1935,13 +2102,16 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 21);
+        assert_eq!(reg.len(), 24);
         for name in [
             "list_calls",
             "get_call_status",
             "health",
             "list_ai_providers",
             "describe_provider",
+            "create_conference",
+            "join_conference",
+            "leave_conference",
             "synthesize",
             "transcribe",
             "llm_chat",

@@ -5,6 +5,78 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.0] - 2026-04-22
+
+Slice 5.5 — N:N audio conferencing. Adds the `smiths-mixer`
+crate with a leave-one-out sum mixer, per-stream AGC, an
+energy-based VAD with hangover, a channel-driven `Conference`
+runtime, a `MixerFabric` that delegates `MediaFabric` operations
+to the UDP fabric while adding conferencing methods, and three
+MCP tools that operate on a shared `ConferenceRegistry`. The core
+audio math is fully unit-tested; a three-participant integration
+test asserts leave-one-out correctness + dominant-speaker pickup.
+
+### Added
+
+- **`smiths-mixer` crate** — new workspace member:
+  - **`Mixer`** — O(N·frame_len) leave-one-out sum. Computes the
+    full N-participant sum into an i32 scratch buffer once, then
+    subtracts each participant's input and clips to i16 for that
+    participant's output. No per-frame allocation.
+  - **`Agc`** — per-stream running-RMS + gain smoothing (attack /
+    release coefficients). Attenuates when the smoothed RMS
+    exceeds `target_rms`; pure attenuator by default
+    (`max_gain = 1.0`), so quiet speech is never boosted.
+  - **`Vad` trait + `EnergyVad` + `NullVad`** — pluggable
+    voice-activity hook. `EnergyVad` is a threshold + hangover
+    detector suitable for dominant-speaker selection;
+    `dominant_speaker(&scores, threshold)` picks the loudest
+    participant above threshold or `None` when the room is silent.
+  - **`Conference`** — N-participant runtime. Per-participant
+    ingress + egress MPSC channels, 20 ms tick task, per-tick
+    VAD observation, and a `dominant` snapshot in
+    `ConferenceStats`. Channel-driven transport so tests exercise
+    the mixer without UDP plumbing.
+  - **`ConferenceRegistry` trait + `InMemoryConferenceRegistry`**
+    — process-wide conference handle manager. Create / join /
+    leave / shutdown / list. MCP tools operate on the trait
+    object.
+  - **`MixerFabric: MediaFabric`** — wraps an existing
+    `UdpMediaFabric`, delegates every `MediaFabric` call, and
+    adds `create_conference` / `join_conference` /
+    `leave_conference` on top.
+- **MCP tools** — three new control-plane operations, registered
+  in `builtin_registry()`:
+  - `create_conference()` — allocates a conference, returns the id.
+  - `join_conference(conference_id)` — attaches a participant,
+    returns the new participant id. The egress `Receiver` is
+    dropped until the shared bridge-integration follow-on wires
+    it to an RTP payloader.
+  - `leave_conference(conference_id, participant_id)` — detaches,
+    closes the participant's channels.
+  - All three return a clean `NotFound` when the operator hasn't
+    wired a `ConferenceRegistry` via
+    `ToolContext::with_conferences`.
+- **Integration test** —
+  `crates/smiths-mixer/tests/three_way_mix.rs`: three
+  participants, each sends a distinct constant-amplitude frame
+  and the test asserts every egress frame is the leave-one-out
+  sum of the other two. A second test proves mid-call departure
+  doesn't wedge the room; a third proves VAD picks the loud
+  speaker as dominant.
+
+### Notes
+
+- **Bridge integration deferred.** Plumbing per-participant RTP
+  sockets into a conference's ingress/egress channels is the
+  same call-FSM refactor slices 5.1 / 5.3 / 5.4 are queued
+  behind. The crate's public surface is ready; the RTP payloader
+  wiring lands with the shared follow-on.
+- **Codec diversity inside one conference** still requires
+  per-participant codec conversion at the edge (the mixer wants
+  PCM16 at a common sample rate); that routes through
+  `smiths-transcode` when the bridge integration lands.
+
 ## [0.51.0] - 2026-04-22
 
 Slice 5.4 — T.38 FAX-over-IP. Adds a UDPTL relay

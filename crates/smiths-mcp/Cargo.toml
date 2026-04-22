@@ -20,6 +20,7 @@ mcp-http3 = []
 [dependencies]
 smiths-core   = { workspace = true }
 smiths-media  = { workspace = true }
+smiths-mixer  = { workspace = true }
 base64        = { workspace = true }
 sha2          = { workspace = true }
 hex           = { workspace = true }
