@@ -5,6 +5,84 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.55.0] - 2026-04-22
+
+Slice 5.7 — WebTransport signaling scaffold. Adds the protocol
+types + listener trait + config surface + browser demo that a
+future QUIC-runtime slice lands behind. Matches the existing
+`mcp-http3` / `sip-quic` scaffold pattern: the config shape and
+wire protocol ship now (testable, round-trippable, operator-
+visible in `--version`), the QUIC runtime follows later.
+
+Takes the v0.55.0 slot previously pre-slotted for slice 5.6c; 5.6c
+cascades one slot forward.
+
+### Added
+
+- **`smiths-sip::webtransport`** module (behind `--features
+  webtransport`). Public surface:
+  - **`WtSignal` enum** — the JSON frame schema: `SessionInit`,
+    `SessionAck`, `Offer`, `Answer`, `IceCandidate`, `IceEnd`,
+    `Bye`, `Error`, `Echo`. `serde(tag = "type", rename_all =
+    "kebab-case")` produces exactly the wire form the browser
+    demo emits. `encode()` / `decode()` surface for the future
+    runtime; `kind()` + `session_id()` accessors for event
+    routing.
+  - **`WtSignalKind`** — the discriminator as a typed enum;
+    `as_str()` produces the kebab-case token for
+    `SipEvent::WebTransportSignal::kind` and for operator log
+    fields.
+  - **`WebTransportListener` trait** — narrow today (`bind`,
+    `shutdown`); a future slice fans it out with session
+    enumeration, per-session send/recv, datagram support.
+  - **`NullWebTransportListener`** — scaffold impl that refuses
+    `bind` with `WtListenError::ScaffoldOnly` and logs a loud
+    "runtime not yet wired" warning so operators discover the
+    deferral immediately.
+  - **`SessionIdAllocator`** — monotonic `WebTransportSessionId`
+    minter the future runtime drops in.
+- **`[webtransport]` config block** (`smiths-core::config::WebTransportConfig`)
+  with `enabled`, `bind` (UDP), `cert_path`, `key_path`. Default
+  picks `127.0.0.1:7880` so accidental enable can't surprise-
+  expose.
+- **`SipEvent::WebTransportSignal`** — typed bus event carrying
+  `session_id` + `kind` (as string, to keep `smiths-core` free of
+  `smiths-sip` types) + `direction` (`"inbound"` / `"outbound"`).
+  Dashboards, audit log, and MCP observability subscribe
+  without needing the `webtransport` Cargo feature.
+- **Browser demo** at `examples/browser-webtransport/` — static
+  HTML + vanilla JS. Faithful rendering of the `WtSignal` wire
+  format a browser author can build against today.
+  `README.md` tabulates every frame shape.
+- **Operator doc** at `docs/deployment/webtransport.md` — scaffold
+  status explicitly, wire protocol diagram, TLS / cert options
+  (incl. Chromium's `serverCertificateHashes` escape hatch), CORS
+  guidance, contrast with SIP-over-WebSocket and slice 5.10
+  WebRTC-native signaling.
+- **11 new unit tests** on the signaling module: round-trips for
+  every variant, optional-field omission, unknown-type decode
+  failure, session-id allocator monotonicity, and the null
+  listener's scaffold error.
+
+### Notes
+
+- **QUIC runtime is deferred.** The listener refuses `bind` with
+  a clear `ScaffoldOnly` error. A follow-on slice picks between
+  `quinn` + `h3-webtransport` vs `wtransport` vs a hand-rolled h3
+  CONNECT path. This slice makes that decision easier by freezing
+  the protocol shape, so the runtime author only has to wire the
+  transport — no design work on the wire format.
+- **5.7 + 5.10 + 5.11 relationship.** 5.7 is the transport
+  substrate, 5.10 is WebRTC-native signaling (JSON-over-WebSocket
+  baseline), 5.11 is privacy hardening on top of both. 5.10's
+  JSON shape can ride over WebSocket today and WebTransport once
+  the runtime lands — the `WtSignal` and 5.10's frames are
+  deliberately alignable.
+- **Takes v0.55.0**. 5.6c (UAS auto-construction + FAX +
+  conferencing wirings) cascades to v0.56.0+; subsequent slices
+  unchanged vs the pre-cascade layout (they were already at
+  v0.56.0+ before).
+
 ## [0.54.0] - 2026-04-22
 
 Slice 5.6b — `TranscodedSession` primitive. Adds the

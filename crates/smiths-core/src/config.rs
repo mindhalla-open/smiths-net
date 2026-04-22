@@ -48,6 +48,12 @@ pub struct Config {
     /// variables; the operator threads them through here for
     /// single-source-of-truth deployments.
     pub ai: AiConfig,
+    /// WebTransport signaling listener (slice 5.7 / P19). Off by
+    /// default — the runtime is a scaffold today, matching the
+    /// `[mcp.http3]` and `[sip] transports = ["quic"]` scaffolds.
+    /// Enabling today + building without `--features webtransport`
+    /// on `smiths-sip` is a config error that surfaces at boot.
+    pub webtransport: WebTransportConfig,
 }
 
 /// `[ai]` TOML block — cloud-provider secrets for the reference
@@ -850,6 +856,50 @@ impl Default for McpHttp3Config {
         Self {
             enabled: false,
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7879),
+        }
+    }
+}
+
+/// `[webtransport]` TOML block — browser-native signaling listener
+/// (slice 5.7 / P19). Today a scaffold: flipping `enabled = true`
+/// with a binary built without `--features webtransport` is a config
+/// error that surfaces at boot; flipping it on *with* the feature
+/// logs a "scaffold-only" warning and refuses to bind until the
+/// runtime follow-on slice lands.
+///
+/// ```toml
+/// [webtransport]
+/// enabled   = true                # requires --features webtransport
+/// bind      = "0.0.0.0:7880"      # UDP (QUIC)
+/// cert_path = "/etc/smiths/wt.crt"
+/// key_path  = "/etc/smiths/wt.key"
+/// ```
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebTransportConfig {
+    /// Enable the WebTransport listener. Ignored when the binary
+    /// was built without `--features webtransport` on `smiths-sip`;
+    /// the CLI logs a clear warning in that case.
+    pub enabled: bool,
+    /// UDP bind for the QUIC listener. Default picks a loopback
+    /// port so accidentally flipping `enabled = true` can't
+    /// surprise-expose anything.
+    pub bind: SocketAddr,
+    /// Path to the TLS certificate (PEM) the listener serves.
+    /// Empty = unconfigured; the runtime rejects bind until the
+    /// operator points at a real cert.
+    pub cert_path: String,
+    /// Path to the matching private key (PEM).
+    pub key_path: String,
+}
+
+impl Default for WebTransportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7880),
+            cert_path: String::new(),
+            key_path: String::new(),
         }
     }
 }

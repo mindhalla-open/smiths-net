@@ -22,6 +22,8 @@ pub mod transport;
 pub mod txn;
 pub mod uac;
 pub mod uas;
+#[cfg(feature = "webtransport")]
+pub mod webtransport;
 
 pub use error::Error;
 pub use rate_limit::SipRateLimiter;
@@ -33,3 +35,7 @@ pub use txn::{
 };
 pub use uac::{UacClient, UacError};
 pub use uas::UasServer;
+#[cfg(feature = "webtransport")]
+pub use webtransport::{
+    NullWebTransportListener, WebTransportListener, WebTransportSessionId, WtSignal, WtSignalKind,
+};

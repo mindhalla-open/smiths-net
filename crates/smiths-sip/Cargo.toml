@@ -25,6 +25,14 @@ auth-http    = ["dep:reqwest", "dep:serde", "dep:serde_json"]
 # operators a supported config shape + `--version` advertisement
 # without silently binding anywhere.
 sip-quic     = []
+# Slice 5.7 / P19: WebTransport signaling scaffold. Off by
+# default. Enables the config surface + `WebTransportListener`
+# trait + signaling protocol types. The actual QUIC runtime
+# (quinn + h3-webtransport) is a follow-on slice — turning the
+# flag on today gives operators a supported config shape and
+# `--version` advertisement without silently binding anywhere.
+# Matches the `sip-quic` + `mcp-http3` scaffold pattern.
+webtransport = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
 smiths-core    = { workspace = true }

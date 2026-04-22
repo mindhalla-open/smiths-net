@@ -58,7 +58,7 @@ pub use config::{
     RecordingBackend, RecordingStoreConfig, SandboxConfig, SeccompPolicy, SipConfig,
     SipProxyConfig, SipRateLimit, SipTransport, SipVpnConfig, SqliteAuthConfig,
     SqliteStorageConfig, StorageBackend, StorageConfig, TranscodeConfig, VectorBackend,
-    VectorStoreConfig, VpnMode,
+    VectorStoreConfig, VpnMode, WebTransportConfig,
 };
 pub use dialog_sessions::DialogSessions;
 pub use drain::Drain;
