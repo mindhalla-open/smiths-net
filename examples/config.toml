@@ -123,6 +123,16 @@ inband_dtmf = false
 root     = ""
 # capacity = 128
 
+# Audio transcoding CPU budget (slice 5.3 / P12). Governs how many
+# simultaneous calls the engine will accept that require codec
+# conversion (Opus ↔ G.711). Calls past the cap get 488 Not
+# Acceptable Here + `Warning: 370 transcode budget exhausted`.
+# Default sizing assumes a 4-core box; raise `max_concurrent_calls`
+# after observing `smiths_transcode_cpu_ms_total` under real traffic.
+[media.transcode]
+max_concurrent_calls   = 40
+cpu_budget_ms_per_call = 50
+
 # Cloud-AI secrets (slice 3.2 / P22). All fields optional — sidecars
 # read their own API keys from environment variables (`OPENAI_API_KEY`,
 # `ANTHROPIC_API_KEY`). This block exists so operators have one

@@ -5,6 +5,77 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.50.0] - 2026-04-21
+
+Slice 5.3 — Audio transcoding + CPU budget. Introduces the
+`smiths-transcode` crate with a `Codec` trait, a shipping G.711
+baseline (μ-law + A-law, bit-exact round-trips), an optional
+Opus ↔ PCM16 path behind the `opus` Cargo feature, and a
+process-wide admission layer that caps simultaneous transcoded
+calls at a configured ceiling. Two metrics (gauge of live
+transcoders + per-codec CPU-ms counter) expose the envelope to
+operators. Live-bridge wiring is explicitly out of scope for
+this slice — see the crate-level doc for the deferral.
+
+### Added
+
+- **`smiths-transcode` crate** — new workspace member. Public
+  surface:
+  - **`Codec` trait** — `encode(&[i16]) -> Vec<u8>` /
+    `decode(&[u8]) -> Vec<i16>`. Synchronous (codec work is pure
+    CPU, no I/O).
+  - **`G711Codec`** — μ-law + A-law variants, 8 kHz. Bit-exact
+    against the ITU-T G.711 reference tables. A-law round-trips
+    byte-identity for every possible input.
+  - **`OpusCodec`** (feature = `opus`) — 48 kHz internal with
+    built-in resampling, VoIP-mode 20 ms frames. Returns a clean
+    `CodecUnavailable` error at construction when the feature is
+    off so the absence surfaces at admission time, not boot.
+  - **`CallTranscoder`** — pairs two codec instances for a
+    single call's two legs, records per-step CPU-ms via the
+    metrics handle, holds the admission `TranscodeLease` until
+    drop.
+  - **`CpuBudget` + `TranscodeLease`** — process-wide CAS-bounded
+    slot counter. `try_admit` returns `AdmissionError::BudgetExhausted`
+    when full; dropping the lease on BYE decrements
+    automatically, so a panicked handler can't leak a slot.
+    The UAS (future slice) maps `BudgetExhausted` to `488 Not
+    Acceptable Here` with `Warning: 370 transcode budget
+    exhausted`.
+- **`TranscodeMetrics`** — three Prometheus metrics registered
+  on the engine's shared `Registry`:
+  - `smiths_transcode_active` — gauge of currently-live
+    transcoders.
+  - `smiths_transcode_cpu_ms_total{codec="..."}` — cumulative
+    CPU-ms per codec (labels: `pcmu`, `pcma`, `opus`, `pcm16`).
+  - `smiths_transcode_admissions_refused_total` — counter of
+    budget-exhausted admissions.
+- **`[media.transcode]` config block** in `smiths-core::config` —
+  `max_concurrent_calls` (default 40) + `cpu_budget_ms_per_call`
+  (default 50, advisory). `From<&TranscodeConfig> for
+  CpuBudgetConfig` bridges the two types without round-tripping
+  through TOML.
+- **Tests** — 12 new tests across unit (`codec` / `budget` /
+  `metrics` / `transcoder`) and integration
+  (`tests/load_cpu_budget.rs` — 40-thread parallel admission
+  stampede proves the cap is strict and every lease returns its
+  slot).
+- **Example config update** — `examples/config.toml` documents
+  the new `[media.transcode]` block with sizing guidance.
+
+### Notes
+
+- **Opus is off by default.** The `opus` crate links a system
+  libopus — most CI images don't have it. `--features opus` on
+  deployments that either install libopus or vendor it separately.
+- **Live bridge integration is explicitly deferred.** Plumbing a
+  `CallTranscoder` into the RTP hot path touches `BridgeConfig`,
+  the per-leg SRTP transforms, and the RTCP stats path — it's
+  the same call-FSM refactor slice 5.1's video dual-bridge
+  follow-on needs, and bundling them keeps the workstream
+  coherent. The primitives + budget + metrics land here; the
+  wiring lands alongside the 5.1 video work.
+
 ## [0.49.0] - 2026-04-22
 
 Slice 5.2 — FlatBuffers plugin wire format. Two formats now

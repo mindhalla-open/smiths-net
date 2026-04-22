@@ -6,7 +6,7 @@ exclude  = ["fuzz"]
 [workspace.package]
 edition      = "2024"
 rust-version = "1.85"
-version      = "0.49.0"
+version      = "0.50.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
@@ -144,19 +144,20 @@ rusqlite = { version = "0.39.0", features = ["bundled"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "json"] }
 
 # internal crates
-smiths-core    = { path = "crates/smiths-core" }
-smiths-proto   = { path = "crates/smiths-proto" }
-smiths-sip     = { path = "crates/smiths-sip" }
-smiths-sdp     = { path = "crates/smiths-sdp" }
-smiths-dtls    = { path = "crates/smiths-dtls" }
-smiths-ice     = { path = "crates/smiths-ice" }
-smiths-media   = { path = "crates/smiths-media" }
-smiths-plugin  = { path = "crates/smiths-plugin" }
-smiths-wasm    = { path = "crates/smiths-wasm" }
-smiths-script  = { path = "crates/smiths-script" }
-smiths-sidecar = { path = "crates/smiths-sidecar" }
-smiths-mcp     = { path = "crates/smiths-mcp" }
-smiths-testkit = { path = "crates/smiths-testkit" }
+smiths-core      = { path = "crates/smiths-core" }
+smiths-proto     = { path = "crates/smiths-proto" }
+smiths-sip       = { path = "crates/smiths-sip" }
+smiths-sdp       = { path = "crates/smiths-sdp" }
+smiths-dtls      = { path = "crates/smiths-dtls" }
+smiths-ice       = { path = "crates/smiths-ice" }
+smiths-media     = { path = "crates/smiths-media" }
+smiths-plugin    = { path = "crates/smiths-plugin" }
+smiths-wasm      = { path = "crates/smiths-wasm" }
+smiths-script    = { path = "crates/smiths-script" }
+smiths-sidecar   = { path = "crates/smiths-sidecar" }
+smiths-mcp       = { path = "crates/smiths-mcp" }
+smiths-testkit   = { path = "crates/smiths-testkit" }
+smiths-transcode = { path = "crates/smiths-transcode" }
 
 # Embedded DSL (slice 4.1 / P24). Rhai is a tiny scripting language
 # designed for embedding into Rust hosts — no unsafe, no FFI, a

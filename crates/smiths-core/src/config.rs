@@ -98,6 +98,46 @@ pub struct MediaConfig {
     /// `record_prompt` MCP tool returns `NotFound` — operators
     /// opt in by setting a concrete directory.
     pub prompts: PromptsConfig,
+    /// Audio transcoding CPU budget + admission control (slice 5.3).
+    /// Governs how many simultaneous calls the engine will accept
+    /// that require codec conversion (today: `Opus ↔ G.711`).
+    pub transcode: TranscodeConfig,
+}
+
+/// `[media.transcode]` TOML block — CPU budget + admission control
+/// for audio transcoding (slice 5.3).
+///
+/// ```toml
+/// [media.transcode]
+/// max_concurrent_calls  = 40    # 0 or unset = built-in default
+/// cpu_budget_ms_per_call = 50   # advisory; SLO not hard cap
+/// ```
+///
+/// Defaults target a 4-core box with ~2.5 % CPU per Opus call —
+/// raise `max_concurrent_calls` after observing the
+/// `smiths_transcode_cpu_ms_total` counter under real traffic.
+/// See `docs/architecture/11-transcoding.md` for sizing guidance.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TranscodeConfig {
+    /// Hard cap on simultaneous transcoded calls. INVITEs past this
+    /// cap receive a `488 Not Acceptable Here` with
+    /// `Warning: 370 transcode budget exhausted`. Default: 40.
+    pub max_concurrent_calls: usize,
+    /// Advisory per-call CPU-ms budget. Drives the
+    /// `smiths_transcode_cpu_ms_total` alerting threshold but is
+    /// *not* enforced per-frame — the bridge doesn't hard-preempt a
+    /// live transcoder. Default: 50.
+    pub cpu_budget_ms_per_call: u64,
+}
+
+impl Default for TranscodeConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_calls: 40,
+            cpu_budget_ms_per_call: 50,
+        }
+    }
 }
 
 /// `[media.prompts]` — IVR prompt-library settings.

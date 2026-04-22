@@ -56,7 +56,8 @@ pub use config::{
     MediaConfig, ObservabilityConfig, PluginsConfig, PromptsConfig, ProxyMode, RateLimitConfig,
     RecordingBackend, RecordingStoreConfig, SandboxConfig, SeccompPolicy, SipConfig,
     SipProxyConfig, SipRateLimit, SipTransport, SipVpnConfig, SqliteAuthConfig,
-    SqliteStorageConfig, StorageBackend, StorageConfig, VectorBackend, VectorStoreConfig, VpnMode,
+    SqliteStorageConfig, StorageBackend, StorageConfig, TranscodeConfig, VectorBackend,
+    VectorStoreConfig, VpnMode,
 };
 pub use drain::Drain;
 pub use dtls::{DtlsCertError, SelfSignedCert};
