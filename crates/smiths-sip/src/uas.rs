@@ -906,6 +906,15 @@ impl<T: Transport> UasServer<T> {
                         // destructure exhaustive.
                         video_media: _video_media,
                         srtp,
+                        // Slice 5.10-dtls: DTLS-SRTP parameters surface
+                        // here when the SIP offer used the WebRTC
+                        // transport profile. The SIP UAS proper
+                        // doesn't drive the DTLS handshake today —
+                        // the WebRTC-native adapter (5.10-bridge) is
+                        // the consumer; SIP-side handshake wiring is
+                        // a dedicated follow-on. Bound so the
+                        // destructure stays exhaustive.
+                        dtls: _dtls,
                         // Slice 5.6: per-leg codec goes into
                         // DialogRecord.per_leg_codec so the
                         // transcoding router (5.6b) can compare legs.

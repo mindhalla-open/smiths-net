@@ -43,6 +43,10 @@ smiths-media       = { workspace = true }
 smiths-mcp         = { workspace = true }
 smiths-plugin      = { workspace = true }
 smiths-transcode   = { workspace = true }
+# Slice 5.10-dtls: thread `DtlsLegConfig` + `DtlsRole` into the
+# handler so the WebRTC adapter can drive the fabric's
+# handshake off the negotiator's `DtlsParams`.
+smiths-dtls        = { workspace = true }
 tokio              = { workspace = true }
 tokio-util         = { workspace = true }
 axum               = { workspace = true, features = ["ws"] }

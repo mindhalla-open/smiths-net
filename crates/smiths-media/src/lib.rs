@@ -10,6 +10,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod bridge;
+pub mod dtls;
 pub mod fabric;
 #[cfg(feature = "pcap")]
 pub mod pcap;
@@ -21,6 +22,7 @@ pub mod srtp;
 pub mod transcoded;
 
 pub use bridge::{Bridge, BridgeConfig, DtmfSink, Leg, RtcpLeg};
+pub use dtls::{HandshakeOutcome, HandshakeResult, PeerBoundUdp, classify_error};
 pub use fabric::UdpMediaFabric;
 pub use port_allocator::{PortPair, allocate_rtp_rtcp_pair};
 pub use prompts::{Prompt, PromptError, PromptLibrary, encode_wav};

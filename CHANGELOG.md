@@ -5,6 +5,197 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.67.0] - 2026-04-23
+
+**WebRTC runtime — DTLS-SRTP terminator + tag-based rendezvous
+bridge.** Closes both 5.10 follow-on sub-slices in one release
+because they're load-bearing for each other: the bridge
+installer needs SRTP keys (which come from the DTLS handshake)
+and the DTLS handshake only makes sense paired with a bridge
+install (otherwise the handshake completes into nothing).
+Browsers offering `UDP/TLS/RTP/SAVP[F]` now receive a real
+answer carrying the engine's fingerprint, complete the
+handshake over the fabric's UDP endpoint, and pair with a
+second leg sharing the same `tag` into a live bridge — audio
+starts flowing the moment both sides' answers are out.
+
+### Added — 5.10-dtls: DTLS-SRTP terminator
+
+- **`DtlsParams` + `DtlsRole`** in `smiths_core::sdp` — new
+  shapes carried on `NegotiationOutcome::Accepted.dtls`.
+  `DtlsParams` surfaces the peer's fingerprint algorithm +
+  value and the role the engine plays during the handshake
+  (`Client` = `active`, `Server` = `passive`). Handedness
+  matches RFC 5763 §5: offer `actpass` / `passive` →
+  answer `active`; offer `active` → answer `passive`.
+- **`Negotiator::with_dtls_cert(Arc<SelfSignedCert>)`** —
+  attaches a DTLS-SRTP identity. When present, the
+  negotiator accepts `UDP/TLS/RTP/SAVP` +
+  `UDP/TLS/RTP/SAVPF` offers and emits an answer with:
+  - `a=fingerprint:sha-256 <cert hash>` in RFC 8122 form,
+  - `a=setup:<reverse role>`,
+  - the DTLS-SRTP profile echoed on the `m=audio` line.
+
+  Without a cert the negotiator returns
+  `UnsupportedTransport("DTLS-SRTP transport offered but
+  engine has no cert configured")` so operators see a clear
+  reason rather than a silent drop.
+- **`smiths-media::dtls` module**:
+  - `PeerBoundUdp` — minimal `webrtc_util::conn::Conn`
+    adapter around `Arc<UdpSocket>`. Pins a peer address
+    for the handshake's duration. Reads drop datagrams
+    from any other source; writes target the pinned peer.
+    **Never calls `connect()`** so the bridge continues
+    `send_to` / `recv_from` after the handshake without
+    re-association.
+  - `HandshakeOutcome` + `classify_error` — stable
+    `{success, fingerprint_mismatch,
+    unsupported_algorithm, cert_load, other}` vocabulary
+    the metrics counter uses, independent of
+    webrtc-dtls's internal error enum.
+- **`UdpMediaFabric::run_dtls_handshake(endpoint, peer,
+  leg_cfg)`** — concrete helper on the fabric. Wraps the
+  endpoint's socket in `PeerBoundUdp`, drives
+  `smiths_dtls::DtlsLeg::handshake`, returns SRTP keying
+  material. Errors are classified + logged; the CLI
+  handler then logs the offer's `o=` origin line so
+  operators can correlate metric spikes with the peer's
+  SDP in logs. `smiths_webrtc_dtls_handshakes_total{outcome}`
+  bumps exactly once per attempt.
+- **Bug fix in `smiths-dtls::DtlsLeg::load_cert`** — the
+  PEM bundle ordering / tagging didn't match
+  webrtc-dtls 0.12's `Certificate::from_pem` contract
+  (expects `PRIVATE_KEY` with underscore first, then
+  `CERTIFICATE`). Prior code emitted `CERTIFICATE` first
+  and `PRIVATE KEY` with a space. Caught by the new
+  integration test — no downstream consumer had ever
+  run a full handshake against the library until this
+  slice.
+
+### Added — 5.10-bridge: tag-based rendezvous + bridge install
+
+- **`WebRtcSessionHandler::handle_offer_tagged`** — new
+  trait method that forwards the session's optional
+  `tag` from `session-init`. Default impl discards the
+  tag and calls `handle_offer`, so downstream handlers
+  stay source-compatible. `WebSocketSignalingListener::handle_frame`
+  now routes offers through the tagged variant.
+- **`CliWebRtcHandler` rewrite**:
+  - Owns `Arc<UdpMediaFabric>` + optional
+    `Arc<SelfSignedCert>` — allocates endpoints, drives
+    the handshake, installs the bridge.
+  - `pending: DashMap<String, PendingLeg>` keyed by
+    `tag`. First leg with tag `X` parks
+    `{session_id, endpoint, peer, srtp, evictor}` and
+    returns its answer. Second leg with tag `X` pulls
+    the partner out, calls `MediaFabric::bridge`,
+    records the `BridgeId` under both sessions, and
+    returns its own answer.
+  - `active: DashMap<WebTransportSessionId, BridgeId>` —
+    `handle_bye` idempotently releases the bridge and
+    reclaims whichever half of the pair is still
+    parked.
+  - Deadline evictor — `tokio::spawn` per parked leg,
+    fires after `DEFAULT_RENDEZVOUS_DEADLINE` (30 s),
+    releases the endpoint, bumps
+    `smiths_webrtc_sessions_paired_total{partner="none"}`.
+    Paired partners abort their own evictor before the
+    bridge install runs.
+- **CLI main wiring** — mints a fresh
+  `SelfSignedCert::generate` at engine boot; a
+  dedicated `UdpMediaFabric` for the WebRTC adapter (so
+  its endpoint pool doesn't share with SIP); threads
+  both through the handler via `.with_dtls_cert()` +
+  `.with_metrics()`. Cert-mint failures log a warning
+  and disable DTLS-SRTP without stopping the engine.
+
+### Added — metrics
+
+- **`smiths_webrtc_dtls_handshakes_total{outcome}`** —
+  counter per fabric handshake attempt. Bounded label
+  vocabulary: `success` /
+  `fingerprint_mismatch` / `unsupported_algorithm` /
+  `cert_load` / `other`.
+- **`smiths_webrtc_sessions_paired_total{partner}`** —
+  counter per bridge install / eviction. `partner` is
+  `sip` / `webrtc` / `none`. A rising `none` slope
+  alerts on orphaned legs.
+
+### Added — docs
+
+- **`docs/deployment/webrtc.md`** — dropped the
+  "DTLS not supported" caveat. New sections:
+  - "DTLS-SRTP" — role negotiation table, handshake-
+    timeout tuning rationale, fingerprint-algorithm
+    policy.
+  - "Tag-based rendezvous" — semantics, deadline,
+    per-partner metric.
+  - Troubleshooting rows for the new metric families
+    and the "missing fingerprint" offer-reject path.
+- **`docs/operator-runbook.md` "WebRTC tag-based
+  rendezvous"** — pairing semantics, deadline, and
+  diagnostic runbook.
+
+### Added — tests
+
+- **`smiths-sdp::negotiate::tests`** — five new DTLS
+  accept-path cases: answer shape for `actpass` /
+  `passive` / `active` offers, without-cert rejection,
+  missing-fingerprint rejection, and a trait-surface
+  round-trip through `SdpNegotiator`.
+- **`smiths-media/tests/dtls_handshake.rs`** —
+  end-to-end DTLS between two loopback fabrics:
+  - `loopback_handshake_derives_mirror_srtp_keys` —
+    real `DTLSConn` exchange; asserts client's
+    `local_tx` == server's `peer_tx` per RFC 5764
+    §4.2 and the `success` counter bumps twice.
+  - `fingerprint_mismatch_counts_against_the_fingerprint_bucket`
+    — client advertises a decoy fingerprint, verifies
+    the rejection lands on the
+    `fingerprint_mismatch` bucket.
+- **`smiths-cli/src/webrtc.rs::tests`** — two pairing
+  tests:
+  - `two_webrtc_legs_with_same_tag_pair_and_bridge` —
+    first leg parks, second installs the bridge, both
+    sessions point at the same `BridgeId`, metric
+    credited to `partner="webrtc"`, `bye` from either
+    side releases.
+  - `unpaired_leg_is_evicted_after_deadline` — 80 ms
+    deadline; evictor drops the endpoint and credits
+    `partner="none"`.
+
+### Changed
+
+- **`NegotiationResult::Answer`** gains a `dtls:
+  Option<DtlsParams>` field. Downstream destructures
+  in `smiths-sip::uas` + the CLI handler updated to
+  match; tests that used the old 2-field pattern now
+  use `..`.
+- **`smiths-sip::webrtc::WebRtcSessionHandler`** gains
+  `handle_offer_tagged` with a default impl. Existing
+  handlers compile unchanged.
+- **Workspace** — `smiths-media` now depends on
+  `smiths-dtls` + `smiths-sdp` + `webrtc-util`;
+  `smiths-cli` depends on `smiths-dtls` for the
+  `DtlsLegConfig` / `DtlsRole` types the handler
+  passes into the fabric.
+
+### Notes
+
+- **No ICE yet.** The DTLS handshake trusts the peer
+  address in the offer's `c=` / `m=` block — works for
+  loopback, same-subnet, and the browser demo through
+  localhost. Real NATs need ICE; slice 5.10-ice /
+  5.11-turn close the gap.
+- **SIP → rendezvous is half-wired.** Two WebRTC legs
+  sharing a tag pair end-to-end today. A SIP INVITE
+  carrying the same tag (in a SIP header) joining the
+  same map is a dedicated follow-on.
+- **One cert per engine process.** Rotation = restart.
+  Per-call cert rotation (and caching the DTLS
+  connection across renegotiations) is not in scope
+  for this slice.
+
 ## [0.66.0] - 2026-04-23
 
 **Live config reload — full path from file to subsystem.**

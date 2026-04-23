@@ -6,7 +6,7 @@ exclude  = ["fuzz"]
 [workspace.package]
 edition      = "2024"
 rust-version = "1.95"
-version      = "0.66.0"
+version      = "0.67.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]

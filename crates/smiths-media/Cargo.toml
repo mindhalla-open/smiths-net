@@ -16,6 +16,8 @@ pcap = []
 
 [dependencies]
 smiths-core      = { workspace = true }
+smiths-dtls      = { workspace = true }
+smiths-sdp       = { workspace = true }
 smiths-transcode = { workspace = true }
 tokio            = { workspace = true }
 tokio-util  = { workspace = true }
@@ -24,10 +26,19 @@ dashmap     = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 webrtc-srtp = { workspace = true }
+# Slice 5.10-dtls: a peer-bound `Conn` adapter around the fabric's
+# UDP socket. Re-use the transitive version `webrtc-dtls` already
+# pins so there's no duplicate webrtc-util in the graph.
+webrtc-util = "0.11"
 
 [dev-dependencies]
-tokio    = { workspace = true, features = ["macros", "test-util"] }
-tempfile = { workspace = true }
+tokio             = { workspace = true, features = ["macros", "test-util"] }
+tempfile          = { workspace = true }
+# Slice 5.10-dtls end-to-end tests need live DTLS leg pairs +
+# a Prometheus registry to verify the outcome-label counters.
+smiths-dtls       = { workspace = true }
+smiths-sdp        = { workspace = true }
+prometheus-client = { workspace = true }
 
 [lints]
 workspace = true

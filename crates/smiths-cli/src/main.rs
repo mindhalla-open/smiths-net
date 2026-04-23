@@ -897,29 +897,52 @@ async fn main() -> anyhow::Result<()> {
     // [webrtc] ws_bind and routes /smiths/webrtc upgrades through
     // the CLI-side WebRtcSessionHandler → SdpNegotiator chain.
     //
-    // Honest-deferral notes: DTLS-SRTP termination + SIP ⇄ WebRTC
-    // bridge-install are follow-on slices (see
-    // .vscode/implementation-slices.md). Real browsers therefore
-    // receive `offer-rejected: DTLS-SRTP not yet supported` — the
-    // signaling path is complete; the media path isn't. See
-    // docs/deployment/webrtc.md.
+    // Slice 5.10-dtls + 5.10-bridge: the handler owns a
+    // fresh DTLS-SRTP cert minted at boot + the shared media
+    // fabric, so DTLS-SRTP offers complete a real handshake and
+    // paired sessions (via their `tag`) get a live `MediaFabric::bridge`.
+    // ICE / NAT traversal is still a follow-on — peer address
+    // comes from the offer's `c=` line.
     if config.webrtc.enabled {
         let bind = config.webrtc.ws_bind;
+        // One cert per engine instance, minted at boot. The
+        // fingerprint lands in every DTLS-SRTP answer we emit;
+        // rotation = engine restart.
+        let webrtc_dtls_cert = match smiths_core::SelfSignedCert::generate("smiths-net-webrtc") {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                warn!(
+                    ?e,
+                    "minting WebRTC DTLS cert failed; DTLS-SRTP offers will be rejected"
+                );
+                None
+            }
+        };
+        // Share the CLI-wide media fabric so the WebRTC leg can
+        // pair with a SIP INVITE through the same `MediaFabric::bridge`
+        // install (follow-on slices wire the SIP → rendezvous
+        // path; today WebRTC ↔ WebRTC pairing via tag works end-to-end).
+        let webrtc_fabric: Arc<UdpMediaFabric> =
+            Arc::new(UdpMediaFabric::new().with_metrics(Arc::clone(&metrics)));
         // Own negotiator instance — the CLI's SIP binds build their
         // own, no sharing required; local_ip is what we publish in
         // the SDP answer's c= line, so using ws_bind.ip() gives the
         // browser an address that reached us in the first place.
-        let negotiator: Arc<dyn SdpNegotiator> =
-            Arc::new(Negotiator::with_default_codecs(bind.ip()));
+        let mut negotiator_builder = Negotiator::with_default_codecs(bind.ip());
+        if let Some(cert) = webrtc_dtls_cert.as_ref() {
+            negotiator_builder = negotiator_builder.with_dtls_cert(Arc::clone(cert));
+        }
+        let negotiator: Arc<dyn SdpNegotiator> = Arc::new(negotiator_builder);
         // Port range: carve a fixed 1000-port slice starting at
         // 50_000. Far enough from the default SIP media range to
         // avoid collisions; a configurable surface is a follow-on.
-        let handler = Arc::new(webrtc::CliWebRtcHandler::new(
-            negotiator,
-            bind.ip(),
-            50_000,
-            1_000,
-        ));
+        let mut handler =
+            webrtc::CliWebRtcHandler::new(negotiator, webrtc_fabric, bind.ip(), 50_000, 1_000)
+                .with_metrics(Arc::clone(&metrics));
+        if let Some(cert) = webrtc_dtls_cert.as_ref() {
+            handler = handler.with_dtls_cert(Arc::clone(cert));
+        }
+        let handler = Arc::new(handler);
         let cancel = shutdown.token();
         adapter_handles.push(tokio::spawn(async move {
             if let Err(e) = webrtc::serve_webrtc(bind, handler, cancel).await {

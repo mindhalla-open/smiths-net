@@ -233,6 +233,19 @@ pub struct Metrics {
     /// if both probes cross at the same tick only the one that
     /// wins the rollback races is credited.
     pub config_probe_triggered: Family<ConfigProbeLabel, Counter>,
+    /// `smiths_webrtc_dtls_handshakes_total{outcome}` —
+    /// counter of DTLS-SRTP handshakes the media fabric ran
+    /// for a WebRTC leg, keyed by outcome. Incremented exactly
+    /// once per handshake attempt — regardless of whether the
+    /// SDP answer already made it out. Operators watch the
+    /// `success`-vs-total ratio as the health signal for the
+    /// DTLS terminator.
+    pub webrtc_dtls_handshakes: Family<WebRtcDtlsOutcomeLabel, Counter>,
+    /// `smiths_webrtc_sessions_paired_total{partner}` —
+    /// counter of WebRTC legs that successfully joined a
+    /// bridge via the rendezvous map (slice 5.10-bridge),
+    /// keyed by the partner leg's type.
+    pub webrtc_sessions_paired: Family<WebRtcPartnerLabel, Counter>,
 }
 
 /// `{field}` label on `smiths_config_reloaded_fields_total`.
@@ -261,6 +274,32 @@ pub struct ConfigRollbackLabel {
 pub struct ConfigProbeLabel {
     /// Which probe fired.
     pub probe: String,
+}
+
+/// `{outcome}` label on `smiths_webrtc_dtls_handshakes_total`
+/// (slice 5.10-dtls). Bounded vocabulary: `"success"`,
+/// `"peer_timeout"`, `"fingerprint_mismatch"`,
+/// `"cert_load_failed"`, `"other"`. Distinguished from the
+/// handshake's underlying `webrtc-dtls` error enum so
+/// dashboards stay stable when the library classifies a new
+/// edge.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct WebRtcDtlsOutcomeLabel {
+    /// Wire token — see the per-value comments on
+    /// `Metrics::webrtc_dtls_handshakes`.
+    pub outcome: String,
+}
+
+/// `{partner}` label on `smiths_webrtc_sessions_paired_total`
+/// (slice 5.10-bridge). `"sip"` — the other leg is a SIP
+/// dialog bridged to this WebRTC session. `"webrtc"` — peer
+/// is another WebRTC leg via the same handler. `"none"` —
+/// reserved for the deadline-evicted case; bumped when an
+/// unpaired leg ages past `[webrtc] rendezvous_deadline_s`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct WebRtcPartnerLabel {
+    /// Wire token.
+    pub partner: String,
 }
 
 impl Metrics {
@@ -297,6 +336,8 @@ impl Metrics {
         let config_rollbacks = Family::<ConfigRollbackLabel, Counter>::default();
         let config_reloaded_fields = Family::<ConfigFieldLabel, Counter>::default();
         let config_probe_triggered = Family::<ConfigProbeLabel, Counter>::default();
+        let webrtc_dtls_handshakes = Family::<WebRtcDtlsOutcomeLabel, Counter>::default();
+        let webrtc_sessions_paired = Family::<WebRtcPartnerLabel, Counter>::default();
 
         registry.register(
             "sip_requests",
@@ -415,6 +456,16 @@ impl Metrics {
             "Error-rate probe trips, keyed by probe name (slice 5.9).",
             config_probe_triggered.clone(),
         );
+        registry.register(
+            "smiths_webrtc_dtls_handshakes",
+            "DTLS-SRTP handshakes driven by the WebRTC media fabric, keyed by outcome (slice 5.10-dtls).",
+            webrtc_dtls_handshakes.clone(),
+        );
+        registry.register(
+            "smiths_webrtc_sessions_paired",
+            "WebRTC legs that completed the tag-based rendezvous, keyed by partner kind (slice 5.10-bridge).",
+            webrtc_sessions_paired.clone(),
+        );
 
         Arc::new(Self {
             sip_requests,
@@ -442,6 +493,8 @@ impl Metrics {
             config_rollbacks,
             config_reloaded_fields,
             config_probe_triggered,
+            webrtc_dtls_handshakes,
+            webrtc_sessions_paired,
         })
     }
 

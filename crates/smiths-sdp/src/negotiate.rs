@@ -12,14 +12,17 @@
 //! or `m=video 0 ...` to decline (RFC 3264 §6 port-zero).
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use rand::Rng as _;
 use smiths_core::SrtpSuite;
-use smiths_core::sdp::{NegotiationOutcome, SdpNegotiator, SrtpKeys};
+use smiths_core::sdp::{DtlsParams, DtlsRole, NegotiationOutcome, SdpNegotiator, SrtpKeys};
+use smiths_core::{Metrics, SelfSignedCert};
 
 use crate::srtp_attr::SdesCrypto;
 use crate::types::{
-    ConnectionInfo, MediaDescription, MediaKind, Origin, RtpMap, SessionDescription,
+    ConnectionInfo, DtlsSetup, Fingerprint, MediaDescription, MediaKind, Origin, RtpMap,
+    SessionDescription,
 };
 
 /// Generate fresh SDES key material for `suite` using the OS CSPRNG.
@@ -35,7 +38,14 @@ pub fn fresh_sdes_key(suite: SrtpSuite) -> Vec<u8> {
 }
 
 /// Outcome of running offer/answer.
+///
+/// Same size-disparity story as
+/// [`smiths_core::NegotiationOutcome`] — `Answer` dominates,
+/// boxing would cascade through every destructuring caller, and
+/// the negotiator fires at most once per INVITE. The `allow`
+/// stays narrow.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum NegotiationResult {
     /// Offer accepted; the engine's answer is ready to send.
     Answer {
@@ -44,12 +54,23 @@ pub enum NegotiationResult {
         /// SRTP keying material, when the offer was `RTP/SAVP` with a
         /// supported `a=crypto:`. `None` for plain `RTP/AVP`.
         srtp: Option<SrtpKeys>,
+        /// DTLS-SRTP parameters (slice 5.10-dtls). `Some` when the
+        /// offer used `UDP/TLS/RTP/SAVP[F]` and the engine had a
+        /// configured cert. The caller runs the DTLS handshake
+        /// to derive SRTP keys; this field surfaces the
+        /// peer-fingerprint + resolved role.
+        dtls: Option<DtlsParams>,
     },
     /// No codec in the offer intersected with the engine's supported
     /// list — caller should reply with `488 Not Acceptable Here`. MVP
     /// guardrail: a future `smiths-transcode` crate can branch on this
     /// instead of failing the call.
     Mismatch,
+    /// Transport profile recognized but unsupported (today:
+    /// `UDP/TLS/RTP/SAVP[F]` without a configured cert). Carries a
+    /// short human-readable reason for the answerer to include in
+    /// the SIP `Warning:` header.
+    UnsupportedTransport(String),
 }
 
 /// Engine-side negotiator.
@@ -67,6 +88,18 @@ pub struct Negotiator {
     /// echoes the offerer's PT so downstream B2BUAs stay happy.
     /// Passthrough only — no decode, no transcoding.
     pub supported_video: Vec<RtpMap>,
+    /// Optional DTLS-SRTP identity (slice 5.10-dtls). When
+    /// present, offers using the `UDP/TLS/RTP/SAVP[F]` transport
+    /// profile are accepted and the answer carries the cert's
+    /// fingerprint + a role complementary to the offer's
+    /// `a=setup:`. `None` = DTLS-SRTP offers are rejected with
+    /// [`NegotiationResult::UnsupportedTransport`].
+    pub dtls_cert: Option<Arc<SelfSignedCert>>,
+    /// Optional metrics handle. When present, every DTLS-SRTP
+    /// negotiation path bumps a counter on the answer's outcome
+    /// so operators see the answer-side signal — distinct from
+    /// the handshake-side metric the media fabric records.
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 impl Negotiator {
@@ -119,7 +152,27 @@ impl Negotiator {
                     channels: None,
                 },
             ],
+            dtls_cert: None,
+            metrics: None,
         }
+    }
+
+    /// Attach a DTLS-SRTP identity (slice 5.10-dtls). Offers
+    /// using the `UDP/TLS/RTP/SAVP[F]` transport profile are
+    /// accepted only when a cert is present; without one the
+    /// negotiator falls back to the pre-5.10 rejection path.
+    #[must_use]
+    pub fn with_dtls_cert(mut self, cert: Arc<SelfSignedCert>) -> Self {
+        self.dtls_cert = Some(cert);
+        self
+    }
+
+    /// Attach the engine's metrics handle so DTLS-SRTP
+    /// negotiation outcomes bump `smiths_webrtc_dtls_negotiations_total`.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Produce an audio-only answer to `offer`, publishing
@@ -137,6 +190,12 @@ impl Negotiator {
     /// are rejected as [`NegotiationResult::Mismatch`] — this mirrors
     /// RFC 4568 §5.1.2: a SAVP responder must not proceed unprotected.
     #[must_use]
+    // Three transport-profile branches (plain / SDES / DTLS-SRTP)
+    // each contribute a handful of lines that are cheaper to read
+    // inline than factored out behind a helper — extracting them
+    // would force the caller to reassemble the `MediaDescription`
+    // from separate pieces without clarifying anything.
+    #[allow(clippy::too_many_lines)]
     pub fn answer(&self, offer: &SessionDescription, local_port: u16) -> NegotiationResult {
         let Some(audio) = offer.media.iter().find(|m| m.kind == MediaKind::Audio) else {
             return NegotiationResult::Mismatch;
@@ -167,18 +226,68 @@ impl Negotiator {
             return NegotiationResult::Mismatch;
         };
 
-        // --- SDES handling -------------------------------------------
+        // --- Transport-profile branching -----------------------------
         //
-        // RFC 4568 §5.1: when the offer's transport is `RTP/SAVP`
-        // (or an `RTP/SAVP`-equivalent profile), the answer **must**
-        // be `RTP/SAVP` and **must** include an `a=crypto:` matching
-        // one of the offered tags. Transports without SAVP ignore any
-        // stray `a=crypto:` lines.
+        // Three profiles are observable on the offer today:
+        // - `RTP/AVP` — plain, no SRTP.
+        // - `RTP/SAVP` — SDES-negotiated SRTP (RFC 4568).
+        // - `UDP/TLS/RTP/SAVP[F]` — DTLS-SRTP (RFC 5764); keys
+        //   come from the handshake, not from the SDP.
+        //
+        // The three return types differ: SDES emits `a=crypto:`
+        // and surfaces `SrtpKeys`; DTLS-SRTP emits `a=fingerprint`
+        // + `a=setup:` and surfaces `DtlsParams`; plain RTP
+        // leaves both empty.
+        let is_dtls = is_dtls_srtp_profile(&audio.protocol);
         let is_savp = audio.protocol.eq_ignore_ascii_case("RTP/SAVP");
-        let (answer_crypto, srtp_keys) = if is_savp {
-            // First offer line whose suite we support wins. `SdesCrypto::parse`
-            // already rejects suites we don't know, so every parsed
-            // entry is already a candidate.
+
+        let mut answer_crypto: Vec<SdesCrypto> = Vec::new();
+        let mut srtp_keys: Option<SrtpKeys> = None;
+        let mut answer_fingerprint: Option<Fingerprint> = None;
+        let mut answer_setup: Option<DtlsSetup> = None;
+        let mut dtls_params: Option<DtlsParams> = None;
+
+        if is_dtls {
+            // Slice 5.10-dtls: accept the DTLS-SRTP offer. Requires
+            // a cert to be configured; without one, surface
+            // `UnsupportedTransport` so the handler can explain the
+            // limitation to the peer.
+            let Some(cert) = self.dtls_cert.as_ref() else {
+                return NegotiationResult::UnsupportedTransport(
+                    "DTLS-SRTP transport offered but engine has no cert configured".into(),
+                );
+            };
+            let Some(peer_fp) = audio.fingerprint.as_ref() else {
+                return NegotiationResult::UnsupportedTransport(
+                    "DTLS-SRTP offer missing a=fingerprint".into(),
+                );
+            };
+            // RFC 5763 §5: answer's setup role is the
+            // complement of the offer's. `actpass` / `passive` →
+            // we pick `active` (we send ClientHello); `active` →
+            // we're `passive`.
+            let offer_setup = audio.setup.unwrap_or(DtlsSetup::ActPass);
+            let local_setup = offer_setup.reverse();
+            let role = match local_setup {
+                DtlsSetup::Passive => DtlsRole::Server,
+                // `ActPass` / `HoldConn` never appear as an
+                // answer setup per `DtlsSetup::reverse`.
+                _ => DtlsRole::Client,
+            };
+            answer_fingerprint = Some(Fingerprint {
+                algorithm: "sha-256".into(),
+                value: cert.sha256_fingerprint.clone(),
+            });
+            answer_setup = Some(local_setup);
+            dtls_params = Some(DtlsParams {
+                peer_fingerprint_algorithm: peer_fp.algorithm.clone(),
+                peer_fingerprint_value: peer_fp.value.clone(),
+                local_role: role,
+            });
+        } else if is_savp {
+            // RFC 4568 §5.1: SDES responder emits matching
+            // `a=crypto:`, surfaces both halves of the key
+            // material.
             let Some(offer_crypto) = audio.crypto.first() else {
                 // SAVP without any acceptable crypto → 488 per §5.1.2.
                 return NegotiationResult::Mismatch;
@@ -190,15 +299,13 @@ impl Negotiator {
                 suite,
                 key_material: local_km.clone(),
             };
-            let keys = SrtpKeys {
+            answer_crypto.push(answer_line);
+            srtp_keys = Some(SrtpKeys {
                 suite,
                 peer_tx_key: offer_crypto.key_material.clone(),
                 local_tx_key: local_km,
-            };
-            (vec![answer_line], Some(keys))
-        } else {
-            (Vec::new(), None)
-        };
+            });
+        }
 
         let answer_media = MediaDescription {
             kind: MediaKind::Audio,
@@ -209,10 +316,9 @@ impl Negotiator {
             crypto: answer_crypto,
             direction: audio.direction.reverse(),
             connection: None,
-            // Engine doesn't emit DTLS-SRTP / ICE attrs yet — slice 1.3
-            // wires fingerprint + setup; 1.4 wires ICE.
-            fingerprint: None,
-            setup: None,
+            fingerprint: answer_fingerprint,
+            setup: answer_setup,
+            // ICE surface lands in slice 1.4 / 5.10-ice.
             ice_ufrag: None,
             ice_pwd: None,
             ice_options: Vec::new(),
@@ -237,6 +343,7 @@ impl Negotiator {
                 media: vec![answer_media],
             },
             srtp: srtp_keys,
+            dtls: dtls_params,
         }
     }
 
@@ -270,6 +377,7 @@ impl Negotiator {
         let NegotiationResult::Answer {
             mut sdp,
             srtp: audio_srtp,
+            dtls: audio_dtls,
         } = audio_result
         else {
             return audio_result;
@@ -278,6 +386,7 @@ impl Negotiator {
             return NegotiationResult::Answer {
                 sdp,
                 srtp: audio_srtp,
+                dtls: audio_dtls,
             };
         };
         // Pick a passthrough codec; same match semantics as audio.
@@ -329,6 +438,7 @@ impl Negotiator {
         NegotiationResult::Answer {
             sdp,
             srtp: audio_srtp,
+            dtls: audio_dtls,
         }
     }
 }
@@ -344,27 +454,13 @@ impl SdpNegotiator for Negotiator {
             Ok(o) => o,
             Err(e) => return NegotiationOutcome::Malformed(e.to_string()),
         };
-        // DTLS-SRTP gate: the WebRTC transport profile (RFC 5764 §8 —
-        // `UDP/TLS/RTP/SAVP[F]`) parses fine and we recognize the
-        // fingerprint/setup/ICE surface, but the handshake itself
-        // lands in slice 1.3. Until then, reject with a descriptive
-        // reason so peers don't see a silent 488 / 408.
-        if offer
-            .media
-            .iter()
-            .any(|m| is_dtls_srtp_profile(&m.protocol))
-        {
-            return NegotiationOutcome::UnsupportedTransport {
-                reason: "DTLS-SRTP not yet supported".into(),
-            };
-        }
         let remote_media = first_audio_endpoint(&offer);
         // Per-call override: always honor the caller's `local_ip` over
         // whatever the negotiator was seeded with.
         let mut scoped = self.clone();
         scoped.local_ip = local_ip;
         match scoped.answer(&offer, local_rtp_port) {
-            NegotiationResult::Answer { sdp, srtp } => {
+            NegotiationResult::Answer { sdp, srtp, dtls } => {
                 let audio_codec = first_codec_of_kind(&sdp, &MediaKind::Audio);
                 NegotiationOutcome::Accepted {
                     answer_body: sdp.to_string(),
@@ -373,11 +469,15 @@ impl SdpNegotiator for Negotiator {
                     // handling lives on the `negotiate` override below.
                     video_media: None,
                     srtp,
+                    dtls,
                     audio_codec,
                     video_codec: None,
                 }
             }
             NegotiationResult::Mismatch => NegotiationOutcome::Mismatch,
+            NegotiationResult::UnsupportedTransport(reason) => {
+                NegotiationOutcome::UnsupportedTransport { reason }
+            }
         }
     }
 
@@ -392,21 +492,12 @@ impl SdpNegotiator for Negotiator {
             Ok(o) => o,
             Err(e) => return NegotiationOutcome::Malformed(e.to_string()),
         };
-        if offer
-            .media
-            .iter()
-            .any(|m| is_dtls_srtp_profile(&m.protocol))
-        {
-            return NegotiationOutcome::UnsupportedTransport {
-                reason: "DTLS-SRTP not yet supported".into(),
-            };
-        }
         let remote_media = first_audio_endpoint(&offer);
         let video_media = first_video_endpoint(&offer);
         let mut scoped = self.clone();
         scoped.local_ip = local_ip;
         match scoped.answer_with_video(&offer, local_audio_port, local_video_port) {
-            NegotiationResult::Answer { sdp, srtp } => {
+            NegotiationResult::Answer { sdp, srtp, dtls } => {
                 let audio_codec = first_codec_of_kind(&sdp, &MediaKind::Audio);
                 let video_codec = first_codec_of_kind(&sdp, &MediaKind::Video);
                 NegotiationOutcome::Accepted {
@@ -414,11 +505,15 @@ impl SdpNegotiator for Negotiator {
                     remote_media,
                     video_media,
                     srtp,
+                    dtls,
                     audio_codec,
                     video_codec,
                 }
             }
             NegotiationResult::Mismatch => NegotiationOutcome::Mismatch,
+            NegotiationResult::UnsupportedTransport(reason) => {
+                NegotiationOutcome::UnsupportedTransport { reason }
+            }
         }
     }
 
@@ -606,7 +701,10 @@ mod tests {
                 },
             ],
         );
-        let NegotiationResult::Answer { sdp: answer, srtp } = neg.answer(&offer, 16_384) else {
+        let NegotiationResult::Answer {
+            sdp: answer, srtp, ..
+        } = neg.answer(&offer, 16_384)
+        else {
             panic!("expected Answer");
         };
         assert_eq!(answer.media.len(), 1);
@@ -652,7 +750,10 @@ mod tests {
     fn savp_offer_gets_savp_answer_with_matching_crypto_tag() {
         let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let offer = savp_offer_with_crypto(42);
-        let NegotiationResult::Answer { sdp: answer, srtp } = neg.answer(&offer, 16_384) else {
+        let NegotiationResult::Answer {
+            sdp: answer, srtp, ..
+        } = neg.answer(&offer, 16_384)
+        else {
             panic!("expected Answer");
         };
         assert_eq!(answer.media[0].protocol, "RTP/SAVP");
@@ -970,6 +1071,161 @@ mod tests {
         assert_eq!(audio_codec, Some(smiths_core::NegotiatedCodec::Pcmu));
         assert_eq!(video_codec, Some(smiths_core::NegotiatedCodec::H264));
     }
+
+    // --- Slice 5.10-dtls: DTLS-SRTP accept path --------------
+
+    fn dtls_offer_with_setup(setup: DtlsSetup) -> SessionDescription {
+        let mut offer = offer_with(
+            vec![0],
+            vec![RtpMap {
+                payload_type: 0,
+                codec: "PCMU".into(),
+                clock_rate: 8_000,
+                channels: None,
+            }],
+        );
+        offer.media[0].protocol = "UDP/TLS/RTP/SAVP".into();
+        offer.media[0].fingerprint = Some(Fingerprint {
+            algorithm: "sha-256".into(),
+            // 32 colon-separated octets — doesn't need to match a
+            // real cert, the negotiator only echoes the peer's
+            // value into DtlsParams.
+            value: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:\
+                 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
+                .into(),
+        });
+        offer.media[0].setup = Some(setup);
+        offer
+    }
+
+    #[test]
+    fn dtls_offer_without_cert_returns_unsupported() {
+        // Bare negotiator — no SelfSignedCert configured. The
+        // previous rejection path used the engine-wide "not yet
+        // supported" string; after slice 5.10-dtls the negotiator
+        // distinguishes "not configured" from "unknown profile"
+        // but still surfaces `UnsupportedTransport`.
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let offer = dtls_offer_with_setup(DtlsSetup::ActPass);
+        match neg.answer(&offer, 16_384) {
+            NegotiationResult::UnsupportedTransport(reason) => {
+                assert!(
+                    reason.contains("cert"),
+                    "unsupported reason should mention the missing cert: {reason}"
+                );
+            }
+            other => panic!("expected UnsupportedTransport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dtls_offer_with_actpass_gets_active_answer() {
+        // Offer `actpass` → engine picks `active` (client role,
+        // RFC 5763 §5). Answer carries the engine's fingerprint
+        // verbatim and the peer's fingerprint echoes back in
+        // DtlsParams.
+        let cert = smiths_core::SelfSignedCert::generate("test").unwrap();
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_dtls_cert(Arc::new(cert.clone()));
+        let offer = dtls_offer_with_setup(DtlsSetup::ActPass);
+        let NegotiationResult::Answer { sdp, dtls, srtp } = neg.answer(&offer, 16_384) else {
+            panic!("expected Answer");
+        };
+        assert_eq!(
+            sdp.media[0].protocol, "UDP/TLS/RTP/SAVP",
+            "answer must echo the DTLS-SRTP transport profile"
+        );
+        let fp = sdp.media[0]
+            .fingerprint
+            .as_ref()
+            .expect("answer must carry a=fingerprint");
+        assert_eq!(fp.algorithm, "sha-256");
+        assert_eq!(
+            fp.value, cert.sha256_fingerprint,
+            "answer fingerprint must hash the engine's cert"
+        );
+        assert_eq!(
+            sdp.media[0].setup,
+            Some(DtlsSetup::Active),
+            "actpass offer should get active answer per RFC 5763 §5"
+        );
+        let dtls = dtls.expect("DTLS-SRTP accept must surface DtlsParams");
+        assert_eq!(dtls.local_role, DtlsRole::Client);
+        assert_eq!(dtls.peer_fingerprint_algorithm, "sha-256");
+        assert!(
+            dtls.peer_fingerprint_value.starts_with("AA:BB:"),
+            "peer fingerprint should round-trip verbatim from the offer"
+        );
+        assert!(
+            srtp.is_none(),
+            "DTLS path derives keys via the handshake — no SDES keys on the outcome"
+        );
+    }
+
+    #[test]
+    fn dtls_offer_with_active_gets_passive_answer() {
+        // Offer `active` → engine takes `passive` (server role).
+        let cert = smiths_core::SelfSignedCert::generate("test").unwrap();
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_dtls_cert(Arc::new(cert));
+        let offer = dtls_offer_with_setup(DtlsSetup::Active);
+        let NegotiationResult::Answer { sdp, dtls, .. } = neg.answer(&offer, 16_384) else {
+            panic!("expected Answer");
+        };
+        assert_eq!(sdp.media[0].setup, Some(DtlsSetup::Passive));
+        assert_eq!(dtls.unwrap().local_role, DtlsRole::Server);
+    }
+
+    #[test]
+    fn dtls_offer_without_fingerprint_is_rejected() {
+        // RFC 5763 §5.3 requires a fingerprint line; without it
+        // we can't verify the peer's cert. Surface as
+        // UnsupportedTransport so the handler gets a clear reason.
+        let cert = smiths_core::SelfSignedCert::generate("test").unwrap();
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_dtls_cert(Arc::new(cert));
+        let mut offer = dtls_offer_with_setup(DtlsSetup::ActPass);
+        offer.media[0].fingerprint = None;
+        match neg.answer(&offer, 16_384) {
+            NegotiationResult::UnsupportedTransport(reason) => {
+                assert!(reason.contains("fingerprint"), "{reason}");
+            }
+            other => panic!("expected UnsupportedTransport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negotiate_audio_exposes_dtls_when_cert_configured() {
+        // Round-trip through the trait method so the
+        // `NegotiationOutcome::Accepted.dtls` binding is
+        // locked in — downstream consumers (CLI WebRTC
+        // handler, SIP UAS) pattern-match on this field.
+        let cert = smiths_core::SelfSignedCert::generate("test").unwrap();
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_dtls_cert(Arc::new(cert.clone()));
+        let offer = dtls_offer_with_setup(DtlsSetup::ActPass);
+        let outcome =
+            neg.negotiate_audio(&offer.to_string(), IpAddr::V4(Ipv4Addr::LOCALHOST), 16_384);
+        let smiths_core::NegotiationOutcome::Accepted {
+            dtls,
+            srtp,
+            answer_body,
+            ..
+        } = outcome
+        else {
+            panic!("expected Accepted");
+        };
+        let dtls = dtls.expect("Accepted should carry DtlsParams");
+        assert_eq!(dtls.local_role, DtlsRole::Client);
+        assert!(srtp.is_none());
+        // Spot-check the rendered answer body carries the
+        // DTLS-SRTP profile + our fingerprint.
+        assert!(answer_body.contains("UDP/TLS/RTP/SAVP"));
+        assert!(answer_body.contains(&cert.sha256_fingerprint));
+        assert!(answer_body.contains("a=setup:active"));
+    }
+
+    // --- end Slice 5.10-dtls ---------------------------------
 
     #[test]
     fn negotiate_declined_video_leaves_video_codec_none() {

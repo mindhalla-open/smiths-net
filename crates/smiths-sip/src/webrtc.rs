@@ -67,6 +67,23 @@ pub trait WebRtcSessionHandler: Send + Sync {
         sdp_offer: &str,
     ) -> Result<String, WebRtcHandlerError>;
 
+    /// Slice 5.10-bridge: handle an inbound `offer` frame with
+    /// the `tag` string captured from the session's
+    /// `SessionInit` (if any). The default impl discards the
+    /// tag and falls through to [`Self::handle_offer`] so older
+    /// handlers stay source-compatible; the CLI's
+    /// `CliWebRtcHandler` overrides this to drive tag-keyed
+    /// rendezvous.
+    async fn handle_offer_tagged(
+        &self,
+        session: WebTransportSessionId,
+        tag: Option<&str>,
+        sdp_offer: &str,
+    ) -> Result<String, WebRtcHandlerError> {
+        let _ = tag;
+        self.handle_offer(session, sdp_offer).await
+    }
+
     /// Handle a trickle ICE candidate. Default: ignore
     /// (many handlers won't care until ICE is wired).
     async fn handle_ice_candidate(
@@ -195,7 +212,15 @@ impl WebSocketSignalingListener {
                         "offer frame's session_id doesn't match session-init".into(),
                     ));
                 }
-                match self.handler.handle_offer(session_id, &sdp).await {
+                // Slice 5.10-bridge: forward the session's tag
+                // (if any) so the handler can drive the
+                // rendezvous map keyed by it.
+                let tag = session.as_ref().and_then(|s| s.tag.as_deref());
+                match self
+                    .handler
+                    .handle_offer_tagged(session_id, tag, &sdp)
+                    .await
+                {
                     Ok(answer_sdp) => Some(WtSignal::Answer {
                         session_id,
                         sdp: answer_sdp,

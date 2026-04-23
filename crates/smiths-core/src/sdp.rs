@@ -12,6 +12,66 @@ use std::net::{IpAddr, SocketAddr};
 use crate::SrtpSuite;
 use crate::call::NegotiatedCodec;
 
+/// DTLS-SRTP parameters extracted from an SDP offer (slice
+/// 5.10-dtls). When the UDP/TLS/RTP/SAVP(F) profile is used, SRTP
+/// keys aren't on the wire — they're derived from the DTLS
+/// handshake after offer/answer completes. The negotiator surfaces
+/// the raw material the handshake driver needs, and the media
+/// fabric runs the handshake.
+///
+/// ## Handedness
+///
+/// - `peer_fingerprint_algorithm` + `peer_fingerprint_value` come
+///   from the offer's `a=fingerprint:` line, verbatim on the
+///   value so the byte-exact comparison against the cert
+///   `webrtc-dtls` negotiates doesn't drift.
+/// - `local_role` is what the **engine** plays during the
+///   handshake, already resolved against the offer's
+///   `a=setup:` (per RFC 5763 §5: offer `actpass` →
+///   answer `active`, offer `passive` → answer `active`, etc.).
+///   The answer's `a=setup:` echoes `local_role`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtlsParams {
+    /// Peer's declared fingerprint hash algorithm — typically
+    /// `"sha-256"`. Stored as-is so the handshake can reject
+    /// weak algorithms before running the expensive DTLS
+    /// handshake.
+    pub peer_fingerprint_algorithm: String,
+    /// Peer's fingerprint value in RFC 8122 wire form
+    /// (`AA:BB:...`, uppercase hex, colon-separated pairs).
+    pub peer_fingerprint_value: String,
+    /// The role the engine plays during the DTLS handshake.
+    /// `"active"` means we send `ClientHello`; `"passive"`
+    /// means we await it. Resolved from the offer's
+    /// `a=setup:` attribute per RFC 5763 §5.
+    pub local_role: DtlsRole,
+}
+
+/// DTLS-SRTP handshake role at the media layer. Mirrors
+/// [`smiths_dtls::DtlsRole`] but lives in `smiths-core` so the
+/// SDP trait seam doesn't force every crate that consumes
+/// [`NegotiationOutcome`] to depend on the DTLS crate.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DtlsRole {
+    /// Engine initiates the handshake (`ClientHello`). Matches
+    /// offerer `setup:passive` or `setup:actpass`.
+    Client,
+    /// Engine awaits the handshake. Matches offerer
+    /// `setup:active`.
+    Server,
+}
+
+impl DtlsRole {
+    /// Wire-format token for `a=setup:` answers.
+    #[must_use]
+    pub fn as_setup_str(self) -> &'static str {
+        match self {
+            Self::Client => "active",
+            Self::Server => "passive",
+        }
+    }
+}
+
 /// SRTP keying material negotiated via SDES (RFC 4568).
 ///
 /// Emitted by [`NegotiationOutcome::Accepted`] when the offer used
@@ -51,7 +111,14 @@ impl std::fmt::Debug for SrtpKeys {
 }
 
 /// Outcome of running offer/answer against an inbound SDP offer.
+///
+/// `Accepted` is an ~240 B variant; the error variants are tens of
+/// bytes. Boxing the big variant would cascade into every
+/// destructuring call-site (UAS, WebRTC handler, tests) for a
+/// memory win that doesn't register — SDP negotiation fires once
+/// per INVITE, not per packet. We eat the size disparity.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum NegotiationOutcome {
     /// Offer accepted.
     Accepted {
@@ -76,7 +143,20 @@ pub enum NegotiationOutcome {
         /// with a supported `a=crypto:` suite. `None` for plain
         /// `RTP/AVP` passthrough calls. The UAS threads this into the
         /// bridge spawn so each leg runs with the right transform.
+        ///
+        /// **Mutually exclusive with [`Self::dtls`].** SDES and
+        /// DTLS-SRTP are alternative key-exchange protocols in
+        /// SDP — a well-formed offer picks one transport profile.
+        /// Callers that see both fields populated should treat it
+        /// as a negotiator bug.
         srtp: Option<SrtpKeys>,
+        /// DTLS-SRTP parameters (slice 5.10-dtls). `Some` when the
+        /// offer used `UDP/TLS/RTP/SAVP[F]` with an acceptable
+        /// `a=fingerprint:` + `a=setup:` combination. The media
+        /// fabric runs the actual handshake; SRTP keys come out
+        /// via the RFC 5764 §4.2 PRF once the handshake
+        /// completes.
+        dtls: Option<DtlsParams>,
         /// Audio codec both sides agreed on (slice 5.6). `None`
         /// when the offer had no audio m-line or no common codec
         /// (but then `Mismatch` would have fired). Recorded on the

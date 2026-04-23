@@ -83,7 +83,7 @@ pub use reloader::{
     ApplyError, ApplyReport, CanaryError, ChangeId, ChangeReceipt, ConfigReloader, RollbackReason,
 };
 pub use rtp::RtpPacket;
-pub use sdp::{NegotiationOutcome, SdpNegotiator, SrtpKeys};
+pub use sdp::{DtlsParams, DtlsRole, NegotiationOutcome, SdpNegotiator, SrtpKeys};
 pub use shutdown::{HangupStream, Shutdown, hangup_stream};
 pub use storage::{
     CallDetailRecord, CdrFilter, CdrStore, FsRecordingStore, KvStore, MemoryVectorStore,
