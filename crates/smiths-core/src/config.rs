@@ -16,37 +16,56 @@ use figment::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::Error;
+use crate::reloader::Reloadable;
 
 /// Root configuration loaded at startup.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+///
+/// Field-level attributes on nested sub-configs drive the
+/// [`crate::reloader::ApplyReport`] surface: `#[nested]` recurses,
+/// leaf fields classify with `#[reloadable]` /
+/// `#[restart_required]`, and unmarked fields are treated as
+/// out-of-scope for hot reload. Adding a new block means adding
+/// the annotations alongside the field — the macro fails to
+/// produce a matching diff string if either is missing, which is
+/// the whole point of replacing the hand-maintained `apply_report`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Runtime-wide tuning knobs (thread pools, etc.).
     pub core: CoreConfig,
     /// Logging, health endpoint, metrics bind (metrics added later).
+    #[nested]
     pub observability: ObservabilityConfig,
     /// SIP signaling configuration.
+    #[nested]
     pub sip: SipConfig,
     /// MCP control-plane server.
+    #[nested]
     pub mcp: McpConfig,
     /// A2A HTTP adapter.
+    #[nested]
     pub a2a: A2aConfig,
     /// Plugin loader settings.
+    #[nested]
     pub plugins: PluginsConfig,
     /// Auth / subscriber-DB configuration (P8, slice 2.1).
+    #[nested]
     pub auth: AuthConfig,
     /// Pluggable storage configuration (P23, slice 2.3). CDR + KV
     /// backends share this section; auth has its own `[auth]`
     /// because its lifetime + security story differs.
+    #[nested]
     pub storage: StorageConfig,
     /// Media-plane tunings (DTMF inband detection, later: jitter
     /// buffer depth, comfort-noise on silence).
+    #[nested]
     pub media: MediaConfig,
     /// AI-provider configuration (P22 / slice 3.2). Keys here are
     /// secrets — the `config://current` resource redacts them on
     /// render. Sidecars read their own API keys from environment
     /// variables; the operator threads them through here for
     /// single-source-of-truth deployments.
+    #[nested]
     pub ai: AiConfig,
     /// WebTransport signaling listener (slice 5.7 / P19). Off by
     /// default — the runtime is a scaffold today, matching the
@@ -87,14 +106,16 @@ pub struct Config {
 /// own environment, and the sidecars inherit them. This section
 /// exists so the secrets have one canonical home on disk + a
 /// redaction-tested surface.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiConfig {
     /// `OpenAI` API key — consumed by `ai-llm-openai`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[reloadable]
     pub openai_api_key: Option<String>,
     /// `Anthropic` API key — consumed by `ai-llm-anthropic`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[reloadable]
     pub anthropic_api_key: Option<String>,
 }
 
@@ -104,7 +125,7 @@ pub struct AiConfig {
 /// [media]
 /// inband_dtmf = true    # run the Goertzel detector on every bridge
 /// ```
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct MediaConfig {
     /// Opt every bridge into the Goertzel inband DTMF detector
@@ -118,10 +139,12 @@ pub struct MediaConfig {
     /// refer to by relative path. When the path is empty, the
     /// `record_prompt` MCP tool returns `NotFound` — operators
     /// opt in by setting a concrete directory.
+    #[nested]
     pub prompts: PromptsConfig,
     /// Audio transcoding CPU budget + admission control (slice 5.3).
     /// Governs how many simultaneous calls the engine will accept
     /// that require codec conversion (today: `Opus ↔ G.711`).
+    #[reloadable(path = "media.transcode")]
     pub transcode: TranscodeConfig,
 }
 
@@ -138,7 +161,7 @@ pub struct MediaConfig {
 /// raise `max_concurrent_calls` after observing the
 /// `smiths_transcode_cpu_ms_total` counter under real traffic.
 /// See `docs/architecture/11-transcoding.md` for sizing guidance.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct TranscodeConfig {
     /// Hard cap on simultaneous transcoded calls. INVITEs past this
@@ -168,7 +191,7 @@ impl Default for TranscodeConfig {
 /// root     = "/var/lib/smiths-net/prompts"
 /// capacity = 128             # LRU size (default 64)
 /// ```
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct PromptsConfig {
     /// Root directory the library resolves relative paths against.
@@ -179,6 +202,7 @@ pub struct PromptsConfig {
     /// Maximum number of decoded prompts kept hot in the LRU.
     /// `0` falls back to the library's built-in default.
     #[serde(default)]
+    #[reloadable]
     pub capacity: usize,
 }
 
@@ -196,10 +220,11 @@ pub struct PromptsConfig {
 /// the same file the `SQLite` auth store serves both surfaces
 /// (credentials + registrations + CDR + KV) from one DB — that's
 /// the default the runbook recommends.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     /// Which backend to wire up for `CdrStore` + `KvStore`.
+    #[restart_required(group = "storage backend")]
     pub backend: StorageBackend,
     /// SQLite-specific settings. Ignored when `backend != "sqlite"`.
     pub sqlite: SqliteStorageConfig,
@@ -366,10 +391,11 @@ impl Default for SqliteStorageConfig {
 ///
 /// `backend = "none"` (the default today) keeps the pre-v0.33.0 dev
 /// behaviour: REGISTER is accepted blindly, INVITE isn't challenged.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
     /// Which subscriber-DB implementation to wire up.
+    #[restart_required(group = "auth backend")]
     pub backend: AuthBackend,
     /// Digest-auth realm the engine advertises in `WWW-Authenticate`.
     /// Must match the realm stored against each account; mismatched
@@ -496,14 +522,17 @@ pub struct CoreConfig {
 }
 
 /// Observability config — logging and the health endpoint.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct ObservabilityConfig {
     /// `tracing-subscriber` env-filter directive (e.g. `info`, `debug,smiths_sip=trace`).
+    #[reloadable]
     pub log_level: String,
     /// Log output formatter.
+    #[restart_required(group = "observability bind / log format")]
     pub log_format: LogFormat,
     /// HTTP bind address for the `/health` endpoint.
+    #[restart_required(group = "observability bind / log format")]
     pub health_bind: SocketAddr,
     /// Per-call packet-capture directory. `None` disables the pcap
     /// tap entirely. When set, each call's RTP + RTCP stream is
@@ -525,22 +554,27 @@ impl Default for ObservabilityConfig {
 }
 
 /// SIP signaling configuration.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct SipConfig {
     /// Addresses to bind for SIP signaling.
+    #[restart_required(group = "sip bind / transports / tls paths")]
     pub bind: Vec<BindSpec>,
     /// Enabled transports. Only `udp` is wired in Phase 1.
+    #[restart_required(group = "sip bind / transports / tls paths")]
     pub transports: Vec<SipTransport>,
     /// Grace period to finish in-flight transactions on shutdown.
     pub drain_timeout_secs: u64,
     /// Filesystem path to the PEM-encoded TLS server certificate.
     /// Required when `transports` contains `tls`. Ignored otherwise.
+    #[restart_required(group = "sip bind / transports / tls paths")]
     pub tls_cert_path: Option<std::path::PathBuf>,
     /// Filesystem path to the PEM-encoded TLS private key that pairs
     /// with `tls_cert_path`.
+    #[restart_required(group = "sip bind / transports / tls paths")]
     pub tls_key_path: Option<std::path::PathBuf>,
     /// Per-source-IP rate limit on inbound SIP datagrams.
+    #[reloadable(path = "sip.rate_limit")]
     pub rate_limit: SipRateLimit,
     /// Outbound proxy / VPN shim (slice 3.5). Applies to the
     /// TCP-based SIP transports (TCP, TLS inner TCP) — SOCKS5 and
@@ -669,7 +703,7 @@ pub enum ProxyMode {
 /// Datagrams from over-limit sources are dropped silently — this is
 /// anti-flood, not a protocol-level response, so we don't burn a
 /// `503 Service Unavailable` generation on every dropped packet.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SipRateLimit {
     /// Sustained datagrams/sec allowed per source IP. `0` disables.
@@ -828,13 +862,15 @@ pub enum SipTransport {
 /// `rate_limit` applies to **every** tool dispatcher — both MCP
 /// (stdio/HTTP) and A2A share the same token buckets, since the
 /// protection target is the engine, not the adapter.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpConfig {
     /// Serve MCP over HTTP JSON-RPC when `true`. stdio is always
     /// available via the `--mcp` CLI flag regardless of this setting.
+    #[restart_required(group = "mcp binds")]
     pub enabled_http: bool,
     /// HTTP bind for MCP.
+    #[restart_required(group = "mcp binds")]
     pub http_bind: SocketAddr,
     /// Token-bucket rate limit applied to tool invocations.
     pub rate_limit: RateLimitConfig,
@@ -843,6 +879,7 @@ pub struct McpConfig {
     /// runtime listener is a dedicated follow-on — 0.45.0 accepts
     /// the config + advertises `h3` in `--version` so operators
     /// aren't surprised later.
+    #[restart_required(group = "mcp binds")]
     pub http3: McpHttp3Config,
 }
 
@@ -853,7 +890,7 @@ pub struct McpConfig {
 /// enabled = true                  # requires --features mcp-http3
 /// bind    = "127.0.0.1:7879"
 /// ```
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpHttp3Config {
     /// Enable the h3 listener. Ignored when the binary was built
@@ -1118,12 +1155,14 @@ pub struct RateLimitConfig {
 }
 
 /// A2A (agent-to-agent) HTTP adapter settings.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct A2aConfig {
     /// Serve the A2A HTTP API when `true`.
+    #[restart_required(group = "a2a bind")]
     pub enabled: bool,
     /// HTTP bind for A2A.
+    #[restart_required(group = "a2a bind")]
     pub bind: SocketAddr,
     /// Optional bearer token. When set, every HTTP request must carry
     /// a matching `Authorization: Bearer <token>` header or the server
@@ -1143,11 +1182,12 @@ impl Default for A2aConfig {
 }
 
 /// Plugin loader settings.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct PluginsConfig {
     /// Directory the loader scans at startup. Each subdirectory is one
     /// plugin. Missing directory → no plugins loaded, no error.
+    #[restart_required]
     pub dir: std::path::PathBuf,
     /// Resource-limit sandbox applied to every sidecar subprocess.
     /// Default is permissive (no limits, no `no_new_privs`) so tests

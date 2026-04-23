@@ -5,10 +5,87 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.65.0] - 2026-04-23
+
+**`#[derive(Reloadable)]` proc-macro.**
+Replaces the hand-maintained `Config::apply_report` body with a
+derive-generated walk so the reloadable / restart-required field
+list can't silently drift when a new config block lands. Pure
+refactor — every pre-existing `apply_report` output is preserved
+byte-for-byte; a dedicated test (`diff_into_emits_expected_*`)
+locks down each of the 6 reloadable paths and 7 restart groups.
+
+### Added
+
+- **New crate `smiths-config-macros`** — proc-macro crate
+  hosting `#[derive(Reloadable)]`. Depends on `syn` / `quote` /
+  `proc-macro2` only; no runtime surface.
+- **`Reloadable` trait** in `smiths-core::reloader` — single
+  method `diff_into(&self, new, report, path_prefix)` that the
+  derive generates impls for. Re-exported alongside the derive
+  at the `smiths_core` root so users write
+  `use smiths_core::Reloadable` once.
+- **Field attributes**:
+  - `#[reloadable]` — live-reloadable; path defaults to
+    `<prefix>.<field_name>`.
+  - `#[reloadable(path = "x.y")]` — composite: any change to
+    the field emits a single entry at the custom dotted path.
+    Field's type must be `PartialEq`.
+  - `#[restart_required]` — path defaults to
+    `<prefix>.<field_name>`.
+  - `#[restart_required(group = "label")]` — coalesces
+    multiple fields in the same struct under one restart
+    label, matching the existing operator-facing convention
+    ("sip bind / transports / tls paths", "mcp binds", etc.).
+  - `#[nested]` — recurse into a field whose type also derives
+    `Reloadable`. Field name is appended to `path_prefix`
+    before the nested walk.
+- **Byte-identity tests** (`diff_into_emits_expected_reloadable_paths`
+  - `diff_into_emits_expected_restart_required_groups`) — table-
+    driven assertions across every tracked field so a future
+    annotation rename is caught before downstream adapters see
+    an unrecognised path.
+
+### Changed
+
+- **`Config::apply_report` is now a 3-line delegate** —
+  `self.diff_into(new, &mut report, "")`. The hardcoded body
+  (66 lines of hand-rolled `if` checks) is gone.
+- **Annotated structs**: `Config` (top-level fields marked
+  `#[nested]` where tracked, untagged for scaffold blocks
+  like `webtransport` / `reload` / `canary` / `webrtc` /
+  `core`), `ObservabilityConfig`, `SipConfig`, `AiConfig`,
+  `MediaConfig`, `PromptsConfig`, `McpConfig`, `A2aConfig`,
+  `PluginsConfig`, `AuthConfig`, `StorageConfig`.
+- **`PartialEq, Eq` added to `SipRateLimit`, `TranscodeConfig`,
+  `McpHttp3Config`** so composite + grouped-restart
+  comparisons work via `!=` on the whole struct. All three are
+  simple value structs (primitive fields only), so no new
+  trait obligations on downstream code.
+
+### Notes
+
+- **Unmarked fields are skipped silently**, matching the prior
+  hand-rolled behaviour. This is the pragmatic default for the
+  first version — many existing config fields (scaffold blocks,
+  internal bookkeeping) weren't tracked before and don't need
+  to be now. A future slice can add a struct-level
+  `#[derive(Reloadable)]` `strict` flag that errors on unmarked
+  fields for operators who want the extra guarantee.
+- **Generated paths use `crate::reloader::…`** absolute paths,
+  so the derive is intended for use inside `smiths-core`. A
+  downstream crate deriving `Reloadable` would flip the
+  generated paths to `::smiths_core::reloader::…`; one-line
+  change in the macro crate.
+- **No behaviour change.** Every existing `ConfigReloader` test
+  passes unchanged (13/13 reloader tests, 101/101 smiths-core
+  lib tests). The derive is a refactor that removes a drift
+  risk, not a semantics change.
+
 ## [0.64.0] - 2026-04-23
 
-**Slice 5.10-followup — WebRTC signaling runtime + browser
-demo.** Plugs the v0.62.0 `WebSocketSignalingListener` scaffold
+**WebRTC signaling runtime + browserdemo.**
+Plugs the v0.62.0 `WebSocketSignalingListener` scaffold
 into the CLI's axum stack and ships a concrete
 `WebRtcSessionHandler` that routes offers through the shared
 `SdpNegotiator`. Browsers (and SIP-over-WebSocket clients) can
@@ -79,7 +156,7 @@ until the DTLS terminator lands; (2) SIP ⇄ WebRTC media bridge
 - **DTLS-SRTP is the prerequisite for real browser calls.**
   Today's `smiths_sdp::Negotiator::negotiate_audio` returns
   `NegotiationOutcome::UnsupportedTransport { reason:
-  "DTLS-SRTP not yet supported" }` for `UDP/TLS/RTP/SAVP`
+"DTLS-SRTP not yet supported" }` for `UDP/TLS/RTP/SAVP`
   offers. The handler forwards that reason verbatim. When
   the DTLS terminator lands, no client-side change will be
   needed — same offers will return a real answer.
@@ -97,9 +174,8 @@ until the DTLS terminator lands; (2) SIP ⇄ WebRTC media bridge
 
 ## [0.63.0] - 2026-04-23
 
-**Slice 5.8-followup-b (minimal) — watch broadcast + generic
-read-through adapter.** The piece that turns the
-`ConfigReloader` substrate from "stores config" into "subsystems
+**Watch broadcast + generic read-through adapter.**
+The piece that turns the `ConfigReloader` substrate from "stores config" into "subsystems
 actually react". Ships the reactive plumbing + a generic helper
 every future adapter uses; concrete per-subsystem adapters
 (tracing filter, rate limiter, prompt library, transcode budget)
@@ -116,7 +192,7 @@ follow-on backlog.
   added a `watch::Sender<Arc<Config>>` to the reloader + wired
   both mutation paths to broadcast after the `ArcSwap` store.
 - **`ConfigReloader::spawn_read_through(field_name, metrics,
-  extract, apply)`** — generic adapter spawner. Watches the
+extract, apply)`** — generic adapter spawner. Watches the
   broadcast, applies a caller-supplied extractor to pull one
   reloadable value out of the live config, invokes the
   caller-supplied applier only when the extracted value
@@ -155,7 +231,7 @@ follow-on backlog.
 - **No-op on boot config**: `spawn_read_through` seeds with
   the current value but never invokes `apply` for the initial
   state — the subsystem already initialised from the boot
-  config. Only *changes* fire the adapter.
+  config. Only _changes_ fire the adapter.
 - **Rollback fires the adapter too**: if the canary window
   rolls back a change to a watched field, the adapter sees
   the restored value and re-applies. Operator-visible
@@ -163,13 +239,13 @@ follow-on backlog.
 
 ## [0.62.0] - 2026-04-23
 
-**Part 5 runtime completion.** One landing that closes the
-remaining Part-5 runtime slices: auto-rollback timer on
-`ConfigReloader` (5.8-c), WebRTC-native signaling adapter
-(5.10), WebRTC privacy helpers (5.11). The `#[derive(Reloadable)]`
-proc-macro (5.8-a), subsystem read-through adapters (5.8-b),
-SIGHUP handler + CLI subcommands + error-rate probe (5.8-c /
-5.9-runtime) remain deferred as CLI-side follow-ons — the
+One landing that closes the
+remaining runtime slices: auto-rollback timer on
+`ConfigReloader`, WebRTC-native signaling adapter, WebRTC privacy helpers.
+The `#[derive(Reloadable)]`
+proc-macro, subsystem read-through adapters,
+SIGHUP handler + CLI subcommands + error-rate probe
+remain deferred as CLI-side follow-ons — the
 substrate they need is live in `smiths-core` today, wiring is
 what's left.
 
@@ -224,29 +300,29 @@ what's left.
 
 ### Notes — what's still deferred (focused follow-ons)
 
-- **5.8-followup-a** — `smiths-config-macros` proc-macro crate
+- `smiths-config-macros` proc-macro crate
   with `#[derive(Reloadable)]` to replace `Config::apply_report`'s
   hardcoded diff. Pure cleanup.
-- **5.8-followup-b** — subsystem read-through adapters
+- subsystem read-through adapters
   (`tracing-subscriber` filter reload on `observability.log_level`,
   SIP rate-limiter live config, prompt library capacity, proxy
   connector). Each is a tracked field in the hardcoded
   reloadable list; the adapters plug them in.
-- **5.8-followup-c (CLI)** — SIGHUP handler calling
+- **(CLI)** — SIGHUP handler calling
   `ConfigReloader::apply(Config::load())`, `smiths-net validate`
-  + `smiths-net reload [--diff] [--dry-run]` subcommands,
-  operator runbook section.
-- **5.9-followup** — background task watching
+  - `smiths-net reload [--diff] [--dry-run]` subcommands,
+    operator runbook section.
+- background task watching
   `plugin_invocations{outcome="error"}` +
   `sip_parse_errors` rates in a 30s trailing window; calls
   `rollback_with_metrics(id, ErrorBudget, _)` on trip. The
   `RollbackReason::ErrorBudget` enum + counter label are
   already live.
-- **5.10-followup** — CLI wires `WebSocketSignalingListener`
+- CLI wires `WebSocketSignalingListener`
   into an axum WebSocket route + a concrete
   `WebRtcSessionHandler` routing through `SdpNegotiator` +
   `UasServer`. Browser demo at `examples/browser-webrtc/`.
-- **5.11-followup** — embedded TURN (RFC 8656) in
+- embedded TURN (RFC 8656) in
   `smiths-ice`. The privacy helpers are usable today by any
   SDP-processing code path; the TURN server is what lets
   deployments avoid a `coturn` sidecar.
@@ -261,7 +337,7 @@ what's left.
 
 ## [0.61.0] - 2026-04-23
 
-**5.8-mvp + 5.9-mvp — `ConfigReloader` substrate.** Wraps the
+`ConfigReloader` substrate.\*\* Wraps the
 engine's live `Config` in `ArcSwap<Config>` and lands the
 full canary state machine (`apply` / `confirm` / `rollback`)
 with deadline tracking. The big architectural plumbing — the
@@ -347,7 +423,7 @@ metric surface the 5.9 spec named is live.
 
 ## [0.60.0] - 2026-04-23
 
-**Slices 5.6d-runtime + 5.6e-runtime** — concrete orchestrator
+Concrete orchestrator
 implementations for the trait seams landed in the v0.59.0
 Part-5 finalization slice. A deployment that wires either
 orchestrator into its UAS gets working T.38 FAX relay / RTP
@@ -355,7 +431,7 @@ conferencing today; the UAS's own re-INVITE parser + MCP tool
 thread-through is a separate follow-on slice (RFC 3261 §12
 tag-matching + in-dialog CSeq handling is its own workstream).
 
-### Added — 5.6d-runtime
+### Added
 
 - **`smiths-fax::UdptlFaxOrchestrator`** — concrete
   `FaxOrchestrator` impl. Holds an `Arc<UdpMediaFabric>` + an
@@ -367,7 +443,7 @@ tag-matching + in-dialog CSeq handling is its own workstream).
   byte-identity, confirming the full orchestrator → fabric →
   session chain.
 - **`UdpMediaFabric::endpoint_socket(EndpointId) ->
-  Option<Arc<UdpSocket>>`** — escape hatch for non-passthrough
+Option<Arc<UdpSocket>>`** — escape hatch for non-passthrough
   sessions that need raw socket access. Documented as
   concrete-impl-only (kept off the `MediaFabric` trait so a
   future non-UDP fabric variant isn't forced to model sockets).
@@ -379,7 +455,7 @@ tag-matching + in-dialog CSeq handling is its own workstream).
   main branch) need a one-line update; the v0.59.0 scaffold's
   trait definition was the only site touched.
 
-### Added — 5.6e-runtime
+### Added
 
 - **`smiths-mixer::ConferenceParticipantSession`** — bridges a
   UDP RTP flow into a `Conference`. Two-task topology: ingress
@@ -429,10 +505,10 @@ tag-matching + in-dialog CSeq handling is its own workstream).
 
 ## [0.59.0] - 2026-04-23
 
-**Part 5 finalization.** One slice that lands the remaining
-Part-5 scaffolds so the whole cluster closes out coherently.
+One slice that lands the remaining
+scaffolds so the whole cluster closes out coherently.
 Every item here matches the scaffold pattern already used for
-5.4 (FAX relay), 5.6b (TranscodedSession), and 5.7
+(FAX relay), (TranscodedSession), and
 (WebTransport): types + trait seams + config surfaces +
 operator-visible docs; full runtime integration stays as
 focused follow-on slices. The alternative — six more full
@@ -442,46 +518,40 @@ any one deliverable.
 
 ### Added — trait seams (5.6d + 5.6e)
 
-- **`smiths_sip::FaxOrchestrator`** (5.6d) — trait seam the UAS
+- **`smiths_sip::FaxOrchestrator`** — trait seam the UAS
   will call when a future re-INVITE handler detects
   `m=image udptl t38`. Today the seam wires through
   `UasServer::with_fax_orchestrator` as a forward-compat hook;
   the re-INVITE handler itself (new parse path) is a focused
   follow-on slice. Deployments ready with an orchestrator can
   wire it today and have it activate when the handler lands.
-- **`smiths_sip::ConferenceOrchestrator`** (5.6e) — parallel
+- **`smiths_sip::ConferenceOrchestrator`** — parallel
   seam for conference-participant session installation. Wired
   via `UasServer::with_conference_orchestrator`.
 
 ### Added — config scaffolds
 
-- **`[reload]` block** (5.8 scaffold) — `enabled` +
+- **`[reload]` block** — `enabled` +
   `max_frequency_s`. The runtime — `ArcSwap<Config>` +
   `#[derive(Reloadable)]` derive macro + SIGHUP handler +
   `Config::apply` returning `ApplyReport` — is deferred to a
   dedicated follow-on slice; scoping the infra honestly takes
   its own cycle. Flipping `enabled = true` in this build logs
   a "runtime not yet wired" warning at boot.
-- **`[canary]` block** (5.9 scaffold) — `deadline_s` +
+- **`[canary]` block** — `deadline_s` +
   `plugin_error_rate_ceiling` + `sip_parse_errors_per_sec_ceiling`.
   Depends on `[reload]`'s runtime. Once that lands, this block
   drives the canary window + auto-rollback thresholds.
-- **`[webrtc]` + `[webrtc.privacy]` blocks** (5.10 + 5.11
-  scaffold) — `enabled` + `ws_bind` + `tls_cert` / `tls_key` +
+- **`[webrtc]` + `[webrtc.privacy]` blocks**
+  — `enabled` + `ws_bind` + `tls_cert` / `tls_key` +
   `privacy.mode` (`open` / `relay_only` / `strict`) +
-  `privacy.redaction_key`. Pairs with the 5.7 `[webtransport]`
+  `privacy.redaction_key`. Pairs with the `[webtransport]`
   block: the JSON message shape is shared (`smiths_sip::WtSignal`),
-  5.7 is the QUIC transport substrate, 5.10 is the WebSocket
+  is the QUIC transport substrate, is the WebSocket
   baseline. Runtime adapter is a follow-on.
 
 ### Notes
 
-- **Part 5 is now strike-through-complete.** Every 5.x slice
-  in `.vscode/implementation-slices.md` is either landed or
-  has its scaffold in place with a named follow-on for the
-  runtime. Subsequent version slots (v0.60+) open up for
-  Part 6 (HA replication + Raft) and Part 7 (init wizard +
-  cookbook + MCP config tool).
 - **Forward-compat wiring works today.** A deployment that
   already has a concrete `FaxOrchestrator` impl can register
   it via `with_fax_orchestrator`; the UAS holds the handle
@@ -493,13 +563,11 @@ any one deliverable.
 
 ## [0.58.0] - 2026-04-23
 
-Slice 6.1 — HA snapshot + replay (MVP). The engine persists
+HA snapshot + replay (MVP). The engine persists
 its dialog table to a JSON file on graceful shutdown and
-replays it on the next boot. First half of the Phase-6 HA
-story — a delta replicator (6.2) and Raft multi-node (6.3) ride
-on top of this primitive. Takes v0.58.0; 6.1 was pre-slotted at
-v0.61.0 in the plan but the out-of-order move was cleaner than
-waiting on slices 5.8/5.9/5.10/5.11 first.
+replays it on the next boot. First half of the HA
+story — a delta replicator and Raft multi-node ride
+on top of this primitive.
 
 ### Added
 
@@ -511,7 +579,7 @@ waiting on slices 5.8/5.9/5.10/5.11 first.
   missing file (cold-boot) and refuse loudly on magic mismatch
   or future version.
 - **`UasServer::dialogs_handle()`** — shares the `Arc<DashMap<DialogKey,
-  DialogRecord>>` so the CLI's shutdown path can snapshot live
+DialogRecord>>` so the CLI's shutdown path can snapshot live
   dialog state. `run()` consumes `self`, so the handle must be
   cloned out before spawn.
 - **`UasServer::restore_dialogs()`** — primes the dialog table
@@ -547,27 +615,13 @@ waiting on slices 5.8/5.9/5.10/5.11 first.
 - **`smiths-cli` deps**: added `dashmap` (typed handle on the
   dialog table for the shutdown snapshot path).
 
-### Notes
-
-- **Out-of-order vs plan**: plan pre-slotted 6.1 at v0.61.0
-  after 5.8/5.9/5.10/5.11. Those slices are larger (config
-  hot-reload + canary + WebRTC native + privacy) and depend on
-  infra that's partial today. 6.1 is self-contained and useful
-  on its own — the HA MVP unblocks single-node restart stories
-  that every deployment wants. Subsequent 5.x / 6.x slices will
-  cascade by one version; the plan will be updated when they
-  land.
-- **No live replication.** Slice 6.2 adds that. A primary that
-  crashes between snapshots loses dialogs opened since the last
-  graceful shutdown.
-
 ## [0.57.0] - 2026-04-23
 
-Slice 5.6c — UAS transcoded-session wiring. Closes the
+UAS transcoded-session wiring. Closes the
 transcoding half of the 5.6 cluster: the UAS's rendezvous
 pairing path now detects codec mismatch between the two legs,
 consults a `TranscodeOrchestrator` trait seam, and installs the
-returned `MediaSession` via `DialogSessions` (from slice 5.6a)
+returned `MediaSession` via `DialogSessions`
 instead of the plain passthrough bridge that would have silently
 dropped audio. Keeps `smiths-sip` dep-light — the orchestrator
 seam is a trait the CLI wires with a concrete
@@ -579,7 +633,7 @@ separate follow-on slices.
 
 - **`smiths_sip::TranscodeOrchestrator` trait** — narrow seam
   (`async fn try_orchestrate(leg_a, codec_a, leg_b, codec_b) ->
-  Result<Option<Arc<dyn MediaSession>>, MediaError>`). `None`
+Result<Option<Arc<dyn MediaSession>>, MediaError>`). `None`
   return = admission refused; UAS logs and falls through to the
   passthrough path (pre-5.6c behaviour).
 - **`PendingLeg.audio_codec: Option<NegotiatedCodec>`** — carries
@@ -601,30 +655,10 @@ separate follow-on slices.
   and asserts the UAS routed a PCMU ↔ Opus rendezvous through
   it exactly once, with the codecs in leg-arrival order.
 
-### Notes
-
-- **Passthrough fallback on refusal.** When the orchestrator
-  returns `None` (budget exhausted), the UAS logs a warning and
-  falls through to the plain bridge. Future slice should
-  instead 488 the second leg + BYE the first — but that path
-  requires unwinding leg-A's already-established dialog,
-  which is out of scope here. Documented in the orchestrator
-  method's code comment.
-- **FAX + conferencing still deferred.** Those wirings use the
-  same `DialogSessions::swap` primitive but add new trigger
-  paths (T.38 re-INVITE, `join_conference` MCP tool). Separate
-  slices — the transcoding path is the most-wanted closure of
-  the 5.3 deferral, so it lands first.
-- **Cross-rate timestamp scaling on `TranscodedSession`** —
-  still TODO per the 5.6b module doc. The integration test
-  uses a stub session, so cross-rate doesn't fire here; when a
-  real orchestrator lands `smiths-media::TranscodedSession`
-  in production traffic, that's the moment to add it.
-
 ## [0.56.0] - 2026-04-23
 
-Slice 5.12 — Observability completeness. Fills the metrics gap
-that accumulated across slices 5.4 and 5.5: `smiths-mixer` and
+Observability completeness. Fills the metrics gap
+that accumulated: `smiths-mixer` and
 `smiths-fax` now publish Prometheus metrics on the same shared
 `Registry` the rest of the engine uses. Adds two MCP tools for
 control-plane introspection so LLM agents and runbook scripts
@@ -641,20 +675,20 @@ publishes, with alerting suggestions.
   - `smiths_mixer_ingress_dropped_total{reason=queue_full|frame_size}`
     (counter).
   - `smiths_mixer_participants_active` (gauge).
-  Wired via `Conference::spawn_with_metrics` — the default
-  `spawn()` stays metric-less for tests, production wires an
-  `Arc<MixerMetrics>` into the registry at boot. Tick loop
-  records tick counts + dominant-speaker transitions; push_frame
-  records ingress drops by reason; join/leave maintain
-  `participants_active`.
+    Wired via `Conference::spawn_with_metrics` — the default
+    `spawn()` stays metric-less for tests, production wires an
+    `Arc<MixerMetrics>` into the registry at boot. Tick loop
+    records tick counts + dominant-speaker transitions; push_frame
+    records ingress drops by reason; join/leave maintain
+    `participants_active`.
 - **`smiths-fax::FaxMetrics`** (new module) — three series:
   - `smiths_fax_sessions_active` (gauge).
   - `smiths_fax_datagrams_forwarded_total{direction}` (counter).
   - `smiths_fax_parse_errors_total{kind}` (counter) — every
     `UdptlError` variant maps to a fixed-cardinality kind token.
-  Wired via `UdptlSessionConfig::metrics`; forwarders credit the
-  counter on successful send, parse errors increment the kind-
-  labelled counter via `record_parse_error`.
+    Wired via `UdptlSessionConfig::metrics`; forwarders credit the
+    counter on successful send, parse errors increment the kind-
+    labelled counter via `record_parse_error`.
 - **MCP tool `list_metrics`** — returns every Prometheus series
   as JSON (`{count, series: [{metric, labels, value}, …]}`).
   Reads through the same `Arc<Mutex<Registry>>` the `/metrics`
@@ -680,38 +714,23 @@ publishes, with alerting suggestions.
   - Existing mixer / fax tests stay green because the metrics
     field is optional (defaults to `None`).
 
-### Notes
-
-- **Takes v0.56.0** as planned in the 5.12 slice entry.
-- **No breaking changes.** `Conference::spawn` still exists
-  with its original signature; `UdptlSessionConfig` gained
-  `metrics: Option<Arc<FaxMetrics>>` with `None` default.
-  Existing callers compile untouched.
-- **OpenTelemetry traces deferred.** That's a bigger integration
-  with `tracing-opentelemetry` + exporter config. The metrics
-  gap was more urgent (slice 5.9's canary would have had nothing
-  to watch on mixer/fax deployments).
-
 ## [0.55.0] - 2026-04-22
 
-Slice 5.7 — WebTransport signaling scaffold. Adds the protocol
+WebTransport signaling scaffold. Adds the protocol
 types + listener trait + config surface + browser demo that a
 future QUIC-runtime slice lands behind. Matches the existing
 `mcp-http3` / `sip-quic` scaffold pattern: the config shape and
 wire protocol ship now (testable, round-trippable, operator-
 visible in `--version`), the QUIC runtime follows later.
 
-Takes the v0.55.0 slot previously pre-slotted for slice 5.6c; 5.6c
-cascades one slot forward.
-
 ### Added
 
 - **`smiths-sip::webtransport`** module (behind `--features
-  webtransport`). Public surface:
+webtransport`). Public surface:
   - **`WtSignal` enum** — the JSON frame schema: `SessionInit`,
     `SessionAck`, `Offer`, `Answer`, `IceCandidate`, `IceEnd`,
     `Bye`, `Error`, `Echo`. `serde(tag = "type", rename_all =
-    "kebab-case")` produces exactly the wire form the browser
+"kebab-case")` produces exactly the wire form the browser
     demo emits. `encode()` / `decode()` surface for the future
     runtime; `kind()` + `session_id()` accessors for event
     routing.
@@ -772,7 +791,7 @@ cascades one slot forward.
 
 ## [0.54.0] - 2026-04-22
 
-Slice 5.6b — `TranscodedSession` primitive. Adds the
+`TranscodedSession` primitive. Adds the
 `MediaSession` variant that runs a `CallTranscoder` inline on a
 two-leg UDP RTP flow. The UAS doesn't auto-construct it yet —
 that's slice 5.6c (codec-mismatch detection + admission
@@ -805,32 +824,12 @@ full path.
   lease (proves the `TranscodeLease` ownership story holds
   end-to-end).
 
-### Notes
-
-- **UAS auto-construction is 5.6c.** This slice ships the
-  primitive; wiring the UAS's INVITE answer path to detect
-  `per_leg_codec` mismatch, call `CpuBudget::try_admit`,
-  build a `CallTranscoder`, and install a `TranscodedSession`
-  via `DialogSessions` is a focused follow-on. The split
-  keeps each session manageable.
-- **Cross-rate timestamp scaling deferred.** Opus 48 kHz ↔
-  PCMU 8 kHz needs a per-frame timestamp rewrite that 5.6b's
-  same-rate path doesn't (G.711↔G.711 and Opus↔Opus are both
-  20 ms / same RTP-clock cadence). Module doc marks the
-  deferral; 5.6c lands the scaling because that's when the
-  cross-rate path actually fires through the UAS.
-- **No SRTP / RTCP yet.** The plain `Bridge` path runs both;
-  the transcoded path adds them in 5.6c (or a 5.6d if
-  scope honesty calls for it). Documented loud in the
-  module doc rather than as a silent capability gap.
-
 ## [0.53.0] - 2026-04-22
 
 Slice 5.6 (5.6a — data-model refactor) — Multi-session call FSM
 substrate. Lands the type infrastructure + atomic session-swap
-API that slices 5.3 / 5.4 / 5.5 deferred to. The follow-on
-5.6b wires the three deferred primitives (transcoding, T.38
-FAX, conference participant sessions) through this substrate;
+API that deferred to. The follow-on wires the three deferred primitives
+(transcoding, T.38 FAX, conference participant sessions) through this substrate;
 this slice lands the refactor itself, the codec detection on
 the negotiator's output, and the arch doc. The split was
 pre-committed in the slice doc's honest-scope call-out.
@@ -838,12 +837,12 @@ pre-committed in the slice doc's honest-scope call-out.
 ### Added
 
 - **`LegId(u64)` + `MediaKindTag` + `SessionKey = (LegId,
-  MediaKindTag)` + `NegotiatedCodec`** in `smiths-core::call`.
+MediaKindTag)` + `NegotiatedCodec`** in `smiths-core::call`.
   The data model lets the call FSM track per-leg codec state
   and address media sessions by `(leg, media_kind)` rather
   than assuming one session per call.
 - **`DialogRecord::per_leg_codec: BTreeMap<LegId,
-  NegotiatedCodec>`** — serializable, `#[serde(default)]` so
+NegotiatedCodec>`** — serializable, `#[serde(default)]` so
   pre-5.6 HA snapshots deserialize unchanged. Populated by
   the UAS at 200 OK INVITE time from the negotiator's output.
 - **`DialogSessions`** (`smiths-core::dialog_sessions`) —
@@ -869,25 +868,9 @@ pre-committed in the slice doc's honest-scope call-out.
   enumeration) + 4 new `DialogRecord` / codec-enum
   serialization tests in `smiths-core::call`.
 
-### Notes
-
-- **Wirings deferred to slice 5.6b (v0.54.0).** Transcoding
-  wiring (codec mismatch → `CallTranscoder` via admission),
-  T.38 wiring (audio→image re-INVITE swap to `UdptlSession`),
-  and conferencing wiring (`join_conference` swap to a
-  `ConferenceParticipantSession`) all ride on top of this
-  slice's substrate. The split was pre-committed in the slice
-  doc because each wiring is ~150–200 LOC in its own right
-  and the 1-big-3-small shape won't absorb them together
-  without drift.
-- **`MediaKindTag` is parallel to `smiths_sdp::MediaKind`,
-  not a replacement.** The SDP one belongs to the parse tree;
-  the core one belongs to the call FSM. Conversion is an
-  impl detail of the 5.6b wirings.
-
 ## [0.52.0] - 2026-04-22
 
-Slice 5.5 — N:N audio conferencing. Adds the `smiths-mixer`
+N:N audio conferencing. Adds the `smiths-mixer`
 crate with a leave-one-out sum mixer, per-stream AGC, an
 energy-based VAD with hangover, a channel-driven `Conference`
 runtime, a `MixerFabric` that delegates `MediaFabric` operations
@@ -959,7 +942,7 @@ test asserts leave-one-out correctness + dominant-speaker pickup.
 
 ## [0.51.0] - 2026-04-22
 
-Slice 5.4 — T.38 FAX-over-IP. Adds a UDPTL relay
+T.38 FAX-over-IP. Adds a UDPTL relay
 (`smiths-fax::UdptlSession`) plus the SDP surface needed to
 negotiate `m=image <port> udptl t38` and the re-INVITE helper that
 switches an active audio call into T.38 mid-dialog. The engine's
@@ -1007,24 +990,9 @@ parsing, fax FSMs, and audio↔T.38 transcoding stay out of scope
   parsing, fax FSM, transcoding), UDPTL wire format, and the
   honest-deferral on bridge integration.
 
-### Notes
-
-- **No spandsp FFI.** The canonical C fax library is `unsafe` at
-  the FFI boundary; pulling it in conflicts with the workspace's
-  `unsafe_code = "deny"` policy. The reference test uses canned
-  fixture bytes — the relay is a bytes-mover, so what actually
-  produced the bytes (terminal, gateway, fixture script) doesn't
-  change the test's signal.
-- **Bridge integration deferred.** Wiring a `UdptlSession` into
-  the UAS re-INVITE path (atomic session swap, BYE propagation
-  across the new session type) is the same call-FSM refactor
-  the slice 5.1 video dual-bridge and slice 5.3 transcoding are
-  queued behind. Primitives land here; wiring lands with the
-  FSM refactor.
-
 ## [0.50.0] - 2026-04-21
 
-Slice 5.3 — Audio transcoding + CPU budget. Introduces the
+Audio transcoding + CPU budget. Introduces the
 `smiths-transcode` crate with a `Codec` trait, a shipping G.711
 baseline (μ-law + A-law, bit-exact round-trips), an optional
 Opus ↔ PCM16 path behind the `opus` Cargo feature, and a
@@ -1057,8 +1025,8 @@ this slice — see the crate-level doc for the deferral.
     when full; dropping the lease on BYE decrements
     automatically, so a panicked handler can't leak a slot.
     The UAS (future slice) maps `BudgetExhausted` to `488 Not
-    Acceptable Here` with `Warning: 370 transcode budget
-    exhausted`.
+Acceptable Here` with `Warning: 370 transcode budget
+exhausted`.
 - **`TranscodeMetrics`** — three Prometheus metrics registered
   on the engine's shared `Registry`:
   - `smiths_transcode_active` — gauge of currently-live
@@ -1070,7 +1038,7 @@ this slice — see the crate-level doc for the deferral.
 - **`[media.transcode]` config block** in `smiths-core::config` —
   `max_concurrent_calls` (default 40) + `cpu_budget_ms_per_call`
   (default 50, advisory). `From<&TranscodeConfig> for
-  CpuBudgetConfig` bridges the two types without round-tripping
+CpuBudgetConfig` bridges the two types without round-tripping
   through TOML.
 - **Tests** — 12 new tests across unit (`codec` / `budget` /
   `metrics` / `transcoder`) and integration
@@ -1080,22 +1048,9 @@ this slice — see the crate-level doc for the deferral.
 - **Example config update** — `examples/config.toml` documents
   the new `[media.transcode]` block with sizing guidance.
 
-### Notes
-
-- **Opus is off by default.** The `opus` crate links a system
-  libopus — most CI images don't have it. `--features opus` on
-  deployments that either install libopus or vendor it separately.
-- **Live bridge integration is explicitly deferred.** Plumbing a
-  `CallTranscoder` into the RTP hot path touches `BridgeConfig`,
-  the per-leg SRTP transforms, and the RTCP stats path — it's
-  the same call-FSM refactor slice 5.1's video dual-bridge
-  follow-on needs, and bundling them keeps the workstream
-  coherent. The primitives + budget + metrics land here; the
-  wiring lands alongside the 5.1 video work.
-
 ## [0.49.0] - 2026-04-22
 
-Slice 5.2 — FlatBuffers plugin wire format. Two formats now
+FlatBuffers plugin wire format. Two formats now
 share the engine↔plugin channel: protobuf (pre-5.2 default, via
 prost) and a hand-rolled flat binary layout (new, tuned for the
 RTP hot path). Plugin authors opt in per-plugin via a single
@@ -1128,43 +1083,23 @@ builds.
   Unknown tokens fail the manifest parse loudly rather than
   silently falling back.
 - **Throughput bench** — `crates/smiths-proto/tests/
-  wire_format_throughput.rs` (marked `#[ignore]`). Runs 50k
+wire_format_throughput.rs` (marked `#[ignore]`). Runs 50k
   round trips of each format on a 160-byte PCMU-shaped
   `RtpFrame`, prints ns-per-iter + byte size, asserts the flat
   path is ≥2× faster than prost. Observed local: `proto
-  2318 ns, flatbuffers 708 ns — 3.27×`.
+2318 ns, flatbuffers 708 ns — 3.27×`.
 - **Tests** — 7 new unit tests on `flatbuffers_io` (`RtpFrame`
-  + `Envelope` round trips, `RtpFrameView` zero-copy proof,
-  truncated + magic-mismatch error paths) + 3 new manifest
-  tests (defaults, explicit `flatbuffers`, unknown-token
-  rejection).
+  - `Envelope` round trips, `RtpFrameView` zero-copy proof,
+    truncated + magic-mismatch error paths) + 3 new manifest
+    tests (defaults, explicit `flatbuffers`, unknown-token
+    rejection).
 - **`docs/architecture/10-plugin-wire-format.md`** — format
   comparison, picking rules, layout tables for both formats,
   migration checklist.
 
-### Notes
-
-The workspace's `unsafe_code = "deny"` lint rules out the
-official `flatbuffers` crate's raw-table API (which is
-`unsafe`-heavy by design). Rather than carry a scoped
-`#[allow(unsafe_code)]` for it, the crate ships a hand-rolled
-flat binary layout that matches the FlatBuffers philosophy
-(flat, offset-addressable, zero-copy reads) while staying
-unsafe-free. The name is still right; the library is just
-absent. A future slice that genuinely needs the library's
-richer schema (optional metadata tables, unions) can revisit —
-a scoped allow is a one-file change.
-
-The `media.streaming_rtp` runtime — the host function that
-actually hands `RtpFrame` bytes to a loaded plugin — is a
-dedicated follow-on. Today the wire format is ready + proven
-against a micro-benchmark; wiring the engine's bridge to
-stream frames into the plugin needs the per-leg call-id
-routing + frame-rate backpressure story.
-
 ## [0.48.0] - 2026-04-21
 
-Slice 5.1 — Video calls (passthrough). SDP negotiator gains
+Video calls (passthrough). SDP negotiator gains
 `m=video` support for H.264 / VP8 / VP9 via a new multi-stream
 negotiation path. Peers that offer audio + video get a
 well-formed answer with both m-lines and the ordering preserved,
@@ -1181,14 +1116,14 @@ as the UAS allocates the second endpoint.
   numbers are placeholders; the answer mirrors the offerer's
   PT so passthrough B2BUAs stay happy.
 - **`Negotiator::answer_with_video(offer, audio_port,
-  video_port)`** — audio negotiation identical to
+video_port)`** — audio negotiation identical to
   `answer()`, then appends a matching `m=video` block. When
   `video_port` is `None` or no offered codec is in the
   passthrough set, emits `m=video 0 ...` to decline while
   preserving m-line ordering (RFC 3264 §6). Never fails the
   whole negotiation on a video-only issue.
 - **`SdpNegotiator::negotiate(offer_body, local_ip, audio_port,
-  video_port)`** — new trait method. Default impl delegates to
+video_port)`** — new trait method. Default impl delegates to
   `negotiate_audio` so existing impls stay trait-compatible;
   the in-tree `Negotiator` overrides it to do the real
   multi-stream answer.
@@ -1209,38 +1144,18 @@ as the UAS allocates the second endpoint.
   unknown-codec declines, audio-only round-trips unchanged,
   `NegotiationOutcome::video_media` populates + redacts
   correctly, audio-backcompat path leaves `video_media` None)
-  + 1 new SIP-level integration test
-  (`invite_with_audio_plus_video_declines_video_but_keeps_audio`)
-  that drives the full UAS surface with a real audio+video
-  INVITE and asserts the declining answer shape.
+  - 1 new SIP-level integration test
+    (`invite_with_audio_plus_video_declines_video_but_keeps_audio`)
+    that drives the full UAS surface with a real audio+video
+    INVITE and asserts the declining answer shape.
 - **`docs/architecture/09-video-passthrough.md`** — "no
   transcoding; passthrough only" framing, SDP shape table,
   rollout plan for the UAS dual-bridge follow-on, reasoning
   on why passthrough beats transcoding for the B2BUA use case.
 
-### Notes
-
-The UAS dual-bridge wiring (allocate a second
-`MediaEndpoint`, spawn a second `MediaFabric::bridge`, track
-both on `DialogRecord`, clean both on BYE) is a dedicated
-follow-on slice. It touches `DialogRecord` serialization,
-`PendingLeg` shape, `bridges_by_dialog` indexing, and every
-call site that reads the per-dialog media handle (control
-plane, MCP tools like `speak` / `send_dtmf`) — a multi-hour
-refactor that deserves its own release. Today's release
-closes the SDP-layer half cleanly: the declining answer is
-RFC-compliant, m-line ordering is preserved, and
-`NegotiationOutcome::video_media` surfaces the peer's endpoint
-so the follow-on wires in additively.
-
-The default video codec set picks RTP payload types `96`,
-`97`, `98`. Per RFC 3264 / RFC 3551 these are dynamic-range
-PTs; the negotiator mirrors the offerer's PT regardless, so
-codec selection is by name + clock rate, not by PT number.
-
 ## [0.47.0] - 2026-04-21
 
-Slice 4.5 — IoT bridges. Two reference sidecars land on the new
+IoT bridges. Two reference sidecars land on the new
 `bridge.*` capability namespace (Home Assistant + generic MQTT
 3.1.1) with documented event-mapping patterns, a doorbell demo,
 and an operator runbook for outbound `call.ended` publishing.
@@ -1255,10 +1170,10 @@ and an operator runbook for outbound `call.ended` publishing.
   - `emit_event(event_type, data)` → `POST /api/events/<type>`
   - `get_state(entity_id)` → `GET /api/states/<entity>`
   - `call_service(domain, service, data)` → `POST
-    /api/services/<domain>/<service>`
-  Env-configured (`HA_BASE_URL`, `HA_TOKEN`, `HA_TIMEOUT_SECS`);
-  every HTTP failure surfaces as a JSON-RPC error the
-  dispatcher can fail over.
+/api/services/<domain>/<service>`
+    Env-configured (`HA_BASE_URL`, `HA_TOKEN`, `HA_TIMEOUT_SECS`);
+    every HTTP failure surfaces as a JSON-RPC error the
+    dispatcher can fail over.
 - **`plugins/examples/mqtt-bridge/`** — stdlib-only MQTT 3.1.1
   publisher. Ships its own CONNECT / PUBLISH / DISCONNECT
   encoder (~100 LOC) so no `paho-mqtt` dep is required.
@@ -1276,30 +1191,9 @@ and an operator runbook for outbound `call.ended` publishing.
   (`accepts_bridge_ha_and_mqtt_capabilities`) covering both
   new tokens round-tripping through the validator.
 
-### Notes
-
-Inbound automation (HA → smiths-net) flows through the webhook
-adapter (slice 4.4 / P20). The `ha-bridge` sidecar covers only
-the outbound direction (engine → HA) because the plugin
-protocol doesn't yet push events from engine to plugin — a
-dedicated "event subscriber" capability is a follow-on slice.
-
-The MQTT bridge is publish-only; `subscribe` needs a
-persistent-connection lifecycle that doesn't fit the sidecar
-JSON-RPC model as it stands. Operators who need subscription-
-driven flows run a dedicated MQTT consumer outside the plugin
-tier and invoke smiths-net's webhook adapter from there.
-
-No engine-host adapter wires these sidecars into named tools
-today — agents invoke them via the generic `ai_invoke` path
-(`{plugin, method, params}`). Adding dedicated MCP tool
-wrappers (`bridge_emit_ha`, `bridge_mqtt_publish`) for better
-discoverability is a small follow-on; the plumbing is already
-in place via the standard dispatcher.
-
 ## [0.46.0] - 2026-04-21
 
-Slice 4.4 — A2A protocols. The control plane learns a fourth
+A2A protocols. The control plane learns a fourth
 adapter (generic HTTP webhook) and gets a new shared trait seam
 (`ControlProtocol` + `ProtocolDispatch` + `ControlOutcome`) so
 operator-authored adapters route through the same auth + rate-
@@ -1311,11 +1205,10 @@ to the existing adapters; everything is additive.
 - **`smiths_mcp::control_protocol`** — adapter-agnostic trait
   seam. Three types land:
   - `ControlOutcome` — normalized `Ok | InvalidArguments |
-    NotFound | Forbidden | Internal` verdict. Stable HTTP status
-    + JSON-RPC code mapping on each variant.
+NotFound | Forbidden | Internal` verdict. Stable HTTP status - JSON-RPC code mapping on each variant.
   - `ProtocolDispatch` — thin wrapper over
     `Arc<ToolRegistry> + Arc<RateLimiter> + Arc<Metrics> +
-    ToolContext` with one `invoke(actor, tool, args)` method
+ToolContext` with one `invoke(actor, tool, args)` method
     that runs the shared `invoke_audited` pipeline and hands
     back a `ControlOutcome`.
   - `ControlProtocol` trait + three singleton markers
@@ -1366,7 +1259,7 @@ land alongside the MCP/A2A dispatch-loop migration.
 
 ## [0.45.0] - 2026-04-21
 
-Slice 4.3 — HTTP/3 MCP + SIP-over-QUIC. MCP HTTP upgrades to
+HTTP/3 MCP + SIP-over-QUIC. MCP HTTP upgrades to
 h1+h2 (free axum feature flip); feature flags + config scaffolds
 land for the h3 listener and SIP-over-QUIC transport. `smiths-net
 --version` now advertises every supported protocol, and
@@ -1403,31 +1296,14 @@ land for the h3 listener and SIP-over-QUIC transport. `smiths-net
 - **`docs/architecture/07-http3.md`** — what shipped in 0.45.0,
   what's deferred and why, rollout plan through 0.48.0.
 
-### Notes
-
-The runtime listeners for both `mcp-http3` and `sip-quic` are
-honestly deferred. Reasons:
-
-- h3 needs a TLS 1.3 cert story separate from the DTLS-SRTP path
-  (media cert vs signaling cert shouldn't be the same key).
-- `quinn` + `h3-quinn` + `h3` integrate with axum through
-  `tower::Service`, not `axum::serve` — ~200-400 LOC of graceful-
-  shutdown + 0-RTT replay-safety code that deserves its own
-  slice.
-- `draft-ietf-sipcore-sip-quic` is still evolving; wiring a
-  listener today pins us to a spec version that may shift.
-
-Operators who opt into either feature today get the config shape
-parsed + a clear warning + the `--version` bump — no silent
-binding, no half-wired socket.
-
 ## [0.44.0] - 2026-04-21
 
-Slice 4.2 — Dialplan + IVR kit. Two more reference plugins land
+Dialplan + IVR kit. Two more reference plugins land
 on the `routing.*` namespace: `dialplan-yaml` (YAML-authored
 from/to/hour-of-day matchers) and `ivr-kit` (Rhai state machine
 driving `play_prompt` / `transfer` / `hangup`). A prompt library
-+ `record_prompt` MCP tool close out the authoring loop.
+
+- `record_prompt` MCP tool close out the authoring loop.
 
 ### Added
 
@@ -1442,7 +1318,7 @@ driving `play_prompt` / `transfer` / `hangup`). A prompt library
 - **`plugins/examples/ivr-kit/`** — reference IVR state machine
   in Rhai. Exports `describe_capabilities`, `greet(session)`, and
   `on_dtmf(session)`; returns `{action, prompt?, target?, state,
-  done}` per press. Ships a press-1-for-sales / press-2-for-
+done}` per press. Ships a press-1-for-sales / press-2-for-
   support / press-3-record-a-message tree with `*` to replay and
   `#` to hang up. Capability `routing.ivr`.
 - **`smiths-media::PromptLibrary`** — LRU of decoded PCM16 LE
@@ -1458,7 +1334,7 @@ driving `play_prompt` / `transfer` / `hangup`). A prompt library
   decodes the provided PCM16 LE audio, refuses absolute or
   `..`-containing paths, writes a mono WAV under the library
   root, seeds the cache. Returns `{path, absolute, sample_rate,
-  bytes, duration_ms}`.
+bytes, duration_ms}`.
 - **`ToolContext::with_prompts`** — engine threads the wired
   `PromptLibrary` onto tools through the existing `ToolContext`
   seam.
@@ -1473,28 +1349,9 @@ driving `play_prompt` / `transfer` / `hangup`). A prompt library
   support, `9` → replay, `#` → hangup, `3` → record submenu,
   submenu `#` → hangup).
 
-### Notes
-
-The IVR runtime seam — the glue that pushes live-call DTMF into
-`on_dtmf` and has the UAS act on a returned `transfer` /
-`hangup` mid-dialog — is a dedicated follow-on. The Rhai
-contract in `ivr-kit` is stable; today the state machine is
-driven synchronously by tests + tools that build a session
-directly. Once the bridge exposes a per-call "IVR session"
-control surface, the plugin switches from "test-driven" to
-"engine-driven" with no script changes.
-
-The dialplan sidecar ships without a native engine-side adapter
-that plugs it in behind a route-selection trait — scripts and
-sidecars alike are reachable via `AiProvider::invoke("route", …)`
-on the plugin registry, and the SIP UAS calls into that surface
-on INVITE. A dedicated `routing::Router` facade that lets
-operators chain multiple `routing.dialplan` plugins (YAML first,
-Rhai fallback, etc.) is a small follow-on.
-
 ## [0.43.0] - 2026-04-21
 
-Slice 4.1 — Embedded DSL runtime (Rhai). The `smiths-script` crate
+Embedded DSL runtime (Rhai). The `smiths-script` crate
 gains a working Rhai-backed `ScriptRuntime` with op-count +
 wall-clock budgets; the plugin loader wires `type = "script"` into
 the same `AiProvider` seam that sidecars + WASM guests use. Hot
@@ -1554,26 +1411,9 @@ out the slice.
   rollback restores the good runtime after 5 consecutive errors);
   2 tool tests on the new `put_script` surface.
 
-### Notes
-
-Hot-reload today refuses to change the advertised capability set
-— a script whose new `describe_capabilities` returns a different
-set is treated as a manifest change, not a script edit. Operators
-pick up the new contract by restarting the engine (or by removing
-and re-adding the plugin directory, which triggers the ordinary
-loader path).
-
-Rhai's engine is synchronous; invocations run on a
-`tokio::task::spawn_blocking` worker. This keeps each call
-isolated from the tokio scheduler but means the effective
-concurrency per script is bounded by the blocking pool. Scripts
-that genuinely need parallelism should stay short — the dialplan
-shape is a good fit; long-form RAG routing should stay in a
-sidecar.
-
 ## [0.42.0] - 2026-04-21
 
-Slice 3.5 — Proxy/VPN transports. SIP-over-TCP and SIP-over-TLS can
+Proxy/VPN transports. SIP-over-TCP and SIP-over-TLS can
 now tunnel outbound connects through a SOCKS5 or HTTP-CONNECT
 proxy. A WireGuard deployment guide lands alongside, plus a
 feature-flag scaffold for the embedded `boringtun` path. Ingress
@@ -1630,7 +1470,7 @@ the sidecar WireGuard pattern documented in
 
 ## [0.41.0] - 2026-04-21
 
-Slice 3.4 — Vector + Recording storage. Two new pluggable storage
+Vector + Recording storage. Two new pluggable storage
 traits join `CdrStore` / `KvStore`: `VectorStore` backs the new
 `search_calls_semantic` MCP tool, and `RecordingStore` unblocks the
 call-id-only path on `transcribe_call` / `summarize_call`. The
@@ -1695,25 +1535,9 @@ recordings) and scaffolds sidecars for the hosted backends.
   integration test exercises the upsert → embed → search round
   trip end-to-end with a deterministic stub embed provider.
 
-### Notes
-
-The storage-sidecar adapter — the shim that lets
-`[storage.vector] backend = "sidecar"` pick up a loaded Qdrant
-plugin and present it through the `VectorStore` trait — is
-scaffolded but not yet wired. Selecting `sidecar` today logs a
-warning and falls through to "no backend"; `search_calls_semantic`
-returns `NotFound`. Landing the adapter is a small follow-on
-slice once we have a second vector backend asking for the same
-seam.
-
-Retention is wall-clock mtime-based on the filesystem store; on
-disks without reliable mtimes (some NFS mounts, tmpfs under
-certain containers) the sweeper may mis-classify. Object-store
-backends use the LIST response's `LastModified` timestamp.
-
 ## [0.40.0] - 2026-04-21
 
-Slice 3.3 — ASR + composite AI pipelines. `ai-asr-whisper`
+ASR + composite AI pipelines. `ai-asr-whisper`
 sidecar (local whisper.cpp) joins the `ai.asr` seam, and two new
 MCP tools — `transcribe_call` and `summarize_call` — route through
 the dispatcher so agents name a capability, not a plugin. The
@@ -1762,25 +1586,9 @@ pipeline histogram.
   `NotFound`; no asr provider → `NotFound`; missing `call_id` →
   `InvalidArguments`). Total MCP tool-unit-test count is now 24.
 
-### Notes
-
-The call-id-only path on `transcribe_call` / `summarize_call` is an
-honest deferral: without a `storage.recording` backend the engine
-has nowhere to pull audio from. Slice 3.4 lands that backend
-(`storage.recording` trait + filesystem default + S3 sidecar); at
-that point both tools will resolve audio from `call_id` alone and
-the `audio_base64` parameter becomes the override, not the
-requirement.
-
-The Whisper sidecar can't be exercised in CI — each invocation
-shells out to the `whisper-cli` binary and loads a 100 MB+ GGML
-model from disk. The tool-level tests use the mock registry and
-prove the dispatcher hookup; the real binary is covered by the
-README's smoke-test recipe.
-
 ## [0.39.0] - 2026-04-21
 
-Slice 3.2 — Cloud AI parity. `ai-llm-openai` and `ai-llm-anthropic`
+Cloud AI parity. `ai-llm-openai` and `ai-llm-anthropic`
 reference sidecars join the local `ai-llm-ollama` at the
 `ai.llm.chat` seam, all behind the same ABI. Streaming partials
 ride the existing plugin-notification rail as `ai.llm.partial`
@@ -1827,25 +1635,9 @@ new `smiths_ai_tokens_total` counter.
   `ai.llm.partial` notifications reach the engine's bus as
   `PluginEvent::Notification`.
 
-### Notes
-
-The engine does **not** auto-forward `[ai]` config secrets into
-sidecar child environments — operators still set `OPENAI_API_KEY` /
-`ANTHROPIC_API_KEY` in the engine's own environment, which the
-sidecars inherit on spawn. The config surface exists so secrets have
-one canonical home on disk + a tested redaction path; an env-
-injection layer ("secrets plumbing") is a small follow-on.
-
-The two cloud sidecars can't be exercised in CI (no API keys on
-CI runners), which is why the streaming-partials test uses the
-extended mock. The mock + the two cloud sidecars emit identical
-wire frames (`ai.llm.partial` shape, final-marker, token accounting
-in the RPC response), so a passing mock test implies the cloud
-path is protocol-correct.
-
 ## [0.38.0] - 2026-04-21
 
-Slice 3.1 — AI providers: `AiDispatcher` + fail-over. Agents now
+AI providers: `AiDispatcher` + fail-over. Agents now
 say `ai_invoke(capability, ...)` and the engine picks the best
 candidate by priority + health; a single flapping plugin no longer
 blocks the whole call. Reference sidecars (`ai-llm-ollama`,
@@ -1859,7 +1651,7 @@ blocks the whole call. Reference sidecars (`ai-llm-ollama`,
   `capability` string, sorted by descriptor `priority` (lower wins;
   ties broken by `latency_ms.p50`, then lexical plugin name),
   breaker-open plugins partitioned to the tail. `invoke(capability,
-  method, params)` runs the chain with per-attempt timeout + fail-
+method, params)` runs the chain with per-attempt timeout + fail-
   over; returns the first `Ok`, or `DispatchError::AllFailed` with
   the final error attached.
 - **`DispatchPolicy`** — `per_attempt_timeout` (30 s default),
@@ -1900,25 +1692,9 @@ blocks the whole call. Reference sidecars (`ai-llm-ollama`,
   three `extract_chat_content` shapes: flat, `message.content`,
   `choices[0].message.content`).
 
-### Notes
-
-Dispatcher metrics are plumbed through `AiDispatcher::with_metrics`
-but the MCP `translate` tool constructs its own dispatcher per
-call and currently runs **without** a metrics handle — engine-level
-wiring (one dispatcher on `ToolContext`, `Arc<Metrics>` threaded
-through) is a small follow-on slice. `smiths_ai_invocations` /
-`smiths_ai_failovers` are still registered on the Prometheus
-registry so they show up at 0 until the wiring lands.
-
-The two reference sidecars assume a healthy local install — Ollama
-daemon up, or `piper` + an ONNX voice on disk. Each sidecar still
-serves `describe_capabilities` when its backend is unreachable, so
-the dispatcher sees the candidate and fails over on `invoke`. That
-keeps `list_ai_providers` honest in both states.
-
 ## [0.37.0] - 2026-04-21
 
-Slice 2.5 — Inband DTMF via Goertzel. Covers legs that never
+Inband DTMF via Goertzel. Covers legs that never
 negotiated RFC 4733 (PSTN gateway crossings) — same `DtmfSink`
 contract as slice 2.4, same `SipEvent::Dtmf` bus event.
 
@@ -1954,19 +1730,9 @@ contract as slice 2.4, same `SipEvent::Dtmf` bus event.
   `dtmf_inband_bus.rs` end-to-end: synthesized tones over PCMU
   through `UdpMediaFabric` → live `EventBus` subscriber.
 
-### Notes
-
-The Python sidecar listed in the slice plan (numpy + Goertzel) is
-deferred — running a detector across a JSON-RPC boundary at 50
-packets/sec/leg is absurd for a hot-path workload. The engine-side
-pure-Rust detector covers the acceptance target (≥ 95% accuracy on
-clean audio; bench passes 100%). A plugin-tier consumer will slot
-in later behind the new `media.streaming_rtp` capability without
-engine changes.
-
 ## [0.36.0] - 2026-04-21
 
-Slice 2.4 — DTMF via RFC 4733 (a.k.a. RFC 2833). DTMF keypresses
+DTMF via RFC 4733 (a.k.a. RFC 2833). DTMF keypresses
 detected on the media bridge now land on the engine's event bus as
 `SipEvent::Dtmf` + are emittable from the control plane via
 `send_dtmf`.
@@ -1976,7 +1742,7 @@ detected on the media bridge now land on the engine's event bus as
 - **`smiths-core::dtmf` module** —
   - `TelephoneEvent::parse` / `encode` (RFC 4733 §2.3 wire format).
   - `event_code_to_digit` / `digit_to_event_code` — §3.2 Table 1
-    mapping (0–9, *, #, A–D, flash).
+    mapping (0–9, \*, #, A–D, flash).
   - `DtmfDetector` — stateful decoder. Dedupes the §2.5.1.3
     three-end retransmits and emits exactly one `DtmfKeypress` per
     press with a wall-clock `duration_ms`.
@@ -2009,17 +1775,9 @@ detected on the media bridge now land on the engine's event bus as
   - 8 unit tests on the parse/encode/detector cycle + 3 on the
     generator.
 
-### Notes
-
-The plugin-tier version (`dtmf-2833` as a WASM plugin under
-`plugins/examples/`) is deferred — the engine-side detection path
-covers the acceptance scenario (MCP subscriber observes DTMF inside
-100 ms of the tone), and landing the reference plugin is a pure
-follow-on behind the same `DtmfSink` trait.
-
 ## [0.35.0] - 2026-04-21
 
-Slice 2.3 — Pluggable storage MVP (P23). Formalizes the persistence
+Pluggable storage MVP (P23). Formalizes the persistence
 surface every post-MVP feature (HA, recording, RAG, presence) now
 targets. CDR recording wired end-to-end.
 
@@ -2032,9 +1790,9 @@ targets. CDR recording wired end-to-end.
   - [`KvStore`] — opaque key/value for session state + hot-reload
     snapshots. `get` / `put` / `delete` / `list_prefix`.
   - [`StorageError`] — backend-agnostic error type.
-  (The existing `smiths-sip::auth::CredentialStore` stays in the
-  SIP crate; it's RFC-2617-shaped and this slice adds the generic
-  companions rather than shuffle the auth seam.)
+    (The existing `smiths-sip::auth::CredentialStore` stays in the
+    SIP crate; it's RFC-2617-shaped and this slice adds the generic
+    companions rather than shuffle the auth seam.)
 - **`[storage]` config section** — `backend = "none" | "sqlite"`,
   `[storage.sqlite] path`. Defaults to `none` so fresh configs
   stay silent until operators opt in.
@@ -2069,7 +1827,7 @@ it's a pure addition when it lands.
 
 ## [0.34.0] - 2026-04-21
 
-Slice 2.2 — HTTP webhook subscriber-DB backend (P8, second half).
+HTTP webhook subscriber-DB backend (P8, second half).
 Operators with existing IAM / HR systems can now delegate
 credential lookup to an HTTPS endpoint without exposing plaintext
 passwords to the engine.
@@ -2119,7 +1877,7 @@ passwords to the engine.
 
 ## [0.33.0] - 2026-04-21
 
-Slice 2.1 — SQLite subscriber DB (P8, first half). Unblocks
+SQLite subscriber DB (P8, first half). Unblocks
 production REGISTER with persisted credentials + contact bindings.
 
 ### Added
@@ -2172,7 +1930,7 @@ production REGISTER with persisted credentials + contact bindings.
 
 ## [0.32.0] - 2026-04-20
 
-Closes **prod-readiness Phase 6** — full e2e + perf validation.
+Closes full e2e + perf validation.
 
 ### Added
 
@@ -2205,7 +1963,7 @@ Closes **prod-readiness Phase 6** — full e2e + perf validation.
 - `systemd/smiths-net.service` — `CAP_NET_BIND_SERVICE` ambient
   cap, `ProtectSystem=strict`, read-only `/etc/smiths-net` mount,
   systemcall filter (`@system-service`), `RestrictAddressFamilies
-  =AF_INET AF_INET6 AF_UNIX`.
+=AF_INET AF_INET6 AF_UNIX`.
 - `k8s/` — `Deployment` (2 replicas, zero-unavailable rolling
   update, read-only root, `RuntimeDefault` seccomp),
   `ConfigMap` (engine config inline), `Service`
@@ -2278,9 +2036,9 @@ stays feature-gated until a CI image can be standardized.
   candidates after the initial offer gets merged without triggering
   a full renegotiation.
 - **Typed media-security events** — `SipEvent::MediaSecurityError`
-  + `MediaSecurityFailure` enum (`DtlsFingerprint`, `DtlsHandshake`,
-  `SrtpAuthTag`, `UnsupportedSuite`). Dashboards can now count
-  crypto failures by class instead of scraping logs.
+  - `MediaSecurityFailure` enum (`DtlsFingerprint`, `DtlsHandshake`,
+    `SrtpAuthTag`, `UnsupportedSuite`). Dashboards can now count
+    crypto failures by class instead of scraping logs.
 - **`smiths-testkit::webrtc_harness`** — module under the new
   `browser` Cargo feature. Placeholder `WebRtcHarness` +
   `HarnessConfig` + `HarnessError` so downstream tests can compile
@@ -2296,7 +2054,7 @@ stays feature-gated until a CI image can be standardized.
 ### Added — ICE MVP (host candidates only)
 
 New `smiths-ice` crate implementing the STUN half of the ICE
-pairing algorithm. Slice 1.4 of the DTLS-SRTP / ICE rollout —
+pairing algorithm. The DTLS-SRTP / ICE rollout —
 LAN loopback works end-to-end today; STUN short-term credentials +
 server-reflexive candidates + TURN relay are follow-on slices.
 
@@ -2319,21 +2077,21 @@ server-reflexive candidates + TURN relay are follow-on slices.
 
 ### Added — DTLS-SRTP handshake (`smiths-dtls`)
 
-Slice 1.3 of the DTLS-SRTP rollout. Per-leg DTLS handshake against
+The DTLS-SRTP rollout. Per-leg DTLS handshake against
 a fixed peer, SRTP keying material extracted via RFC 5764 §4.2
 `EXTRACTOR-dtls_srtp` label, fingerprint verification against the
 SDP-advertised value.
 
 - **New crate `smiths-dtls`** wrapping `webrtc-dtls` 0.12.
   `DtlsLeg` per-leg state machine (`Idle → Handshaking → Active
-  → Closed`); `DtlsLegConfig` bundles the local cert, the
+→ Closed`); `DtlsLegConfig` bundles the local cert, the
   `DtlsRole` (Client / Server), and the peer fingerprint to check.
 - **Fingerprint verification** — SHA-256 of the peer's leaf cert
   compared against the normalized SDP fingerprint. Mismatch
   surfaces as `DtlsHandshakeError::FingerprintMismatch`; weaker
   algorithms (sha-1) surface as `UnsupportedAlgorithm`.
 - **`use_srtp` extension** — `srtp_protection_profiles =
-  [SRTP_AES128_CM_HMAC_SHA1_80]` fixed for MVP; any other profile
+[SRTP_AES128_CM_HMAC_SHA1_80]` fixed for MVP; any other profile
   on the wire is a hard error.
 - **SRTP key extraction** — 60-byte export sliced into
   client/server stacks and assigned to `peer_tx_key` /
@@ -2353,7 +2111,7 @@ SDP-advertised value.
 
 ### Added — DTLS-SRTP SDP surface + cert helper
 
-Slice 1.2 of the DTLS-SRTP rollout. Parses (but does not yet
+The DTLS-SRTP rollout. Parses (but does not yet
 terminate) the full WebRTC SDP surface so peers offering
 `UDP/TLS/RTP/SAVP` see a descriptive 488 rather than a silent
 reject — and later slices (1.3 handshake, 1.4 ICE) slot into a
@@ -2518,9 +2276,10 @@ the idiomatic per-package route.
 ### Added — `sdes_crypto` fuzz target
 
 New `fuzz/fuzz_targets/sdes_crypto.rs` drives `SdesCrypto::parse`
-+ `SessionDescription::parse` with adversarial bytes. Matches the
-existing `sip_parser` target's shape. Run via
-`cargo +nightly fuzz run sdes_crypto`.
+
+- `SessionDescription::parse` with adversarial bytes. Matches the
+  existing `sip_parser` target's shape. Run via
+  `cargo +nightly fuzz run sdes_crypto`.
 
 ## [0.21.0] - 2026-04-20
 
@@ -2642,6 +2401,7 @@ automatically.
 ### Added — `codec_mismatch` integration coverage (`tests/codec_mismatch.rs`)
 
 Four richer SDP-offer shapes the UAS must reject with 488:
+
 - Multiple unknown codecs at three different clock rates in one
   offer (guards against a regression where the first PT number
   matched regardless of codec name).
@@ -2673,14 +2433,6 @@ Moved from `bridge(a, peer_a, b, peer_b)` to
 `bridge(a: BridgeLeg, b: BridgeLeg)`. Every in-tree caller migrated;
 external trait implementers need to update their `bridge` signature
 and import `smiths_core::BridgeLeg`.
-
-### Docs
-
-- `docs/architecture/03-mcp-and-ops.md` — rewritten MCP section to
-  reflect the actual three-transport surface (stdio, HTTP, SSE) +
-  the A2A HTTP adapter, the shipped tool + resource sets, SSE
-  notification stream, and bearer/rate-limit/audit posture. Closes
-  the Phase 5 pending item.
 
 ### Roadmap tidy-up
 
@@ -2735,13 +2487,13 @@ hosts both client and server FSMs.
 
 All four FSMs written, tested, and hosted by the async driver:
 
-- Client non-INVITE (§17.1.2) — migrated (`UacClient::hangup`).
-- Client INVITE (§17.1.1) — migrated (`UacClient::place_call`).
-- Server INVITE (§17.2.1) — library + driver API, UAS wiring
+- Client non-INVITE — migrated (`UacClient::hangup`).
+- Client INVITE — migrated (`UacClient::place_call`).
+- Server INVITE — library + driver API, UAS wiring
   deferred.
-- Server non-INVITE (§17.2.2) — library + driver API, UAS
+- Server non-INVITE — library + driver API, UAS
   wiring deferred.
-- Dialog FSM (§12) — library, ready for the dialog-layer glue
+- Dialog FSM — library, ready for the dialog-layer glue
   slice that ties transactions to call lifecycle.
 
 The existing UAS dedupe DashMap keeps working (deadlock fix
@@ -2751,7 +2503,7 @@ as an optional follow-on rather than a roadmap blocker.
 
 ## [0.18.0] - 2026-04-20
 
-### Added — Transaction FSM slices 3 + 4
+### Added — Transaction FSM
 
 Both INVITE-side transaction FSMs (RFC 3261 §17.1.1 + §17.2.1). The
 UAC `place_call` path migrates onto the client INVITE FSM; server
@@ -2822,7 +2574,7 @@ upgrades:
 
 ### Added — async `TransactionDriver` + first migration (UAC BYE)
 
-Second slice of the RFC 3261 §17 migration. The pure FSM built in
+Second slice of the RFC 3261 migration. The pure FSM built in
 v0.16.0 now has an async runtime + its first real call-site in the
 engine.
 
@@ -2858,7 +2610,7 @@ engine.
   `uac_places_call_and_hangs_up_against_fake_uas` integration test
   passes through the migrated path unchanged.
 
-### Deferred to FSM slice 3+
+### Deferred to FSM
 
 - **Client INVITE FSM** (§17.1.1, timers A/B/D, `Calling` state).
   Needed to migrate `UacClient::place_call` / `wait_for_final`.
@@ -2870,7 +2622,7 @@ engine.
 
 ## [0.16.0] - 2026-04-20
 
-### Added — RFC 3261 §17 transaction layer: framework + client non-INVITE
+### Added — RFC 3261 transaction layer: framework + client non-INVITE
 
 First slice of a multi-session migration off the ad-hoc UAC retransmit
 path. **Additive only** — the new FSM module lives alongside `uas.rs`
@@ -2889,7 +2641,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
     every FSM flavor implements.
 - **`smiths-sip::txn::timers`** — `T1` (500 ms), `T2` (4 s), `T4`
   (5 s), `TIMEOUT_64T1` (32 s) constants; `doubling_backoff(attempt,
-  cap)` helper shared across FSMs.
+cap)` helper shared across FSMs.
 - **`ClientNonInviteTxn` (RFC 3261 §17.1.2)** — smallest of the four
   FSMs, covers outbound BYE / OPTIONS / REGISTER / CANCEL once the
   driver wires it next session:
@@ -2907,7 +2659,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
   Trying and Proceeding, post-Terminated events are no-ops, key
   round-trips).
 
-### Deferred (FSM slice 2+)
+### Deferred FSM
 
 - **`TransactionDriver`** — async wrapper that owns timers +
   transaction table. Needed to integrate FSMs with the live UAC.
@@ -2943,7 +2695,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
   tests (canonical, `|lifetime|mki` tail, round-trip, wrong-suite,
   short-key, truncated, not-a-crypto early bail-out).
 - **`smiths-media::Bridge` SRTP integration** — `Leg.srtp:
-  Option<LegSrtp>` carries `(peer_tx, local_tx)`. Forwarder: decrypt
+Option<LegSrtp>` carries `(peer_tx, local_tx)`. Forwarder: decrypt
   with ingress-leg's `peer_tx` → rewrite SSRC on plaintext →
   re-encrypt with egress-leg's `local_tx`. Re-sign happens under
   SRTP because auth covers the header (including SSRC). Integration
@@ -3018,7 +2770,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
 - **`smiths-sip::rate_limit::SipRateLimiter`** — token bucket per
   source IP. `SipRateLimit { per_sec, burst }` config tuple lands
   on `SipConfig` (disabled by default; `per_sec == 0`). Over-limit
-  datagrams are silently dropped *before* the rsip parser runs,
+  datagrams are silently dropped _before_ the rsip parser runs,
   keeping the hot path short during a flood.
 - **`UasServer::with_rate_limit(...)`** — builder. UAS checks the
   limiter in `handle_datagram`, before parse, before any state
@@ -3039,7 +2791,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
   `jitter` / `last_sr` / `delay_since_last_sr`. 4 round-trip /
   validation tests cover the happy path, wrong PT, lying RC.
 - **Bridge emitter now embeds a Report Block** in each outgoing SR
-  describing what the engine *received* from the peer of the
+  describing what the engine _received_ from the peer of the
   current direction. When no inbound packets have been observed
   yet (fresh bridge), the emitter still emits a bare SR (`RC=0`)
   rather than burning cycles building an empty RB.
@@ -3144,8 +2896,8 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
 
 ### Operational / deferred
 
-- sipp perf validation remains an operator task. `scenarios/sipp/
-  register.xml` + `README.md` document the run. Needs a host with
+- sipp perf validation remains an operator task.
+- `scenarios/sipp/register.xml` + `README.md` document the run. Needs a host with
   sipp installed; not reproducible inside the sandbox.
 
 ## [0.12.0] - 2026-04-20
@@ -3180,7 +2932,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
   - `Sidecar::set_metrics` — set post-`spawn` (uses `OnceLock`
     internally so the hot path reads without locking).
 - **Optional at every layer.** Each new hook checks `Option<Arc<
-  Metrics>>`; tests and embedded use that bypass the registry
+Metrics>>`; tests and embedded use that bypass the registry
   continue to work unchanged.
 
 ### Changed
@@ -3230,7 +2982,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
   `MediaFabric::send_packet`. Returns `0` on dispatch, `-1` for
   unknown calls. Gated behind the new `"send_rtp"` permission.
 - **`smiths-core::CallLookup`** trait — seam for `call-id →
-  (EndpointId, SocketAddr)`. Lives in `smiths-core` so
+(EndpointId, SocketAddr)`. Lives in `smiths-core` so
   `smiths-wasm` can consume it without linking the MCP crate.
   `ControlState` implements it.
 - **`WasmEngine::with_media(lookup, fabric)`** — builder that
@@ -3274,7 +3026,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
 ### Added — plugin hot reload
 
 - **`smiths-plugin::watcher`** — `spawn(root, registry) ->
-  WatcherHandle` launches a background task that polls the plugins
+WatcherHandle` launches a background task that polls the plugins
   directory and calls `AiRegistry::reload(name)` when `plugin.toml`
   or an entry file changes. Uses `notify::PollWatcher` with
   `compare_contents(true)` for same-second-edit detection
@@ -3303,7 +3055,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
 ### Added — WASM plugin invocation dispatch
 
 - **`WasmEngine::call_invoke(module, plugin, method, &params) ->
-  Result<Value, WasmError>`** — the invoke trampoline. Guest ABI:
+Result<Value, WasmError>`** — the invoke trampoline. Guest ABI:
   module exports `memory`, `alloc(len: i32) -> i32`, and
   `invoke(method_ptr, method_len, params_ptr, params_len) -> i64`.
   The host serializes `params` as JSON, allocates + writes both
@@ -3346,7 +3098,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
 - Tests for `state_get` / `state_set` now explicitly register the
   `"state"` permission via `engine.set_plugin_permissions(...)` —
   previously permission-free access was implicit, now it's the
-  *declared* path. `for_plugin` (the empty-default helper) now
+  _declared_ path. `for_plugin` (the empty-default helper) now
   grants no permissions, matching runtime behavior.
 
 ## [0.8.0] - 2026-04-18
@@ -3379,7 +3131,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
 - **`ai-asr-mock` example** — grew a `stream: boolean` control.
   When `controls.stream = true`, the plugin emits two `emit_partial`
   JSON-RPC notifications with cumulative `{call_id, text,
-  is_final}` fragments before returning the final transcript. An
+is_final}` fragments before returning the final transcript. An
   integration test (`smiths-plugin/tests/streaming.rs`) loads the
   mock, invokes it, and asserts the two partials flow through the
   engine's bus in order.
@@ -3450,14 +3202,14 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
   implements it; `ToolContext.originator: Option<Arc<dyn …>>` gates
   the tools cleanly when no UAC is configured (UAS-only deployments).
 - **`SdpNegotiator` grew two methods** — `build_offer(local_ip,
-  local_rtp_port)` (UAC-side offer emission) and `parse_remote_rtp(
-  answer_body)` (UAC parses peer's RTP endpoint out of a 200 OK).
+local_rtp_port)` (UAC-side offer emission) and `parse_remote_rtp(
+answer_body)` (UAC parses peer's RTP endpoint out of a 200 OK).
   `smiths-sdp::Negotiator` implements both; UAC never touches the
   SDP parse tree.
 - **`make_call(target)` + `end_call(call_id)` MCP tools** (2 new
   built-ins, registry now 13 tools). Input schema validates the SIP
   URI shape; output returns `{call_id, target}` / `{call_id,
-  status}`. Errors map through `CallError` → `ToolError` so rate
+status}`. Errors map through `CallError` → `ToolError` so rate
   limit + audit + metrics paths work unchanged.
 - **UAS** gained `with_response_router` builder — when set, responses
   arriving on the UAS socket are routed to the UAC by Via branch.
@@ -3584,8 +3336,8 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
 ### Added — Phase 1 completion (TCP + INVITE auth + testkit + fuzz + sipp)
 
 - **TCP SIP transport** (`smiths-sip::TcpTransport`) — Content-Length
-  + double-CRLF framing, per-peer mpsc writers, inbound accept loop
-  + lazy outbound connect. Wired into the CLI alongside UDP.
+  - double-CRLF framing, per-peer mpsc writers, inbound accept loop
+  - lazy outbound connect. Wired into the CLI alongside UDP.
 - **INVITE digest auth** — `UasServer::invite_auth_ok` mirrors the
   REGISTER challenge path. Dedupe now skips ACK so ACKs for rejected
   INVITEs don't loop the transaction (RFC 3261 §17.1.1.3).
@@ -3621,7 +3373,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
   `git@github.com:friday-mindhalla/smiths-net-docs.git`. Parent repo
   pins a commit via `.gitmodules`.
 
-### Added — `transcribe` + `llm_chat` MCP tools (P4 slice 3)
+### Added — `transcribe` + `llm_chat` MCP tools
 
 - **`transcribe`** MCP tool: accepts base64 PCM16 + language hint,
   dispatches to any plugin providing `ai.asr`, returns transcript
@@ -3629,7 +3381,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
   factored out so `transcribe` / `llm_chat` / future `embed` share
   the same plugin-lookup + strict control-validation prologue.
 - **`llm_chat`** MCP tool: `messages`-array in, `{message, usage,
-  finish_reason}` out. Rejects empty `messages`. Dispatches to any
+finish_reason}` out. Rejects empty `messages`. Dispatches to any
   plugin providing `ai.llm.chat`.
 - **Reference plugin `plugins/examples/ai-asr-mock/`** — pure-stdlib
   Python sidecar advertising a realistic `ai.asr` descriptor
@@ -3652,7 +3404,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
 - Release binary: 3.4 MB → **3.5 MB** (two extra tools + refactored
   validation helper).
 
-### Added — Digest auth + REGISTER (Phase 1 catch-up)
+### Added — Digest auth + REGISTER
 
 - **`smiths-sip::auth::digest`** module — RFC 2617 + RFC 8760
   primitives: `ha1` / `ha2` / `response_qop_auth` / `response_no_qop`,
@@ -3666,7 +3418,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
   and uses constant-time equality on the response comparison.
 - **UAS handles `REGISTER`**: no registrar → 200 OK (dev mode).
   Registrar attached → 401 Unauthorized + `WWW-Authenticate: Digest
-  realm=…, nonce=…, qop="auth", algorithm=MD5` on missing or bad
+realm=…, nonce=…, qop="auth", algorithm=MD5` on missing or bad
   auth, 200 OK on valid auth. `UasServer::with_registrar(reg)`
   builder.
 - **`RequestSummary`** gained `request_uri` + `authorization` fields;
@@ -3679,7 +3431,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
   `register_without_registrar_is_accepted_blindly`.
 - Workspace deps gained `md-5` `0.10`, `sha2` `0.10`, `hex` `0.4`.
 
-### Added — Plugin invocation loop (P4 slice 2)
+### Added — Plugin invocation loop
 
 - **`smiths-plugin::controls`**: strict JSON-schema-ish validator with
   structured `ValidationError { field, reason, hint }`. Supports the
@@ -3697,7 +3449,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
 - **`ai-tts-mock` plugin** grew a real `synthesize` handler: shells
   out to macOS `say` with a voice-id → macOS-voice map, reads the
   8 kHz WAV back, and returns `{codec, sample_rate, frames,
-  duration_ms, audio_base64, voice}`. Linux fallback is silent audio
+duration_ms, audio_base64, voice}`. Linux fallback is silent audio
   so CI still works. Validation (voice, codec, sample_rate) lives on
   both sides.
 - **`voice_agent.py`** rewired: dropped its local `subprocess say`
@@ -3716,7 +3468,7 @@ path. **Additive only** — the new FSM module lives alongside `uas.rs`
 
 ## [0.5.0] - 2026-04-18
 
-Phase 4 slice 1 — the plugin platform's foundation lands. Two crates
+The plugin platform's foundation lands. Two crates
 that were stubs since v0.0.0 (`smiths-sidecar`, `smiths-plugin`)
 become real: subprocess supervisor with JSON-RPC 2.0 over stdio,
 `CapabilityDescriptor` + `AiRegistry`, fail-partial plugin scanner.
@@ -3784,7 +3536,7 @@ slice.
 
 ## [0.4.0] - 2026-04-18
 
-Phase 5 slice 2 — MCP grows a real push channel, and the first
+MCP grows a real push channel, and the first
 end-to-end voice-agent demo lands on top of it. The agent spawns the
 engine, drains `notifications/call/*` frames over stdio, parks a SIP
 UA on a rendezvous key, and runs a full STT → LLM → TTS pipeline
@@ -3805,7 +3557,7 @@ will slot in.
 
 - `--mcp stdio` no longer suppresses SIP, health HTTP, or A2A.
   MCP stdio runs alongside whatever else is configured, so an agent can
-  spawn the engine as a subprocess *and* have the engine serve real
+  spawn the engine as a subprocess _and_ have the engine serve real
   incoming calls at the same time. stdin EOF still terminates the
   process (the shutdown token is triggered).
 - Logs routed to stderr when `--mcp stdio` is active so stdout stays
@@ -3828,7 +3580,7 @@ will slot in.
 
 ## [0.3.0] - 2026-04-18
 
-Phase 5 first slice — real control plane. The engine grows a typed
+Real control plane. The engine grows a typed
 `Tool` abstraction served by two protocol adapters (MCP stdio + A2A
 HTTP) over the same registry. A live event-bus subscriber feeds tools
 a current view of dialogs. Two new Python demos drive both adapters
@@ -3879,7 +3631,7 @@ with pure stdlib.
 
 ## [0.2.0] - 2026-04-18
 
-Phase 1 slice 2 — full INVITE/ACK/BYE dialog lifecycle with SDP
+Full INVITE/ACK/BYE dialog lifecycle with SDP
 offer/answer, a byte-transparent media bridge between two UAs
 (audio end-to-end), a real-binary e2e test harness, a pure-stdlib
 Python client sample, and a clean-architecture refactor that removes
@@ -4036,7 +3788,7 @@ remote-tag)` per RFC 3261.
 
 ## [0.1.0] - [2026-04-18]
 
-Phase 1 slice — SIP signaling over UDP with an `OPTIONS`-answering UAS
+SIP signaling over UDP with an `OPTIONS`-answering UAS
 and the MVP guardrails (`Transport` trait, `CredentialStore` trait) in
 place. Full RFC 3261 transaction FSMs, TCP/TLS transports, REGISTER, and
 digest challenge/response land in subsequent passes.
@@ -4089,7 +3841,7 @@ digest challenge/response land in subsequent passes.
 
 ## [0.0.0] - [2026-04-17]
 
-Phase 0 — Foundation. Workspace scaffolding, core runtime primitives, and a
+Foundation. Workspace scaffolding, core runtime primitives, and a
 boot-and-shutdown binary. No SIP / media / plugins yet.
 
 ### Added
@@ -4129,21 +3881,3 @@ boot-and-shutdown binary. No SIP / media / plugins yet.
 - `README.md` project pitch.
 - `CONTRIBUTING.md` — prerequisites, dev loop, conventions, PR checklist.
 - `LICENSE` — Apache-2.0.
-- `docs/openswitch.md` — authoritative spec.
-- `docs/architecture/` — overview, crate layout, plugin system, MCP + ops,
-  post-MVP scope.
-- `docs/plans/` — roadmap, MVP phase docs (0 through 6), post-MVP phases
-  (P7–P23), and a live implementation TODO.
-
-### Fixed
-
-- `.gitignore`: added `.DS_Store` to the ignore list.
-
-[0.7.0]: https://github.com/mindhalla/smiths-net/compare/v0.6.0...v0.7.0
-[0.6.0]: https://github.com/mindhalla/smiths-net/compare/v0.5.0...v0.6.0
-[0.5.0]: https://github.com/mindhalla/smiths-net/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/mindhalla/smiths-net/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/mindhalla/smiths-net/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/mindhalla/smiths-net/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/mindhalla/smiths-net/releases/tag/v0.1.0
-[0.0.0]: https://github.com/mindhalla/smiths-net/releases/tag/v0.0.0

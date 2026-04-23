@@ -7,6 +7,7 @@ license      = { workspace = true }
 description  = "Core runtime primitives for smiths-net: event bus, config, shutdown."
 
 [dependencies]
+smiths-config-macros = { workspace = true }
 tokio             = { workspace = true }
 tokio-util        = { workspace = true }
 arc-swap          = { workspace = true }
