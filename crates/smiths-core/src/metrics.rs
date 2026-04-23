@@ -158,6 +158,20 @@ pub struct Metrics {
     /// Plugin invocation outcomes (AI sidecar or WASM), keyed by
     /// plugin name + outcome (`ok` / `error`).
     pub plugin_invocations: Family<PluginOutcomeLabel, Counter>,
+    /// Aggregate of `plugin_invocations{outcome="ok"}` across
+    /// every plugin. Shadows the labelled family so the 5.9
+    /// error-rate probe can sum "ok" invocations in one atomic
+    /// read — `prometheus-client` 0.24's `Family` has no
+    /// iter-values API, which would otherwise force a whole-
+    /// registry text-encode + parse round-trip per probe tick.
+    /// Incremented in tandem with the labelled counter by
+    /// `record_invocation` in the plugin crate.
+    pub plugin_invocations_ok: Counter,
+    /// Aggregate of `plugin_invocations{outcome="error"}` across
+    /// every plugin — paired with
+    /// [`Self::plugin_invocations_ok`]. See that field's doc
+    /// for the probe-read rationale.
+    pub plugin_invocations_error: Counter,
     /// Plugin invoke latency, keyed by plugin name.
     pub plugin_invoke_duration: Family<PluginLabel, Histogram, fn() -> Histogram>,
     /// Sidecar supervisor respawns, keyed by plugin name.
@@ -210,6 +224,15 @@ pub struct Metrics {
     /// could") because a cautious adapter might decline a
     /// suspect value and leave it on the restart-required pile.
     pub config_reloaded_fields: Family<ConfigFieldLabel, Counter>,
+    /// `smiths_config_probe_triggered_total{probe}` — counter
+    /// bumped every time the 5.9 error-rate probe tripped a
+    /// configured ceiling and called `rollback_with_metrics`.
+    /// Labelled by probe name (`plugin_error_rate` /
+    /// `sip_parse_errors`) so dashboards can tell which safety
+    /// net fired. Counter bumps exactly once per rollback —
+    /// if both probes cross at the same tick only the one that
+    /// wins the rollback races is credited.
+    pub config_probe_triggered: Family<ConfigProbeLabel, Counter>,
 }
 
 /// `{field}` label on `smiths_config_reloaded_fields_total`.
@@ -231,6 +254,15 @@ pub struct ConfigRollbackLabel {
     pub reason: String,
 }
 
+/// `{probe}` label on `smiths_config_probe_triggered_total`.
+/// Two concrete values today — `"plugin_error_rate"` and
+/// `"sip_parse_errors"` — so cardinality is bounded at 2.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ConfigProbeLabel {
+    /// Which probe fired.
+    pub probe: String,
+}
+
 impl Metrics {
     /// Register every metric on `registry` and return a cheaply-
     /// clonable handle.
@@ -250,6 +282,8 @@ impl Metrics {
         let tool_duration: Family<ToolLabel, Histogram, fn() -> Histogram> =
             Family::new_with_constructor(default_histogram);
         let plugin_invocations = Family::<PluginOutcomeLabel, Counter>::default();
+        let plugin_invocations_ok = Counter::default();
+        let plugin_invocations_error = Counter::default();
         let plugin_invoke_duration: Family<PluginLabel, Histogram, fn() -> Histogram> =
             Family::new_with_constructor(default_histogram);
         let sidecar_restarts = Family::<PluginLabel, Counter>::default();
@@ -262,6 +296,7 @@ impl Metrics {
         let config_canary_active = Gauge::default();
         let config_rollbacks = Family::<ConfigRollbackLabel, Counter>::default();
         let config_reloaded_fields = Family::<ConfigFieldLabel, Counter>::default();
+        let config_probe_triggered = Family::<ConfigProbeLabel, Counter>::default();
 
         registry.register(
             "sip_requests",
@@ -321,6 +356,10 @@ impl Metrics {
             "AiProvider::invoke outcomes, per plugin",
             plugin_invocations.clone(),
         );
+        // The aggregate shadows aren't re-registered: rendering
+        // both would duplicate the same totals in `/metrics` and
+        // confuse dashboards. The probe reads them via the
+        // `Metrics` struct handle directly.
         registry.register(
             "plugin_invoke_duration_seconds",
             "AiProvider::invoke latency, per plugin",
@@ -371,6 +410,11 @@ impl Metrics {
             "Live-reloadable fields a subsystem adapter actually applied, per field (slice 5.8-b).",
             config_reloaded_fields.clone(),
         );
+        registry.register(
+            "smiths_config_probe_triggered",
+            "Error-rate probe trips, keyed by probe name (slice 5.9).",
+            config_probe_triggered.clone(),
+        );
 
         Arc::new(Self {
             sip_requests,
@@ -385,6 +429,8 @@ impl Metrics {
             tool_invocations,
             tool_duration,
             plugin_invocations,
+            plugin_invocations_ok,
+            plugin_invocations_error,
             plugin_invoke_duration,
             sidecar_restarts,
             ai_failovers,
@@ -395,6 +441,7 @@ impl Metrics {
             config_canary_active,
             config_rollbacks,
             config_reloaded_fields,
+            config_probe_triggered,
         })
     }
 

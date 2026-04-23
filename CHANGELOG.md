@@ -5,6 +5,150 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.66.0] - 2026-04-23
+
+**Live config reload — full path from file to subsystem.**
+Closes the three follow-on slices in one release since
+they are inter-dependent: the read-through adapters
+have no triggers without the SIGHUP handler + subcommands,
+and the error-rate probe (5.9) arms on the same
+`ConfigReloader::apply` call that SIGHUP drives. Operators now
+edit `config.toml`, `kill -HUP $pid`, and the engine swaps
+individual fields live without a restart — with a deadline
+timer + error-rate probe watching the canary window so a bad
+config rolls itself back within seconds.
+
+### Added — read-through adapters
+
+- **`ConfigReloader::spawn_read_through`** (landed 0.65.0) is
+  now wired from `main.rs` to five live subsystems:
+  - `observability.log_level` → `tracing_subscriber::reload::Handle`
+  - `sip.rate_limit` → `SipRateLimiter::reconfigure`
+    (lock-free atomic swap; per-IP buckets keep tokens)
+  - `media.transcode.max_concurrent_calls` →
+    `CpuBudget::set_max_concurrent` (dormant until the UAS
+    admission follow-on, but the wiring is live today so the
+    metric path is proven end-to-end)
+  - `media.prompts.capacity` → new `PromptLibrary::resize`
+    (LRU evicts down on shrink)
+  - `ai.openai_api_key` / `ai.anthropic_api_key` → new
+    `AiRegistry::set_env` / `clear_env` — next sidecar respawn
+    inherits the rotated credentials; already-live sidecars
+    keep their old env until reloaded (documented honest-
+    deferral comment on the adapter).
+- **`PromptLibrary::resize(cap)`** — in-place LRU resize that
+  clamps zero to one and evicts immediately. `with_capacity`
+  now delegates to `resize` so both paths share the clamp /
+  eviction logic.
+- **`AiRegistry::env_overrides`** + `set_env` / `clear_env` /
+  `env_snapshot` — `Arc<Mutex<BTreeMap>>`-backed, shared across
+  clones so the adapter writes propagate to every registry
+  handle. The loader's sidecar-spawn wiring consumes this snap-
+  shot in a follow-on slice; today the map is updated in
+  lockstep with config so the invariant "snapshot reflects
+  current config" holds from boot.
+- **`Metrics::plugin_invocations_ok` / `plugin_invocations_error`**
+  — plugin-agnostic aggregate counters the 5.9 probe reads.
+  Incremented in tandem with the labelled `plugin_invocations`
+  family by `record_invocation` in `smiths-plugin`; not
+  registered with the Prometheus registry (would duplicate
+  the labelled family in `/metrics`).
+
+### Added — user-facing triggers
+
+- **POSIX SIGHUP reload driver** in `main.rs` — installs a
+  `tokio::signal::unix::Signal` listener when `hangup_stream()`
+  succeeds. On each signal: `Config::load(path)` → `validate()` →
+  `ConfigReloader::apply(deadline_s)` → spawn deadline timer +
+  error-rate probe. Failures (load / validate / apply) keep the
+  prior config live and land in the log.
+- **`--no-reload-signal` CLI flag** — opts out of the SIGHUP
+  handler for deployments that repurpose the signal.
+- **`smiths-net validate [--config path]`** — non-running
+  subcommand that load + validates the file and exits `0` clean,
+  `1` on parse error, `2` on semantic error. The engine's own
+  `main` now runs the same `validate()` during startup, so a
+  broken invariant is caught before any bind.
+- **`smiths-net reload [--pid N] [--diff] [--dry-run] [--canary-secs N]`**
+  — load + validate the candidate locally, print the
+  `ApplyReport` (against defaults) with `--diff`, exit after the
+  diff with `--dry-run`, otherwise `kill(pid, SIGHUP)` via
+  `rustix::process::kill_process`. Shares the load / validate /
+  apply _path_ with SIGHUP — the subcommand itself just signals
+  the target; the running engine's handler does the apply.
+- **`Shutdown::hangup_stream()`** + `HangupStream::recv` —
+  async-friendly wrapper over `SignalKind::hangup()` with a
+  no-op stub on non-Unix targets.
+
+### Added — error-rate probe
+
+- **`smiths-core::probe` module** — `ErrorRateProbe`,
+  `ProbeConfig`, `ProbeSample`, `ProbeVerdict`, `classify`,
+  `sample`. Spawns a 1-Hz background task that maintains a
+  30-second trailing window of `(plugin_errors, plugin_oks,
+sip_parse_errors)` samples. When either
+  `plugin_errors / total > ceiling` or
+  `Δsip_parse_errors / window_secs > ceiling`, calls
+  `ConfigReloader::rollback_with_metrics(id, ErrorBudget, _)`
+  and exits. Disabled ceilings (`1.0` / `u64::MAX`) skip the
+  spawn entirely.
+- **`smiths_config_probe_triggered_total{probe}` metric** —
+  `plugin_error_rate` / `sip_parse_errors` label. Bumps once
+  per rollback.
+- **Probe lifecycle tied to the canary** — the CLI's
+  `spawn_canary_watchdogs` helper shares a `CancellationToken`
+  between the deadline timer and the probe; whichever arm wins
+  (operator confirm, deadline, probe trip) ends the other two.
+
+### Added — docs + tests
+
+- **`docs/operator-runbook.md` "Live config changes"** — the
+  three trigger paths, default deadline, field × reloadability
+  table, worked examples (log-level bump, AI key rotation),
+  restart-required handling.
+- **`docs/operator-runbook.md` "Canary config changes +
+  incident response"** — dashboard signals, probe-triggered vs
+  deadline-timeout response recipes, disabling the probe for a
+  planned risky change.
+- **`tests/config_reload.rs`** — six integration tests, one
+  per adapter + the probe happy path. Each reloader
+  receives a live `Config` mutation and the test asserts the
+  subsystem state reflects within a 50 ms watch-tick grace.
+
+### Changed
+
+- **`Cli` refactored to clap subcommands** — `RunArgs` flattens
+  into the root so `smiths-net --config foo validate` keeps
+  working; new `--no-reload-signal` lives on `RunArgs`.
+- **`init_tracing` returns `LogReloader`** — type-erased
+  `Box<dyn Fn(&str) -> Result<(), String>>` the log-level
+  adapter consumes without naming the subscriber's full
+  `Layered<…>` type.
+- **`ErrorRateProbe::spawn` takes `&ChangeReceipt`** — clones
+  only `id` / `deadline_at_unix` / `report.clone()` internally;
+  callers keep their receipt handle for the deadline task.
+- **Workspace pulls in `smiths-transcode` through `smiths-cli`**
+  — the CLI now owns a dormant `CpuBudget` so the
+  transcode adapter has something to update today.
+
+### Notes
+
+- **Running sidecars keep their old env** on
+  `ai.*_api_key` rotation. The CLI's adapter updates the
+  registry's env snapshot; the loader's spawn path consumes
+  that snapshot on the next respawn. A full in-flight rotation
+  needs `AiRegistry::reload(name)` per plugin or a scheduled
+  restart.
+- **The `reload` subcommand's `--canary-secs` is informational
+  today** — the running engine uses its own `[canary] deadline_s`
+  for SIGHUP-driven applies. Plumbing the override through a
+  side-channel (MCP control message) is a follow-on.
+- **Non-Unix platforms have no SIGHUP**. The engine logs
+  "SIGHUP reload unavailable on this platform" at boot; the
+  `reload` subcommand refuses with a clear error. The MCP
+  `put_config` tool (slice 7.3) will be the cross-platform
+  path.
+
 ## [0.65.0] - 2026-04-23
 
 **`#[derive(Reloadable)]` proc-macro.**

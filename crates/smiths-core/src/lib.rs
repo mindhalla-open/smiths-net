@@ -34,6 +34,7 @@ pub mod error;
 pub mod event;
 pub mod media;
 pub mod metrics;
+pub mod probe;
 pub mod reloader;
 pub mod rtp;
 pub mod sdp;
@@ -77,12 +78,13 @@ pub use media::{
     MediaFabric, MediaSession, SrtpError, SrtpSuite, SrtpTransform,
 };
 pub use metrics::Metrics;
+pub use probe::{ErrorRateProbe, ProbeConfig, ProbeSample, ProbeVerdict};
 pub use reloader::{
     ApplyError, ApplyReport, CanaryError, ChangeId, ChangeReceipt, ConfigReloader, RollbackReason,
 };
 pub use rtp::RtpPacket;
 pub use sdp::{NegotiationOutcome, SdpNegotiator, SrtpKeys};
-pub use shutdown::Shutdown;
+pub use shutdown::{HangupStream, Shutdown, hangup_stream};
 pub use storage::{
     CallDetailRecord, CdrFilter, CdrStore, FsRecordingStore, KvStore, MemoryVectorStore,
     RecordingStore, StorageError, VectorHit, VectorRecord, VectorStore,
