@@ -121,6 +121,51 @@ pub trait TranscodeOrchestrator: Send + Sync {
     ) -> Result<Option<Arc<dyn smiths_core::media::MediaSession>>, smiths_core::MediaError>;
 }
 
+/// Seam the UAS uses to install a T.38 UDPTL session when a
+/// re-INVITE flips a live audio call to FAX (slice 5.6d
+/// scaffold). Parallel to [`TranscodeOrchestrator`]; the future
+/// re-INVITE handler calls `try_orchestrate_fax` on detection
+/// of `m=image udptl t38` in the offer, then
+/// `DialogSessions::swap` to atomically replace the audio
+/// session. Today's UAS doesn't yet parse re-INVITE bodies
+/// (non-scope per `handle_invite`'s module doc) — the seam
+/// exists so the future work slots in without another
+/// `UasServer` surface change.
+#[async_trait::async_trait]
+pub trait FaxOrchestrator: Send + Sync {
+    /// Build a UDPTL relay session bridging two legs that just
+    /// re-INVITEd into T.38. `leg_a` + `leg_b` carry each side's
+    /// local endpoint + peer UDPTL address from the paired
+    /// re-INVITE answers. `None` = orchestrator declined
+    /// (policy, resource exhaustion).
+    async fn try_orchestrate_fax(
+        &self,
+        leg_a: BridgeLeg,
+        leg_b: BridgeLeg,
+    ) -> Result<Option<Arc<dyn smiths_core::media::MediaSession>>, smiths_core::MediaError>;
+}
+
+/// Seam the UAS uses to install a conference-participant
+/// session when an MCP `join_conference` call fires against a
+/// live dialog (slice 5.6e scaffold). Parallel to
+/// [`TranscodeOrchestrator`]; the MCP wiring is a follow-on —
+/// today's `join_conference` tool updates the
+/// `ConferenceRegistry` but doesn't yet swap the 2-peer bridge
+/// for a conference-participant session.
+#[async_trait::async_trait]
+pub trait ConferenceOrchestrator: Send + Sync {
+    /// Install a conference-participant session on `dialog`.
+    /// `conference_id` is the opaque id minted by
+    /// `smiths_mixer::ConferenceRegistry::create`. `None` =
+    /// orchestrator declined (conference closed, etc.).
+    async fn try_orchestrate_conference(
+        &self,
+        dialog: DialogKey,
+        conference_id: u64,
+        leg: BridgeLeg,
+    ) -> Result<Option<Arc<dyn smiths_core::media::MediaSession>>, smiths_core::MediaError>;
+}
+
 /// Parsed request summary.
 struct RequestSummary {
     method: String,
@@ -213,6 +258,16 @@ pub struct UasServer<T: Transport> {
     /// bridge (the pre-5.6c behaviour). The CLI wires a real
     /// orchestrator from `[media.transcode]` config.
     transcode_orchestrator: Option<Arc<dyn TranscodeOrchestrator>>,
+    /// Optional FAX session builder (slice 5.6d scaffold).
+    /// `None` = re-INVITE to T.38 doesn't install a session (the
+    /// future re-INVITE handler logs + does nothing). CLI wires
+    /// a real orchestrator from `[media.fax]` config.
+    fax_orchestrator: Option<Arc<dyn FaxOrchestrator>>,
+    /// Optional conference-participant session builder (slice
+    /// 5.6e scaffold). `None` = `join_conference` MCP tool
+    /// updates the registry but doesn't yet bridge RTP. CLI
+    /// wires a real orchestrator from `[media.mixer]` config.
+    conference_orchestrator: Option<Arc<dyn ConferenceOrchestrator>>,
     /// Registrar: digest-auths `REGISTER` against a [`CredentialStore`].
     /// `None` = auth disabled, registrar accepts any REGISTER blindly
     /// (dev convenience; never do that in prod).
@@ -294,6 +349,8 @@ impl<T: Transport> UasServer<T> {
             bridges_by_dialog: Arc::new(DashMap::new()),
             dialog_sessions: DialogSessions::new(),
             transcode_orchestrator: None,
+            fax_orchestrator: None,
+            conference_orchestrator: None,
             registrar: None,
             registration_store: None,
             cdr_store: None,
@@ -394,6 +451,29 @@ impl<T: Transport> UasServer<T> {
         orchestrator: Arc<dyn TranscodeOrchestrator>,
     ) -> Self {
         self.transcode_orchestrator = Some(orchestrator);
+        self
+    }
+
+    /// Attach a [`FaxOrchestrator`] (slice 5.6d scaffold). Today's
+    /// UAS has no re-INVITE parser so this field is read-only
+    /// until the future handler lands; the accessor is a
+    /// forward-compat hook so a deployment that's ready with an
+    /// orchestrator can wire it today and have it activate when
+    /// the re-INVITE path does.
+    #[must_use]
+    pub fn with_fax_orchestrator(mut self, orchestrator: Arc<dyn FaxOrchestrator>) -> Self {
+        self.fax_orchestrator = Some(orchestrator);
+        self
+    }
+
+    /// Attach a [`ConferenceOrchestrator`] (slice 5.6e scaffold).
+    /// Same forward-compat story as [`Self::with_fax_orchestrator`].
+    #[must_use]
+    pub fn with_conference_orchestrator(
+        mut self,
+        orchestrator: Arc<dyn ConferenceOrchestrator>,
+    ) -> Self {
+        self.conference_orchestrator = Some(orchestrator);
         self
     }
 
@@ -540,8 +620,10 @@ impl<T: Transport> UasServer<T> {
         // of the INVITE transaction; ACK for 2xx is end-to-end per
         // §13.3.1.4). [`Self::handle_ack`] reaches into the INVITE
         // FSM directly for the non-2xx → Confirmed transition.
-        if let Some(branch) = req.branch.as_deref() {
-            if req.method != "ACK" {
+        if let Some(branch) = req.branch.as_deref()
+            && req.method != "ACK"
+        {
+            {
                 let key = server_txn_key(branch, &req.method);
                 if self.txn_driver.is_alive(&key) {
                     // Retransmit: FSM replays its cached response.

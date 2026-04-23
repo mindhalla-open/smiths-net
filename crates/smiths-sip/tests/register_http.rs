@@ -90,16 +90,16 @@ async fn authenticate_handler(
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_owned);
 
-    if let Some(expected) = state.expected_bearer.lock().unwrap().clone() {
-        if bearer.as_deref() != Some(expected.as_str()) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(AuthResponseBody {
-                    status: "deny",
-                    ha1: None,
-                }),
-            );
-        }
+    if let Some(expected) = state.expected_bearer.lock().unwrap().clone()
+        && bearer.as_deref() != Some(expected.as_str())
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(AuthResponseBody {
+                status: "deny",
+                ha1: None,
+            }),
+        );
     }
 
     *state.last_request.lock().unwrap() = Some(IncomingRequest {

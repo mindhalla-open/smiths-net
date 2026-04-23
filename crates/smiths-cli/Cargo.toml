@@ -34,14 +34,17 @@ sip-quic  = ["smiths-sip/sip-quic"]
 [dependencies]
 smiths-core        = { workspace = true }
 const_format       = "0.2"
-smiths-sip         = { workspace = true }
+# `webtransport` feature is required so the WebRTC-native signaling
+# listener (slice 5.10) sees the shared `WtSignal` JSON frame type.
+smiths-sip         = { workspace = true, features = ["webtransport"] }
+async-trait        = { workspace = true }
 smiths-sdp         = { workspace = true }
 smiths-media       = { workspace = true }
 smiths-mcp         = { workspace = true }
 smiths-plugin      = { workspace = true }
 tokio              = { workspace = true }
 tokio-util         = { workspace = true }
-axum               = { workspace = true }
+axum               = { workspace = true, features = ["ws"] }
 clap               = { workspace = true }
 dashmap            = { workspace = true }
 prometheus-client  = { workspace = true }

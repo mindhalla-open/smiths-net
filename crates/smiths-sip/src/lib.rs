@@ -24,6 +24,8 @@ pub mod txn;
 pub mod uac;
 pub mod uas;
 #[cfg(feature = "webtransport")]
+pub mod webrtc;
+#[cfg(feature = "webtransport")]
 pub mod webtransport;
 
 pub use error::Error;
@@ -36,7 +38,12 @@ pub use txn::{
     TransactionState, TuEvent,
 };
 pub use uac::{UacClient, UacError};
-pub use uas::{TranscodeOrchestrator, UasServer};
+pub use uas::{ConferenceOrchestrator, FaxOrchestrator, TranscodeOrchestrator, UasServer};
+#[cfg(feature = "webtransport")]
+pub use webrtc::{
+    WebRtcHandlerError, WebRtcListenError, WebRtcSession, WebRtcSessionHandler,
+    WebRtcSignalingListener, WebSocketSignalingListener,
+};
 #[cfg(feature = "webtransport")]
 pub use webtransport::{
     NullWebTransportListener, WebTransportListener, WebTransportSessionId, WtSignal, WtSignalKind,

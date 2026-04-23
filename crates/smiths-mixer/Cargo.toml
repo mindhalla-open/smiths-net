@@ -9,11 +9,12 @@ description  = "N:N audio conferencing mixer (slice 5.5 / P14): leave-one-out su
 [dependencies]
 smiths-core  = { workspace = true }
 smiths-media = { workspace = true }
+smiths-sip   = { workspace = true }
 async-trait  = { workspace = true }
 dashmap      = { workspace = true }
 prometheus-client = { workspace = true }
 thiserror    = { workspace = true }
-tokio        = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+tokio        = { workspace = true, features = ["net", "rt", "sync", "macros", "time"] }
 tokio-util   = { workspace = true }
 tracing      = { workspace = true }
 

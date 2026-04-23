@@ -340,7 +340,7 @@ fn decode_wav(bytes: &[u8]) -> Result<(u32, Vec<i16>), String> {
                 if bits != 16 {
                     return Err(format!("{bits}-bit samples; 16-bit only"));
                 }
-                if body.len() % 2 != 0 {
+                if !body.len().is_multiple_of(2) {
                     return Err("data chunk length is odd".into());
                 }
                 let mut out = Vec::with_capacity(body.len() / 2);

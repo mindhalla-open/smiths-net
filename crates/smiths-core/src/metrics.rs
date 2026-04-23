@@ -190,6 +190,45 @@ pub struct Metrics {
     /// bumps by the snapshot's record count when a prior shutdown
     /// left one.
     pub snapshot_replay_dialogs: Counter,
+    /// `smiths_config_canary_active` — `1` while a config
+    /// change is in its canary window (between `apply` and
+    /// `confirm`/`rollback`), `0` otherwise (slice 5.9-mvp).
+    /// Dashboards alert when this stays at `1` past the
+    /// configured deadline — something ate the operator's
+    /// confirm signal.
+    pub config_canary_active: Gauge,
+    /// `smiths_config_rollbacks_total{reason}` — counter of
+    /// rolled-back changes keyed by reason
+    /// (`manual` / `timeout` / `error_budget`). Slice 5.9-mvp.
+    pub config_rollbacks: Family<ConfigRollbackLabel, Counter>,
+    /// `smiths_config_reloaded_fields_total{field}` — bumped by
+    /// each subsystem's read-through adapter when it actually
+    /// applied a live change (slice 5.8-b). Shows operators
+    /// which fields the engine treated as hot-reloadable on
+    /// the most recent apply — distinct from
+    /// `ApplyReport::reloaded` (which says "the engine said it
+    /// could") because a cautious adapter might decline a
+    /// suspect value and leave it on the restart-required pile.
+    pub config_reloaded_fields: Family<ConfigFieldLabel, Counter>,
+}
+
+/// `{field}` label on `smiths_config_reloaded_fields_total`.
+/// Fixed per-field vocabulary (`observability.log_level`,
+/// `sip.rate_limit`, …) so cardinality stays bounded.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ConfigFieldLabel {
+    /// Dotted field path — matches the
+    /// `ApplyReport::reloaded` entries.
+    pub field: String,
+}
+
+/// `{reason}` label on `smiths_config_rollbacks_total`. Fixed
+/// vocabulary so Prometheus cardinality stays bounded.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ConfigRollbackLabel {
+    /// `"manual"` / `"timeout"` / `"error_budget"` —
+    /// matches `RollbackReason::as_str`.
+    pub reason: String,
 }
 
 impl Metrics {
@@ -220,6 +259,9 @@ impl Metrics {
         let ai_pipeline_duration: Family<AiPipelineLabel, Histogram, fn() -> Histogram> =
             Family::new_with_constructor(default_histogram);
         let snapshot_replay_dialogs = Counter::default();
+        let config_canary_active = Gauge::default();
+        let config_rollbacks = Family::<ConfigRollbackLabel, Counter>::default();
+        let config_reloaded_fields = Family::<ConfigFieldLabel, Counter>::default();
 
         registry.register(
             "sip_requests",
@@ -314,6 +356,21 @@ impl Metrics {
             "Dialogs restored from the HA snapshot file at startup (slice 6.1).",
             snapshot_replay_dialogs.clone(),
         );
+        registry.register(
+            "smiths_config_canary_active",
+            "1 while a config change is inside its canary window; 0 otherwise (slice 5.9).",
+            config_canary_active.clone(),
+        );
+        registry.register(
+            "smiths_config_rollbacks",
+            "Config changes rolled back, keyed by reason (manual / timeout / error_budget).",
+            config_rollbacks.clone(),
+        );
+        registry.register(
+            "smiths_config_reloaded_fields",
+            "Live-reloadable fields a subsystem adapter actually applied, per field (slice 5.8-b).",
+            config_reloaded_fields.clone(),
+        );
 
         Arc::new(Self {
             sip_requests,
@@ -335,6 +392,9 @@ impl Metrics {
             ai_tokens,
             ai_pipeline_duration,
             snapshot_replay_dialogs,
+            config_canary_active,
+            config_rollbacks,
+            config_reloaded_fields,
         })
     }
 

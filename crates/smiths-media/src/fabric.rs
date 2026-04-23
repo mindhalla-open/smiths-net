@@ -128,6 +128,25 @@ impl UdpMediaFabric {
     fn fresh_bridge_id(&self) -> BridgeId {
         BridgeId(self.next_bridge.fetch_add(1, Ordering::Relaxed))
     }
+
+    /// Direct handle on the RTP socket allocated for `id`
+    /// (slice 5.6d-runtime + 5.6e-runtime). Trait-level
+    /// `MediaFabric::bridge` is purpose-built for the plain
+    /// SSRC-rewriting case; non-passthrough sessions
+    /// (`UdptlSession`, `ConferenceParticipantSession`,
+    /// future SRTP-transforming flows) need raw socket access
+    /// to spawn their own forwarder tasks. Returns `None` when
+    /// the endpoint was never allocated or has been released.
+    ///
+    /// Kept out of the `MediaFabric` trait because it's a
+    /// concrete-implementation escape hatch — if a future
+    /// fabric variant doesn't use UDP sockets at all (a WASM
+    /// host fabric, say), the trait shouldn't force the
+    /// concept.
+    #[must_use]
+    pub fn endpoint_socket(&self, id: EndpointId) -> Option<Arc<UdpSocket>> {
+        self.endpoints.get(&id).map(|e| Arc::clone(&e.rtp))
+    }
 }
 
 #[async_trait]

@@ -5,6 +5,492 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.64.0] - 2026-04-23
+
+**Slice 5.10-followup — WebRTC signaling runtime + browser
+demo.** Plugs the v0.62.0 `WebSocketSignalingListener` scaffold
+into the CLI's axum stack and ships a concrete
+`WebRtcSessionHandler` that routes offers through the shared
+`SdpNegotiator`. Browsers (and SIP-over-WebSocket clients) can
+now connect at `ws://.../smiths/webrtc` and round-trip real
+WtSignal frames against the engine.
+
+Two honest deferrals remain and surface to the client as clear
+errors, not silent failure: (1) DTLS-SRTP termination — browser
+offers receive `offer-rejected: DTLS-SRTP not yet supported`
+until the DTLS terminator lands; (2) SIP ⇄ WebRTC media bridge
+— `MediaFabric::bridge` is still INVITE-triggered only.
+
+### Added
+
+- **`smiths_cli::webrtc::CliWebRtcHandler`** — concrete
+  `WebRtcSessionHandler` impl. Holds an
+  `Arc<dyn SdpNegotiator>` + local-IP + a port allocator with
+  configurable base/range. `handle_offer` calls
+  `negotiate_audio` and maps the outcome into the
+  `WebRtcHandlerError` variants the listener translates into
+  `error` frames.
+- **`smiths_cli::webrtc::serve_webrtc`** — axum app that
+  binds `[webrtc] ws_bind`, exposes `GET /smiths/webrtc` as a
+  WebSocket upgrade, and pipes binary frames through
+  `WebSocketSignalingListener::handle_frame`. Graceful
+  shutdown via the shared cancellation token.
+- **CLI wiring in `main.rs`** — gated on
+  `config.webrtc.enabled`; spawned alongside the A2A / MCP
+  HTTP adapter tasks. Logs a warning when `webrtc.tls_cert` /
+  `webrtc.tls_key` are set (they're reserved for a future
+  in-engine TLS terminator; front with nginx/Caddy today).
+- **`examples/browser-webrtc/`** — static HTML + vanilla JS
+  demo, fork of the WebTransport demo with `new WebSocket(...)`
+  instead of `new WebTransport(...)`. Exercises every frame
+  shape; the offer button sends a real browser DTLS-SRTP
+  offer so the `offer-rejected` diagnostic is visible in the
+  log, proving the signaling round-trip.
+- **`docs/deployment/webrtc.md`** — full state + roadmap +
+  nginx TLS-termination recipe + WebRTC-vs-SIP-over-WS
+  decision guide + troubleshooting table.
+- **4 new unit tests** on `CliWebRtcHandler`:
+  - `dtls_srtp_offer_rejected_with_reason` — DTLS-SRTP offers
+    surface as `OfferRejected` with a DTLS-naming reason.
+  - `plain_rtp_avp_offer_is_accepted` — SIP-style `RTP/AVP`
+    offers negotiate cleanly.
+  - `malformed_offer_surfaces_as_offer_rejected` — bad SDP
+    doesn't poison the session.
+  - `port_allocator_wraps_within_configured_range` — proves
+    the modulo-based port allocator wraps at the range
+    boundary.
+
+### Changed
+
+- **`smiths-cli` depends on `smiths-sip` with the
+  `webtransport` feature enabled** + `async-trait` — both
+  required to consume the `WebRtcSessionHandler` trait + the
+  shared `WtSignal` JSON types.
+- **`smiths-cli` axum dep carries the `ws` feature** — needed
+  for `axum::extract::ws::WebSocketUpgrade`.
+- **`smiths_sip::webrtc::handle_frame` collapsed duplicate
+  no-op match arms** (`IceEnd` / `SessionAck` / `Answer` /
+  `Error`) into a single pattern. Cosmetic clippy fix
+  surfaced when enabling the `webtransport` feature across
+  the workspace.
+
+### Notes
+
+- **DTLS-SRTP is the prerequisite for real browser calls.**
+  Today's `smiths_sdp::Negotiator::negotiate_audio` returns
+  `NegotiationOutcome::UnsupportedTransport { reason:
+  "DTLS-SRTP not yet supported" }` for `UDP/TLS/RTP/SAVP`
+  offers. The handler forwards that reason verbatim. When
+  the DTLS terminator lands, no client-side change will be
+  needed — same offers will return a real answer.
+- **No bridge install in this slice.** An accepted offer
+  gets a well-formed SDP answer but no
+  `MediaFabric::bridge` call — there's no rendezvous
+  primitive that pairs a WebRTC leg with a SIP leg yet.
+  Follow-on slice tracked in
+  `.vscode/implementation-slices.md`.
+- **TLS termination stays out-of-engine.** The `tls_cert` /
+  `tls_key` config fields log a startup warning;
+  `docs/deployment/webrtc.md` shows the nginx recipe every
+  deployment uses today. Same pattern as the MCP HTTP
+  adapter.
+
+## [0.63.0] - 2026-04-23
+
+**Slice 5.8-followup-b (minimal) — watch broadcast + generic
+read-through adapter.** The piece that turns the
+`ConfigReloader` substrate from "stores config" into "subsystems
+actually react". Ships the reactive plumbing + a generic helper
+every future adapter uses; concrete per-subsystem adapters
+(tracing filter, rate limiter, prompt library, transcode budget)
+become trivial one-liners once wired from the CLI. This slice
+lands the substrate only — per-subsystem adapters stay in the
+follow-on backlog.
+
+### Added
+
+- **`ConfigReloader::subscribe() -> watch::Receiver<Arc<Config>>`**
+  — cheap reactive handle. Every `apply` / `rollback` sends
+  the new live `Arc<Config>` through the channel; subsystems
+  `select!`-await `changed()` instead of polling. Internally
+  added a `watch::Sender<Arc<Config>>` to the reloader + wired
+  both mutation paths to broadcast after the `ArcSwap` store.
+- **`ConfigReloader::spawn_read_through(field_name, metrics,
+  extract, apply)`** — generic adapter spawner. Watches the
+  broadcast, applies a caller-supplied extractor to pull one
+  reloadable value out of the live config, invokes the
+  caller-supplied applier only when the extracted value
+  actually changed (no-op apply on unrelated fields doesn't
+  wake the adapter), and bumps
+  `smiths_config_reloaded_fields_total{field}` on each fire.
+  Returns a `JoinHandle` — runs for the lifetime of the
+  reloader.
+- **`Metrics::config_reloaded_fields`** —
+  `smiths_config_reloaded_fields_total{field}` counter.
+  Distinct from `ApplyReport::reloaded` because an adapter
+  may decline a suspect value; the counter says what was
+  **actually** applied, not just what the engine said it
+  could.
+- **3 new unit tests**:
+  - `subscribe_receives_applied_config` — receiver observes
+    the new value after `apply`.
+  - `subscribe_receives_restored_config_on_rollback` —
+    receiver observes the restored prior snapshot.
+  - `spawn_read_through_fires_only_on_actual_change` — an
+    apply that changes an unrelated field leaves the adapter
+    quiet; a change to the watched field fires it exactly
+    once.
+
+### Notes
+
+- **Per-subsystem adapters deferred.** Each of log-level
+  (`tracing-subscriber::reload::Handle`), rate-limit
+  (`SipRateLimiter::reconfigure`), prompt library
+  (`PromptLibrary::resize`), transcode budget
+  (`CpuBudget::set_max_concurrent`) needs its own subsystem
+  API work plus CLI wiring. With `spawn_read_through` live,
+  each becomes a 20-line `cli/main.rs` hook against a
+  one-method subsystem change. The backlog in
+  `.vscode/implementation-slices.md` lists them.
+- **No-op on boot config**: `spawn_read_through` seeds with
+  the current value but never invokes `apply` for the initial
+  state — the subsystem already initialised from the boot
+  config. Only *changes* fire the adapter.
+- **Rollback fires the adapter too**: if the canary window
+  rolls back a change to a watched field, the adapter sees
+  the restored value and re-applies. Operator-visible
+  symmetry.
+
+## [0.62.0] - 2026-04-23
+
+**Part 5 runtime completion.** One landing that closes the
+remaining Part-5 runtime slices: auto-rollback timer on
+`ConfigReloader` (5.8-c), WebRTC-native signaling adapter
+(5.10), WebRTC privacy helpers (5.11). The `#[derive(Reloadable)]`
+proc-macro (5.8-a), subsystem read-through adapters (5.8-b),
+SIGHUP handler + CLI subcommands + error-rate probe (5.8-c /
+5.9-runtime) remain deferred as CLI-side follow-ons — the
+substrate they need is live in `smiths-core` today, wiring is
+what's left.
+
+### Added
+
+- **`ConfigReloader::spawn_auto_rollback(&receipt, metrics)`** —
+  spawns a tokio task that sleeps until `deadline_at_unix`,
+  then calls `rollback(id, Timeout)` unless the change
+  already resolved. Updates `smiths_config_canary_active` +
+  `smiths_config_rollbacks_total{reason=timeout}` on fire.
+  Idempotent with operator `confirm` / manual `rollback`.
+- **`ConfigReloader::rollback_with_metrics(id, reason, metrics)`**
+  — wrapper around `rollback` that bumps the canary metrics.
+  Use this from MCP tools / CLI so the
+  `smiths_config_rollbacks_total{reason=manual}` counter
+  tracks operator-driven rollbacks.
+- **`smiths_sip::webrtc`** module (feature-gated on
+  `webtransport`) — WebRTC-native signaling adapter:
+  - `WebRtcSessionHandler` trait seam (the CLI wires a
+    concrete handler routing offers through `SdpNegotiator`).
+  - `WebSocketSignalingListener` — frame-by-frame adapter
+    that parses `WtSignal` JSON, echoes `session-ack` on
+    `session-init`, forwards offers to the handler, mirrors
+    `echo` frames, and translates handler errors into client-
+    facing `error` frames.
+  - `WebRtcSignalingListener` trait, `WebRtcSession`,
+    `WebRtcListenError`, `WebRtcHandlerError` types.
+  - 5 unit tests covering session-init / offer / wrong-session
+    / echo mirror / malformed frame.
+- **`smiths_sdp::privacy`** module — WebRTC privacy helpers:
+  - `reject_direct_candidates(sdp) -> OfferPrivacyVerdict` —
+    scans every media block's candidates and reports
+    `Rejected` if any `host` / `srflx` type appears. Operators
+    in `relay_only` / `strict` mode call this on inbound
+    offers and reply `488` on `Rejected`.
+  - `strip_host_candidates(&mut sdp)` / `strip_host_candidates_on(&mut m)`
+    — remove `host` candidates from outbound answers so the
+    engine doesn't advertise its LAN addresses.
+  - `redact_ip(ip, key)` — keyed SHA-256 hash (8-byte prefix,
+    16-hex-char output) for audit-log IP redaction in `strict`
+    mode. Stable for same `(ip, key)`, differs across keys or
+    IPs. Documented as "correlation within a key lifetime"
+    strength — rotate the key via `[reload]` when that lifetime
+    should end.
+  - 8 unit tests covering clean / host / srflx / mixed offers,
+    strip-only-host semantics, and redaction stability +
+    uniqueness.
+
+### Changed
+
+- `smiths-sdp` adds `sha2` workspace dep for `redact_ip`.
+
+### Notes — what's still deferred (focused follow-ons)
+
+- **5.8-followup-a** — `smiths-config-macros` proc-macro crate
+  with `#[derive(Reloadable)]` to replace `Config::apply_report`'s
+  hardcoded diff. Pure cleanup.
+- **5.8-followup-b** — subsystem read-through adapters
+  (`tracing-subscriber` filter reload on `observability.log_level`,
+  SIP rate-limiter live config, prompt library capacity, proxy
+  connector). Each is a tracked field in the hardcoded
+  reloadable list; the adapters plug them in.
+- **5.8-followup-c (CLI)** — SIGHUP handler calling
+  `ConfigReloader::apply(Config::load())`, `smiths-net validate`
+  + `smiths-net reload [--diff] [--dry-run]` subcommands,
+  operator runbook section.
+- **5.9-followup** — background task watching
+  `plugin_invocations{outcome="error"}` +
+  `sip_parse_errors` rates in a 30s trailing window; calls
+  `rollback_with_metrics(id, ErrorBudget, _)` on trip. The
+  `RollbackReason::ErrorBudget` enum + counter label are
+  already live.
+- **5.10-followup** — CLI wires `WebSocketSignalingListener`
+  into an axum WebSocket route + a concrete
+  `WebRtcSessionHandler` routing through `SdpNegotiator` +
+  `UasServer`. Browser demo at `examples/browser-webrtc/`.
+- **5.11-followup** — embedded TURN (RFC 8656) in
+  `smiths-ice`. The privacy helpers are usable today by any
+  SDP-processing code path; the TURN server is what lets
+  deployments avoid a `coturn` sidecar.
+
+### Workspace status at v0.62.0
+
+- Tests green (148 smiths-sip lib + 8 smiths-sdp privacy +
+  existing coverage across workspace).
+- Workspace clippy clean (the `similar_names` CI gate that
+  caught v0.61 is now satisfied across the new modules too).
+- 5 new smiths-sip webrtc tests + 8 smiths-sdp privacy tests.
+
+## [0.61.0] - 2026-04-23
+
+**5.8-mvp + 5.9-mvp — `ConfigReloader` substrate.** Wraps the
+engine's live `Config` in `ArcSwap<Config>` and lands the
+full canary state machine (`apply` / `confirm` / `rollback`)
+with deadline tracking. The big architectural plumbing — the
+`#[derive(Reloadable)]` proc-macro, subsystem read-through
+adapters, SIGHUP / CLI wiring, MCP tools — remains deferred,
+each to its own focused follow-on slice that layers on top of
+this substrate. The state machine itself is fully tested + the
+metric surface the 5.9 spec named is live.
+
+### Added
+
+- **`smiths-core::reloader`** module with:
+  - `ConfigReloader::new(boot_config)` — returns
+    `Arc<ConfigReloader>`. Holds `ArcSwap<Config>` + the canary
+    state machine.
+  - `current() -> Arc<Config>` — cheap hot-path snapshot;
+    concurrent `apply` doesn't tear.
+  - `apply(candidate, canary_window_s)` — validates, diffs vs
+    live, returns `ApplyError::RestartRequired` on any
+    restart-required field change, returns `ApplyError::Invalid`
+    on validation failure, otherwise atomically swaps the live
+    `Arc<Config>` and mints a `ChangeReceipt` with
+    `deadline_at_unix`. Refuses while another change is pending
+    (simple single-pending canary model).
+  - `confirm(id)` — drops the prior snapshot; apply is
+    permanent.
+  - `rollback(id, reason)` — atomically restores the prior
+    snapshot; `RollbackReason::{Manual, Timeout, ErrorBudget}`.
+  - `pending()` — snapshot of the in-flight canary (if any).
+- **`Config::apply_report(&Self, &Self) -> ApplyReport`** —
+  diffs two configs, returning the reloadable-vs-restart-required
+  field lists. Hardcoded today (follow-on slice derives this
+  via `#[derive(Reloadable)]`).
+- **`Config::validate() -> Result<(), String>`** — semantic
+  check pass (rate-limit self-consistency, TLS path presence
+  when TLS transport is enabled). Cheap; future slice adds
+  rustls cert+key cryptographic match.
+- **Metrics on `Metrics`**:
+  - `smiths_config_canary_active` gauge (`1` while a change
+    is pending, `0` otherwise).
+  - `smiths_config_rollbacks_total{reason}` counter with
+    `reason ∈ {manual, timeout, error_budget}`.
+- **10 new unit tests** covering: snapshot baseline, no-op
+  apply, reloadable apply + pending, restart-required refusal,
+  confirm path + double-confirm error, rollback restores
+  snapshot, wrong-id rollback leaves pending intact,
+  pending-blocks-apply invariant, validate catches
+  inconsistent rate-limit, deadline arithmetic.
+
+### Deps
+
+- New workspace dep `arc-swap = "1.7"` — lock-free atomic
+  swap for the `Arc<Config>` slot. Pulled into `smiths-core`
+  only; every subsystem that eventually reads live config
+  does so through `ConfigReloader::current()`.
+
+### Notes
+
+- **What's deferred** (each a focused follow-on slice that
+  layers on this substrate):
+  - `#[derive(Reloadable)]` proc-macro crate to replace the
+    hardcoded field-diff logic.
+  - Subsystem read-throughs (`tracing-subscriber` filter
+    handle, SIP rate-limiter live config, prompt library
+    capacity, proxy connector).
+  - Auto-rollback timer task — today the deadline lives on
+    the receipt; a caller decides how to watch it.
+  - SIGHUP handler + `smiths-net reload` / `smiths-net validate`
+    CLI subcommands.
+  - `confirm_config` / `rollback_config` MCP tools (these
+    layer trivially on top of `ConfigReloader`).
+  - 5.9-spec error-rate probe (30s trailing window on
+    `plugin_invocations{outcome="error"}` +
+    `sip_parse_errors`) — the `RollbackReason::ErrorBudget`
+    enum value exists so the wire format is stable when the
+    probe lands.
+- **Canary model**: single-pending semantics. A second
+  `apply` while the first is still canary-open errors; operator
+  must `confirm` or `rollback` first. Simpler than a
+  multi-pending model; matches how operators think about
+  "the current change".
+- **Clippy-clean** at v0.61.0.
+
+## [0.60.0] - 2026-04-23
+
+**Slices 5.6d-runtime + 5.6e-runtime** — concrete orchestrator
+implementations for the trait seams landed in the v0.59.0
+Part-5 finalization slice. A deployment that wires either
+orchestrator into its UAS gets working T.38 FAX relay / RTP
+conferencing today; the UAS's own re-INVITE parser + MCP tool
+thread-through is a separate follow-on slice (RFC 3261 §12
+tag-matching + in-dialog CSeq handling is its own workstream).
+
+### Added — 5.6d-runtime
+
+- **`smiths-fax::UdptlFaxOrchestrator`** — concrete
+  `FaxOrchestrator` impl. Holds an `Arc<UdpMediaFabric>` + an
+  `Arc<FaxMetrics>`; on `try_orchestrate_fax`, resolves both
+  legs' UDP sockets via the new
+  `UdpMediaFabric::endpoint_socket` accessor and spawns a
+  `UdptlSession` with them. Integration test proves a UDPTL
+  datagram sent through terminal A reaches terminal B
+  byte-identity, confirming the full orchestrator → fabric →
+  session chain.
+- **`UdpMediaFabric::endpoint_socket(EndpointId) ->
+  Option<Arc<UdpSocket>>`** — escape hatch for non-passthrough
+  sessions that need raw socket access. Documented as
+  concrete-impl-only (kept off the `MediaFabric` trait so a
+  future non-UDP fabric variant isn't forced to model sockets).
+- **Trait signature change**:
+  `FaxOrchestrator::try_orchestrate_fax` now takes two
+  [`BridgeLeg`]s instead of one dialog + one leg. Matches the
+  `TranscodeOrchestrator` shape + the UDPTL-as-relay
+  architecture. Existing stub impls (there were none on the
+  main branch) need a one-line update; the v0.59.0 scaffold's
+  trait definition was the only site touched.
+
+### Added — 5.6e-runtime
+
+- **`smiths-mixer::ConferenceParticipantSession`** — bridges a
+  UDP RTP flow into a `Conference`. Two-task topology: ingress
+  depayloads PCMU → PCM16 → `Conference::push_frame`; egress
+  drains `ParticipantFrame` from the channel, payloads PCM16 →
+  PCMU, stamps an RTP header (V=2, PT=0, monotonic seq +
+  80-samples-per-frame timestamp, configurable SSRC), and
+  `send_to` the peer. `stop()` cancels both tasks and calls
+  `Conference::leave` so the participant slot doesn't linger.
+- **`smiths-mixer::DirectConferenceOrchestrator`** — concrete
+  `ConferenceOrchestrator` impl for deployments that hold an
+  `Arc<Conference>` directly (single-conference bridges, tests).
+  Registry-path variant (`MixerConferenceOrchestrator`) ships
+  too but requires a follow-on `ConferenceRegistry::get`
+  method to resolve the conference handle; today's registry
+  exposes only `join`/`leave`/`create`, so the general-path
+  orchestrator logs + returns `Ok(None)`. Direct-path is the
+  usable runtime right now.
+- **Integration tests**: two real UDP peers exchange RTP
+  through two `ConferenceParticipantSession`s via a live
+  `Conference`; asserts each peer receives a non-zero payload
+  (i.e. the other peer's voice survived the round trip). A
+  second test proves `stop()` drops the participant slot.
+
+### Changed
+
+- `smiths-fax` depends on `smiths-sip` + `smiths-media`
+  (previously only `smiths-core` + `smiths-sdp`). No cycles:
+  `smiths-sip` depends only on `smiths-core`.
+- `smiths-mixer` depends on `smiths-sip` (for the
+  `ConferenceOrchestrator` trait). No cycles.
+- `smiths-mixer`'s `tokio` features add `net` (for `UdpSocket`
+  in `ConferenceParticipantSession`).
+
+### Notes
+
+- **What's still deferred**: the UAS itself doesn't yet detect
+  re-INVITE bodies to call `FaxOrchestrator`, and the MCP
+  `join_conference` tool doesn't yet resolve the caller's
+  dialog to call `ConferenceOrchestrator`. Those are two
+  focused follow-on slices — the orchestrators land today so
+  operators who wire them manually (or via custom MCP tools)
+  get working transcoded / FAX / conference audio. The
+  integration tests in this slice prove the runtime paths
+  work in isolation.
+- **Clippy-clean** across the workspace at v0.60.0.
+
+## [0.59.0] - 2026-04-23
+
+**Part 5 finalization.** One slice that lands the remaining
+Part-5 scaffolds so the whole cluster closes out coherently.
+Every item here matches the scaffold pattern already used for
+5.4 (FAX relay), 5.6b (TranscodedSession), and 5.7
+(WebTransport): types + trait seams + config surfaces +
+operator-visible docs; full runtime integration stays as
+focused follow-on slices. The alternative — six more full
+slices, each with its own workflow overhead — would have
+stretched Part 5 across months without moving the needle on
+any one deliverable.
+
+### Added — trait seams (5.6d + 5.6e)
+
+- **`smiths_sip::FaxOrchestrator`** (5.6d) — trait seam the UAS
+  will call when a future re-INVITE handler detects
+  `m=image udptl t38`. Today the seam wires through
+  `UasServer::with_fax_orchestrator` as a forward-compat hook;
+  the re-INVITE handler itself (new parse path) is a focused
+  follow-on slice. Deployments ready with an orchestrator can
+  wire it today and have it activate when the handler lands.
+- **`smiths_sip::ConferenceOrchestrator`** (5.6e) — parallel
+  seam for conference-participant session installation. Wired
+  via `UasServer::with_conference_orchestrator`.
+
+### Added — config scaffolds
+
+- **`[reload]` block** (5.8 scaffold) — `enabled` +
+  `max_frequency_s`. The runtime — `ArcSwap<Config>` +
+  `#[derive(Reloadable)]` derive macro + SIGHUP handler +
+  `Config::apply` returning `ApplyReport` — is deferred to a
+  dedicated follow-on slice; scoping the infra honestly takes
+  its own cycle. Flipping `enabled = true` in this build logs
+  a "runtime not yet wired" warning at boot.
+- **`[canary]` block** (5.9 scaffold) — `deadline_s` +
+  `plugin_error_rate_ceiling` + `sip_parse_errors_per_sec_ceiling`.
+  Depends on `[reload]`'s runtime. Once that lands, this block
+  drives the canary window + auto-rollback thresholds.
+- **`[webrtc]` + `[webrtc.privacy]` blocks** (5.10 + 5.11
+  scaffold) — `enabled` + `ws_bind` + `tls_cert` / `tls_key` +
+  `privacy.mode` (`open` / `relay_only` / `strict`) +
+  `privacy.redaction_key`. Pairs with the 5.7 `[webtransport]`
+  block: the JSON message shape is shared (`smiths_sip::WtSignal`),
+  5.7 is the QUIC transport substrate, 5.10 is the WebSocket
+  baseline. Runtime adapter is a follow-on.
+
+### Notes
+
+- **Part 5 is now strike-through-complete.** Every 5.x slice
+  in `.vscode/implementation-slices.md` is either landed or
+  has its scaffold in place with a named follow-on for the
+  runtime. Subsequent version slots (v0.60+) open up for
+  Part 6 (HA replication + Raft) and Part 7 (init wizard +
+  cookbook + MCP config tool).
+- **Forward-compat wiring works today.** A deployment that
+  already has a concrete `FaxOrchestrator` impl can register
+  it via `with_fax_orchestrator`; the UAS holds the handle
+  and the future re-INVITE handler consults it without
+  another surface change.
+- **No runtime regressions.** Every type added is opt-in
+  (`Option<_>` fields with `None` defaults); existing call
+  sites and integration tests need no updates.
+
 ## [0.58.0] - 2026-04-23
 
 Slice 6.1 — HA snapshot + replay (MVP). The engine persists

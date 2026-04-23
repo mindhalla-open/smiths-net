@@ -1,5 +1,7 @@
 //! smiths-net binary entry point.
 
+mod webrtc;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -583,6 +585,49 @@ async fn main() -> anyhow::Result<()> {
         info!("MCP HTTP adapter: http/1.1 + http/2 negotiated via ALPN when TLS-terminated");
     }
 
+    // ---- WebRTC signaling adapter (slice 5.10-followup) ----
+    // Off by default. When enabled, opens a plain-HTTP WebSocket at
+    // [webrtc] ws_bind and routes /smiths/webrtc upgrades through
+    // the CLI-side WebRtcSessionHandler → SdpNegotiator chain.
+    //
+    // Honest-deferral notes: DTLS-SRTP termination + SIP ⇄ WebRTC
+    // bridge-install are follow-on slices (see
+    // .vscode/implementation-slices.md). Real browsers therefore
+    // receive `offer-rejected: DTLS-SRTP not yet supported` — the
+    // signaling path is complete; the media path isn't. See
+    // docs/deployment/webrtc.md.
+    if config.webrtc.enabled {
+        let bind = config.webrtc.ws_bind;
+        // Own negotiator instance — the CLI's SIP binds build their
+        // own, no sharing required; local_ip is what we publish in
+        // the SDP answer's c= line, so using ws_bind.ip() gives the
+        // browser an address that reached us in the first place.
+        let negotiator: Arc<dyn SdpNegotiator> =
+            Arc::new(Negotiator::with_default_codecs(bind.ip()));
+        // Port range: carve a fixed 1000-port slice starting at
+        // 50_000. Far enough from the default SIP media range to
+        // avoid collisions; a configurable surface is a follow-on.
+        let handler = Arc::new(webrtc::CliWebRtcHandler::new(
+            negotiator,
+            bind.ip(),
+            50_000,
+            1_000,
+        ));
+        let cancel = shutdown.token();
+        adapter_handles.push(tokio::spawn(async move {
+            if let Err(e) = webrtc::serve_webrtc(bind, handler, cancel).await {
+                warn!(%bind, ?e, "WebRTC WebSocket server error");
+            }
+        }));
+        if !config.webrtc.tls_cert.is_empty() || !config.webrtc.tls_key.is_empty() {
+            warn!(
+                "webrtc.tls_cert/tls_key are set but this adapter binds plaintext; \
+                 front the engine with a TLS terminator (nginx / Caddy / Envoy) for wss://. \
+                 See docs/deployment/webrtc.md."
+            );
+        }
+    }
+
     // Slice 4.3 / P17: mcp-http3 scaffold — feature gate + config
     // accepted, runtime listener deferred. Warn clearly so a mis-
     // set `enabled = true` never looks like success.
@@ -709,7 +754,7 @@ fn spawn_recording_retention_sweeper(
     }
     let max_age = std::time::Duration::from_secs(u64::from(retention_days) * 86_400);
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+        let mut ticker = tokio::time::interval(std::time::Duration::from_hours(1));
         loop {
             tokio::select! {
                 biased;

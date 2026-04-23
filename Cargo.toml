@@ -5,8 +5,8 @@ exclude  = ["fuzz"]
 
 [workspace.package]
 edition      = "2024"
-rust-version = "1.85"
-version      = "0.58.0"
+rust-version = "1.95"
+version      = "0.64.0"
 license      = "Apache-2.0"
 
 [workspace.lints.rust]
@@ -75,6 +75,9 @@ anyhow    = "1"
 rsip    = "0.4"
 bytes   = "1"
 dashmap = "6"
+
+# Lock-free atomic swap for Arc<T>, used by the 5.8 ConfigReloader.
+arc-swap = "1.7"
 md-5    = "0.11.0"
 sha2    = "0.11.0"
 hex     = "0.4"

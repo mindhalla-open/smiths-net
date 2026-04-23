@@ -58,6 +58,8 @@ pub mod conference;
 pub mod fabric;
 pub mod metrics;
 pub mod mixer;
+pub mod orchestrator;
+pub mod participant;
 pub mod registry;
 pub mod vad;
 
@@ -69,5 +71,7 @@ pub use conference::{
 pub use fabric::MixerFabric;
 pub use metrics::{ConferenceLabel, IngressDropReason, MixerMetrics};
 pub use mixer::{Mixer, MixerConfig};
+pub use orchestrator::{DirectConferenceOrchestrator, MixerConferenceOrchestrator};
+pub use participant::ConferenceParticipantSession;
 pub use registry::{ConferenceRegistry, ConferenceRegistryError, InMemoryConferenceRegistry};
 pub use vad::{EnergyVad, Vad, VadScore};

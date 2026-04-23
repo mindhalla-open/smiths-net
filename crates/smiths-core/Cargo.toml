@@ -9,6 +9,7 @@ description  = "Core runtime primitives for smiths-net: event bus, config, shutd
 [dependencies]
 tokio             = { workspace = true }
 tokio-util        = { workspace = true }
+arc-swap          = { workspace = true }
 async-trait       = { workspace = true }
 dashmap           = { workspace = true }
 figment           = { workspace = true }

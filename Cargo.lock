@@ -138,6 +138,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "asn1-rs"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -276,6 +285,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
+ "base64",
  "bytes",
  "futures-util",
  "http",
@@ -292,8 +302,10 @@ dependencies = [
  "serde_core",
  "serde_json",
  "serde_path_to_error",
+ "sha1",
  "sync_wrapper",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
@@ -3365,9 +3377,10 @@ dependencies = [
 
 [[package]]
 name = "smiths-cli"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "const_format",
@@ -3389,8 +3402,9 @@ dependencies = [
 
 [[package]]
 name = "smiths-core"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "dashmap",
  "figment",
@@ -3409,7 +3423,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-dtls"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "async-trait",
  "rustls",
@@ -3425,12 +3439,14 @@ dependencies = [
 
 [[package]]
 name = "smiths-fax"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "async-trait",
  "prometheus-client",
  "smiths-core",
+ "smiths-media",
  "smiths-sdp",
+ "smiths-sip",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -3439,7 +3455,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-ice"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "bytes",
  "rand 0.10.1",
@@ -3454,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-mcp"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3484,7 +3500,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-media"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3500,13 +3516,14 @@ dependencies = [
 
 [[package]]
 name = "smiths-mixer"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "async-trait",
  "dashmap",
  "prometheus-client",
  "smiths-core",
  "smiths-media",
+ "smiths-sip",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -3515,7 +3532,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-plugin"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -3539,14 +3556,14 @@ dependencies = [
 
 [[package]]
 name = "smiths-proto"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "prost",
 ]
 
 [[package]]
 name = "smiths-script"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "async-trait",
  "rhai",
@@ -3561,10 +3578,11 @@ dependencies = [
 
 [[package]]
 name = "smiths-sdp"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "base64",
  "rand 0.10.1",
+ "sha2 0.11.0",
  "smiths-core",
  "thiserror 2.0.18",
  "tracing",
@@ -3572,7 +3590,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sidecar"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "rustix",
  "seccompiler",
@@ -3588,7 +3606,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sip"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3620,7 +3638,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-testkit"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "smiths-core",
  "smiths-media",
@@ -3634,7 +3652,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-transcode"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "opus",
  "prometheus-client",
@@ -3646,7 +3664,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-wasm"
-version = "0.58.0"
+version = "0.64.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3970,6 +3988,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4187,6 +4217,22 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "tungstenite"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.9.4",
+ "sha1",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "typenum"

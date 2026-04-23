@@ -54,6 +54,21 @@ pub struct Config {
     /// Enabling today + building without `--features webtransport`
     /// on `smiths-sip` is a config error that surfaces at boot.
     pub webtransport: WebTransportConfig,
+    /// Config hot-reload substrate (slice 5.8 scaffold). Off by
+    /// default; the runtime — `ArcSwap<Config>` + `#[reloadable]`
+    /// derive macro + SIGHUP handler — lands in a focused
+    /// follow-on. The config block exists today so operators can
+    /// express their intent in TOML + the future CLI knows how
+    /// to read it.
+    pub reload: ReloadConfig,
+    /// Config canary + auto-rollback (slice 5.9 scaffold).
+    /// Builds on `[reload]` — thresholds trip a rollback of the
+    /// most recent `apply` when hard-failure probes fire.
+    pub canary: CanaryConfig,
+    /// WebRTC-native signaling adapter (slice 5.10 scaffold).
+    /// Pairs with the 5.7 WebTransport scaffold; shares the
+    /// JSON-over-stream message shape. Runtime follow-on.
+    pub webrtc: WebRtcConfig,
 }
 
 /// `[ai]` TOML block — cloud-provider secrets for the reference
@@ -902,6 +917,177 @@ impl Default for WebTransportConfig {
             key_path: String::new(),
         }
     }
+}
+
+/// `[reload]` TOML block — config hot-reload substrate (slice
+/// 5.8 scaffold). The runtime — `ArcSwap<Config>`,
+/// `#[derive(Reloadable)]`, `Config::apply` returning
+/// `ApplyReport` — lands in a focused follow-on. The block
+/// exists today so the CLI can accept `--reload` on the command
+/// line without the build changing; the current behaviour is
+/// "refuse with `RestartRequired` for every field" until the
+/// derive macro lands.
+///
+/// ```toml
+/// [reload]
+/// enabled         = true     # accept SIGHUP + CLI `reload`
+/// signal          = "SIGHUP" # POSIX default; Windows uses a named event
+/// max_frequency_s = 10       # reject reloads arriving faster than this
+/// ```
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReloadConfig {
+    /// Enable SIGHUP-triggered + CLI-triggered config reload.
+    /// Scaffold only today: flipping this on logs a loud
+    /// "runtime not yet wired" warning at startup.
+    pub enabled: bool,
+    /// Minimum seconds between reload attempts; extras are
+    /// refused with a clean diagnostic rather than queued.
+    pub max_frequency_s: u64,
+}
+
+impl Default for ReloadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_frequency_s: 10,
+        }
+    }
+}
+
+/// `[canary]` TOML block — config-change canary window +
+/// auto-rollback thresholds (slice 5.9 scaffold). Depends on
+/// `[reload]`'s runtime. Once the derive macro + `Config::apply`
+/// land, this block controls:
+///
+/// - `deadline_s` — how long the new config has to prove itself
+///   before auto-rolling back to the prior snapshot.
+/// - `plugin_error_rate_ceiling` — hard-failure early rollback
+///   if the plugin error rate in a 30 s trailing window trips
+///   this.
+/// - `sip_parse_errors_per_sec_ceiling` — same, for SIP parse
+///   error rate.
+///
+/// ```toml
+/// [canary]
+/// deadline_s                        = 300
+/// plugin_error_rate_ceiling         = 0.5
+/// sip_parse_errors_per_sec_ceiling  = 10
+/// ```
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CanaryConfig {
+    /// Seconds the new config gets before auto-rollback.
+    pub deadline_s: u64,
+    /// Plugin-invocation error-rate ceiling (0.0..=1.0) that
+    /// triggers hard-failure rollback. `1.0` disables.
+    pub plugin_error_rate_ceiling: f32,
+    /// SIP parse-error rate (per second) that triggers
+    /// hard-failure rollback. `u64::MAX` disables.
+    pub sip_parse_errors_per_sec_ceiling: u64,
+}
+
+impl Default for CanaryConfig {
+    fn default() -> Self {
+        Self {
+            deadline_s: 300,
+            plugin_error_rate_ceiling: 0.5,
+            sip_parse_errors_per_sec_ceiling: 10,
+        }
+    }
+}
+
+/// `[webrtc]` TOML block — WebRTC-native signaling + privacy
+/// (slices 5.10 + 5.11 scaffold). The runtime adapter and the
+/// privacy layers land in dedicated follow-on slices; the block
+/// exists today so operators can express their intent. Pairs
+/// with the 5.7 `[webtransport]` block: the JSON message shape
+/// is shared, 5.7 is the QUIC transport substrate, 5.10 is the
+/// WebSocket baseline.
+///
+/// ```toml
+/// [webrtc]
+/// enabled  = true
+/// ws_bind  = "0.0.0.0:7881"
+/// tls_cert = "/etc/smiths/wt.crt"
+/// tls_key  = "/etc/smiths/wt.key"
+///
+/// [webrtc.privacy]
+/// mode           = "open"         # "open" | "relay_only" | "strict"
+/// redaction_key  = ""             # required for `strict`
+/// ```
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebRtcConfig {
+    /// Enable the WebRTC-native signaling adapter. Scaffold
+    /// today — binds nothing, logs "runtime not yet wired".
+    pub enabled: bool,
+    /// WebSocket bind for the signaling adapter.
+    pub ws_bind: SocketAddr,
+    /// Path to the TLS cert the adapter serves. Empty =
+    /// plaintext (disallowed in privacy `strict` mode).
+    pub tls_cert: String,
+    /// Matching private key.
+    pub tls_key: String,
+    /// Privacy hardening knobs (slice 5.11 scaffold).
+    pub privacy: WebRtcPrivacyConfig,
+}
+
+impl Default for WebRtcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ws_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7881),
+            tls_cert: String::new(),
+            tls_key: String::new(),
+            privacy: WebRtcPrivacyConfig::default(),
+        }
+    }
+}
+
+/// `[webrtc.privacy]` — privacy hardening modes (slice 5.11
+/// scaffold). Three modes that compose additively:
+///
+/// - `open` (default) — today's behavior, no hardening.
+/// - `relay_only` — reject offers carrying `host` / `srflx`
+///   candidates; strip `host` candidates from answers; hint
+///   the client to `iceTransportPolicy = "relay"`.
+/// - `strict` — `relay_only` + keyed-hash redaction of every
+///   peer IP in audit/CDR/tracing + require TLS-only signaling.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebRtcPrivacyConfig {
+    /// Privacy mode. Scaffold only — runtime enforcement is a
+    /// follow-on slice.
+    pub mode: WebRtcPrivacyMode,
+    /// `blake3` key for source-IP redaction when
+    /// `mode = "strict"`. Rotate via
+    /// `[reload]` / `confirm_config`. Empty in `open` /
+    /// `relay_only`.
+    pub redaction_key: String,
+}
+
+impl Default for WebRtcPrivacyConfig {
+    fn default() -> Self {
+        Self {
+            mode: WebRtcPrivacyMode::Open,
+            redaction_key: String::new(),
+        }
+    }
+}
+
+/// Privacy mode selector for `[webrtc.privacy]`.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebRtcPrivacyMode {
+    /// Default — no privacy hardening. Matches pre-5.11 behavior.
+    #[default]
+    Open,
+    /// Reject `host` / `srflx` candidates; force relay-only
+    /// ICE. Operators paying for TURN land here.
+    RelayOnly,
+    /// `relay_only` + IP redaction + TLS-only signaling.
+    Strict,
 }
 
 impl Default for McpConfig {

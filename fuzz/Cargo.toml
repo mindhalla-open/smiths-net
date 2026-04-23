@@ -3,7 +3,7 @@ name         = "smiths-fuzz"
 version      = "0.0.0"
 publish      = false
 edition      = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [package.metadata]
 cargo-fuzz = true

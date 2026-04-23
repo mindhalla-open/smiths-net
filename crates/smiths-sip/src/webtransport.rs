@@ -7,6 +7,17 @@
 //! a later slice can drop in the QUIC runtime (`quinn` +
 //! `h3-webtransport`) and have a place to plug in.
 //!
+//! ## Shared with WebRTC-native (slice 5.10)
+//!
+//! The same [`WtSignal`] JSON frame shape is reused by the
+//! WebRTC-native signaling adapter (slice 5.10 scaffold) — that
+//! adapter carries the frames over plain WebSocket, this one
+//! over WebTransport. Sharing the wire format means a browser
+//! demo built against one transport's listener lights up the
+//! other by changing a URL. The scaffold status is identical:
+//! the types + listener trait + config surface exist; the two
+//! runtimes (QUIC + WebSocket) are focused follow-ons.
+//!
 //! ## What ships today (v0.55.0)
 //!
 //! - [`WtSignal`] — the per-frame JSON message schema browsers and

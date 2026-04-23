@@ -91,7 +91,18 @@ pub enum AdmissionError {
 /// counter is truly shared.
 #[derive(Clone, Debug)]
 pub struct CpuBudget {
+    /// Advisory knobs (`cpu_budget_ms_per_call`) — rarely
+    /// changed, stored snapshot. The live
+    /// `max_concurrent_calls` cap is on [`Self::max_concurrent`]
+    /// so it can be hot-reloaded via a read-through adapter
+    /// (slice 5.8-b).
     config: CpuBudgetConfig,
+    /// Live admission cap. Separate from `config` so a
+    /// `ConfigReloader` read-through adapter can
+    /// [`Self::set_max_concurrent`] without rebuilding the
+    /// budget — rebuilding would orphan every live
+    /// [`TranscodeLease`] and break the slot accounting.
+    max_concurrent: Arc<AtomicUsize>,
     active: Arc<AtomicUsize>,
     metrics: Arc<TranscodeMetrics>,
 }
@@ -101,18 +112,25 @@ impl CpuBudget {
     #[must_use]
     pub fn new(config: CpuBudgetConfig, metrics: Arc<TranscodeMetrics>) -> Self {
         Self {
+            max_concurrent: Arc::new(AtomicUsize::new(config.max_concurrent_calls)),
             config,
             active: Arc::new(AtomicUsize::new(0)),
             metrics,
         }
     }
 
-    /// Configuration snapshot. Read-only — the budget isn't designed
-    /// to be reconfigured at runtime (slice 5.7 will add hot-reload,
-    /// but it'll rebuild the budget, not mutate this one).
+    /// Configuration snapshot. `max_concurrent_calls` reflects
+    /// the **live** cap, which may differ from the value passed
+    /// to [`Self::new`] if [`Self::set_max_concurrent`] has
+    /// fired via a config read-through adapter. The
+    /// `cpu_budget_ms_per_call` field is a snapshot of the
+    /// config at construction time — advisory, rarely changed.
     #[must_use]
     pub fn config(&self) -> CpuBudgetConfig {
-        self.config
+        CpuBudgetConfig {
+            max_concurrent_calls: self.max_concurrent.load(Ordering::Acquire),
+            cpu_budget_ms_per_call: self.config.cpu_budget_ms_per_call,
+        }
     }
 
     /// Metrics handle the budget reports to. Exposed so the bridge
@@ -129,6 +147,26 @@ impl CpuBudget {
         self.active.load(Ordering::Relaxed)
     }
 
+    /// Live admission cap. Updated in-place by
+    /// [`Self::set_max_concurrent`]; reads are lock-free.
+    #[must_use]
+    pub fn max_concurrent(&self) -> usize {
+        self.max_concurrent.load(Ordering::Acquire)
+    }
+
+    /// Update the admission cap (slice 5.8-b read-through).
+    /// Atomic — new [`Self::try_admit`] calls see the new cap
+    /// on the very next admission. **Does not evict** any
+    /// already-admitted [`TranscodeLease`]: if the new cap is
+    /// below `active()`, existing calls stay open (releasing
+    /// a lease through the cap correctly leaves it admitted),
+    /// but no further admissions happen until `active` drops
+    /// below the new cap. This matches the "don't tear down
+    /// live calls on config change" expectation.
+    pub fn set_max_concurrent(&self, n: usize) {
+        self.max_concurrent.store(n, Ordering::Release);
+    }
+
     /// Attempt to admit a new transcoded call. Returns a
     /// [`TranscodeLease`] guard on success; dropping the lease
     /// decrements the counter.
@@ -143,8 +181,8 @@ impl CpuBudget {
     /// [`AdmissionError::BudgetExhausted`] when the concurrent-call
     /// cap has been reached.
     pub fn try_admit(&self) -> Result<TranscodeLease, AdmissionError> {
-        let max = self.config.max_concurrent_calls;
         loop {
+            let max = self.max_concurrent.load(Ordering::Acquire);
             let cur = self.active.load(Ordering::Acquire);
             if cur >= max {
                 self.metrics.admissions_refused.inc();
@@ -232,5 +270,61 @@ mod tests {
         let b2 = b.clone();
         let _lease = b.try_admit().unwrap();
         assert_eq!(b2.active(), 1);
+    }
+
+    #[test]
+    fn set_max_concurrent_raises_cap_live() {
+        // Start with cap 1, admit one, verify second refuses,
+        // then raise the cap and verify the second admits.
+        let b = budget(1);
+        let _a = b.try_admit().unwrap();
+        assert!(b.try_admit().is_err());
+        b.set_max_concurrent(3);
+        assert_eq!(b.max_concurrent(), 3);
+        let _b = b.try_admit().unwrap();
+        let _c = b.try_admit().unwrap();
+        assert_eq!(b.active(), 3);
+    }
+
+    #[test]
+    fn set_max_concurrent_lowering_preserves_active_calls() {
+        // Start with cap 3, admit three, then lower the cap to
+        // 1. The three already-admitted calls stay live; new
+        // admissions refuse until `active` drops below the new
+        // cap.
+        let b = budget(3);
+        let a = b.try_admit().unwrap();
+        let _c = b.try_admit().unwrap();
+        let _d = b.try_admit().unwrap();
+        b.set_max_concurrent(1);
+        assert_eq!(b.max_concurrent(), 1);
+        // `active` is still 3 — no eviction.
+        assert_eq!(b.active(), 3);
+        // Further admissions refuse until the queue drains
+        // past the new cap.
+        assert!(b.try_admit().is_err());
+        // Drop two — active falls to 1, still not under cap.
+        drop(a);
+        assert_eq!(b.active(), 2);
+        assert!(b.try_admit().is_err());
+    }
+
+    #[test]
+    fn config_accessor_reflects_live_cap() {
+        let b = budget(5);
+        assert_eq!(b.config().max_concurrent_calls, 5);
+        b.set_max_concurrent(12);
+        assert_eq!(b.config().max_concurrent_calls, 12);
+    }
+
+    #[test]
+    fn cloned_budget_shares_live_cap() {
+        // A CpuBudget clone must see the cap updates — otherwise
+        // the read-through adapter wouldn't propagate to every
+        // holder. This is the reason `max_concurrent` is `Arc`.
+        let b = budget(2);
+        let b2 = b.clone();
+        b.set_max_concurrent(10);
+        assert_eq!(b2.max_concurrent(), 10);
     }
 }

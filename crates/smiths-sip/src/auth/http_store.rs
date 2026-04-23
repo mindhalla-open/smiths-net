@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn breaker_trips_after_threshold_failures() {
-        let b = Breaker::new(3, Duration::from_secs(60));
+        let b = Breaker::new(3, Duration::from_mins(1));
         assert!(b.gate().is_none());
         b.record_failure();
         b.record_failure();
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn breaker_success_resets_counter() {
-        let b = Breaker::new(3, Duration::from_secs(60));
+        let b = Breaker::new(3, Duration::from_mins(1));
         b.record_failure();
         b.record_failure();
         b.record_success();

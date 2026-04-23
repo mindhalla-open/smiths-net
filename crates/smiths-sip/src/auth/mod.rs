@@ -560,7 +560,7 @@ pub mod digest {
                 realm: realm.into(),
                 store,
                 nonces: Arc::new(DashMap::new()),
-                ttl: Duration::from_secs(300), // 5 minutes is a fine default
+                ttl: Duration::from_mins(5), // 5 minutes is a fine default
             }
         }
 

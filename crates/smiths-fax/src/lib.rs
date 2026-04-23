@@ -55,12 +55,14 @@
 #![warn(missing_docs)]
 
 pub mod metrics;
+pub mod orchestrator;
 pub mod renegotiate;
 pub mod sdp;
 pub mod session;
 pub mod udptl;
 
 pub use metrics::{FaxDirectionLabel, FaxMetrics, FaxParseErrorLabel};
+pub use orchestrator::UdptlFaxOrchestrator;
 pub use renegotiate::{FaxRenegotiateError, fax_renegotiate};
 pub use sdp::{T38Params, answer_fax_offer, find_fax_media, offer_fax};
 pub use session::{UdptlSession, UdptlSessionConfig};

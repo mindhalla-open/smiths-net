@@ -7,14 +7,16 @@ license      = { workspace = true }
 description  = "T.38 FAX-over-IP (slice 5.4 / P13): UDPTL framing + UdptlSession + SDP renegotiation helpers."
 
 [dependencies]
-smiths-core = { workspace = true }
-smiths-sdp  = { workspace = true }
-async-trait = { workspace = true }
+smiths-core  = { workspace = true }
+smiths-sdp   = { workspace = true }
+smiths-sip   = { workspace = true }
+smiths-media = { workspace = true }
+async-trait  = { workspace = true }
 prometheus-client = { workspace = true }
-thiserror   = { workspace = true }
-tokio       = { workspace = true, features = ["net", "rt", "sync", "macros"] }
-tokio-util  = { workspace = true }
-tracing     = { workspace = true }
+thiserror    = { workspace = true }
+tokio        = { workspace = true, features = ["net", "rt", "sync", "macros"] }
+tokio-util   = { workspace = true }
+tracing      = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
