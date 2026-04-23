@@ -34,7 +34,7 @@ pub use txn::{
     TransactionState, TuEvent,
 };
 pub use uac::{UacClient, UacError};
-pub use uas::UasServer;
+pub use uas::{TranscodeOrchestrator, UasServer};
 #[cfg(feature = "webtransport")]
 pub use webtransport::{
     NullWebTransportListener, WebTransportListener, WebTransportSessionId, WtSignal, WtSignalKind,

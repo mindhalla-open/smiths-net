@@ -5,6 +5,66 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.57.0] - 2026-04-23
+
+Slice 5.6c — UAS transcoded-session wiring. Closes the
+transcoding half of the 5.6 cluster: the UAS's rendezvous
+pairing path now detects codec mismatch between the two legs,
+consults a `TranscodeOrchestrator` trait seam, and installs the
+returned `MediaSession` via `DialogSessions` (from slice 5.6a)
+instead of the plain passthrough bridge that would have silently
+dropped audio. Keeps `smiths-sip` dep-light — the orchestrator
+seam is a trait the CLI wires with a concrete
+`smiths-transcode` + `smiths-media` implementation at boot.
+The FAX re-INVITE swap and conference-participant wiring are
+separate follow-on slices.
+
+### Added
+
+- **`smiths_sip::TranscodeOrchestrator` trait** — narrow seam
+  (`async fn try_orchestrate(leg_a, codec_a, leg_b, codec_b) ->
+  Result<Option<Arc<dyn MediaSession>>, MediaError>`). `None`
+  return = admission refused; UAS logs and falls through to the
+  passthrough path (pre-5.6c behaviour).
+- **`PendingLeg.audio_codec: Option<NegotiatedCodec>`** — carries
+  the first-in leg's codec through the rendezvous so the
+  pairing step can compare both codecs.
+- **`UasServer.dialog_sessions: DialogSessions`** — runtime
+  session table. Exposed via `dialog_sessions()` accessor for
+  tests + a `with_transcode_orchestrator()` builder to wire a
+  concrete orchestrator. Plain-bridge rendezvous paths stay
+  untouched; only transcoded pairs install entries here.
+- **BYE path drain** — `DialogSessions::remove_dialog(key)`
+  runs on every BYE, stopping any installed session (transcoded
+  today; FAX / conference when those slices land). The
+  admission lease drops with the session `Arc`, so a budget
+  slot can't leak when a transcoded call terminates.
+- **Integration test**
+  (`crates/smiths-sip/tests/transcode_rendezvous.rs`) — a fake
+  `RecordingOrchestrator` captures the codec pair at pair time
+  and asserts the UAS routed a PCMU ↔ Opus rendezvous through
+  it exactly once, with the codecs in leg-arrival order.
+
+### Notes
+
+- **Passthrough fallback on refusal.** When the orchestrator
+  returns `None` (budget exhausted), the UAS logs a warning and
+  falls through to the plain bridge. Future slice should
+  instead 488 the second leg + BYE the first — but that path
+  requires unwinding leg-A's already-established dialog,
+  which is out of scope here. Documented in the orchestrator
+  method's code comment.
+- **FAX + conferencing still deferred.** Those wirings use the
+  same `DialogSessions::swap` primitive but add new trigger
+  paths (T.38 re-INVITE, `join_conference` MCP tool). Separate
+  slices — the transcoding path is the most-wanted closure of
+  the 5.3 deferral, so it lands first.
+- **Cross-rate timestamp scaling on `TranscodedSession`** —
+  still TODO per the 5.6b module doc. The integration test
+  uses a stub session, so cross-rate doesn't fire here; when a
+  real orchestrator lands `smiths-media::TranscodedSession`
+  in production traffic, that's the moment to add it.
+
 ## [0.56.0] - 2026-04-23
 
 Slice 5.12 — Observability completeness. Fills the metrics gap

@@ -32,8 +32,8 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use smiths_core::metrics::{Metrics, SipCodeLabel, SipMethodLabel};
 use smiths_core::{
-    BridgeId, BridgeLeg, DialogKey, DialogRecord, DialogState, EndpointId, Event, EventBus,
-    MediaFabric, NegotiationOutcome, SdpNegotiator, SipEvent, SrtpKeys,
+    BridgeId, BridgeLeg, DialogKey, DialogRecord, DialogSessions, DialogState, EndpointId, Event,
+    EventBus, MediaFabric, NegotiatedCodec, NegotiationOutcome, SdpNegotiator, SipEvent, SrtpKeys,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -71,6 +71,11 @@ struct PendingLeg {
     /// supported `a=crypto:` line. Threaded into the bridge when the
     /// matching second INVITE lands.
     srtp: Option<SrtpKeys>,
+    /// Codec the negotiator chose for this leg (slice 5.6c).
+    /// Carried through the rendezvous so the pairing step can
+    /// detect a codec mismatch and route to the transcoded
+    /// session path instead of the plain passthrough bridge.
+    audio_codec: Option<NegotiatedCodec>,
 }
 
 /// Per-dialog CDR metadata captured at 200 OK INVITE. Consumed
@@ -82,6 +87,38 @@ struct CdrInProgress {
     from_uri: String,
     to_uri: String,
     started_at_unix: i64,
+}
+
+/// Seam the UAS uses to build a transcoded media session when a
+/// rendezvous pair's two legs speak different codecs (slice
+/// 5.6c). Keeps `smiths-sip` free of a direct
+/// `smiths-transcode` / `smiths-media` dep — the CLI wires a
+/// concrete impl (typically `smiths_media::TranscodedSession` +
+/// `smiths_transcode::CpuBudget`) at boot.
+///
+/// `try_orchestrate` is consulted only when the two legs'
+/// [`NegotiatedCodec`] values differ. Implementations return:
+///
+/// - `Ok(Some(session))` on admission success — the UAS installs
+///   the session via [`DialogSessions`] and skips the plain
+///   passthrough bridge.
+/// - `Ok(None)` when admission is refused (CPU budget
+///   exhausted). Callers emit a `488 Not Acceptable Here` plus
+///   `Warning: 370` — the UAS uses this as a signal to tear the
+///   second leg down cleanly.
+/// - `Err(_)` on fabric / codec construction failure; treated
+///   the same as a passthrough bridge failure today (logged, no
+///   bridge installed).
+#[async_trait::async_trait]
+pub trait TranscodeOrchestrator: Send + Sync {
+    /// Attempt to build a transcoded session for the two legs.
+    async fn try_orchestrate(
+        &self,
+        leg_a: BridgeLeg,
+        codec_a: NegotiatedCodec,
+        leg_b: BridgeLeg,
+        codec_b: NegotiatedCodec,
+    ) -> Result<Option<Arc<dyn smiths_core::media::MediaSession>>, smiths_core::MediaError>;
 }
 
 /// Parsed request summary.
@@ -165,6 +202,17 @@ pub struct UasServer<T: Transport> {
     /// at the same [`BridgeId`]; the first `BYE` releases it from the
     /// fabric and clears both entries.
     bridges_by_dialog: Arc<DashMap<DialogKey, BridgeId>>,
+    /// Non-passthrough media sessions (transcoding, later FAX /
+    /// conference) keyed per-leg. Slice 5.6c uses this for the
+    /// transcoded rendezvous path only; FAX / conference wirings
+    /// are follow-on slices. Empty when no transcoded path has
+    /// fired — the plain-bridge rendezvous stays untouched.
+    dialog_sessions: DialogSessions,
+    /// Optional transcoded-session builder (slice 5.6c). `None` =
+    /// rendezvous mismatches fall back to the plain passthrough
+    /// bridge (the pre-5.6c behaviour). The CLI wires a real
+    /// orchestrator from `[media.transcode]` config.
+    transcode_orchestrator: Option<Arc<dyn TranscodeOrchestrator>>,
     /// Registrar: digest-auths `REGISTER` against a [`CredentialStore`].
     /// `None` = auth disabled, registrar accepts any REGISTER blindly
     /// (dev convenience; never do that in prod).
@@ -244,6 +292,8 @@ impl<T: Transport> UasServer<T> {
             media_bind_ip: local.ip(),
             pending_bridges: Arc::new(DashMap::new()),
             bridges_by_dialog: Arc::new(DashMap::new()),
+            dialog_sessions: DialogSessions::new(),
+            transcode_orchestrator: None,
             registrar: None,
             registration_store: None,
             cdr_store: None,
@@ -330,6 +380,29 @@ impl<T: Transport> UasServer<T> {
     pub fn with_rate_limit(mut self, rate_limit: crate::rate_limit::SipRateLimiter) -> Self {
         self.rate_limit = rate_limit;
         self
+    }
+
+    /// Attach a [`TranscodeOrchestrator`] so rendezvous pairs with
+    /// different per-leg codecs route through a transcoded session
+    /// instead of a plain passthrough bridge (slice 5.6c). Without
+    /// this, a codec mismatch falls through to the passthrough
+    /// path — which forwards bytes but won't be audible to the peer
+    /// that expected a different codec.
+    #[must_use]
+    pub fn with_transcode_orchestrator(
+        mut self,
+        orchestrator: Arc<dyn TranscodeOrchestrator>,
+    ) -> Self {
+        self.transcode_orchestrator = Some(orchestrator);
+        self
+    }
+
+    /// Snapshot handle on the runtime session table (slice 5.6c).
+    /// Useful for tests asserting which transcoded / FAX /
+    /// conference sessions have been installed.
+    #[must_use]
+    pub fn dialog_sessions(&self) -> &DialogSessions {
+        &self.dialog_sessions
     }
 
     /// Run the UAS event loop. Exits when `cancel` fires or `rx` closes.
@@ -784,20 +857,46 @@ impl<T: Transport> UasServer<T> {
                 let leg_a = BridgeLeg {
                     endpoint: pending.endpoint,
                     peer: pending.remote_media,
-                    srtp: pending.srtp,
+                    srtp: pending.srtp.clone(),
                 };
                 let leg_b = BridgeLeg {
                     endpoint: ep.id(),
                     peer: remote_rtp,
                     srtp: srtp_keys.clone(),
                 };
-                match self.media_fabric.bridge(leg_a, leg_b).await {
-                    Ok(bid) => {
-                        self.bridges_by_dialog.insert(pending.dialog_key, bid);
-                        self.bridges_by_dialog.insert(dialog_key.clone(), bid);
-                        info!(rendezvous = %key, "rendezvous bridge established");
+                // Slice 5.6c: detect codec mismatch at pair time.
+                // When both codecs are known and differ AND a
+                // `TranscodeOrchestrator` is wired, route through
+                // the transcoded session path; otherwise fall
+                // through to the plain passthrough bridge (pre-5.6c
+                // behaviour).
+                let codec_mismatch = match (pending.audio_codec.as_ref(), audio_codec.as_ref()) {
+                    (Some(a), Some(b)) => a != b,
+                    _ => false,
+                };
+                let orchestrated = if codec_mismatch {
+                    self.try_orchestrate_transcoded(
+                        key,
+                        &pending.dialog_key,
+                        &dialog_key,
+                        leg_a.clone(),
+                        pending.audio_codec.clone().unwrap_or(NegotiatedCodec::Pcmu),
+                        leg_b.clone(),
+                        audio_codec.clone().unwrap_or(NegotiatedCodec::Pcmu),
+                    )
+                    .await
+                } else {
+                    false
+                };
+                if !orchestrated {
+                    match self.media_fabric.bridge(leg_a, leg_b).await {
+                        Ok(bid) => {
+                            self.bridges_by_dialog.insert(pending.dialog_key, bid);
+                            self.bridges_by_dialog.insert(dialog_key.clone(), bid);
+                            info!(rendezvous = %key, "rendezvous bridge established");
+                        }
+                        Err(e) => warn!(?e, rendezvous = %key, "rendezvous bridge failed"),
                     }
-                    Err(e) => warn!(?e, rendezvous = %key, "rendezvous bridge failed"),
                 }
             } else {
                 self.pending_bridges.insert(
@@ -807,6 +906,7 @@ impl<T: Transport> UasServer<T> {
                         endpoint: ep.id(),
                         remote_media: remote_rtp,
                         srtp: srtp_keys.clone(),
+                        audio_codec: audio_codec.clone(),
                     },
                 );
                 info!(rendezvous = %key, "rendezvous leg parked, awaiting peer");
@@ -885,6 +985,87 @@ impl<T: Transport> UasServer<T> {
         }));
     }
 
+    /// Slice 5.6c: try to route a codec-mismatched rendezvous pair
+    /// through a transcoded session. Returns `true` if the
+    /// orchestrator admitted the call and the session was installed
+    /// into [`DialogSessions`] — in that case the caller skips the
+    /// plain passthrough bridge. Returns `false` when no
+    /// orchestrator is wired, admission was refused, or
+    /// construction errored — the caller then falls through to the
+    /// passthrough path (pre-5.6c behaviour).
+    #[allow(clippy::too_many_arguments)]
+    async fn try_orchestrate_transcoded(
+        &self,
+        rendezvous_key: &str,
+        dialog_a: &DialogKey,
+        dialog_b: &DialogKey,
+        leg_a: BridgeLeg,
+        codec_a: NegotiatedCodec,
+        leg_b: BridgeLeg,
+        codec_b: NegotiatedCodec,
+    ) -> bool {
+        let Some(orch) = self.transcode_orchestrator.as_ref() else {
+            warn!(
+                rendezvous = rendezvous_key,
+                %codec_a,
+                %codec_b,
+                "codec mismatch at rendezvous but no TranscodeOrchestrator wired; \
+                 falling through to passthrough bridge (audio will not be audible)",
+            );
+            return false;
+        };
+        match orch
+            .try_orchestrate(leg_a, codec_a.clone(), leg_b, codec_b.clone())
+            .await
+        {
+            Ok(Some(session)) => {
+                // Install the same session handle under both legs'
+                // keys. `(LegId(0), Audio)` for the first-in leg,
+                // `(LegId(1), Audio)` for the second — matches
+                // slice 5.6's `per_leg_codec` convention.
+                use smiths_core::{LegId, MediaKindTag};
+                let key_a = (LegId(0), MediaKindTag::Audio);
+                let key_b = (LegId(1), MediaKindTag::Audio);
+                self.dialog_sessions
+                    .install(dialog_a.clone(), key_a, Arc::clone(&session));
+                self.dialog_sessions
+                    .install(dialog_b.clone(), key_b, session);
+                info!(
+                    rendezvous = rendezvous_key,
+                    %codec_a,
+                    %codec_b,
+                    "rendezvous transcoded session installed",
+                );
+                true
+            }
+            Ok(None) => {
+                warn!(
+                    rendezvous = rendezvous_key,
+                    %codec_a,
+                    %codec_b,
+                    "transcode admission refused (budget exhausted); \
+                     passthrough fallback will not produce audible audio",
+                );
+                // NOTE: a future slice should respond 488 + `Warning:
+                // 370` here instead of silently falling through, but
+                // that path needs to unwind leg-A's already-200-OK'd
+                // dialog too. Out of scope for 5.6c.
+                false
+            }
+            Err(e) => {
+                warn!(
+                    rendezvous = rendezvous_key,
+                    %codec_a,
+                    %codec_b,
+                    error = %e,
+                    "transcoded session construction failed; \
+                     falling back to passthrough",
+                );
+                false
+            }
+        }
+    }
+
     fn handle_ack(&self, req: &RequestSummary, peer: SocketAddr) {
         // Transaction-layer: for a non-2xx final, ACK shares the
         // INVITE's branch (RFC 3261 §17.1.1.3) and transitions the
@@ -952,6 +1133,15 @@ impl<T: Transport> UasServer<T> {
                     self.bridges_by_dialog.retain(|_, other| *other != bid);
                     self.media_fabric.release_bridge(bid).await;
                     debug!(call_id = %record.call_id, "rendezvous bridge stopped");
+                }
+                // Slice 5.6c: drain any non-passthrough sessions
+                // (transcoded, and later FAX / conference) that
+                // belong to this dialog. `remove_dialog` returns
+                // every handle we owned; we stop each one so the
+                // forwarder tasks exit and the admission lease
+                // (if any) releases.
+                for session in self.dialog_sessions.remove_dialog(&key) {
+                    session.stop().await;
                 }
                 if let Some(ep) = record.media {
                     self.media_fabric.release_endpoint(ep).await;
