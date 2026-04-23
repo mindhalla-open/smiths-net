@@ -35,6 +35,7 @@ tracing       = { workspace = true }
 thiserror     = { workspace = true }
 axum          = { workspace = true }
 dashmap       = { workspace = true }
+prometheus-client = { workspace = true }
 
 [dev-dependencies]
 smiths-plugin     = { workspace = true }

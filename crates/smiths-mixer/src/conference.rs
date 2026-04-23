@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::agc::{Agc, AgcConfig};
+use crate::metrics::{ConferenceLabel, IngressDropReason, MixerMetrics};
 use crate::mixer::{Mixer, MixerConfig};
 use crate::vad::{EnergyVad, Vad, VadScore, dominant_speaker};
 
@@ -149,6 +150,10 @@ pub struct Conference {
     state: Arc<Mutex<ConferenceState>>,
     cancel: CancellationToken,
     tick_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Prometheus metrics handle. `None` on tests that don't
+    /// supply one; `Some` in every production deployment so
+    /// operators see live mixer health. Slice 5.12.
+    metrics: Option<Arc<MixerMetrics>>,
 }
 
 struct ConferenceState {
@@ -163,6 +168,18 @@ impl Conference {
     /// [`Self::shutdown`].
     #[must_use]
     pub fn spawn(id: ConferenceId, cfg: ConferenceConfig) -> Arc<Self> {
+        Self::spawn_with_metrics(id, cfg, None)
+    }
+
+    /// Same as [`Self::spawn`] with an optional
+    /// [`MixerMetrics`] handle — the engine wires one at boot;
+    /// tests pass `None` to skip the Prometheus path.
+    #[must_use]
+    pub fn spawn_with_metrics(
+        id: ConferenceId,
+        cfg: ConferenceConfig,
+        metrics: Option<Arc<MixerMetrics>>,
+    ) -> Arc<Self> {
         let cancel = CancellationToken::new();
         let state = Arc::new(Mutex::new(ConferenceState {
             participants: BTreeMap::new(),
@@ -172,12 +189,21 @@ impl Conference {
         }));
         let mixer = Mixer::new(cfg.mixer);
 
+        if let Some(m) = &metrics {
+            m.conferences_active.inc();
+        }
+        let label = ConferenceLabel {
+            conference: id.0.to_string(),
+        };
+
         let tick_handle = tokio::spawn(run_tick(
             Arc::clone(&state),
             mixer,
             cfg.frame_interval,
             cfg.vad_threshold,
             cancel.clone(),
+            metrics.clone(),
+            label,
         ));
 
         Arc::new(Self {
@@ -186,6 +212,7 @@ impl Conference {
             state,
             cancel,
             tick_handle: Mutex::new(Some(tick_handle)),
+            metrics,
         })
     }
 
@@ -220,6 +247,9 @@ impl Conference {
                 tx_out,
             },
         );
+        if let Some(m) = &self.metrics {
+            m.participants_active.inc();
+        }
         debug!(conf = %self.id, %id, "participant joined");
         (id, rx_out)
     }
@@ -236,6 +266,13 @@ impl Conference {
         samples: Vec<i16>,
     ) -> Result<(), ConferenceError> {
         if samples.len() != self.cfg.mixer.samples_per_frame {
+            if let Some(m) = &self.metrics {
+                m.ingress_dropped
+                    .get_or_create(&IngressDropReason {
+                        reason: "frame_size".into(),
+                    })
+                    .inc();
+            }
             return Err(ConferenceError::FrameSizeMismatch {
                 expected: self.cfg.mixer.samples_per_frame,
                 got: samples.len(),
@@ -247,7 +284,16 @@ impl Conference {
             .get(&participant)
             .ok_or(ConferenceError::UnknownParticipant(participant))?;
         p.tx_in.try_send(samples).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => ConferenceError::IngressFull(participant),
+            mpsc::error::TrySendError::Full(_) => {
+                if let Some(m) = &self.metrics {
+                    m.ingress_dropped
+                        .get_or_create(&IngressDropReason {
+                            reason: "queue_full".into(),
+                        })
+                        .inc();
+                }
+                ConferenceError::IngressFull(participant)
+            }
             mpsc::error::TrySendError::Closed(_) => {
                 ConferenceError::UnknownParticipant(participant)
             }
@@ -261,6 +307,9 @@ impl Conference {
             .participants
             .remove(&participant)
             .ok_or(ConferenceError::UnknownParticipant(participant))?;
+        if let Some(m) = &self.metrics {
+            m.participants_active.dec();
+        }
         debug!(conf = %self.id, %participant, "participant left");
         Ok(())
     }
@@ -279,8 +328,19 @@ impl Conference {
     pub async fn shutdown(&self) {
         self.cancel.cancel();
         let mut lock = self.tick_handle.lock().await;
+        let was_live = lock.is_some();
         if let Some(h) = lock.take() {
             let _ = h.await;
+        }
+        if was_live && let Some(m) = &self.metrics {
+            m.conferences_active.dec();
+            // Best-effort: decrement participants_active by the
+            // count still on the roster. Leaves not yet seen
+            // stay in the gauge until their own leave() — that
+            // path zeros them out.
+            let state = self.state.lock().await;
+            let remaining = i64::try_from(state.participants.len()).unwrap_or(0);
+            m.participants_active.dec_by(remaining);
         }
     }
 }
@@ -291,6 +351,8 @@ async fn run_tick(
     interval: Duration,
     vad_threshold: f32,
     cancel: CancellationToken,
+    metrics: Option<Arc<MixerMetrics>>,
+    label: ConferenceLabel,
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -302,16 +364,25 @@ async fn run_tick(
                 return;
             }
             _ = ticker.tick() => {
-                tick_once(&state, &mixer, vad_threshold).await;
+                tick_once(&state, &mixer, vad_threshold, metrics.as_deref(), &label).await;
             }
         }
     }
 }
 
-async fn tick_once(state: &Mutex<ConferenceState>, mixer: &Mixer, vad_threshold: f32) {
+async fn tick_once(
+    state: &Mutex<ConferenceState>,
+    mixer: &Mixer,
+    vad_threshold: f32,
+    metrics: Option<&MixerMetrics>,
+    label: &ConferenceLabel,
+) {
     let mut s = state.lock().await;
     if s.participants.is_empty() {
         s.ticks = s.ticks.wrapping_add(1);
+        if let Some(m) = metrics {
+            m.ticks.get_or_create(label).inc();
+        }
         return;
     }
 
@@ -365,7 +436,13 @@ async fn tick_once(state: &Mutex<ConferenceState>, mixer: &Mixer, vad_threshold:
         };
         scores.push(p.vad.observe(input));
     }
+    let prior_dominant = s.dominant;
     s.dominant = dominant_speaker(&scores, vad_threshold).map(|i| ids[i]);
+    if prior_dominant != s.dominant
+        && let Some(m) = metrics
+    {
+        m.dominant_switches.get_or_create(label).inc();
+    }
 
     // Publish outputs.
     for (id, out) in ids.iter().zip(outputs) {
@@ -381,6 +458,9 @@ async fn tick_once(state: &Mutex<ConferenceState>, mixer: &Mixer, vad_threshold:
     }
 
     s.ticks = s.ticks.wrapping_add(1);
+    if let Some(m) = metrics {
+        m.ticks.get_or_create(label).inc();
+    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,77 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.56.0] - 2026-04-23
+
+Slice 5.12 — Observability completeness. Fills the metrics gap
+that accumulated across slices 5.4 and 5.5: `smiths-mixer` and
+`smiths-fax` now publish Prometheus metrics on the same shared
+`Registry` the rest of the engine uses. Adds two MCP tools for
+control-plane introspection so LLM agents and runbook scripts
+can query live values without issuing an HTTP scrape. Ships a
+metrics catalog doc enumerating every series the engine
+publishes, with alerting suggestions.
+
+### Added
+
+- **`smiths-mixer::MixerMetrics`** (new module) — five series:
+  - `smiths_mixer_conferences_active` (gauge).
+  - `smiths_mixer_ticks_total{conference}` (counter).
+  - `smiths_mixer_dominant_switches_total{conference}` (counter).
+  - `smiths_mixer_ingress_dropped_total{reason=queue_full|frame_size}`
+    (counter).
+  - `smiths_mixer_participants_active` (gauge).
+  Wired via `Conference::spawn_with_metrics` — the default
+  `spawn()` stays metric-less for tests, production wires an
+  `Arc<MixerMetrics>` into the registry at boot. Tick loop
+  records tick counts + dominant-speaker transitions; push_frame
+  records ingress drops by reason; join/leave maintain
+  `participants_active`.
+- **`smiths-fax::FaxMetrics`** (new module) — three series:
+  - `smiths_fax_sessions_active` (gauge).
+  - `smiths_fax_datagrams_forwarded_total{direction}` (counter).
+  - `smiths_fax_parse_errors_total{kind}` (counter) — every
+    `UdptlError` variant maps to a fixed-cardinality kind token.
+  Wired via `UdptlSessionConfig::metrics`; forwarders credit the
+  counter on successful send, parse errors increment the kind-
+  labelled counter via `record_parse_error`.
+- **MCP tool `list_metrics`** — returns every Prometheus series
+  as JSON (`{count, series: [{metric, labels, value}, …]}`).
+  Reads through the same `Arc<Mutex<Registry>>` the `/metrics`
+  endpoint encodes from, so the two views can't disagree.
+- **MCP tool `get_metric(name)`** — targeted lookup. Matches
+  both the bare name and the `_total` Prometheus-text form so
+  counters are addressable under either spelling.
+- **`ToolContext::metrics_registry`** — new optional field,
+  plumbed through the `with_metrics_registry` builder. `None` in
+  tests and transport-less contexts; the two new tools return a
+  clean `NotFound` rather than panicking.
+- **Metrics catalog** at `docs/observability/metrics.md` —
+  enumerates every series, groups by subsystem (SIP, AI, tools,
+  transcoding, mixer, fax), notes the alerting threshold an ops
+  team would typically set.
+- **Tests**:
+  - `MixerMetrics::register` + per-kind label assertions.
+  - `FaxMetrics::register` + every `UdptlError` variant maps to
+    the expected kind token.
+  - 3 new `list_metrics` / `get_metric` tests covering
+    registry-not-wired, empty-registry, and populated-registry
+    paths.
+  - Existing mixer / fax tests stay green because the metrics
+    field is optional (defaults to `None`).
+
+### Notes
+
+- **Takes v0.56.0** as planned in the 5.12 slice entry.
+- **No breaking changes.** `Conference::spawn` still exists
+  with its original signature; `UdptlSessionConfig` gained
+  `metrics: Option<Arc<FaxMetrics>>` with `None` default.
+  Existing callers compile untouched.
+- **OpenTelemetry traces deferred.** That's a bigger integration
+  with `tracing-opentelemetry` + exporter config. The metrics
+  gap was more urgent (slice 5.9's canary would have had nothing
+  to watch on mixer/fax deployments).
+
 ## [0.55.0] - 2026-04-22
 
 Slice 5.7 — WebTransport signaling scaffold. Adds the protocol

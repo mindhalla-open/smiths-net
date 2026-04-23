@@ -24,6 +24,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::metrics::FaxMetrics;
 use crate::udptl::UdptlPacket;
 
 /// Runtime knobs for [`UdptlSession`].
@@ -35,6 +36,10 @@ pub struct UdptlSessionConfig {
     /// received datagram and logs sequence jumps at `debug`. Adds a
     /// ~200 ns parse cost per datagram; off by default.
     pub trace_sequence: bool,
+    /// Prometheus metrics handle — when `Some`, the forwarders
+    /// record datagram counts + parse errors through it. `None` on
+    /// tests that don't need Prometheus output. Slice 5.12.
+    pub metrics: Option<Arc<FaxMetrics>>,
 }
 
 impl Default for UdptlSessionConfig {
@@ -42,6 +47,7 @@ impl Default for UdptlSessionConfig {
         Self {
             id: BridgeId(0),
             trace_sequence: false,
+            metrics: None,
         }
     }
 }
@@ -55,6 +61,7 @@ pub struct UdptlSession {
     id: BridgeId,
     cancel: CancellationToken,
     tasks: tokio::sync::Mutex<Vec<JoinHandle<()>>>,
+    metrics: Option<Arc<FaxMetrics>>,
 }
 
 impl UdptlSession {
@@ -70,12 +77,16 @@ impl UdptlSession {
         leg_b: (Arc<UdpSocket>, SocketAddr),
     ) -> Arc<Self> {
         let cancel = CancellationToken::new();
+        if let Some(m) = &cfg.metrics {
+            m.sessions_active.inc();
+        }
         let a_to_b = spawn_forwarder(
             "a_to_b",
             Arc::clone(&leg_a.0),
             Arc::clone(&leg_b.0),
             leg_b.1,
             cfg.trace_sequence,
+            cfg.metrics.clone(),
             cancel.clone(),
         );
         let b_to_a = spawn_forwarder(
@@ -84,12 +95,14 @@ impl UdptlSession {
             Arc::clone(&leg_a.0),
             leg_a.1,
             cfg.trace_sequence,
+            cfg.metrics.clone(),
             cancel.clone(),
         );
         Arc::new(Self {
             id: cfg.id,
             cancel,
             tasks: tokio::sync::Mutex::new(vec![a_to_b, b_to_a]),
+            metrics: cfg.metrics,
         })
     }
 }
@@ -103,11 +116,15 @@ impl MediaSession for UdptlSession {
     async fn stop(&self) {
         self.cancel.cancel();
         let mut handles = self.tasks.lock().await;
+        let was_live = !handles.is_empty();
         for h in handles.drain(..) {
             // Abort on join errors; we've already signaled cancel, so
             // a panicking forwarder is already "stopped" for our
             // purposes.
             let _ = h.await;
+        }
+        if was_live && let Some(m) = &self.metrics {
+            m.sessions_active.dec();
         }
     }
 }
@@ -118,6 +135,7 @@ fn spawn_forwarder(
     send_sock: Arc<UdpSocket>,
     peer: SocketAddr,
     trace_sequence: bool,
+    metrics: Option<Arc<FaxMetrics>>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -134,10 +152,12 @@ fn spawn_forwarder(
                     match recv {
                         Ok((n, _from)) => {
                             if trace_sequence {
-                                trace_seq(direction, &buf[..n], &mut last_seq);
+                                trace_seq(direction, &buf[..n], &mut last_seq, metrics.as_deref());
                             }
                             if let Err(e) = send_sock.send_to(&buf[..n], peer).await {
                                 warn!(direction, error = %e, "udptl send_to failed");
+                            } else if let Some(m) = &metrics {
+                                m.record_forward(direction);
                             }
                         }
                         Err(e) => {
@@ -150,7 +170,12 @@ fn spawn_forwarder(
     })
 }
 
-fn trace_seq(direction: &'static str, bytes: &[u8], last_seq: &mut Option<u16>) {
+fn trace_seq(
+    direction: &'static str,
+    bytes: &[u8],
+    last_seq: &mut Option<u16>,
+    metrics: Option<&FaxMetrics>,
+) {
     match UdptlPacket::parse(bytes) {
         Ok(pkt) => {
             if let Some(prev) = *last_seq {
@@ -168,6 +193,9 @@ fn trace_seq(direction: &'static str, bytes: &[u8], last_seq: &mut Option<u16>) 
         }
         Err(e) => {
             debug!(direction, error = %e, "udptl parse failed (not fatal, forwarding raw)");
+            if let Some(m) = metrics {
+                m.record_parse_error(&e);
+            }
         }
     }
 }

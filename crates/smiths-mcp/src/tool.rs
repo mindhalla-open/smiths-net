@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use prometheus_client::registry::Registry;
 use serde_json::Value;
 use smiths_core::Config;
 use smiths_core::Metrics;
@@ -21,6 +22,7 @@ use smiths_core::storage::{CdrStore, RecordingStore, VectorStore};
 use smiths_media::PromptLibrary;
 use smiths_mixer::ConferenceRegistry;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 use crate::control::ControlState;
 
@@ -75,6 +77,12 @@ pub struct ToolContext {
     /// is wired; `create_conference` / `join_conference` /
     /// `leave_conference` return a clean `NotFound` in that case.
     pub conferences: Option<Arc<dyn ConferenceRegistry>>,
+    /// Shared Prometheus registry (slice 5.12). Wired by the CLI
+    /// from the same `Arc<Mutex<Registry>>` the `/metrics`
+    /// endpoint encodes from, so `list_metrics` / `get_metric`
+    /// MCP tools can never disagree with a scrape. `None` in
+    /// tests and in transport-free contexts.
+    pub metrics_registry: Option<Arc<Mutex<Registry>>>,
 }
 
 impl ToolContext {
@@ -99,6 +107,7 @@ impl ToolContext {
             recording: None,
             prompts: None,
             conferences: None,
+            metrics_registry: None,
         }
     }
 
@@ -107,6 +116,14 @@ impl ToolContext {
     #[must_use]
     pub fn with_conferences(mut self, registry: Arc<dyn ConferenceRegistry>) -> Self {
         self.conferences = Some(registry);
+        self
+    }
+
+    /// Attach the shared Prometheus `Registry` so `list_metrics` /
+    /// `get_metric` become live.
+    #[must_use]
+    pub fn with_metrics_registry(mut self, registry: Arc<Mutex<Registry>>) -> Self {
+        self.metrics_registry = Some(registry);
         self
     }
 
