@@ -405,6 +405,47 @@ impl<T: Transport> UasServer<T> {
         &self.dialog_sessions
     }
 
+    /// Shared handle on the dialog table (slice 6.1). Cloned out
+    /// so the CLI can take a live-dialog snapshot on graceful
+    /// shutdown — the UAS's `run()` consumes `self`, so without
+    /// this accessor the snapshot path would need to live inside
+    /// the UAS and duplicate the shutdown plumbing. The `Arc` +
+    /// `DashMap` are cheap to share; concurrent read from the
+    /// snapshot writer doesn't interfere with the live UAS
+    /// modifying its own dialogs because `DashMap::iter` yields
+    /// a consistent per-shard view.
+    #[must_use]
+    pub fn dialogs_handle(&self) -> Arc<DashMap<DialogKey, DialogRecord>> {
+        Arc::clone(&self.dialogs)
+    }
+
+    /// Prime the dialog table with a set of pre-existing records
+    /// (slice 6.1 — snapshot replay). Called by the CLI at boot
+    /// before `run()` if a snapshot file was loaded. Each restored
+    /// dialog gets its record slot re-populated; the UAS then
+    /// processes subsequent in-dialog requests (ACK, BYE,
+    /// re-INVITE) exactly as if the record had been built by a
+    /// live INVITE.
+    ///
+    /// Returns the number of records restored so the caller can
+    /// emit a log or increment its own counter.
+    ///
+    /// Does **not** re-bind media endpoints or rebuild bridges —
+    /// a failover primary restarts the media plane from cold, which
+    /// is correct: an in-flight RTP flow belonging to a pre-crash
+    /// primary can't be resumed without the socket state, and a
+    /// sane BYE (from either side) will tear the restored record
+    /// down cleanly.
+    pub fn restore_dialogs(&self, records: impl IntoIterator<Item = DialogRecord>) -> usize {
+        let mut n = 0;
+        for rec in records {
+            let key = rec.key();
+            self.dialogs.insert(key, rec);
+            n += 1;
+        }
+        n
+    }
+
     /// Run the UAS event loop. Exits when `cancel` fires or `rx` closes.
     #[instrument(skip_all)]
     pub async fn run(self, mut rx: mpsc::Receiver<Datagram>, cancel: CancellationToken) {

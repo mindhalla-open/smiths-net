@@ -98,6 +98,14 @@ struct Cli {
     /// clean MCP server for an LLM host.
     #[arg(long, value_enum)]
     mcp: Option<McpMode>,
+
+    /// HA snapshot file path (slice 6.1). When set, the engine
+    /// reads this file at startup and restores every dialog
+    /// record in it; on graceful shutdown, the live dialog table
+    /// is serialized back to the same path. `None` = no HA
+    /// persistence (cold boot every time).
+    #[arg(long, env = "SMITHS_SNAPSHOT")]
+    snapshot_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -219,6 +227,37 @@ async fn main() -> anyhow::Result<()> {
     // operator's intent even when a particular bind fails (the failure
     // is already in the startup warn! log).
     let mut sip_binds_report: Vec<String> = Vec::new();
+    // Slice 6.1: HA dialog snapshot. Read the file once before
+    // any SIP bind so the first UAS restores from it; the handle
+    // we capture is used on shutdown to serialize back.
+    let (mut initial_dialogs, snapshot_sink): (
+        Vec<smiths_core::DialogRecord>,
+        Option<std::path::PathBuf>,
+    ) = if let Some(path) = cli.snapshot_path.clone() {
+        match smiths_sip::read_snapshot(&path) {
+            Ok(Some(records)) => {
+                info!(
+                    path = %path.display(),
+                    count = records.len(),
+                    "HA snapshot loaded; dialogs will be replayed on first UDP bind"
+                );
+                (records, Some(path))
+            }
+            Ok(None) => {
+                info!(path = %path.display(), "HA snapshot file absent; cold boot");
+                (Vec::new(), Some(path))
+            }
+            Err(e) => {
+                warn!(path = %path.display(), ?e, "HA snapshot unreadable; cold boot");
+                (Vec::new(), Some(path))
+            }
+        }
+    } else {
+        (Vec::new(), None)
+    };
+    let mut sip_dialogs_for_snapshot: Option<
+        Arc<dashmap::DashMap<smiths_core::DialogKey, smiths_core::DialogRecord>>,
+    > = None;
     let udp_enabled = config.sip.transports.contains(&SipTransport::Udp);
     let tcp_enabled = config.sip.transports.contains(&SipTransport::Tcp);
     let tls_enabled = config.sip.transports.contains(&SipTransport::Tls);
@@ -267,12 +306,22 @@ async fn main() -> anyhow::Result<()> {
             sip_rate_limit.clone(),
             registrar.clone(),
             /* build_uac */ true,
+            std::mem::take(&mut initial_dialogs),
         )
         .await
         {
-            Ok(SpawnedSipUdp { handles, uac }) => {
+            Ok(SpawnedSipUdp {
+                handles,
+                uac,
+                dialogs,
+            }) => {
                 sip_handles.extend(handles);
                 originator = uac.map(|u| u as Arc<dyn CallOriginator>);
+                // The first UDP bind owns the snapshot — multi-bind
+                // deployments still get one coherent file.
+                if sip_dialogs_for_snapshot.is_none() {
+                    sip_dialogs_for_snapshot = Some(dialogs);
+                }
             }
             Err(e) => warn!(%bind, ?e, "failed to start SIP/UDP on first bind; continuing"),
         }
@@ -415,10 +464,18 @@ async fn main() -> anyhow::Result<()> {
                 sip_rate_limit.clone(),
                 registrar.clone(),
                 /* build_uac */ false,
+                std::mem::take(&mut initial_dialogs),
             )
             .await
             {
-                Ok(SpawnedSipUdp { handles, .. }) => sip_handles.extend(handles),
+                Ok(SpawnedSipUdp {
+                    handles, dialogs, ..
+                }) => {
+                    sip_handles.extend(handles);
+                    if sip_dialogs_for_snapshot.is_none() {
+                        sip_dialogs_for_snapshot = Some(dialogs);
+                    }
+                }
                 Err(e) => warn!(%bind, ?e, "failed to start SIP/UDP on bind; continuing"),
             }
         }
@@ -607,6 +664,19 @@ async fn main() -> anyhow::Result<()> {
     // Drain plugin sidecars.
     ai_registry.shutdown_all().await;
 
+    // Slice 6.1: write the HA snapshot if the operator wired a
+    // path. Happens after every SIP / adapter / health task has
+    // joined, so the dialog table is quiescent — no races with
+    // UAS writes. The sink / dialogs handles are independent so
+    // either can be `None` (MCP-only mode, no UDP bind, etc.)
+    // without breaking the other.
+    if let (Some(path), Some(dialogs)) = (snapshot_sink, sip_dialogs_for_snapshot) {
+        match smiths_sip::write_snapshot(&path, &dialogs) {
+            Ok(n) => info!(path = %path.display(), count = n, "HA snapshot written"),
+            Err(e) => warn!(path = %path.display(), ?e, "HA snapshot write failed"),
+        }
+    }
+
     let _ = bus.publish(Event::System(SystemEvent::ShutdownComplete));
     info!("graceful shutdown complete");
     Ok(())
@@ -617,6 +687,11 @@ struct SpawnedSipUdp {
     /// Populated only on the bind we designate as the outbound-call
     /// origin. `None` for every other UDP listener.
     uac: Option<Arc<UacClient<UdpTransport>>>,
+    /// Shared handle on the UAS's dialog table (slice 6.1). Cloned
+    /// out before `run()` is spawned so the shutdown path can
+    /// serialize every live dialog to disk without reaching into
+    /// the private `UasServer` state.
+    dialogs: Arc<dashmap::DashMap<smiths_core::DialogKey, smiths_core::DialogRecord>>,
 }
 
 /// Fire-and-forget retention sweep for the filesystem recording
@@ -668,6 +743,7 @@ async fn spawn_sip_udp(
     rate_limit: smiths_sip::SipRateLimiter,
     registrar: Option<smiths_sip::auth::digest::Registrar>,
     build_uac: bool,
+    restore_dialogs: Vec<smiths_core::DialogRecord>,
 ) -> anyhow::Result<SpawnedSipUdp> {
     let transport = UdpTransport::bind(bind)
         .await
@@ -696,6 +772,18 @@ async fn spawn_sip_udp(
     if let Some(reg) = registrar {
         server = server.with_registrar(reg);
     }
+    // Slice 6.1: replay any pre-shutdown snapshot before `run`
+    // takes ownership of the server. Also clone out the dialogs
+    // handle so the shutdown path can serialize live state.
+    let restored = server.restore_dialogs(restore_dialogs);
+    if restored > 0 {
+        metrics.snapshot_replay_dialogs.inc_by(restored as u64);
+        info!(
+            restored,
+            "HA snapshot replay: {restored} dialog records restored"
+        );
+    }
+    let dialogs = server.dialogs_handle();
     let server_handle = tokio::spawn(server.run(rx, cancel));
     info!(%local, "SIP UDP listening");
 
@@ -718,6 +806,7 @@ async fn spawn_sip_udp(
     Ok(SpawnedSipUdp {
         handles: vec![reader, server_handle],
         uac,
+        dialogs,
     })
 }
 

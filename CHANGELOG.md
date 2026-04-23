@@ -5,6 +5,76 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.58.0] - 2026-04-23
+
+Slice 6.1 — HA snapshot + replay (MVP). The engine persists
+its dialog table to a JSON file on graceful shutdown and
+replays it on the next boot. First half of the Phase-6 HA
+story — a delta replicator (6.2) and Raft multi-node (6.3) ride
+on top of this primitive. Takes v0.58.0; 6.1 was pre-slotted at
+v0.61.0 in the plan but the out-of-order move was cleaner than
+waiting on slices 5.8/5.9/5.10/5.11 first.
+
+### Added
+
+- **`smiths_sip::snapshot`** (new module) — `write_snapshot` +
+  `read_snapshot` + `SnapshotError`. JSON format with a magic
+  tag (`"smiths-net/dialog-snapshot"`) + version integer so
+  future evolution has a migration hook. Writes atomically via
+  `<path>.snapshot.tmp` + rename; reads return `Ok(None)` on a
+  missing file (cold-boot) and refuse loudly on magic mismatch
+  or future version.
+- **`UasServer::dialogs_handle()`** — shares the `Arc<DashMap<DialogKey,
+  DialogRecord>>` so the CLI's shutdown path can snapshot live
+  dialog state. `run()` consumes `self`, so the handle must be
+  cloned out before spawn.
+- **`UasServer::restore_dialogs()`** — primes the dialog table
+  from a snapshot at boot. Returns the restored count. Does
+  **not** rebuild bridges or re-bind media endpoints — an
+  in-flight RTP flow from a pre-crash primary can't be resumed
+  without the socket state; a BYE from either side tears the
+  restored record down cleanly.
+- **CLI flag `--snapshot-path` (env `SMITHS_SNAPSHOT`)** — when
+  set, engine reads the file at boot (replaying into the first
+  UDP bind's UAS) and writes it back after every SIP / adapter
+  / health task has drained.
+- **`Metrics::snapshot_replay_dialogs`** — cumulative
+  `smiths_snapshot_replay_dialogs_total` counter, bumped by
+  the restored record count at each boot. Zero on a cold boot.
+- **`Error::Other`** + `Error::other(msg)` — catch-all for
+  subsystem-specific failures the snapshot module flattens
+  into the SIP error type.
+- **Runbook** — new "Cold-start recovery" section in
+  `docs/operator-runbook.md` with enable recipe, what's persisted
+  vs not, troubleshooting, and limits.
+- **5 new tests** on `smiths_sip::snapshot` — round-trip,
+  missing-file returns None, magic mismatch, future-version
+  refusal, atomic-write tmp cleanup.
+
+### Changed
+
+- **`smiths-sip` deps**: `serde` + `serde_json` promoted from
+  optional (gated by `auth-http` / `webtransport`) to
+  unconditional. The snapshot module needs them on the default
+  build. Zero cost on downstream crates — those features pulled
+  serde in already.
+- **`smiths-cli` deps**: added `dashmap` (typed handle on the
+  dialog table for the shutdown snapshot path).
+
+### Notes
+
+- **Out-of-order vs plan**: plan pre-slotted 6.1 at v0.61.0
+  after 5.8/5.9/5.10/5.11. Those slices are larger (config
+  hot-reload + canary + WebRTC native + privacy) and depend on
+  infra that's partial today. 6.1 is self-contained and useful
+  on its own — the HA MVP unblocks single-node restart stories
+  that every deployment wants. Subsequent 5.x / 6.x slices will
+  cascade by one version; the plan will be updated when they
+  land.
+- **No live replication.** Slice 6.2 adds that. A primary that
+  crashes between snapshots loses dialogs opened since the last
+  graceful shutdown.
+
 ## [0.57.0] - 2026-04-23
 
 Slice 5.6c — UAS transcoded-session wiring. Closes the

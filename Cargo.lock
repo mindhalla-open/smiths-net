@@ -3001,9 +3001,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.38"
+version = "0.23.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
+checksum = "7c2c118cb077cca2822033836dfb1b975355dfb784b5e8da48f7b6c5db74e60e"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -3365,12 +3365,13 @@ dependencies = [
 
 [[package]]
 name = "smiths-cli"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "anyhow",
  "axum",
  "clap",
  "const_format",
+ "dashmap",
  "prometheus-client",
  "serde_json",
  "smiths-core",
@@ -3388,7 +3389,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-core"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3408,7 +3409,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-dtls"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "async-trait",
  "rustls",
@@ -3424,7 +3425,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-fax"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "async-trait",
  "prometheus-client",
@@ -3438,7 +3439,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-ice"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "bytes",
  "rand 0.10.1",
@@ -3453,7 +3454,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-mcp"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3483,7 +3484,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-media"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3499,7 +3500,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-mixer"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3514,7 +3515,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-plugin"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -3538,14 +3539,14 @@ dependencies = [
 
 [[package]]
 name = "smiths-proto"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "prost",
 ]
 
 [[package]]
 name = "smiths-script"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "async-trait",
  "rhai",
@@ -3560,7 +3561,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sdp"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "base64",
  "rand 0.10.1",
@@ -3571,7 +3572,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sidecar"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "rustix",
  "seccompiler",
@@ -3587,7 +3588,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sip"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3619,7 +3620,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-testkit"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "smiths-core",
  "smiths-media",
@@ -3633,7 +3634,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-transcode"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "opus",
  "prometheus-client",
@@ -3645,7 +3646,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-wasm"
-version = "0.57.0"
+version = "0.58.0"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -184,6 +184,12 @@ pub struct Metrics {
     /// once per tool invocation regardless of how many dispatcher
     /// hops the pipeline made.
     pub ai_pipeline_duration: Family<AiPipelineLabel, Histogram, fn() -> Histogram>,
+    /// `smiths_snapshot_replay_dialogs_total` — cumulative count
+    /// of dialog records restored from the HA snapshot file on
+    /// startup (slice 6.1). Zero on a cold boot (no snapshot);
+    /// bumps by the snapshot's record count when a prior shutdown
+    /// left one.
+    pub snapshot_replay_dialogs: Counter,
 }
 
 impl Metrics {
@@ -213,6 +219,7 @@ impl Metrics {
         let ai_tokens = Family::<AiTokensLabel, Counter>::default();
         let ai_pipeline_duration: Family<AiPipelineLabel, Histogram, fn() -> Histogram> =
             Family::new_with_constructor(default_histogram);
+        let snapshot_replay_dialogs = Counter::default();
 
         registry.register(
             "sip_requests",
@@ -302,6 +309,11 @@ impl Metrics {
             "End-to-end wall-clock of composite AI pipelines (e.g. transcribe_call, summarize_call).",
             ai_pipeline_duration.clone(),
         );
+        registry.register(
+            "smiths_snapshot_replay_dialogs",
+            "Dialogs restored from the HA snapshot file at startup (slice 6.1).",
+            snapshot_replay_dialogs.clone(),
+        );
 
         Arc::new(Self {
             sip_requests,
@@ -322,6 +334,7 @@ impl Metrics {
             ai_invocations,
             ai_tokens,
             ai_pipeline_duration,
+            snapshot_replay_dialogs,
         })
     }
 
