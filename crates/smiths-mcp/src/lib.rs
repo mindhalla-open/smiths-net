@@ -20,6 +20,7 @@
 
 pub mod a2a;
 pub mod audit;
+pub mod cluster;
 pub mod control;
 pub mod control_protocol;
 pub mod dispatch;

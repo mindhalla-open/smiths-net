@@ -129,6 +129,7 @@ pub fn builtin_registry() -> ResourceRegistry {
     reg.register(CallsResource);
     reg.register(CurrentConfigResource);
     reg.register(RegistrationsResource);
+    reg.register(crate::cluster::ClusterStatusResource);
     reg
 }
 

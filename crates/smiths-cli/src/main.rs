@@ -1,5 +1,6 @@
 //! smiths-net binary entry point.
 
+mod replication_service;
 mod webrtc;
 
 use std::net::SocketAddr;
@@ -417,9 +418,55 @@ async fn main() -> anyhow::Result<()> {
         (None, None)
     };
 
+    // ---- HA Replication (slice 6.2) ----
+    let mut replicator: Arc<dyn smiths_core::Replicator> = Arc::new(smiths_core::NoopReplicator);
+    let mut dialogs_shared: Option<
+        Arc<dashmap::DashMap<smiths_core::DialogKey, smiths_core::DialogRecord>>,
+    > = None;
+
+    if config.cluster.mode == smiths_core::ClusterMode::Primary {
+        if let Some(peer_addr) = config.cluster.peer_addr {
+            let (tx, rx) = mpsc::channel(1024);
+            replicator = Arc::new(replication_service::PrimaryReplicator::new(tx));
+            let cancel = shutdown.token();
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = cancel.cancelled() => {},
+                    res = replication_service::run_primary_service(peer_addr, rx) => {
+                        if let Err(e) = res {
+                            tracing::error!(?e, "HA Primary replication service failed");
+                        }
+                    }
+                }
+            });
+        } else {
+            warn!("HA mode = primary but cluster.peer_addr is unset; replication disabled");
+        }
+    } else if config.cluster.mode == smiths_core::ClusterMode::Secondary {
+        if let Some(peer_addr) = config.cluster.peer_addr {
+            let shared = Arc::new(dashmap::DashMap::new());
+            dialogs_shared = Some(Arc::clone(&shared));
+            for record in std::mem::take(&mut initial_dialogs) {
+                shared.insert(record.key(), record);
+            }
+            let cancel = shutdown.token();
+            let shared_for_listener = Arc::clone(&shared);
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = cancel.cancelled() => {},
+                    res = replication_service::run_secondary_service(peer_addr, shared_for_listener) => {
+                        if let Err(e) = res {
+                            tracing::error!(?e, "HA Secondary replication service failed");
+                        }
+                    }
+                }
+            });
+        } else {
+            warn!("HA mode = secondary but cluster.peer_addr is unset; replication disabled");
+        }
+    }
+
     // Build the UAC from the first configured UDP bind. The UAC shares
-    // that bind's UdpTransport + ResponseRouter with the UAS, so
-    // outbound INVITEs / BYEs get their responses on the same socket.
     let mut originator: Option<Arc<dyn CallOriginator>> = None;
     if udp_enabled && let Some(bind) = config.sip.bind.first() {
         let addr = bind.socket_addr();
@@ -437,6 +484,8 @@ async fn main() -> anyhow::Result<()> {
             webrtc_rendezvous.clone(),
             /* build_uac */ true,
             std::mem::take(&mut initial_dialogs),
+            Arc::clone(&replicator),
+            dialogs_shared.as_ref().map(Arc::clone),
         )
         .await
         {
@@ -794,6 +843,8 @@ async fn main() -> anyhow::Result<()> {
                 webrtc_rendezvous.clone(),
                 /* build_uac */ false,
                 std::mem::take(&mut initial_dialogs),
+                Arc::clone(&replicator),
+                dialogs_shared.as_ref().map(Arc::clone),
             )
             .await
             {
@@ -820,6 +871,8 @@ async fn main() -> anyhow::Result<()> {
                 sip_rate_limit.clone(),
                 registrar.clone(),
                 &config_snapshot.sip.proxy,
+                Arc::clone(&replicator),
+                dialogs_shared.as_ref().map(Arc::clone),
             )
             .await
             {
@@ -842,6 +895,8 @@ async fn main() -> anyhow::Result<()> {
                 drain.clone(),
                 sip_rate_limit.clone(),
                 registrar.clone(),
+                Arc::clone(&replicator),
+                dialogs_shared.as_ref().map(Arc::clone),
             )
             .await
             {
@@ -1367,6 +1422,10 @@ async fn spawn_sip_udp(
     webrtc_rendezvous: Option<Arc<dyn smiths_core::WebRtcRendezvous>>,
     build_uac: bool,
     restore_dialogs: Vec<smiths_core::DialogRecord>,
+    replicator: Arc<dyn smiths_core::Replicator>,
+    dialogs_shared: Option<
+        Arc<dashmap::DashMap<smiths_core::DialogKey, smiths_core::DialogRecord>>,
+    >,
 ) -> anyhow::Result<SpawnedSipUdp> {
     let transport = UdpTransport::bind(bind)
         .await
@@ -1391,7 +1450,11 @@ async fn spawn_sip_udp(
     .with_metrics(Arc::clone(&metrics))
     .with_response_router(Arc::clone(&router))
     .with_drain(drain.clone())
-    .with_rate_limit(rate_limit.clone());
+    .with_rate_limit(rate_limit.clone())
+    .with_replicator(replicator);
+    if let Some(d) = dialogs_shared {
+        server = server.with_dialogs(d);
+    }
     if let Some(reg) = registrar {
         server = server.with_registrar(reg);
     }
@@ -1448,6 +1511,10 @@ async fn spawn_sip_tls(
     drain: smiths_core::Drain,
     rate_limit: smiths_sip::SipRateLimiter,
     registrar: Option<smiths_sip::auth::digest::Registrar>,
+    replicator: Arc<dyn smiths_core::Replicator>,
+    dialogs_shared: Option<
+        Arc<dashmap::DashMap<smiths_core::DialogKey, smiths_core::DialogRecord>>,
+    >,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let transport = TlsTransport::bind(bind, cert, key)
         .await
@@ -1463,7 +1530,11 @@ async fn spawn_sip_tls(
         .with_context(|| format!("building UAS on {local}"))?
         .with_metrics(metrics)
         .with_drain(drain)
-        .with_rate_limit(rate_limit);
+        .with_rate_limit(rate_limit)
+        .with_replicator(replicator);
+    if let Some(d) = dialogs_shared {
+        server = server.with_dialogs(d);
+    }
     if let Some(reg) = registrar {
         server = server.with_registrar(reg);
     }
@@ -1483,6 +1554,10 @@ async fn spawn_sip_tcp(
     rate_limit: smiths_sip::SipRateLimiter,
     registrar: Option<smiths_sip::auth::digest::Registrar>,
     proxy_cfg: &smiths_core::SipProxyConfig,
+    replicator: Arc<dyn smiths_core::Replicator>,
+    dialogs_shared: Option<
+        Arc<dashmap::DashMap<smiths_core::DialogKey, smiths_core::DialogRecord>>,
+    >,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let mut transport = TcpTransport::bind(bind)
         .await
@@ -1508,7 +1583,11 @@ async fn spawn_sip_tcp(
         .with_context(|| format!("building UAS on {local}"))?
         .with_metrics(metrics)
         .with_drain(drain)
-        .with_rate_limit(rate_limit);
+        .with_rate_limit(rate_limit)
+        .with_replicator(replicator);
+    if let Some(d) = dialogs_shared {
+        server = server.with_dialogs(d);
+    }
     if let Some(reg) = registrar {
         server = server.with_registrar(reg);
     }

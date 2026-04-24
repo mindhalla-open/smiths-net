@@ -5,6 +5,37 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.70.0] - 2026-04-24
+
+**HA Replication — the engine gains Primary/Secondary state synchronization.**
+Implements Slice 6.2 for high-availability. Primary nodes stream SIP dialog
+state mutations to secondary nodes over TCP, ensuring call persistence and
+consistent state for failover consistency.
+
+### Added — 6.2: HA Replication Engine
+
+- **`DialogDelta`** — new core data model for serializing state transitions (`Upsert` vs `Delete`).
+- **`Replicator` trait** — decoupled interface for streaming state updates, with `NoopReplicator` and `PrimaryReplicator` (TCP) implementations.
+- **`UasServer::with_replicator`** — integration hook that ensures every dialog mutation (INVITE, ACK, BYE) is mirrored to the replicator.
+- **`UasServer::with_dialogs`** — allows sharing a single dialog table across multiple listeners, required for consistent secondary state.
+- **`replication_service`** — background task in the CLI that handles TCP streaming (Primary) and TCP replaying (Secondary) of deltas.
+- **`cluster://status` MCP resource** — exposes HA role, peer connectivity, and replication metrics to the control plane.
+- **`[cluster]` configuration** — new block for setting `mode` (`standalone`, `primary`, `secondary`), `peer_addr`, and heartbeat intervals.
+
+### Changed
+
+- **SIP listeners share a global dialog table** in HA mode, ensuring the Secondary node has a coherent view of all calls regardless of transport.
+- **`UasServer`** instrumented to emit deltas on:
+    - `handle_invite` (New dialog)
+    - `handle_ack` (Dialog confirmed)
+    - `terminate_dialog` (Dialog removed)
+    - `send_response` (Update for 2xx retransmissions)
+
+### Notes
+
+- **Secondary nodes are passive.** They maintain the dialog table in sync with the Primary but do not yet automatically take over VIPs or traffic.
+- **TCP-based streaming.** The current implementation uses JSON-over-newline over TCP for replication; robust for same-subnet HA pairs.
+
 ## [0.69.0] - 2026-04-24
 
 **Full ICE — the engine graduates from ICE-Lite to a full agent.**

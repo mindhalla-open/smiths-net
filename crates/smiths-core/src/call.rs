@@ -253,6 +253,19 @@ pub struct DialogRecord {
     pub ice: Option<crate::sdp::IceParams>,
 }
 
+/// Dialog state mutation for replication (slice 6.2).
+///
+/// Primary sends these to the secondary; secondary replays into its
+/// local `DashMap`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DialogDelta {
+    /// Create or update a dialog record.
+    Upsert(Box<DialogRecord>),
+    /// Remove a dialog record.
+    Delete(DialogKey),
+}
+
 impl DialogRecord {
     /// Compose the dialog key.
     #[must_use]

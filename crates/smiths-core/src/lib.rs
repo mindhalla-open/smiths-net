@@ -36,6 +36,7 @@ pub mod media;
 pub mod metrics;
 pub mod probe;
 pub mod reloader;
+pub mod replication;
 pub mod rtp;
 pub mod sdp;
 pub mod shutdown;
@@ -49,19 +50,20 @@ pub use ai::{
 };
 pub use bus::EventBus;
 pub use call::{
-    CallError, CallLookup, CallOriginator, DialogKey, DialogRecord, DialogState, LegId,
-    MediaKindTag, NegotiatedCodec, RegistrationSnapshot, RegistrationView, SessionKey,
+    CallError, CallLookup, CallOriginator, DialogDelta, DialogKey, DialogRecord, DialogState,
+    LegId, MediaKindTag, NegotiatedCodec, RegistrationSnapshot, RegistrationView, SessionKey,
 };
 pub use codec::{linear_to_ulaw, pcm16_to_pcmu, pcmu_to_pcm16, ulaw_to_linear};
 pub use config::{
-    A2aConfig, AiConfig, AuthBackend, AuthConfig, BindSpec, BindSpecError, CanaryConfig, Config,
-    CoreConfig, FsRecordingConfig, HttpAuthConfig, HttpFailureMode, LogFormat, McpConfig,
-    McpHttp3Config, MediaConfig, ObservabilityConfig, PluginsConfig, PromptsConfig, ProxyMode,
-    RateLimitConfig, RecordingBackend, RecordingStoreConfig, ReloadConfig, SandboxConfig,
-    SeccompPolicy, SipConfig, SipProxyConfig, SipRateLimit, SipTransport, SipVpnConfig,
-    SqliteAuthConfig, SqliteStorageConfig, StorageBackend, StorageConfig, TranscodeConfig,
-    VectorBackend, VectorStoreConfig, VpnMode, WebRtcConfig, WebRtcIceConfig, WebRtcPrivacyConfig,
-    WebRtcPrivacyMode, WebRtcTurnConfig, WebRtcTurnCredential, WebTransportConfig,
+    A2aConfig, AiConfig, AuthBackend, AuthConfig, BindSpec, BindSpecError, CanaryConfig,
+    ClusterConfig, ClusterMode, Config, CoreConfig, FsRecordingConfig, HttpAuthConfig,
+    HttpFailureMode, LogFormat, McpConfig, McpHttp3Config, MediaConfig, ObservabilityConfig,
+    PluginsConfig, PromptsConfig, ProxyMode, RateLimitConfig, RecordingBackend,
+    RecordingStoreConfig, ReloadConfig, SandboxConfig, SeccompPolicy, SipConfig, SipProxyConfig,
+    SipRateLimit, SipTransport, SipVpnConfig, SqliteAuthConfig, SqliteStorageConfig,
+    StorageBackend, StorageConfig, TranscodeConfig, VectorBackend, VectorStoreConfig, VpnMode,
+    WebRtcConfig, WebRtcIceConfig, WebRtcPrivacyConfig, WebRtcPrivacyMode, WebRtcTurnConfig,
+    WebRtcTurnCredential, WebTransportConfig,
 };
 pub use dialog_sessions::DialogSessions;
 pub use drain::Drain;
@@ -82,6 +84,7 @@ pub use probe::{ErrorRateProbe, ProbeConfig, ProbeSample, ProbeVerdict};
 pub use reloader::{
     ApplyError, ApplyReport, CanaryError, ChangeId, ChangeReceipt, ConfigReloader, RollbackReason,
 };
+pub use replication::{NoopReplicator, Replicator};
 pub use rtp::RtpPacket;
 pub use sdp::{DtlsParams, DtlsRole, NegotiationOutcome, SdpNegotiator, SrtpKeys};
 pub use shutdown::{HangupStream, Shutdown, hangup_stream};

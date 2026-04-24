@@ -88,6 +88,9 @@ pub struct Config {
     /// Pairs with the 5.7 WebTransport scaffold; shares the
     /// JSON-over-stream message shape. Runtime follow-on.
     pub webrtc: WebRtcConfig,
+    /// HA cluster configuration (slice 6.2).
+    #[nested]
+    pub cluster: ClusterConfig,
 }
 
 /// `[ai]` TOML block — cloud-provider secrets for the reference
@@ -1424,6 +1427,54 @@ impl Config {
             .extract()
             .map_err(|e| Error::Config(e.to_string()))
     }
+}
+
+/// `[cluster]` TOML block — HA replication settings (slice 6.2).
+///
+/// ```toml
+/// [cluster]
+/// mode      = "primary"               # "standalone" | "primary" | "secondary"
+/// peer_addr = "10.42.0.10:8000"       # address to dial/bind
+/// ```
+#[derive(Clone, Debug, Deserialize, Serialize, Reloadable)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClusterConfig {
+    /// HA role: Standalone (no replication), Primary (sends deltas),
+    /// Secondary (replays deltas).
+    #[restart_required]
+    pub mode: ClusterMode,
+    /// Peer address for replication traffic (TCP).
+    /// When mode = Primary, this is the address to dial (the secondary).
+    /// When mode = Secondary, this is the address to bind (the listener).
+    #[restart_required]
+    pub peer_addr: Option<SocketAddr>,
+    /// Interval between heartbeat pings between primary and secondary.
+    #[reloadable]
+    pub heartbeat_interval_secs: u32,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            mode: ClusterMode::Standalone,
+            peer_addr: None,
+            heartbeat_interval_secs: 5,
+        }
+    }
+}
+
+/// HA role selector.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClusterMode {
+    /// Single node, no replication.
+    #[default]
+    Standalone,
+    /// Primary node: publishes dialog deltas to the secondary.
+    Primary,
+    /// Secondary node: subscribes to deltas from the primary and
+    /// replays them into its local table.
+    Secondary,
 }
 
 #[cfg(test)]

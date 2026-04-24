@@ -320,6 +320,8 @@ pub struct UasServer<T: Transport> {
     /// header is silently ignored (safe fallback for
     /// deployments without the WebRTC adapter wired).
     webrtc_rendezvous: Option<Arc<dyn smiths_core::WebRtcRendezvous>>,
+    /// HA replicator (slice 6.2). Standalone deployments use a no-op.
+    replicator: Arc<dyn smiths_core::Replicator>,
     /// Async driver hosting every server-side transaction — both
     /// INVITE (`ServerInviteTxn` with G/H/I timers, ACK correlation,
     /// 2xx bypass) and non-INVITE (`ServerNonInviteTxn` with timer J).
@@ -356,6 +358,7 @@ impl<T: Transport> UasServer<T> {
             bus,
             invite_2xx_retransmits: Arc::new(DashMap::new()),
             dialogs: Arc::new(DashMap::new()),
+            replicator: Arc::new(smiths_core::NoopReplicator),
             contact,
             media_fabric,
             negotiator,
@@ -503,6 +506,24 @@ impl<T: Transport> UasServer<T> {
         orchestrator: Arc<dyn ConferenceOrchestrator>,
     ) -> Self {
         self.conference_orchestrator = Some(orchestrator);
+        self
+    }
+
+    /// Inject an HA replicator (slice 6.2).
+    #[must_use]
+    pub fn with_replicator(mut self, replicator: Arc<dyn smiths_core::Replicator>) -> Self {
+        self.replicator = replicator;
+        self
+    }
+
+    /// Inject an existing dialog table (slice 6.2).
+    /// Useful for sharing the table across multiple listeners in HA setups.
+    #[must_use]
+    pub fn with_dialogs(
+        mut self,
+        dialogs: Arc<dashmap::DashMap<smiths_core::DialogKey, smiths_core::DialogRecord>>,
+    ) -> Self {
+        self.dialogs = dialogs;
         self
     }
 
@@ -1151,7 +1172,9 @@ impl<T: Transport> UasServer<T> {
             per_leg_codec,
             ice,
         };
-        self.dialogs.insert(dialog_key.clone(), record);
+        self.dialogs.insert(dialog_key.clone(), record.clone());
+        self.replicator
+            .replicate(smiths_core::DialogDelta::Upsert(Box::new(record)));
         self.metrics.dialogs_active.inc();
 
         // CDR: remember the call's start + URIs so the `handle_bye`
@@ -1301,6 +1324,8 @@ impl<T: Transport> UasServer<T> {
                 entry.state = DialogState::Confirmed;
                 entry.pending_2xx = None;
                 info!(call_id = %entry.call_id, "dialog confirmed");
+                self.replicator
+                    .replicate(smiths_core::DialogDelta::Upsert(Box::new(entry.clone())));
             }
         } else {
             debug!(?key, "ACK for unknown dialog; ignoring");
@@ -1319,6 +1344,8 @@ impl<T: Transport> UasServer<T> {
         match self.dialogs.remove(&key) {
             Some((_, record)) => {
                 self.metrics.dialogs_active.dec();
+                self.replicator
+                    .replicate(smiths_core::DialogDelta::Delete(key.clone()));
                 // BYE before ACK is exotic but legal — cancel any
                 // in-flight §13.3.1.4 retransmit so the loop doesn't
                 // keep firing after the dialog is gone.
@@ -1471,6 +1498,8 @@ impl<T: Transport> UasServer<T> {
             let key: DialogKey = (call_id.to_owned(), l_tag.to_owned(), remote_tag.to_owned());
             if let Some(mut entry) = self.dialogs.get_mut(&key) {
                 entry.pending_2xx = Some(bytes.to_vec());
+                self.replicator
+                    .replicate(smiths_core::DialogDelta::Upsert(Box::new(entry.clone())));
             }
             self.spawn_invite_2xx_retransmit(&key, bytes.clone(), peer);
         }
