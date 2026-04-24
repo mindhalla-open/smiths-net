@@ -115,6 +115,9 @@ pub enum NegotiationResult {
         /// to derive SRTP keys; this field surfaces the
         /// peer-fingerprint + resolved role.
         dtls: Option<DtlsParams>,
+        /// ICE parameters (slice 5.10-ice). Populated when
+        /// `ice_enabled` is true.
+        ice: Option<smiths_core::sdp::IceParams>,
     },
     /// No codec in the offer intersected with the engine's supported
     /// list — caller should reply with `488 Not Acceptable Here`. MVP
@@ -168,6 +171,10 @@ pub struct Negotiator {
     /// attrs, peer address taken from the offer's `c=` / `m=`
     /// line.
     pub ice_enabled: bool,
+    /// Tie-breaker for ICE role determination (RFC 8445 §6.1.1).
+    /// Randomly initialized; persisted across negotiations in a
+    /// single negotiator instance.
+    pub ice_tie_breaker: u64,
 }
 
 impl Negotiator {
@@ -223,6 +230,7 @@ impl Negotiator {
             dtls_cert: None,
             metrics: None,
             ice_enabled: false,
+            ice_tie_breaker: rand::rng().random(),
         }
     }
 
@@ -326,6 +334,7 @@ impl Negotiator {
         let mut dtls_params: Option<DtlsParams> = None;
         let mut answer_ice_ufrag: Option<String> = None;
         let mut answer_ice_pwd: Option<IcePassword> = None;
+        let mut ice_params: Option<smiths_core::sdp::IceParams> = None;
         let mut answer_ice_options: Vec<String> = Vec::new();
         let mut answer_candidates: Vec<IceCandidate> = Vec::new();
         let mut answer_end_of_candidates = false;
@@ -377,11 +386,39 @@ impl Negotiator {
             // relay candidates can be appended post-hoc by
             // the handler.
             if self.ice_enabled {
-                answer_ice_ufrag = Some(fresh_ice_ufrag());
-                answer_ice_pwd = Some(IcePassword(fresh_ice_pwd()));
+                let local_ufrag = fresh_ice_ufrag();
+                let local_pwd = fresh_ice_pwd();
+                answer_ice_ufrag = Some(local_ufrag.clone());
+                answer_ice_pwd = Some(IcePassword(local_pwd.clone()));
                 answer_ice_options.push("trickle".into());
                 answer_candidates.push(make_host_candidate(self.local_ip, local_port));
                 answer_end_of_candidates = true;
+
+                if let (Some(remote_ufrag), Some(remote_pwd)) =
+                    (audio.ice_ufrag.as_ref(), audio.ice_pwd.as_ref())
+                {
+                    // RFC 8445 §6.1.1: If one agent is full and the other
+                    // is lite, full agent is controlling. If both are full,
+                    // offerer is controlling, answerer is controlled.
+                    let remote_is_lite = audio
+                        .ice_options
+                        .iter()
+                        .any(|o| o.eq_ignore_ascii_case("ice-lite"));
+                    let role = if remote_is_lite {
+                        smiths_core::sdp::IceRole::Controlling
+                    } else {
+                        smiths_core::sdp::IceRole::Controlled
+                    };
+                    ice_params = Some(smiths_core::sdp::IceParams {
+                        local_ufrag,
+                        local_pwd,
+                        remote_ufrag: remote_ufrag.clone(),
+                        remote_pwd: remote_pwd.0.clone(),
+                        role,
+                        tie_breaker: self.ice_tie_breaker,
+                    });
+                }
+
                 if let Some(m) = self.metrics.as_ref() {
                     m.ice_candidates_gathered
                         .get_or_create(&smiths_core::metrics::IceCandidateTypeLabel {
@@ -449,6 +486,7 @@ impl Negotiator {
             },
             srtp: srtp_keys,
             dtls: dtls_params,
+            ice: ice_params,
         }
     }
 
@@ -483,6 +521,7 @@ impl Negotiator {
             mut sdp,
             srtp: audio_srtp,
             dtls: audio_dtls,
+            ice: audio_ice,
         } = audio_result
         else {
             return audio_result;
@@ -492,6 +531,7 @@ impl Negotiator {
                 sdp,
                 srtp: audio_srtp,
                 dtls: audio_dtls,
+                ice: audio_ice,
             };
         };
         // Pick a passthrough codec; same match semantics as audio.
@@ -544,6 +584,7 @@ impl Negotiator {
             sdp,
             srtp: audio_srtp,
             dtls: audio_dtls,
+            ice: audio_ice,
         }
     }
 }
@@ -565,7 +606,12 @@ impl SdpNegotiator for Negotiator {
         let mut scoped = self.clone();
         scoped.local_ip = local_ip;
         match scoped.answer(&offer, local_rtp_port) {
-            NegotiationResult::Answer { sdp, srtp, dtls } => {
+            NegotiationResult::Answer {
+                sdp,
+                srtp,
+                dtls,
+                ice,
+            } => {
                 let audio_codec = first_codec_of_kind(&sdp, &MediaKind::Audio);
                 NegotiationOutcome::Accepted {
                     answer_body: sdp.to_string(),
@@ -577,6 +623,7 @@ impl SdpNegotiator for Negotiator {
                     dtls,
                     audio_codec,
                     video_codec: None,
+                    ice,
                 }
             }
             NegotiationResult::Mismatch => NegotiationOutcome::Mismatch,
@@ -602,7 +649,12 @@ impl SdpNegotiator for Negotiator {
         let mut scoped = self.clone();
         scoped.local_ip = local_ip;
         match scoped.answer_with_video(&offer, local_audio_port, local_video_port) {
-            NegotiationResult::Answer { sdp, srtp, dtls } => {
+            NegotiationResult::Answer {
+                sdp,
+                srtp,
+                dtls,
+                ice,
+            } => {
                 let audio_codec = first_codec_of_kind(&sdp, &MediaKind::Audio);
                 let video_codec = first_codec_of_kind(&sdp, &MediaKind::Video);
                 NegotiationOutcome::Accepted {
@@ -613,6 +665,7 @@ impl SdpNegotiator for Negotiator {
                     dtls,
                     audio_codec,
                     video_codec,
+                    ice,
                 }
             }
             NegotiationResult::Mismatch => NegotiationOutcome::Mismatch,
@@ -1233,7 +1286,10 @@ mod tests {
         let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST))
             .with_dtls_cert(Arc::new(cert.clone()));
         let offer = dtls_offer_with_setup(DtlsSetup::ActPass);
-        let NegotiationResult::Answer { sdp, dtls, srtp } = neg.answer(&offer, 16_384) else {
+        let NegotiationResult::Answer {
+            sdp, dtls, srtp, ..
+        } = neg.answer(&offer, 16_384)
+        else {
             panic!("expected Answer");
         };
         assert_eq!(

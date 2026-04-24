@@ -765,6 +765,87 @@ impl TurnServer {
     }
 }
 
+/// Client helper: allocate a relay address from `server` using `cred`.
+/// Returns the `XOR-RELAYED-ADDRESS` on success.
+pub async fn allocate_relay_addr(
+    socket: &UdpSocket,
+    server: SocketAddr,
+    cred: &LongTermCredential,
+    timeout: Duration,
+) -> Result<SocketAddr, String> {
+    // 1. Initial Allocate request.
+    let txid = TransactionId::random();
+    let mut msg = Vec::with_capacity(24);
+    msg.extend_from_slice(&encode_type(METHOD_ALLOCATE, 0b00).to_be_bytes());
+    msg.extend_from_slice(&0u16.to_be_bytes());
+    msg.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+    msg.extend_from_slice(&txid.0);
+    append_attr(&mut msg, ATTR_REQUESTED_TRANSPORT, &[17, 0, 0, 0]); // UDP
+    finalize_length(&mut msg);
+
+    socket
+        .send_to(&msg, server)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut buf = [0u8; 1500];
+    let (n, _) = tokio::time::timeout(timeout, socket.recv_from(&mut buf))
+        .await
+        .map_err(|_| "timeout waiting for 401".to_owned())?
+        .map_err(|e| e.to_string())?;
+
+    let resp = ParsedStun::parse(&buf[..n]).ok_or_else(|| "malformed TURN response".to_owned())?;
+
+    // Expect 401 Unauthorized.
+    let err_attr = resp
+        .attr(ATTR_ERROR_CODE)
+        .ok_or_else(|| "missing ERROR-CODE".to_owned())?;
+    if err_attr.len() < 4 || err_attr[2] != 4 || err_attr[3] != 1 {
+        return Err(format!(
+            "expected 401, got code {}.{}",
+            err_attr[2], err_attr[3]
+        ));
+    }
+
+    let realm = resp
+        .attr(ATTR_REALM)
+        .ok_or_else(|| "missing REALM".to_owned())?;
+    let nonce = resp
+        .attr(ATTR_NONCE)
+        .ok_or_else(|| "missing NONCE".to_owned())?;
+
+    // 2. Authenticated Allocate request.
+    let txid = TransactionId::random();
+    let mut msg = Vec::with_capacity(100);
+    msg.extend_from_slice(&encode_type(METHOD_ALLOCATE, 0b00).to_be_bytes());
+    msg.extend_from_slice(&0u16.to_be_bytes());
+    msg.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+    msg.extend_from_slice(&txid.0);
+    append_attr(&mut msg, ATTR_REQUESTED_TRANSPORT, &[17, 0, 0, 0]);
+    append_attr(&mut msg, ATTR_USERNAME, cred.username.as_bytes());
+    append_attr(&mut msg, ATTR_REALM, realm);
+    append_attr(&mut msg, ATTR_NONCE, nonce);
+    append_message_integrity(&mut msg, &cred.long_term_key);
+    finalize_length(&mut msg);
+
+    socket
+        .send_to(&msg, server)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let (n, _) = tokio::time::timeout(timeout, socket.recv_from(&mut buf))
+        .await
+        .map_err(|_| "timeout waiting for success".to_owned())?
+        .map_err(|e| e.to_string())?;
+
+    let resp = ParsedStun::parse(&buf[..n]).ok_or_else(|| "malformed TURN response".to_owned())?;
+    let relay_attr = resp
+        .attr(ATTR_XOR_RELAYED_ADDRESS)
+        .ok_or_else(|| "missing RELAYED-ADDRESS".to_owned())?;
+
+    decode_xor_addr(relay_attr, &resp.txid).ok_or_else(|| "malformed RELAYED-ADDRESS".to_owned())
+}
+
 // ---- STUN message parser helpers (TURN-flavour) ----
 
 #[derive(Debug)]

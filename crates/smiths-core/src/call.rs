@@ -247,6 +247,10 @@ pub struct DialogRecord {
     /// default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub per_leg_codec: BTreeMap<LegId, NegotiatedCodec>,
+    /// ICE parameters (slice 5.10-ice). Populated when the
+    /// dialog uses native ICE connectivity checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ice: Option<crate::sdp::IceParams>,
 }
 
 impl DialogRecord {
@@ -432,6 +436,7 @@ mod tests {
             remote_media: None,
             pending_2xx: None,
             per_leg_codec: codecs.clone(),
+            ice: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: DialogRecord = serde_json::from_str(&json).unwrap();

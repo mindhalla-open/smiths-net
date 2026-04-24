@@ -885,7 +885,7 @@ impl<T: Transport> UasServer<T> {
         // Allocate a media endpoint first (so we can include its port
         // in the answer), then negotiate. On any failure the endpoint
         // is released so the fabric's table doesn't grow unbounded.
-        let (endpoint, sdp_answer_body, remote_media, srtp_keys, audio_codec, video_codec) =
+        let (endpoint, sdp_answer_body, remote_media, srtp_keys, audio_codec, video_codec, ice) =
             if has_offer {
                 let endpoint = match self.media_fabric.allocate(self.media_bind_ip).await {
                     Ok(ep) => ep,
@@ -949,6 +949,7 @@ impl<T: Transport> UasServer<T> {
                         // transcoding router (5.6b) can compare legs.
                         audio_codec,
                         video_codec,
+                        ice,
                     } => (
                         Some(endpoint),
                         Some(answer_body),
@@ -956,6 +957,7 @@ impl<T: Transport> UasServer<T> {
                         srtp,
                         audio_codec,
                         video_codec,
+                        ice,
                     ),
                     NegotiationOutcome::Mismatch => {
                         self.media_fabric.release_endpoint(endpoint.id()).await;
@@ -1002,7 +1004,7 @@ impl<T: Transport> UasServer<T> {
                     }
                 }
             } else {
-                (None, None, None, None, None, None)
+                (None, None, None, None, None, None, None)
             };
 
         let local_tag = next_tag();
@@ -1147,6 +1149,7 @@ impl<T: Transport> UasServer<T> {
             remote_media,
             pending_2xx: None,
             per_leg_codec,
+            ice,
         };
         self.dialogs.insert(dialog_key.clone(), record);
         self.metrics.dialogs_active.inc();

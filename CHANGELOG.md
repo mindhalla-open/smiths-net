@@ -5,6 +5,26 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.69.0] - 2026-04-24
+
+**Full ICE — the engine graduates from ICE-Lite to a full agent.**
+Implements concurrent candidate gathering (host, srflx, relay),
+role determination (Controlling vs Controlled), and the connectivity
+check state machine with retransmits.
+
+### Added — 5.10-ice-full: Full ICE support
+
+- **`CandidateGatherer::gather_all`** — concurrent gathering of `host`, `srflx` (via STUN), and `relay` (via TURN) candidates.
+- **`IceAgent`** — state machine handling candidate pairing, connectivity checks (Binding Requests) with retransmits, and nomination.
+- **`IceParams`** — new core type for passing ICE credentials and roles between the negotiator and the media layer.
+- **`Negotiator` role determination** — RFC 8445 §6.1.1 compliant role selection (Controlling if peer is ice-lite or we are offerer; otherwise Controlled).
+- **STUN attributes** — expanded hand-rolled STUN stack with `PRIORITY`, `USE-CANDIDATE`, `ICE-CONTROLLING`, and `ICE-CONTROLLED`.
+- **TURN Allocation** — client-side `Allocate` flow against embedded or external TURN servers to obtain `relay` candidates.
+
+### Added — 5.11-turn-gather: Relay candidate support
+
+- **ICE + TURN integration** — the gatherer now emits `relay` candidates when a TURN server is configured, enabling connectivity across restrictive NATs.
+
 ## [0.68.0] - 2026-04-24
 
 **WebRTC + privacy + TURN — the remaining 5.10 / 5.11

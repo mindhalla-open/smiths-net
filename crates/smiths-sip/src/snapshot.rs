@@ -173,6 +173,7 @@ mod tests {
             remote_media: None,
             pending_2xx: None,
             per_leg_codec: std::collections::BTreeMap::new(),
+            ice: None,
         }
     }
 
