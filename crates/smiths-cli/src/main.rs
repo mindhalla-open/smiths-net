@@ -399,6 +399,24 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Slice 5.10-sipjoin: when the WebRTC adapter is enabled
+    // we build its `CliWebRtcHandler` early (before SIP binds)
+    // so the SIP UAS can receive an `Arc<dyn WebRtcRendezvous>`
+    // handle on construction. The WebSocket server itself is
+    // spawned later, after all the other adapters; this split
+    // keeps the signaling listener spawn next to the rest of
+    // the CLI's adapter wiring.
+    let (webrtc_handler, webrtc_rendezvous): (
+        Option<Arc<webrtc::CliWebRtcHandler>>,
+        Option<Arc<dyn smiths_core::WebRtcRendezvous>>,
+    ) = if config.webrtc.enabled {
+        let handler = build_webrtc_handler(&config, &metrics);
+        let rdv: Arc<dyn smiths_core::WebRtcRendezvous> = Arc::clone(&handler) as _;
+        (Some(handler), Some(rdv))
+    } else {
+        (None, None)
+    };
+
     // Build the UAC from the first configured UDP bind. The UAC shares
     // that bind's UdpTransport + ResponseRouter with the UAS, so
     // outbound INVITEs / BYEs get their responses on the same socket.
@@ -416,6 +434,7 @@ async fn main() -> anyhow::Result<()> {
             drain.clone(),
             sip_rate_limit.clone(),
             registrar.clone(),
+            webrtc_rendezvous.clone(),
             /* build_uac */ true,
             std::mem::take(&mut initial_dialogs),
         )
@@ -772,6 +791,7 @@ async fn main() -> anyhow::Result<()> {
                 drain.clone(),
                 sip_rate_limit.clone(),
                 registrar.clone(),
+                webrtc_rendezvous.clone(),
                 /* build_uac */ false,
                 std::mem::take(&mut initial_dialogs),
             )
@@ -903,46 +923,26 @@ async fn main() -> anyhow::Result<()> {
     // paired sessions (via their `tag`) get a live `MediaFabric::bridge`.
     // ICE / NAT traversal is still a follow-on — peer address
     // comes from the offer's `c=` line.
-    if config.webrtc.enabled {
+    if let Some(handler) = webrtc_handler.clone() {
         let bind = config.webrtc.ws_bind;
-        // One cert per engine instance, minted at boot. The
-        // fingerprint lands in every DTLS-SRTP answer we emit;
-        // rotation = engine restart.
-        let webrtc_dtls_cert = match smiths_core::SelfSignedCert::generate("smiths-net-webrtc") {
-            Ok(c) => Some(Arc::new(c)),
-            Err(e) => {
-                warn!(
-                    ?e,
-                    "minting WebRTC DTLS cert failed; DTLS-SRTP offers will be rejected"
-                );
-                None
-            }
-        };
-        // Share the CLI-wide media fabric so the WebRTC leg can
-        // pair with a SIP INVITE through the same `MediaFabric::bridge`
-        // install (follow-on slices wire the SIP → rendezvous
-        // path; today WebRTC ↔ WebRTC pairing via tag works end-to-end).
-        let webrtc_fabric: Arc<UdpMediaFabric> =
-            Arc::new(UdpMediaFabric::new().with_metrics(Arc::clone(&metrics)));
-        // Own negotiator instance — the CLI's SIP binds build their
-        // own, no sharing required; local_ip is what we publish in
-        // the SDP answer's c= line, so using ws_bind.ip() gives the
-        // browser an address that reached us in the first place.
-        let mut negotiator_builder = Negotiator::with_default_codecs(bind.ip());
-        if let Some(cert) = webrtc_dtls_cert.as_ref() {
-            negotiator_builder = negotiator_builder.with_dtls_cert(Arc::clone(cert));
-        }
-        let negotiator: Arc<dyn SdpNegotiator> = Arc::new(negotiator_builder);
-        // Port range: carve a fixed 1000-port slice starting at
-        // 50_000. Far enough from the default SIP media range to
-        // avoid collisions; a configurable surface is a follow-on.
-        let mut handler =
-            webrtc::CliWebRtcHandler::new(negotiator, webrtc_fabric, bind.ip(), 50_000, 1_000)
-                .with_metrics(Arc::clone(&metrics));
-        if let Some(cert) = webrtc_dtls_cert.as_ref() {
-            handler = handler.with_dtls_cert(Arc::clone(cert));
-        }
-        let handler = Arc::new(handler);
+        // Slice 5.11-privacy: hot-reload `[webrtc.privacy]` via
+        // the generic 5.8-b read-through adapter. Mode flips +
+        // redaction-key rotation take effect on the next offer
+        // without restarting the engine.
+        let privacy_handle = handler.privacy_handle();
+        reload_adapter_handles.push(config_reloader.spawn_read_through(
+            "webrtc.privacy",
+            Some(Arc::clone(&metrics)),
+            |c: &Config| c.webrtc.privacy.clone(),
+            move |new_cfg: &smiths_core::WebRtcPrivacyConfig| {
+                let mut guard = privacy_handle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *guard = new_cfg.clone();
+                tracing::info!(mode = ?new_cfg.mode, "webrtc.privacy reloaded");
+            },
+        ));
+
         let cancel = shutdown.token();
         adapter_handles.push(tokio::spawn(async move {
             if let Err(e) = webrtc::serve_webrtc(bind, handler, cancel).await {
@@ -956,6 +956,66 @@ async fn main() -> anyhow::Result<()> {
                  See docs/deployment/webrtc.md."
             );
         }
+    }
+
+    // ---- Embedded TURN server (slice 5.11-turn) ----
+    // Off by default. When `[webrtc.turn] external_url` is set,
+    // the embedded server is skipped in favour of handing
+    // clients the external URL.
+    if config.webrtc.turn.enabled && config.webrtc.turn.external_url.is_empty() {
+        let turn_cfg = smiths_ice::TurnServerConfig {
+            bind: config.webrtc.turn.bind,
+            realm: if config.webrtc.turn.realm.is_empty() {
+                "smiths-turn".to_owned()
+            } else {
+                config.webrtc.turn.realm.clone()
+            },
+            relay_ip: config
+                .webrtc
+                .turn
+                .relay_ip
+                .unwrap_or_else(|| config.webrtc.turn.bind.ip()),
+            allocation_lifetime: std::time::Duration::from_secs(u64::from(
+                config.webrtc.turn.allocation_lifetime_s,
+            )),
+            credentials: config
+                .webrtc
+                .turn
+                .credentials
+                .iter()
+                .map(|c| {
+                    smiths_ice::LongTermCredential::new(
+                        &c.username,
+                        if config.webrtc.turn.realm.is_empty() {
+                            "smiths-turn"
+                        } else {
+                            &config.webrtc.turn.realm
+                        },
+                        &c.password,
+                    )
+                })
+                .collect(),
+        };
+        if turn_cfg.credentials.is_empty() {
+            warn!(
+                bind = %turn_cfg.bind,
+                "webrtc.turn.enabled but credentials list is empty; every Allocate will 401. \
+                 Add `[[webrtc.turn.credentials]]` entries or disable the server."
+            );
+        }
+        let server =
+            Arc::new(smiths_ice::TurnServer::new(turn_cfg).with_metrics(Arc::clone(&metrics)));
+        let cancel = shutdown.token();
+        adapter_handles.push(tokio::spawn(async move {
+            if let Err(e) = server.run(cancel).await {
+                warn!(?e, "TURN server exited with error");
+            }
+        }));
+    } else if config.webrtc.turn.enabled && !config.webrtc.turn.external_url.is_empty() {
+        info!(
+            url = %config.webrtc.turn.external_url,
+            "webrtc.turn.external_url set; embedded TURN server skipped"
+        );
     }
 
     // Slice 4.3 / P17: mcp-http3 scaffold — feature gate + config
@@ -1253,6 +1313,47 @@ fn spawn_recording_retention_sweeper(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Build the WebRTC signaling handler (slice 5.10-bridge +
+/// 5.10-dtls + 5.10-ice + 5.11-privacy) without starting its
+/// WebSocket server. The handler is also handed to the SIP
+/// UAS as an `Arc<dyn WebRtcRendezvous>` (slice 5.10-sipjoin)
+/// so SIP INVITEs carrying `X-Smiths-Webrtc-Tag:` can bridge
+/// against a parked WebRTC partner. The server is spawned
+/// later next to the other control-plane adapters.
+fn build_webrtc_handler(config: &Config, metrics: &Arc<Metrics>) -> Arc<webrtc::CliWebRtcHandler> {
+    let bind = config.webrtc.ws_bind;
+    // One cert per engine instance, minted at boot.
+    let webrtc_dtls_cert = match smiths_core::SelfSignedCert::generate("smiths-net-webrtc") {
+        Ok(c) => Some(Arc::new(c)),
+        Err(e) => {
+            warn!(
+                ?e,
+                "minting WebRTC DTLS cert failed; DTLS-SRTP offers will be rejected"
+            );
+            None
+        }
+    };
+    // Dedicated fabric for the WebRTC adapter so its endpoint
+    // pool doesn't share with SIP.
+    let webrtc_fabric: Arc<UdpMediaFabric> =
+        Arc::new(UdpMediaFabric::new().with_metrics(Arc::clone(metrics)));
+    let mut negotiator_builder = Negotiator::with_default_codecs(bind.ip());
+    if let Some(cert) = webrtc_dtls_cert.as_ref() {
+        negotiator_builder = negotiator_builder.with_dtls_cert(Arc::clone(cert));
+    }
+    negotiator_builder = negotiator_builder.with_ice_enabled(config.webrtc.ice.enabled);
+    let negotiator: Arc<dyn SdpNegotiator> = Arc::new(negotiator_builder);
+    let mut handler =
+        webrtc::CliWebRtcHandler::new(negotiator, webrtc_fabric, bind.ip(), 50_000, 1_000)
+            .with_metrics(Arc::clone(metrics))
+            .with_privacy(config.webrtc.privacy.clone());
+    if let Some(cert) = webrtc_dtls_cert.as_ref() {
+        handler = handler.with_dtls_cert(Arc::clone(cert));
+    }
+    Arc::new(handler)
+}
+
+#[allow(clippy::too_many_arguments)] // CLI wiring helper: one arg per subsystem the UAS composes
 async fn spawn_sip_udp(
     bind: SocketAddr,
     bus: EventBus,
@@ -1263,6 +1364,7 @@ async fn spawn_sip_udp(
     drain: smiths_core::Drain,
     rate_limit: smiths_sip::SipRateLimiter,
     registrar: Option<smiths_sip::auth::digest::Registrar>,
+    webrtc_rendezvous: Option<Arc<dyn smiths_core::WebRtcRendezvous>>,
     build_uac: bool,
     restore_dialogs: Vec<smiths_core::DialogRecord>,
 ) -> anyhow::Result<SpawnedSipUdp> {
@@ -1292,6 +1394,9 @@ async fn spawn_sip_udp(
     .with_rate_limit(rate_limit.clone());
     if let Some(reg) = registrar {
         server = server.with_registrar(reg);
+    }
+    if let Some(rdv) = webrtc_rendezvous {
+        server = server.with_webrtc_rendezvous(rdv);
     }
     // Slice 6.1: replay any pre-shutdown snapshot before `run`
     // takes ownership of the server. Also clone out the dialogs

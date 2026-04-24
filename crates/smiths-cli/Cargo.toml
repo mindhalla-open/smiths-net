@@ -47,6 +47,10 @@ smiths-transcode   = { workspace = true }
 # handler so the WebRTC adapter can drive the fabric's
 # handshake off the negotiator's `DtlsParams`.
 smiths-dtls        = { workspace = true }
+# Slice 5.11-turn: the CLI owns the embedded TURN server's
+# lifecycle (bind + cancel on shutdown) — the server itself
+# lives in smiths-ice.
+smiths-ice         = { workspace = true }
 tokio              = { workspace = true }
 tokio-util         = { workspace = true }
 axum               = { workspace = true, features = ["ws"] }

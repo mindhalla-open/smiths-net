@@ -60,8 +60,8 @@ pub use config::{
     RateLimitConfig, RecordingBackend, RecordingStoreConfig, ReloadConfig, SandboxConfig,
     SeccompPolicy, SipConfig, SipProxyConfig, SipRateLimit, SipTransport, SipVpnConfig,
     SqliteAuthConfig, SqliteStorageConfig, StorageBackend, StorageConfig, TranscodeConfig,
-    VectorBackend, VectorStoreConfig, VpnMode, WebRtcConfig, WebRtcPrivacyConfig,
-    WebRtcPrivacyMode, WebTransportConfig,
+    VectorBackend, VectorStoreConfig, VpnMode, WebRtcConfig, WebRtcIceConfig, WebRtcPrivacyConfig,
+    WebRtcPrivacyMode, WebRtcTurnConfig, WebRtcTurnCredential, WebTransportConfig,
 };
 pub use dialog_sessions::DialogSessions;
 pub use drain::Drain;
@@ -75,7 +75,7 @@ pub use error::Error;
 pub use event::{Event, MediaSecurityFailure, PluginEvent, SipEvent, SystemEvent};
 pub use media::{
     BridgeId, BridgeLeg, Endpoint, EndpointId, EndpointKind, MediaEndpoint, MediaError,
-    MediaFabric, MediaSession, SrtpError, SrtpSuite, SrtpTransform,
+    MediaFabric, MediaSession, SrtpError, SrtpSuite, SrtpTransform, WebRtcRendezvous,
 };
 pub use metrics::Metrics;
 pub use probe::{ErrorRateProbe, ProbeConfig, ProbeSample, ProbeVerdict};

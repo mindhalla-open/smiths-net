@@ -14,15 +14,15 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use rand::Rng as _;
+use rand::{Rng as _, RngExt as _};
 use smiths_core::SrtpSuite;
 use smiths_core::sdp::{DtlsParams, DtlsRole, NegotiationOutcome, SdpNegotiator, SrtpKeys};
 use smiths_core::{Metrics, SelfSignedCert};
 
 use crate::srtp_attr::SdesCrypto;
 use crate::types::{
-    ConnectionInfo, DtlsSetup, Fingerprint, MediaDescription, MediaKind, Origin, RtpMap,
-    SessionDescription,
+    ConnectionInfo, DtlsSetup, Fingerprint, IceCandidate, IcePassword, MediaDescription, MediaKind,
+    Origin, RtpMap, SessionDescription,
 };
 
 /// Generate fresh SDES key material for `suite` using the OS CSPRNG.
@@ -35,6 +35,61 @@ pub fn fresh_sdes_key(suite: SrtpSuite) -> Vec<u8> {
     let mut buf = vec![0u8; suite.key_material_len()];
     rand::rng().fill_bytes(&mut buf);
     buf
+}
+
+/// Generate a fresh `a=ice-ufrag` token (slice 5.10-ice). RFC 8839
+/// §5.3: 4–256 ICE-chars. 8 chars drawn from the unreserved
+/// `a-zA-Z0-9+/` alphabet covers the browser-compat baseline
+/// with room to grow.
+#[must_use]
+pub fn fresh_ice_ufrag() -> String {
+    random_ice_token(8)
+}
+
+/// Generate a fresh `a=ice-pwd` token. RFC 8839 §5.3: 22–256
+/// ICE-chars. 24 gives ~142 bits of entropy — same ballpark
+/// browsers emit today.
+#[must_use]
+pub fn fresh_ice_pwd() -> String {
+    random_ice_token(24)
+}
+
+fn random_ice_token(len: usize) -> String {
+    // ICE-chars per RFC 8839 §5.3: ALPHA / DIGIT / "+" / "/".
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut rng = rand::rng();
+    (0..len)
+        .map(|_| char::from(CHARS[rng.random_range(0..CHARS.len())]))
+        .collect()
+}
+
+/// Build a `host` ICE candidate for `(ip, port)` on component 1
+/// (RTP) with the RFC 8445 §5.1.2.1 priority formula. Used by
+/// the negotiator to emit a host candidate in the answer when
+/// native ICE is enabled; the `smiths-ice` crate has the
+/// multi-bind gatherer for callers that need more than one.
+#[must_use]
+pub fn make_host_candidate(ip: IpAddr, port: u16) -> IceCandidate {
+    let type_pref: u32 = 126;
+    let local_pref: u32 = if matches!(ip, IpAddr::V6(_)) {
+        65_535
+    } else {
+        65_534
+    };
+    // component = 1 (RTP); priority = (2^24)*type + (2^8)*local + (256 - component)
+    let priority = (type_pref << 24) + (local_pref << 8) + 255;
+    IceCandidate {
+        foundation: "host0".into(),
+        component: 1,
+        transport: "UDP".into(),
+        priority,
+        address: ip,
+        port,
+        candidate_type: "host".into(),
+        related_address: None,
+        related_port: None,
+        raw_params: Vec::new(),
+    }
 }
 
 /// Outcome of running offer/answer.
@@ -100,6 +155,19 @@ pub struct Negotiator {
     /// so operators see the answer-side signal — distinct from
     /// the handshake-side metric the media fabric records.
     pub metrics: Option<Arc<Metrics>>,
+    /// Emit native ICE attributes on DTLS-SRTP answers (slice
+    /// 5.10-ice). When `true`, the answer carries
+    /// `a=ice-ufrag`, `a=ice-pwd`, `a=ice-options:trickle`,
+    /// `a=setup:...`, a host candidate derived from
+    /// `(local_ip, local_rtp_port)`, and `a=end-of-candidates`
+    /// (ICE-Lite posture — we don't gather srflx/relay in the
+    /// answer itself; future slice 5.10-ice-trickle adds the
+    /// trickle round-trip). The offer's ice-ufrag/ice-pwd are
+    /// consulted for connectivity-check authentication in a
+    /// follow-on. `false` keeps the pre-5.10-ice shape: no ICE
+    /// attrs, peer address taken from the offer's `c=` / `m=`
+    /// line.
+    pub ice_enabled: bool,
 }
 
 impl Negotiator {
@@ -154,7 +222,17 @@ impl Negotiator {
             ],
             dtls_cert: None,
             metrics: None,
+            ice_enabled: false,
         }
+    }
+
+    /// Enable the native ICE surface on DTLS-SRTP answers
+    /// (slice 5.10-ice). See [`Self::ice_enabled`] for the
+    /// exact wire effect.
+    #[must_use]
+    pub fn with_ice_enabled(mut self, enabled: bool) -> Self {
+        self.ice_enabled = enabled;
+        self
     }
 
     /// Attach a DTLS-SRTP identity (slice 5.10-dtls). Offers
@@ -246,6 +324,11 @@ impl Negotiator {
         let mut answer_fingerprint: Option<Fingerprint> = None;
         let mut answer_setup: Option<DtlsSetup> = None;
         let mut dtls_params: Option<DtlsParams> = None;
+        let mut answer_ice_ufrag: Option<String> = None;
+        let mut answer_ice_pwd: Option<IcePassword> = None;
+        let mut answer_ice_options: Vec<String> = Vec::new();
+        let mut answer_candidates: Vec<IceCandidate> = Vec::new();
+        let mut answer_end_of_candidates = false;
 
         if is_dtls {
             // Slice 5.10-dtls: accept the DTLS-SRTP offer. Requires
@@ -284,6 +367,29 @@ impl Negotiator {
                 peer_fingerprint_value: peer_fp.value.clone(),
                 local_role: role,
             });
+
+            // Slice 5.10-ice: emit the native ICE surface when
+            // enabled. The host candidate is derived from
+            // `(local_ip, local_port)` — the same tuple the
+            // media fabric just allocated. `trickle` option is
+            // advertised for browser compat even though we
+            // emit all candidates in-band today; extra srflx/
+            // relay candidates can be appended post-hoc by
+            // the handler.
+            if self.ice_enabled {
+                answer_ice_ufrag = Some(fresh_ice_ufrag());
+                answer_ice_pwd = Some(IcePassword(fresh_ice_pwd()));
+                answer_ice_options.push("trickle".into());
+                answer_candidates.push(make_host_candidate(self.local_ip, local_port));
+                answer_end_of_candidates = true;
+                if let Some(m) = self.metrics.as_ref() {
+                    m.ice_candidates_gathered
+                        .get_or_create(&smiths_core::metrics::IceCandidateTypeLabel {
+                            ty: "host".into(),
+                        })
+                        .inc();
+                }
+            }
         } else if is_savp {
             // RFC 4568 §5.1: SDES responder emits matching
             // `a=crypto:`, surfaces both halves of the key
@@ -318,12 +424,11 @@ impl Negotiator {
             connection: None,
             fingerprint: answer_fingerprint,
             setup: answer_setup,
-            // ICE surface lands in slice 1.4 / 5.10-ice.
-            ice_ufrag: None,
-            ice_pwd: None,
-            ice_options: Vec::new(),
-            candidates: Vec::new(),
-            end_of_candidates: false,
+            ice_ufrag: answer_ice_ufrag,
+            ice_pwd: answer_ice_pwd,
+            ice_options: answer_ice_options,
+            candidates: answer_candidates,
+            end_of_candidates: answer_end_of_candidates,
         };
 
         NegotiationResult::Answer {
@@ -1192,6 +1297,79 @@ mod tests {
             }
             other => panic!("expected UnsupportedTransport, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ice_disabled_answer_omits_ice_attrs() {
+        // Without `with_ice_enabled(true)`, a DTLS-SRTP answer
+        // skips ice-ufrag/ice-pwd/candidate — the pre-5.10-ice
+        // behaviour we promised operators who don't want the
+        // native stack.
+        let cert = smiths_core::SelfSignedCert::generate("test").unwrap();
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_dtls_cert(Arc::new(cert));
+        let offer = dtls_offer_with_setup(DtlsSetup::ActPass);
+        let NegotiationResult::Answer { sdp, .. } = neg.answer(&offer, 16_384) else {
+            panic!("expected Answer");
+        };
+        assert!(sdp.media[0].ice_ufrag.is_none());
+        assert!(sdp.media[0].ice_pwd.is_none());
+        assert!(sdp.media[0].candidates.is_empty());
+    }
+
+    #[test]
+    fn ice_enabled_answer_carries_ufrag_pwd_and_host_candidate() {
+        // Slice 5.10-ice — with ICE enabled, the DTLS-SRTP
+        // answer carries a fresh ufrag/pwd + one host
+        // candidate derived from the engine's local address +
+        // allocated port. `end-of-candidates` marks the
+        // in-band list complete for a browser running with
+        // `iceGatheringPolicy = "all"`.
+        let cert = smiths_core::SelfSignedCert::generate("test").unwrap();
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)))
+            .with_dtls_cert(Arc::new(cert))
+            .with_ice_enabled(true);
+        let offer = dtls_offer_with_setup(DtlsSetup::ActPass);
+        let NegotiationResult::Answer { sdp, .. } = neg.answer(&offer, 31_415) else {
+            panic!("expected Answer");
+        };
+        let m = &sdp.media[0];
+        let ufrag = m.ice_ufrag.as_ref().expect("ice-ufrag");
+        let pwd = m.ice_pwd.as_ref().expect("ice-pwd");
+        assert!(ufrag.len() >= 4, "ice-ufrag must be >=4 ICE-chars");
+        assert!(pwd.0.len() >= 22, "ice-pwd must be >=22 ICE-chars");
+        assert_eq!(m.candidates.len(), 1, "one host candidate");
+        let c = &m.candidates[0];
+        assert_eq!(c.candidate_type, "host");
+        assert_eq!(c.address, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9)));
+        assert_eq!(c.port, 31_415);
+        assert!(m.end_of_candidates);
+        // Trickle option advertised so browsers treat it
+        // as a valid trickle-ICE session.
+        assert!(m.ice_options.iter().any(|o| o == "trickle"));
+    }
+
+    #[test]
+    fn ice_ufrag_and_pwd_are_fresh_across_answers() {
+        // Each answer must mint new tokens — repeating them
+        // across dialogs would let a cross-dialog attacker
+        // guess the connectivity-check key.
+        let cert = smiths_core::SelfSignedCert::generate("test").unwrap();
+        let neg = Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_dtls_cert(Arc::new(cert))
+            .with_ice_enabled(true);
+        let offer = dtls_offer_with_setup(DtlsSetup::ActPass);
+        let NegotiationResult::Answer { sdp: a, .. } = neg.answer(&offer, 16_384) else {
+            panic!();
+        };
+        let NegotiationResult::Answer { sdp: b, .. } = neg.answer(&offer, 16_384) else {
+            panic!();
+        };
+        assert_ne!(a.media[0].ice_ufrag, b.media[0].ice_ufrag);
+        assert_ne!(
+            a.media[0].ice_pwd.as_ref().map(|p| &p.0),
+            b.media[0].ice_pwd.as_ref().map(|p| &p.0)
+        );
     }
 
     #[test]

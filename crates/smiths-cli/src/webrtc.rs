@@ -64,13 +64,15 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use dashmap::DashMap;
-use smiths_core::metrics::WebRtcPartnerLabel;
+use smiths_core::metrics::{PrivacyRejectReasonLabel, WebRtcPartnerLabel};
 use smiths_core::{
     BridgeId, BridgeLeg, EndpointId, MediaFabric, Metrics, NegotiationOutcome, SdpNegotiator,
-    SelfSignedCert, SrtpKeys,
+    SelfSignedCert, SrtpKeys, WebRtcPrivacyConfig, WebRtcPrivacyMode,
 };
 use smiths_dtls::{DtlsLegConfig, DtlsRole as DtlsLegRole};
 use smiths_media::UdpMediaFabric;
+use smiths_sdp::SessionDescription;
+use smiths_sdp::privacy::{OfferPrivacyVerdict, redact_ip, reject_direct_candidates};
 use smiths_sip::webrtc::{
     WebRtcHandlerError, WebRtcSession, WebRtcSessionHandler, WebSocketSignalingListener,
 };
@@ -143,6 +145,11 @@ pub(crate) struct CliWebRtcHandler {
     /// `with_rendezvous_deadline` for tests that need tighter
     /// eviction.
     rendezvous_deadline: Duration,
+    /// Privacy posture (slice 5.11-privacy). Reads of
+    /// `[webrtc.privacy]`; the 5.8-b read-through adapter
+    /// live-updates the inner `Mutex<WebRtcPrivacyConfig>` when
+    /// the operator rotates the `redaction_key` or flips `mode`.
+    privacy: Arc<std::sync::Mutex<WebRtcPrivacyConfig>>,
 }
 
 impl CliWebRtcHandler {
@@ -174,6 +181,74 @@ impl CliWebRtcHandler {
             active: Arc::new(DashMap::new()),
             metrics: None,
             rendezvous_deadline: DEFAULT_RENDEZVOUS_DEADLINE,
+            privacy: Arc::new(std::sync::Mutex::new(WebRtcPrivacyConfig::default())),
+        }
+    }
+
+    /// Attach the `[webrtc.privacy]` config. Holds an
+    /// `Arc<Mutex<_>>` internally so the CLI's config
+    /// read-through adapter can swap `mode` / `redaction_key`
+    /// live without rebuilding the handler.
+    #[must_use]
+    pub(crate) fn with_privacy(self, cfg: WebRtcPrivacyConfig) -> Self {
+        {
+            let mut guard = self
+                .privacy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = cfg;
+        }
+        self
+    }
+
+    /// Handle onto the mutable privacy config. Shared by the
+    /// config read-through adapter in `main.rs`: flipping
+    /// `mode` or rotating `redaction_key` mutates through
+    /// this.
+    pub(crate) fn privacy_handle(&self) -> Arc<std::sync::Mutex<WebRtcPrivacyConfig>> {
+        Arc::clone(&self.privacy)
+    }
+
+    fn snapshot_privacy(&self) -> WebRtcPrivacyConfig {
+        self.privacy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn bump_reject(&self, reason: &'static str) {
+        if let Some(m) = &self.metrics {
+            m.webrtc_candidates_rejected
+                .get_or_create(&PrivacyRejectReasonLabel {
+                    reason: reason.into(),
+                })
+                .inc();
+        }
+    }
+
+    fn bump_redaction(&self) {
+        if let Some(m) = &self.metrics {
+            m.webrtc_privacy_redactions.inc();
+        }
+    }
+
+    /// Render a peer socket address for log emission, honoring
+    /// the current privacy mode. In `Strict` the IP half goes
+    /// through `redact_ip`; in other modes the address renders
+    /// verbatim. The port is kept in both modes — operators
+    /// triangulating NAT issues need it, and a port alone
+    /// leaks nothing about the peer's identity.
+    fn render_peer(&self, peer: SocketAddr) -> String {
+        let snap = self.snapshot_privacy();
+        if snap.mode == WebRtcPrivacyMode::Strict && !snap.redaction_key.is_empty() {
+            self.bump_redaction();
+            format!(
+                "ip=<redacted:{}>:{}",
+                redact_ip(peer.ip(), snap.redaction_key.as_bytes()),
+                peer.port()
+            )
+        } else {
+            peer.to_string()
         }
     }
 
@@ -335,6 +410,92 @@ impl CliWebRtcHandler {
 }
 
 #[async_trait]
+#[async_trait]
+impl smiths_core::WebRtcRendezvous for CliWebRtcHandler {
+    async fn pair_sip_leg(
+        &self,
+        tag: &str,
+        endpoint: EndpointId,
+        peer: SocketAddr,
+        srtp: Option<SrtpKeys>,
+    ) -> Result<Option<BridgeId>, String> {
+        // If a WebRTC leg is already parked under `tag`,
+        // install the bridge now.
+        if let Some((_, partner)) = self.pending.remove(tag) {
+            partner.evictor.abort();
+            let leg_sip = match &srtp {
+                Some(k) => BridgeLeg::with_srtp(endpoint, peer, k.clone()),
+                None => BridgeLeg::plain(endpoint, peer),
+            };
+            let leg_webrtc = match &partner.srtp {
+                Some(k) => BridgeLeg::with_srtp(partner.endpoint, partner.peer, k.clone()),
+                None => BridgeLeg::plain(partner.endpoint, partner.peer),
+            };
+            let bid = self
+                .fabric
+                .bridge(leg_sip, leg_webrtc)
+                .await
+                .map_err(|e| format!("bridge install: {e}"))?;
+            // The WebRTC partner's session maps to this
+            // bridge id for teardown-on-bye; the SIP side
+            // stores the id in its own dialog record.
+            self.active.insert(partner.session, bid);
+            self.bump_pair("sip");
+            info!(
+                partner = ?partner.session,
+                %tag,
+                ?bid,
+                "sip→webrtc rendezvous paired; bridge installed"
+            );
+            Ok(Some(bid))
+        } else {
+            // No WebRTC partner yet — park this SIP leg in
+            // the same map the WebRTC handler consults when
+            // its own leg arrives.
+            let synthetic_session =
+                WebTransportSessionId(u64::from(u32::MAX ^ next_sip_pending_suffix()));
+            let evictor = self.spawn_evictor(tag.to_owned(), synthetic_session);
+            self.pending.insert(
+                tag.to_owned(),
+                PendingLeg {
+                    session: synthetic_session,
+                    endpoint,
+                    peer,
+                    srtp,
+                    evictor,
+                },
+            );
+            debug!(
+                %tag,
+                ?synthetic_session,
+                "sip leg parked awaiting webrtc partner"
+            );
+            Ok(None)
+        }
+    }
+
+    async fn release_sip_leg(&self, tag: &str) {
+        if let Some((_, parked)) = self.pending.remove(tag) {
+            parked.evictor.abort();
+            self.fabric.release_endpoint(parked.endpoint).await;
+            debug!(%tag, "sip-parked leg released");
+        }
+    }
+}
+
+/// Give SIP-side parked legs a synthetic `WebTransportSessionId`
+/// (the top bit of `u32::MAX` is the marker + a monotonically
+/// increasing suffix) so they can't collide with real WebRTC
+/// session IDs minted by the listener. Per-process counter is
+/// fine — we just need uniqueness, not cryptographic
+/// unguessability.
+fn next_sip_pending_suffix() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+#[async_trait]
 impl WebRtcSessionHandler for CliWebRtcHandler {
     async fn handle_offer(
         &self,
@@ -347,6 +508,12 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
         self.handle_offer_tagged(session, None, sdp_offer).await
     }
 
+    // Single-sitting offer dispatch: parse → privacy filter →
+    // allocate → negotiate → optional DTLS handshake → rendezvous.
+    // Splitting into per-phase helpers sacrificed readability for
+    // a pedantic line-count target; the state threads through too
+    // many locals to cleanly factor.
+    #[allow(clippy::too_many_lines)]
     async fn handle_offer_tagged(
         &self,
         session: WebTransportSessionId,
@@ -355,6 +522,40 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
     ) -> Result<String, WebRtcHandlerError> {
         let _hint = self.alloc_port_hint();
         debug!(?session, ?tag, "webrtc: negotiating offer");
+
+        // Slice 5.11-privacy: pre-negotiation candidate filter.
+        // In `relay_only` / `strict` mode, reject offers that
+        // advertise `host` / `srflx` candidates — the engine
+        // is contractually "relay only" and accepting such a
+        // candidate would defeat the whole point. Parse the
+        // offer cheaply (the negotiator parses it again on
+        // `negotiate_audio`; one extra parse per offer is
+        // below the noise floor on a SIP-scale engine).
+        let privacy = self.snapshot_privacy();
+        if privacy.mode != WebRtcPrivacyMode::Open
+            && let Ok(parsed_offer) = SessionDescription::parse(sdp_offer)
+            && reject_direct_candidates(&parsed_offer) == OfferPrivacyVerdict::Rejected
+        {
+            for m in &parsed_offer.media {
+                for c in &m.candidates {
+                    if c.candidate_type == "host" {
+                        self.bump_reject("host");
+                    } else if c.candidate_type == "srflx" {
+                        self.bump_reject("srflx");
+                    }
+                }
+            }
+            warn!(
+                ?session,
+                mode = ?privacy.mode,
+                "privacy: rejecting offer with host/srflx candidates"
+            );
+            return Err(WebRtcHandlerError::OfferRejected(
+                "privacy policy forbids host/srflx candidates — \
+                 set iceTransportPolicy=\"relay\" on the client"
+                    .into(),
+            ));
+        }
 
         // Allocate a fabric endpoint before negotiating so the
         // answer we build publishes its port.
@@ -446,13 +647,31 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
                     self.rendezvous(session, tag, endpoint_id, peer, srtp_keys)
                         .await?;
                 }
+                // Slice 5.11-privacy: strip `host` candidates
+                // from the answer in `relay_only` / `strict`.
+                // Today the negotiator doesn't emit candidates
+                // in answers (ICE emission lands with
+                // 5.10-ice); this call is a no-op in that
+                // steady state and becomes meaningful the
+                // moment the negotiator starts advertising host
+                // candidates.
+                let final_answer = if matches!(
+                    privacy.mode,
+                    WebRtcPrivacyMode::RelayOnly | WebRtcPrivacyMode::Strict
+                ) {
+                    strip_answer_host_candidates(&answer_body)
+                } else {
+                    answer_body
+                };
+                let peer_rendered = self.render_peer(peer);
                 debug!(
                     ?session,
                     port,
-                    answer_len = answer_body.len(),
+                    answer_len = final_answer.len(),
+                    peer = %peer_rendered,
                     "webrtc: offer accepted"
                 );
-                Ok(answer_body)
+                Ok(final_answer)
             }
             NegotiationOutcome::Mismatch => {
                 self.fabric.release_endpoint(endpoint_id).await;
@@ -472,7 +691,12 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
     }
 
     async fn handle_bye(&self, session: WebTransportSessionId) {
-        debug!(?session, "webrtc: session bye");
+        let peer_note = self
+            .active
+            .get(&session)
+            .map(|e| format!(" bridge={:?}", *e.value()))
+            .unwrap_or_default();
+        debug!(?session, note = %peer_note, "webrtc: session bye");
         // Release a live bridge if one is installed for this
         // session. The fabric's `release_bridge` is idempotent
         // — a concurrent bye from the partner side races harmlessly.
@@ -496,6 +720,36 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
             self.fabric.release_endpoint(parked.endpoint).await;
             debug!(?session, %tag, "webrtc: parked leg released on bye");
         }
+    }
+
+    async fn handle_ice_candidate(
+        &self,
+        session: WebTransportSessionId,
+        candidate: &str,
+        sdp_m_line_index: u16,
+    ) -> Result<(), WebRtcHandlerError> {
+        // Slice 5.10-ice: accept trickle-ICE candidates.
+        // Real ICE pair checks happen against whatever address
+        // the DTLS handshake actually received from — the
+        // candidate line is diagnostic + future pair-check
+        // input. We parse to validate syntax, log, move on.
+        use smiths_sdp::parse::parse_candidate_line;
+        match parse_candidate_line(candidate) {
+            Ok(c) => {
+                debug!(
+                    ?session,
+                    sdp_m_line_index,
+                    ty = %c.candidate_type,
+                    addr = %c.address,
+                    port = c.port,
+                    "webrtc: trickle ICE candidate"
+                );
+            }
+            Err(e) => {
+                warn!(?session, error = %e, raw = %candidate, "webrtc: malformed ICE candidate");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -545,6 +799,24 @@ async fn ws_upgrade(State(state): State<WsState>, ws: WebSocketUpgrade) -> impl 
 /// `handle_frame`. The listener already knows the `WtSignal` JSON
 /// shape; this wrapper just converts between axum's `Message`
 /// and raw bytes, and closes the socket on terminal frames.
+/// Reparse `answer_body`, drop every `host`-typed
+/// `a=candidate:` line, re-emit. Wrapper around
+/// `smiths_sdp::privacy::strip_host_candidates` that works on
+/// the string shape the handler returns — round-trip through
+/// `SessionDescription::parse` + `Display` preserves every
+/// other attribute. When the answer can't be re-parsed (never
+/// happens with an answer we just emitted), returns the
+/// original verbatim.
+fn strip_answer_host_candidates(answer_body: &str) -> String {
+    match SessionDescription::parse(answer_body) {
+        Ok(mut sdp) => {
+            smiths_sdp::privacy::strip_host_candidates(&mut sdp);
+            sdp.to_string()
+        }
+        Err(_) => answer_body.to_owned(),
+    }
+}
+
 async fn handle_socket(mut socket: WebSocket, state: WsState) {
     let mut session: Option<WebRtcSession> = None;
     loop {
@@ -789,5 +1061,269 @@ mod tests {
             })
             .get();
         assert_eq!(orphaned, 1);
+    }
+
+    #[tokio::test]
+    async fn relay_only_rejects_offer_with_host_candidate() {
+        // Slice 5.11-privacy — in `relay_only`, an offer
+        // advertising a `host` candidate is rejected before
+        // the negotiator even runs; the reject-reason counter
+        // bumps against the `host` bucket.
+        let mut scratch = prometheus_client::registry::Registry::default();
+        let metrics = Metrics::register(&mut scratch);
+        let neg: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(IpAddr::V4(
+            Ipv4Addr::LOCALHOST,
+        )));
+        let h = CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000, 100)
+            .with_metrics(Arc::clone(&metrics))
+            .with_privacy(WebRtcPrivacyConfig {
+                mode: WebRtcPrivacyMode::RelayOnly,
+                redaction_key: String::new(),
+            });
+
+        let offer = "v=0\r\n\
+                     o=- 1 1 IN IP4 192.0.2.1\r\n\
+                     s=-\r\n\
+                     c=IN IP4 192.0.2.1\r\n\
+                     t=0 0\r\n\
+                     m=audio 49170 RTP/AVP 0\r\n\
+                     a=rtpmap:0 PCMU/8000\r\n\
+                     a=candidate:1 1 UDP 2130706431 192.168.1.5 49170 typ host\r\n";
+        let err = h
+            .handle_offer(WebTransportSessionId(77), offer)
+            .await
+            .unwrap_err();
+        match err {
+            WebRtcHandlerError::OfferRejected(reason) => {
+                assert!(
+                    reason.contains("privacy"),
+                    "reason should mention privacy, got: {reason}"
+                );
+            }
+            other => panic!("expected OfferRejected, got {other:?}"),
+        }
+        let rejected = metrics
+            .webrtc_candidates_rejected
+            .get_or_create(&PrivacyRejectReasonLabel {
+                reason: "host".into(),
+            })
+            .get();
+        assert_eq!(rejected, 1);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_redacts_peer_ip_in_render() {
+        // `render_peer` is what the handler's debug/warn logs
+        // call on every peer address. In strict mode with a
+        // redaction key set, the IP half is hashed; port stays
+        // for triage. The counter bumps exactly once per
+        // render.
+        let mut scratch = prometheus_client::registry::Registry::default();
+        let metrics = Metrics::register(&mut scratch);
+        let neg: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(IpAddr::V4(
+            Ipv4Addr::LOCALHOST,
+        )));
+        let h = CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000, 100)
+            .with_metrics(Arc::clone(&metrics))
+            .with_privacy(WebRtcPrivacyConfig {
+                mode: WebRtcPrivacyMode::Strict,
+                redaction_key: "rotation-key-2026-04".into(),
+            });
+
+        let rendered = h.render_peer("203.0.113.45:55123".parse().unwrap());
+        assert!(
+            !rendered.contains("203.0.113.45"),
+            "strict mode must never render the literal IP"
+        );
+        assert!(
+            rendered.contains(":55123"),
+            "port should remain visible for triage; got {rendered}"
+        );
+        let redactions = metrics.webrtc_privacy_redactions.get();
+        assert_eq!(redactions, 1);
+    }
+
+    #[tokio::test]
+    async fn open_mode_leaves_host_candidates_alone() {
+        // Sanity: `Open` preserves the pre-5.11 behaviour —
+        // no offer rejection, no redactions.
+        let mut scratch = prometheus_client::registry::Registry::default();
+        let metrics = Metrics::register(&mut scratch);
+        let h = CliWebRtcHandler::new(
+            Arc::new(Negotiator::with_default_codecs(IpAddr::V4(
+                Ipv4Addr::LOCALHOST,
+            ))),
+            fabric(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            40_000,
+            100,
+        )
+        .with_metrics(Arc::clone(&metrics));
+
+        let offer = "v=0\r\n\
+                     o=- 1 1 IN IP4 192.0.2.1\r\n\
+                     s=-\r\n\
+                     c=IN IP4 192.0.2.1\r\n\
+                     t=0 0\r\n\
+                     m=audio 49170 RTP/AVP 0\r\n\
+                     a=rtpmap:0 PCMU/8000\r\n\
+                     a=candidate:1 1 UDP 2130706431 192.168.1.5 49170 typ host\r\n";
+        let answer = h
+            .handle_offer(WebTransportSessionId(78), offer)
+            .await
+            .expect("open mode must accept");
+        assert!(answer.contains("m=audio"));
+        assert_eq!(
+            metrics
+                .webrtc_candidates_rejected
+                .get_or_create(&PrivacyRejectReasonLabel {
+                    reason: "host".into(),
+                })
+                .get(),
+            0,
+            "open mode must not bump reject counter"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sip_leg_pairs_with_parked_webrtc_leg() {
+        // Slice 5.10-sipjoin — a WebRTC leg parks under tag
+        // "room-1"; a SIP leg arrives via `pair_sip_leg(...)`
+        // with the same tag and the bridge is installed
+        // through the WebRTC handler's rendezvous map.
+        use smiths_core::WebRtcRendezvous;
+
+        let mut scratch = prometheus_client::registry::Registry::default();
+        let metrics = Metrics::register(&mut scratch);
+        let h = CliWebRtcHandler::new(
+            Arc::new(Negotiator::with_default_codecs(IpAddr::V4(
+                Ipv4Addr::LOCALHOST,
+            ))),
+            fabric(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            40_000,
+            100,
+        )
+        .with_metrics(Arc::clone(&metrics));
+
+        // Park a WebRTC leg by invoking the handler directly —
+        // in production this is the first `handle_offer_tagged`.
+        let offer = "v=0\r\n\
+                     o=- 1 1 IN IP4 127.0.0.1\r\n\
+                     s=-\r\n\
+                     c=IN IP4 127.0.0.1\r\n\
+                     t=0 0\r\n\
+                     m=audio 49170 RTP/AVP 0\r\n\
+                     a=rtpmap:0 PCMU/8000\r\n";
+        h.handle_offer_tagged(WebTransportSessionId(1_001), Some("room-1"), offer)
+            .await
+            .expect("first leg parks");
+        assert_eq!(h.pending.len(), 1);
+        assert_eq!(
+            metrics
+                .webrtc_sessions_paired
+                .get_or_create(&WebRtcPartnerLabel {
+                    partner: "sip".into(),
+                })
+                .get(),
+            0
+        );
+
+        // SIP leg arrives through the rendezvous trait.
+        // Allocate a real endpoint on the handler's fabric so
+        // the bridge install finds a matching socket.
+        let sip_endpoint = h
+            .fabric
+            .allocate(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .expect("sip endpoint");
+        let sip_peer: SocketAddr = "127.0.0.1:60001".parse().unwrap();
+        let bid = h
+            .pair_sip_leg(
+                "room-1",
+                sip_endpoint.id(),
+                sip_peer,
+                None, // plain RTP — DTLS handshake not exercised in this test
+            )
+            .await
+            .expect("pair_sip_leg succeeds");
+        assert!(
+            bid.is_some(),
+            "partner was parked; should have installed bridge"
+        );
+        assert_eq!(h.pending.len(), 0, "parked leg pulled");
+        // `partner="sip"` credits the bump.
+        let sip_paired = metrics
+            .webrtc_sessions_paired
+            .get_or_create(&WebRtcPartnerLabel {
+                partner: "sip".into(),
+            })
+            .get();
+        assert_eq!(sip_paired, 1);
+
+        // No-partner case: sip arrives first, parks.
+        let sip_endpoint_2 = h
+            .fabric
+            .allocate(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await
+            .unwrap();
+        let parked = h
+            .pair_sip_leg("solo", sip_endpoint_2.id(), sip_peer, None)
+            .await
+            .expect("park ok");
+        assert!(parked.is_none(), "no partner → park, no bridge");
+        assert!(
+            h.pending.contains_key("solo"),
+            "sip leg should be parked in the map"
+        );
+
+        // release_sip_leg is idempotent + evicts cleanly.
+        h.release_sip_leg("solo").await;
+        assert!(!h.pending.contains_key("solo"));
+        h.release_sip_leg("solo").await; // no-op second call
+    }
+
+    #[tokio::test]
+    async fn hot_reload_flips_mode_live() {
+        // Slice 5.11-privacy Small 1 — mutating the handler's
+        // privacy handle flips the enforcement without
+        // rebuilding. First offer (open) accepts; reload to
+        // relay_only; second offer rejects.
+        let mut scratch = prometheus_client::registry::Registry::default();
+        let metrics = Metrics::register(&mut scratch);
+        let h = CliWebRtcHandler::new(
+            Arc::new(Negotiator::with_default_codecs(IpAddr::V4(
+                Ipv4Addr::LOCALHOST,
+            ))),
+            fabric(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            40_000,
+            100,
+        )
+        .with_metrics(Arc::clone(&metrics));
+
+        let offer = "v=0\r\n\
+                     o=- 1 1 IN IP4 192.0.2.1\r\n\
+                     s=-\r\n\
+                     c=IN IP4 192.0.2.1\r\n\
+                     t=0 0\r\n\
+                     m=audio 49170 RTP/AVP 0\r\n\
+                     a=rtpmap:0 PCMU/8000\r\n\
+                     a=candidate:1 1 UDP 2130706431 192.168.1.5 49170 typ host\r\n";
+        h.handle_offer(WebTransportSessionId(81), offer)
+            .await
+            .expect("open mode accepts");
+
+        // Flip the mode via the handle the config adapter uses.
+        *h.privacy_handle().lock().unwrap() = WebRtcPrivacyConfig {
+            mode: WebRtcPrivacyMode::RelayOnly,
+            redaction_key: String::new(),
+        };
+
+        let err = h
+            .handle_offer(WebTransportSessionId(82), offer)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WebRtcHandlerError::OfferRejected(_)));
     }
 }

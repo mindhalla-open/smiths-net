@@ -2031,6 +2031,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3377,7 +3383,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-cli"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3390,6 +3396,7 @@ dependencies = [
  "serde_json",
  "smiths-core",
  "smiths-dtls",
+ "smiths-ice",
  "smiths-mcp",
  "smiths-media",
  "smiths-plugin",
@@ -3405,7 +3412,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-config-macros"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3414,7 +3421,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-core"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3436,7 +3443,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-dtls"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "async-trait",
  "rustls",
@@ -3452,7 +3459,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-fax"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "async-trait",
  "prometheus-client",
@@ -3468,22 +3475,27 @@ dependencies = [
 
 [[package]]
 name = "smiths-ice"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "bytes",
+ "hmac",
+ "md5",
+ "prometheus-client",
  "rand 0.10.1",
  "serde",
+ "sha1",
  "smiths-core",
  "smiths-sdp",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml 0.9.12+spec-1.1.0",
  "tracing",
 ]
 
 [[package]]
 name = "smiths-mcp"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3513,7 +3525,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-media"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3533,7 +3545,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-mixer"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -3549,7 +3561,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-plugin"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -3573,14 +3585,14 @@ dependencies = [
 
 [[package]]
 name = "smiths-proto"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "prost",
 ]
 
 [[package]]
 name = "smiths-script"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "async-trait",
  "rhai",
@@ -3595,7 +3607,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sdp"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "base64",
  "rand 0.10.1",
@@ -3607,7 +3619,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sidecar"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "rustix",
  "seccompiler",
@@ -3623,7 +3635,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-sip"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3655,7 +3667,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-testkit"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "smiths-core",
  "smiths-media",
@@ -3669,7 +3681,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-transcode"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "opus",
  "prometheus-client",
@@ -3681,7 +3693,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-wasm"
-version = "0.67.0"
+version = "0.68.0"
 dependencies = [
  "anyhow",
  "async-trait",

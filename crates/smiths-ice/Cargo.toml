@@ -10,16 +10,28 @@ description  = "ICE / STUN MVP (host candidates only) for smiths-net."
 smiths-core = { workspace = true }
 smiths-sdp  = { workspace = true }
 
-tokio     = { workspace = true }
-bytes     = { workspace = true }
-thiserror = { workspace = true }
-tracing   = { workspace = true }
-rand      = { workspace = true }
-serde     = { workspace = true }
+tokio      = { workspace = true }
+tokio-util = { workspace = true }
+bytes      = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+rand       = { workspace = true }
+serde      = { workspace = true }
+# Slice 5.11-turn: MESSAGE-INTEGRITY uses HMAC-SHA-1 (RFC 8489
+# §14.2); RFC 8489 §14.3 hashes long-term credentials with MD5.
+# The crypto footprint is hand-picked — pulling in `ring` or
+# the full `rustls` stack just for two primitives is overkill.
+hmac = "0.12"
+sha1 = "0.10"
+md5 = "0.7"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "test-util"] }
-toml  = "0.9"
+tokio             = { workspace = true, features = ["macros", "test-util"] }
+tokio-util        = { workspace = true }
+toml              = "0.9"
+hmac              = "0.12"
+sha1              = "0.10"
+prometheus-client = { workspace = true }
 
 [lints]
 workspace = true

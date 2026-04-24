@@ -5,6 +5,241 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.68.0] - 2026-04-24
+
+**WebRTC + privacy + TURN — the remaining 5.10 / 5.11
+follow-ons land in one release.** Four related slices ship
+together because they snap into each other: privacy
+enforcement (5.11-privacy) needs the ICE candidate surface
+(5.10-ice) to have teeth; the SIP-join path (5.10-sipjoin) is
+the counterpart to the WebRTC-rendezvous work in 0.67; TURN
+(5.11-turn) is how any of the above works across a NAT.
+Splitting into four releases would've produced four
+frozen-in-time snapshots of half-wired scaffolds.
+
+### Added — 5.10-ice: native ICE-Lite posture
+
+- **`Negotiator::with_ice_enabled(bool)`** — when `true`,
+  DTLS-SRTP answers carry:
+  - `a=ice-ufrag:` (fresh 8-char ICE-char token per answer)
+  - `a=ice-pwd:` (fresh 24-char token — ~142 bits entropy)
+  - `a=ice-options:trickle`
+  - `a=candidate:...` (one `host` candidate for
+    `(local_ip, allocated_port)` with RFC 8445 §5.1.2.1
+    priority)
+  - `a=end-of-candidates`
+- **`fresh_ice_ufrag` / `fresh_ice_pwd` / `make_host_candidate`**
+  public helpers in `smiths-sdp::negotiate` — reusable from
+  tests + future trickle-ICE work.
+- **`parse_candidate_line`** public wrapper in
+  `smiths-sdp::parse` — validates a trickle-ICE candidate
+  frame in isolation, strips optional `a=candidate:` /
+  `candidate:` prefixes.
+- **`CliWebRtcHandler::handle_ice_candidate`** — parses
+  trickle candidates from the signaling WebSocket, logs at
+  debug. The DTLS handshake trusts whatever source address
+  actually reaches its socket, so extra peer candidates are
+  diagnostic rather than load-bearing in the ICE-Lite
+  posture.
+- **`[webrtc.ice]` config block** — `enabled` /
+  `host_binds` / `stun_servers`.
+- **Metrics**: `smiths_ice_candidates_gathered_total{type}` +
+  `smiths_ice_binding_checks_total{outcome}`.
+
+### Added — 5.10-sipjoin: SIP INVITE joins the WebRTC rendezvous
+
+- **`WebRtcRendezvous` trait** in `smiths-core::media` —
+  cross-subsystem handle the UAS uses to join the
+  WebRTC-side pending-legs map. `pair_sip_leg(tag, endpoint,
+  peer, srtp)` returns `Some(bridge_id)` on pair / `None`
+  on park + deadline. `release_sip_leg(tag)` is the BYE-side
+  idempotent cleanup.
+- **`X-Smiths-Webrtc-Tag:` extension header** — UAS extracts
+  from `INVITE`; when present + a `WebRtcRendezvous` handle
+  is wired (`UasServer::with_webrtc_rendezvous`), SIP
+  dialogs bridge against a pre-parked WebRTC leg. Without the
+  header, SIP-side rendezvous on the Request-URI user-part
+  stays the default.
+- **`CliWebRtcHandler` impls `WebRtcRendezvous`** — the same
+  `pending` DashMap services both WebRTC and SIP legs. A SIP
+  leg that arrives first parks under a synthetic session
+  id (`u32::MAX ^ counter`) so it can't collide with a real
+  WebRTC session.
+- **Metric credits `partner="sip"`** on a SIP→WebRTC pair.
+  The existing `partner="webrtc"` / `partner="none"` buckets
+  stay correct.
+
+### Added — 5.11-privacy: mode enforcement
+
+- **Pre-negotiation candidate filter** — `CliWebRtcHandler`
+  rejects DTLS-SRTP offers that advertise `host` / `srflx`
+  candidates in `relay_only` / `strict` mode. Offer-reject
+  reason names the policy so the browser gets a diagnostic
+  (not a silent drop).
+- **Post-negotiation host-strip** — `relay_only` / `strict`
+  answers round-trip through `strip_host_candidates` before
+  they reach the client. No-op today (the negotiator doesn't
+  emit host candidates in open mode) + load-bearing the
+  moment the gatherer grows srflx support.
+- **Peer-IP redaction** — `render_peer(peer)` honors the
+  live mode. In `strict` with a non-empty `redaction_key`
+  every peer IP in logs hashes through `redact_ip`; port
+  stays visible for triage. `smiths_webrtc_privacy_redactions_total`
+  bumps per render.
+- **Hot-reload** — `privacy` is held behind
+  `Arc<Mutex<WebRtcPrivacyConfig>>`; the CLI's 5.8-b
+  read-through adapter flips `mode` + rotates
+  `redaction_key` live via `webrtc.privacy` field
+  subscription.
+- **Metrics**:
+  `smiths_webrtc_candidates_rejected_total{reason}` +
+  `smiths_webrtc_privacy_redactions_total`.
+- **`WebRtcPrivacyConfig` gains `PartialEq + Eq`** so the
+  read-through adapter's value-change comparison works.
+
+### Added — 5.11-turn: embedded RFC 8656 TURN server
+
+- **New `smiths-ice::turn` module** — UDP-only, long-term
+  credential mechanism (RFC 8489 §14 + RFC 8656 §3.2):
+  - `LongTermCredential::new(user, realm, password)` —
+    derives the MD5 long-term key at load, discards
+    plaintext.
+  - `TurnServerConfig` — bind / realm / relay_ip /
+    allocation_lifetime / credentials.
+  - `TurnServer::new(cfg).with_metrics(...).run(cancel)` —
+    binds the server socket + drives the STUN event loop
+    until cancelled.
+- **Protocol scope**:
+  - `Allocate` (0x003) — 401-challenged; second request
+    with `USERNAME` + `MESSAGE-INTEGRITY` returns
+    `XOR-RELAYED-ADDRESS` + `XOR-MAPPED-ADDRESS` +
+    `LIFETIME`.
+  - `Refresh` (0x004) — bump lifetime; `LIFETIME=0`
+    deletes the allocation + decrements
+    `smiths_turn_active_allocations`.
+  - `CreatePermission` (0x008) — one permission per
+    `XOR-PEER-ADDRESS` attribute; 5-minute default.
+  - `ChannelBind` (0x009) — bind a channel number in
+    0x4000..=0x7FFF to a peer address; implicitly installs
+    a permission.
+  - `Send` indication (0x006) — relay `DATA` to the named
+    peer.
+  - `Data` indication (0x007) — server-to-client wrapping
+    of a permitted peer's datagram.
+  - `ChannelData` — 4-byte `channel || length` framing for
+    the fast path once the channel is bound.
+- **`[webrtc.turn]` config block** — `enabled` / `bind` /
+  `realm` / `relay_ip` / `allocation_lifetime_s` /
+  `credentials` / `external_url`. Setting `external_url`
+  skips the embedded server + hands clients the URL
+  verbatim (typical coturn front-end).
+- **Metrics**:
+  `smiths_turn_allocations_total{outcome}` +
+  `smiths_turn_active_allocations`.
+- **CLI wiring** — `main.rs` spawns the server when
+  `[webrtc.turn] enabled = true && external_url = ""`;
+  joins on graceful shutdown via the same cancellation
+  token the other adapters use.
+
+### Added — configuration surface
+
+- **`WebRtcIceConfig`** — `[webrtc.ice]` block (`enabled`,
+  `host_binds`, `stun_servers`).
+- **`WebRtcTurnConfig` + `WebRtcTurnCredential`** —
+  `[webrtc.turn]` block.
+
+### Added — tests
+
+- **`smiths-sdp::negotiate::tests`** — three new ICE tests:
+  - `ice_disabled_answer_omits_ice_attrs` — no `ice-ufrag`,
+    no candidates when the flag is off.
+  - `ice_enabled_answer_carries_ufrag_pwd_and_host_candidate`
+    — answer shape + priority formula.
+  - `ice_ufrag_and_pwd_are_fresh_across_answers` — per-answer
+    entropy (connectivity-check key anti-predictability).
+- **`smiths-cli/src/webrtc.rs::tests`** — five new privacy +
+  SIP-join tests:
+  - `relay_only_rejects_offer_with_host_candidate` —
+    offer-rejection path + metric.
+  - `strict_mode_redacts_peer_ip_in_render` — render_peer
+    hashes the IP; port stays.
+  - `open_mode_leaves_host_candidates_alone` — open-mode
+    no-op.
+  - `hot_reload_flips_mode_live` — `privacy_handle()` lock
+    swap takes effect on the next offer.
+  - `sip_leg_pairs_with_parked_webrtc_leg` — full `pair_sip_leg`
+    → bridge install → `partner="sip"` metric credit.
+- **`smiths-ice/tests/turn_allocation.rs`** — full
+  end-to-end drive-through: 401 challenge →
+  authenticated Allocate → CreatePermission → Send
+  indication (peer receives) → peer reply (client
+  receives Data indication) → ChannelBind → ChannelData
+  round trip → metric sanity. Spins the real server on
+  a loopback ephemeral port + real UDP peer socket.
+- **`smiths-ice::turn::tests`** — three unit tests:
+  - `long_term_key_matches_rfc_example` — MD5 key
+    derivation round-trip.
+  - `encode_type_round_trips_request_method_bits` — RFC
+    8489 §5 bit-scatter.
+  - `xor_addr_round_trip_v4` — XOR-PEER-ADDRESS encode /
+    decode.
+  - `message_integrity_accepts_matching_hmac_rejects_tampered`
+    — HMAC verification + tamper-detection.
+
+### Added — docs
+
+- **`docs/deployment/webrtc-privacy.md`** — threat-model
+  table, mode-picking decision tree, what each mode does
+  *not* protect against, `redaction_key` rotation recipe.
+- **`docs/deployment/turn.md`** — embedded vs coturn
+  decision tree, NAT-traversal flowchart, credential
+  rotation recipe, observability rundown, limits.
+- **`docs/deployment/webrtc.md`** — new "ICE" +
+  "TURN — embedded or external" sections.
+- **`docs/operator-runbook.md`** — "SIP INVITEs joining
+  the same map" subsection on the WebRTC rendezvous block.
+
+### Changed
+
+- **`Negotiator::answer` + `answer_with_video`** emit the
+  new ICE attrs on DTLS-SRTP when enabled. No other path
+  changes shape.
+- **`WebRtcSessionHandler::handle_ice_candidate`** — default
+  impl stays a no-op; the CLI's handler now parses +
+  logs trickle candidates.
+- **`RequestSummary`** in `smiths-sip::uas` gains an optional
+  `webrtc_tag: Option<String>` field.
+- **`UasServer::with_webrtc_rendezvous(Arc<dyn …>)`**
+  builder method; absent = the `X-Smiths-Webrtc-Tag:`
+  header is silently ignored (safe fallback for
+  deployments without a WebRTC adapter).
+- **`spawn_sip_udp`** takes an optional rendezvous handle;
+  the CLI threads the WebRTC handler's `Arc<dyn
+  WebRtcRendezvous>` through at boot.
+- **`smiths-media`** and `smiths-cli` now depend on
+  `smiths-ice` for the TURN config types / server spawn.
+
+### Notes
+
+- **TURN scope is UDP-only.** TCP transport (RFC 6062) + full
+  IPv6 relay verification land in a follow-on; the integration
+  test covers the IPv4 happy path end-to-end.
+- **ICE is Lite, not full.** We don't run the controlling /
+  controlled role agent loop; the engine emits one host
+  candidate + trusts the peer's selection. Full ICE
+  (srflx gathering via `[webrtc.ice] stun_servers` + pair
+  checks with retransmit) is future scope.
+- **SIP-join auth.** A SIP caller can dial any tag that's
+  pre-parked — there's no per-tag ACL in the engine.
+  Multi-tenant deployments should front the SIP UAS with
+  an MCP tool that validates `(caller, tag)` against an
+  allow-list before the INVITE reaches the engine.
+- **The MD5 + HMAC-SHA-1 crypto in TURN** is dictated by
+  RFC 8489 §14.3 and webrtc-adopter reality — not a design
+  preference. Modern TURN profiles (e.g., RFC 8489
+  §14.3 with SHA-256) land when browsers widely support
+  them.
+
 ## [0.67.0] - 2026-04-23
 
 **WebRTC runtime — DTLS-SRTP terminator + tag-based rendezvous

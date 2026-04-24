@@ -246,6 +246,37 @@ pub struct Metrics {
     /// bridge via the rendezvous map (slice 5.10-bridge),
     /// keyed by the partner leg's type.
     pub webrtc_sessions_paired: Family<WebRtcPartnerLabel, Counter>,
+    /// `smiths_ice_candidates_gathered_total{type}` — counter
+    /// of ICE candidates the engine emitted in SDP answers
+    /// (slice 5.10-ice). Labelled by RFC 8445 type so
+    /// operators can see the `host` / `srflx` / `relay` mix.
+    pub ice_candidates_gathered: Family<IceCandidateTypeLabel, Counter>,
+    /// `smiths_ice_binding_checks_total{outcome}` — counter
+    /// per `STUN Binding` connectivity check. Slice 5.10-ice
+    /// runs exactly one per bridge install; a richer
+    /// ICE-agent pair check loop is future scope.
+    pub ice_binding_checks: Family<IceBindingCheckLabel, Counter>,
+    /// `smiths_turn_allocations_total{outcome}` — counter
+    /// per `Allocate` response the embedded TURN server
+    /// emitted (slice 5.11-turn).
+    pub turn_allocations: Family<TurnAllocationOutcomeLabel, Counter>,
+    /// `smiths_turn_active_allocations` — gauge of live TURN
+    /// allocations (slice 5.11-turn). Matches the size of
+    /// the server's allocation map; bumps on `Allocate`,
+    /// decrements on `REFRESH lifetime=0` or expiry.
+    pub turn_active_allocations: Gauge,
+    /// `smiths_webrtc_candidates_rejected_total{reason}` —
+    /// counter per candidate the privacy filter dropped
+    /// (slice 5.11-privacy). Rising slope in the
+    /// `"host"` bucket against `relay_only` deployments
+    /// usually means clients aren't forcing their
+    /// `iceTransportPolicy = "relay"` correctly.
+    pub webrtc_candidates_rejected: Family<PrivacyRejectReasonLabel, Counter>,
+    /// `smiths_webrtc_privacy_redactions_total` — counter of
+    /// peer-IP strings the engine redacted before emitting
+    /// them into a log / CDR / tracing span (slice
+    /// 5.11-privacy). Active only in `strict` mode.
+    pub webrtc_privacy_redactions: Counter,
 }
 
 /// `{field}` label on `smiths_config_reloaded_fields_total`.
@@ -302,6 +333,48 @@ pub struct WebRtcPartnerLabel {
     pub partner: String,
 }
 
+/// `{type}` label on `smiths_ice_candidates_gathered_total`
+/// (slice 5.10-ice). `"host"` / `"srflx"` / `"relay"` /
+/// `"prflx"` — RFC 8445 candidate-type vocabulary.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct IceCandidateTypeLabel {
+    /// RFC 8445 candidate type.
+    pub ty: String,
+}
+
+/// `{outcome}` label on `smiths_ice_binding_checks_total`
+/// (slice 5.10-ice). `"success"` — peer replied with the
+/// expected `XOR-MAPPED-ADDRESS`. `"timeout"` — no reply
+/// within the per-check window. `"mismatch"` — reply came
+/// from an unexpected address (possible spoof / NAT hairpin).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct IceBindingCheckLabel {
+    /// Outcome token.
+    pub outcome: String,
+}
+
+/// `{outcome}` label on `smiths_turn_allocations_total`
+/// (slice 5.11-turn). `"success"` — `Allocate` succeeded
+/// with a relay address. `"auth_failed"` — `401` challenge
+/// or `MESSAGE-INTEGRITY` mismatch. `"forbidden"` — `403`
+/// for an unauthorized transport/realm. `"other"` —
+/// catch-all for malformed / resource-exhausted paths.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TurnAllocationOutcomeLabel {
+    /// Outcome token.
+    pub outcome: String,
+}
+
+/// `{reason}` label on `smiths_webrtc_candidates_rejected_total`
+/// (slice 5.11-privacy). `"host"` / `"srflx"` — the privacy
+/// filter rejected the offer because it carried a direct
+/// candidate in a mode that forbids them.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PrivacyRejectReasonLabel {
+    /// Offending candidate type the filter caught.
+    pub reason: String,
+}
+
 impl Metrics {
     /// Register every metric on `registry` and return a cheaply-
     /// clonable handle.
@@ -338,6 +411,12 @@ impl Metrics {
         let config_probe_triggered = Family::<ConfigProbeLabel, Counter>::default();
         let webrtc_dtls_handshakes = Family::<WebRtcDtlsOutcomeLabel, Counter>::default();
         let webrtc_sessions_paired = Family::<WebRtcPartnerLabel, Counter>::default();
+        let ice_candidates_gathered = Family::<IceCandidateTypeLabel, Counter>::default();
+        let ice_binding_checks = Family::<IceBindingCheckLabel, Counter>::default();
+        let turn_allocations = Family::<TurnAllocationOutcomeLabel, Counter>::default();
+        let turn_active_allocations = Gauge::default();
+        let webrtc_candidates_rejected = Family::<PrivacyRejectReasonLabel, Counter>::default();
+        let webrtc_privacy_redactions = Counter::default();
 
         registry.register(
             "sip_requests",
@@ -466,6 +545,36 @@ impl Metrics {
             "WebRTC legs that completed the tag-based rendezvous, keyed by partner kind (slice 5.10-bridge).",
             webrtc_sessions_paired.clone(),
         );
+        registry.register(
+            "smiths_ice_candidates_gathered",
+            "ICE candidates the engine emitted, keyed by RFC 8445 type (slice 5.10-ice).",
+            ice_candidates_gathered.clone(),
+        );
+        registry.register(
+            "smiths_ice_binding_checks",
+            "STUN Binding connectivity checks, keyed by outcome (slice 5.10-ice).",
+            ice_binding_checks.clone(),
+        );
+        registry.register(
+            "smiths_turn_allocations",
+            "TURN Allocate response outcomes, keyed by outcome (slice 5.11-turn).",
+            turn_allocations.clone(),
+        );
+        registry.register(
+            "smiths_turn_active_allocations",
+            "Live TURN allocations held by the embedded server (slice 5.11-turn).",
+            turn_active_allocations.clone(),
+        );
+        registry.register(
+            "smiths_webrtc_candidates_rejected",
+            "WebRTC offer candidates dropped by the privacy filter, keyed by reason (slice 5.11-privacy).",
+            webrtc_candidates_rejected.clone(),
+        );
+        registry.register(
+            "smiths_webrtc_privacy_redactions",
+            "Peer IPs redacted before emission in strict privacy mode (slice 5.11-privacy).",
+            webrtc_privacy_redactions.clone(),
+        );
 
         Arc::new(Self {
             sip_requests,
@@ -495,6 +604,12 @@ impl Metrics {
             config_probe_triggered,
             webrtc_dtls_handshakes,
             webrtc_sessions_paired,
+            ice_candidates_gathered,
+            ice_binding_checks,
+            turn_allocations,
+            turn_active_allocations,
+            webrtc_candidates_rejected,
+            webrtc_privacy_redactions,
         })
     }
 

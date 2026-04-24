@@ -204,6 +204,12 @@ struct RequestSummary {
     /// Raw request bytes; the response builder copies header lines
     /// from them verbatim.
     raw: Bytes,
+    /// `X-Smiths-Webrtc-Tag:` (slice 5.10-sipjoin). Present only
+    /// on INVITEs that want to join a pre-parked WebRTC leg
+    /// sharing the same tag via the `[webrtc]` rendezvous map.
+    /// Absent on every other request + on INVITEs from clients
+    /// that don't care about WebRTC bridging.
+    webrtc_tag: Option<String>,
 }
 
 /// UAS answering a subset of RFC 3261 requests.
@@ -305,6 +311,15 @@ pub struct UasServer<T: Transport> {
     /// Per-source-IP token bucket. Always present — when config
     /// disables rate limiting it's a cheap always-allow.
     rate_limit: crate::rate_limit::SipRateLimiter,
+    /// Optional handle on the WebRTC rendezvous map (slice
+    /// 5.10-sipjoin). When present + an `INVITE` carries
+    /// `X-Smiths-Webrtc-Tag:`, the UAS asks the rendezvous to
+    /// bridge this SIP dialog with a WebRTC leg sharing the
+    /// same tag instead of running the normal SIP-side
+    /// rendezvous on the Request-URI user-part. `None` = the
+    /// header is silently ignored (safe fallback for
+    /// deployments without the WebRTC adapter wired).
+    webrtc_rendezvous: Option<Arc<dyn smiths_core::WebRtcRendezvous>>,
     /// Async driver hosting every server-side transaction — both
     /// INVITE (`ServerInviteTxn` with G/H/I timers, ACK correlation,
     /// 2xx bypass) and non-INVITE (`ServerNonInviteTxn` with timer J).
@@ -359,8 +374,22 @@ impl<T: Transport> UasServer<T> {
             response_router: None,
             drain: None,
             rate_limit: crate::rate_limit::SipRateLimiter::disabled(),
+            webrtc_rendezvous: None,
             txn_driver,
         })
+    }
+
+    /// Attach a [`smiths_core::WebRtcRendezvous`] handle so
+    /// `INVITE` requests carrying `X-Smiths-Webrtc-Tag:` can
+    /// bridge with a pre-parked WebRTC leg (slice
+    /// 5.10-sipjoin). `None` = the header is ignored.
+    #[must_use]
+    pub fn with_webrtc_rendezvous(
+        mut self,
+        rendezvous: Arc<dyn smiths_core::WebRtcRendezvous>,
+    ) -> Self {
+        self.webrtc_rendezvous = Some(rendezvous);
+        self
     }
 
     /// Attach a digest registrar — `REGISTER` now requires valid auth.
@@ -980,10 +1009,54 @@ impl<T: Transport> UasServer<T> {
         let rendezvous = req.ruri_user.clone();
         let dialog_key: DialogKey = (call_id.clone(), local_tag.clone(), remote_tag.clone());
 
+        // Slice 5.10-sipjoin: when an `X-Smiths-Webrtc-Tag:`
+        // header is present + the WebRTC rendezvous is wired,
+        // the SIP dialog joins the shared pending-legs map
+        // instead of the local Request-URI-user-part one. A
+        // match installs the bridge through the WebRTC handler;
+        // a miss parks the SIP leg there until its WebRTC
+        // partner arrives. Header without rendezvous wired =
+        // silent ignore (honest fallback for deployments that
+        // don't run WebRTC).
+        let mut webrtc_bridged = false;
+        if let (Some(tag), Some(rdv), Some(ep), Some(remote_rtp)) = (
+            req.webrtc_tag.as_deref(),
+            self.webrtc_rendezvous.as_ref(),
+            endpoint.as_ref(),
+            remote_media,
+        ) {
+            match rdv
+                .pair_sip_leg(tag, ep.id(), remote_rtp, srtp_keys.clone())
+                .await
+            {
+                Ok(Some(bid)) => {
+                    self.bridges_by_dialog.insert(dialog_key.clone(), bid);
+                    info!(
+                        %tag,
+                        ?bid,
+                        "webrtc rendezvous: SIP dialog bridged to WebRTC partner"
+                    );
+                    webrtc_bridged = true;
+                }
+                Ok(None) => {
+                    info!(%tag, "webrtc rendezvous: SIP leg parked awaiting WebRTC partner");
+                    // The WebRTC handler holds the SIP leg;
+                    // the SIP UAS stores the tag on the
+                    // DialogRecord so BYE can tell the
+                    // rendezvous to release.
+                    webrtc_bridged = true; // skip the SIP-side rendezvous
+                }
+                Err(e) => {
+                    warn!(%tag, ?e, "webrtc rendezvous: pair_sip_leg failed; falling through");
+                }
+            }
+        }
+
         // Rendezvous pairing: need a key, an endpoint, and the peer RTP
         // address from the offer.
-        if let (Some(key), Some(ep), Some(remote_rtp)) =
-            (rendezvous.as_ref(), endpoint.as_ref(), remote_media)
+        if !webrtc_bridged
+            && let (Some(key), Some(ep), Some(remote_rtp)) =
+                (rendezvous.as_ref(), endpoint.as_ref(), remote_media)
         {
             if let Some((_, pending)) = self.pending_bridges.remove(key) {
                 let leg_a = BridgeLeg {
@@ -1627,6 +1700,7 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
     let mut expires: Option<u32> = None;
     let mut from_uri: Option<String> = None;
     let mut to_uri: Option<String> = None;
+    let mut webrtc_tag: Option<String> = None;
 
     for line in lines {
         if line.is_empty() {
@@ -1678,6 +1752,15 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
             if let Ok(n) = v.parse::<u32>() {
                 expires = Some(n);
             }
+        } else if webrtc_tag.is_none() && lower.starts_with("x-smiths-webrtc-tag:") {
+            // Slice 5.10-sipjoin: custom extension header asking
+            // the UAS to bridge this dialog with a WebRTC leg
+            // sharing the same tag. Case-insensitive prefix
+            // match; value trimmed of surrounding whitespace.
+            let v = line.split_once(':').map_or("", |(_, v)| v).trim();
+            if !v.is_empty() {
+                webrtc_tag = Some(v.to_owned());
+            }
         }
     }
 
@@ -1697,6 +1780,7 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
         to_uri,
         body: (!body.is_empty()).then(|| body.to_owned()),
         raw: raw.clone(),
+        webrtc_tag,
     }
 }
 

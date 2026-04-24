@@ -1056,8 +1056,7 @@ impl Default for CanaryConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebRtcConfig {
-    /// Enable the WebRTC-native signaling adapter. Scaffold
-    /// today — binds nothing, logs "runtime not yet wired".
+    /// Enable the WebRTC-native signaling adapter.
     pub enabled: bool,
     /// WebSocket bind for the signaling adapter.
     pub ws_bind: SocketAddr,
@@ -1066,8 +1065,17 @@ pub struct WebRtcConfig {
     pub tls_cert: String,
     /// Matching private key.
     pub tls_key: String,
-    /// Privacy hardening knobs (slice 5.11 scaffold).
+    /// Privacy hardening knobs (slice 5.11).
     pub privacy: WebRtcPrivacyConfig,
+    /// ICE surface (slice 5.10-ice). Off by default —
+    /// deployments without NATs keep the pre-5.10-ice
+    /// direct-peer-address shape.
+    pub ice: WebRtcIceConfig,
+    /// TURN server / client surface (slice 5.11-turn). Off
+    /// by default. `external_url` overrides the embedded
+    /// server + redirects clients through an operator's
+    /// existing `coturn`.
+    pub turn: WebRtcTurnConfig,
 }
 
 impl Default for WebRtcConfig {
@@ -1078,8 +1086,120 @@ impl Default for WebRtcConfig {
             tls_cert: String::new(),
             tls_key: String::new(),
             privacy: WebRtcPrivacyConfig::default(),
+            ice: WebRtcIceConfig::default(),
+            turn: WebRtcTurnConfig::default(),
         }
     }
+}
+
+/// `[webrtc.ice]` — ICE candidate gathering + connectivity
+/// checks (slice 5.10-ice). When enabled, the WebRTC adapter
+/// emits `a=ice-ufrag` / `a=ice-pwd` / `a=candidate:` lines
+/// on every answer + runs a `binding_ping` per bridge install
+/// to verify the pair before audio flows. ICE-Lite posture:
+/// the engine doesn't swap roles, it just serves the peer's
+/// candidate list.
+///
+/// ```toml
+/// [webrtc.ice]
+/// enabled       = true
+/// host_binds    = ["0.0.0.0:50000"]  # empty = derive from ws_bind.ip()
+/// stun_servers  = []                  # future: gather srflx via these
+/// ```
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebRtcIceConfig {
+    /// Master switch. `false` keeps the pre-5.10-ice
+    /// "peer address lives in `c=` / `m=`" shape so deployments
+    /// without NATs don't pay for a STUN/TURN round trip.
+    pub enabled: bool,
+    /// Extra host-candidate binds the gatherer advertises. When
+    /// empty, the gatherer derives one host candidate per
+    /// allocated media endpoint (the default production shape).
+    pub host_binds: Vec<SocketAddr>,
+    /// External STUN servers the engine queries for
+    /// server-reflexive candidates. Empty = host-only gathering
+    /// (MVP). Real srflx support lands with
+    /// `smiths-ice::binding_ping` extended for asymmetric
+    /// servers.
+    pub stun_servers: Vec<SocketAddr>,
+}
+
+/// `[webrtc.turn]` — embedded RFC 8656 TURN server + optional
+/// external relay fallback (slice 5.11-turn). Off by default.
+///
+/// ```toml
+/// [webrtc.turn]
+/// enabled        = true
+/// bind           = "0.0.0.0:3478"       # standard TURN port
+/// realm          = "turn.example.com"
+/// relay_ip       = "203.0.113.1"        # public IP to hand back
+/// allocation_lifetime_s = 600
+/// # One credential per operator account. Rotate via [reload].
+/// credentials    = [
+///   { username = "alice", password = "hunter2" },
+/// ]
+/// # When set, the server is disabled and the adapter hands
+/// # clients this URL instead (typical coturn front-end).
+/// external_url   = ""
+/// ```
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebRtcTurnConfig {
+    /// Enable the embedded TURN server.
+    pub enabled: bool,
+    /// UDP bind for the embedded TURN server.
+    pub bind: SocketAddr,
+    /// RFC 7616 long-term credential realm. Echoed in 401
+    /// challenges; clients hash this into the
+    /// `MESSAGE-INTEGRITY` key per RFC 8489 §14.
+    pub realm: String,
+    /// IP the server hands clients in `XOR-RELAYED-ADDRESS`.
+    /// Defaults to the bind's IP; override to publish a
+    /// routable public IP when the server runs behind a NAT.
+    pub relay_ip: Option<IpAddr>,
+    /// How long an allocation lives (seconds) between
+    /// `REFRESH` requests. RFC 8656 §3.2 caps at 3600 s; we
+    /// cap at 600 s by default so stale allocations drain
+    /// faster.
+    pub allocation_lifetime_s: u32,
+    /// Static credentials served by the long-term
+    /// credential mechanism. Rotate via `[reload]` — the
+    /// reload driver resizes the credential map in place,
+    /// new `Allocate` requests use the refreshed set.
+    pub credentials: Vec<WebRtcTurnCredential>,
+    /// External TURN URL to hand clients instead of
+    /// spawning the embedded server. When set, `enabled`
+    /// is ignored + clients receive this URL verbatim on
+    /// the signaling channel.
+    pub external_url: String,
+}
+
+impl Default for WebRtcTurnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3478),
+            realm: String::new(),
+            relay_ip: None,
+            allocation_lifetime_s: 600,
+            credentials: Vec::new(),
+            external_url: String::new(),
+        }
+    }
+}
+
+/// One long-term credential entry for the embedded TURN
+/// server. Passwords are held in-memory only; never logged.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebRtcTurnCredential {
+    /// `USERNAME` attribute value clients must present.
+    pub username: String,
+    /// Raw password. Hashed via RFC 8489's long-term key
+    /// derivation (`MD5(user:realm:pass)`) on load; the
+    /// plaintext doesn't live past config parse.
+    pub password: String,
 }
 
 /// `[webrtc.privacy]` — privacy hardening modes (slice 5.11
@@ -1091,7 +1211,7 @@ impl Default for WebRtcConfig {
 ///   the client to `iceTransportPolicy = "relay"`.
 /// - `strict` — `relay_only` + keyed-hash redaction of every
 ///   peer IP in audit/CDR/tracing + require TLS-only signaling.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebRtcPrivacyConfig {
     /// Privacy mode. Scaffold only — runtime enforcement is a
