@@ -188,7 +188,7 @@ impl Transaction for ClientInviteTxn {
                 // keeps doubling until B fires. We pass a huge
                 // effective cap (1 h) to the helper; the real stop
                 // condition is timer B.
-                let cap = std::time::Duration::from_secs(3600);
+                let cap = std::time::Duration::from_hours(1);
                 let next = doubling_backoff(self.attempt, cap);
                 vec![
                     TransactionAction::SendToPeer(self.invite.clone()),

@@ -16,7 +16,7 @@ default      = ["auth-sqlite", "auth-http"]
 auth-sqlite  = ["dep:rusqlite"]
 # Enables `auth::http_store::HttpAuthStore`, a `CredentialStore`
 # backed by an operator-provided HTTPS webhook.
-auth-http    = ["dep:reqwest", "dep:serde", "dep:serde_json"]
+auth-http    = ["dep:reqwest"]
 # Slice 4.3 / P17: SIP-over-QUIC transport scaffold. Off by
 # default; 0.45.0 ships the config surface + a `Transport`
 # skeleton that logs a clear "not yet wired" warning at bind.
@@ -25,6 +25,14 @@ auth-http    = ["dep:reqwest", "dep:serde", "dep:serde_json"]
 # operators a supported config shape + `--version` advertisement
 # without silently binding anywhere.
 sip-quic     = []
+# Slice 5.7 / P19: WebTransport signaling scaffold. Off by
+# default. Enables the config surface + `WebTransportListener`
+# trait + signaling protocol types. The actual QUIC runtime
+# (quinn + h3-webtransport) is a follow-on slice — turning the
+# flag on today gives operators a supported config shape and
+# `--version` advertisement without silently binding anywhere.
+# Matches the `sip-quic` + `mcp-http3` scaffold pattern.
+webtransport = []
 
 [dependencies]
 smiths-core    = { workspace = true }
@@ -45,8 +53,8 @@ tracing        = { workspace = true }
 thiserror      = { workspace = true }
 rusqlite       = { workspace = true, optional = true }
 reqwest        = { workspace = true, optional = true }
-serde          = { workspace = true, optional = true }
-serde_json     = { workspace = true, optional = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
 
 [dev-dependencies]
 # Integration tests wire the real media + SDP implementations through

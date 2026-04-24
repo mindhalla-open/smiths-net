@@ -53,6 +53,29 @@ pub struct Manifest {
     /// plugins. `0` means "use the engine default" (500 ms).
     #[serde(default)]
     pub script_wall_clock_ms: u64,
+    /// Wire format the engine uses to deliver streaming-RTP
+    /// frames (and future per-packet host-function payloads) to
+    /// this plugin (slice 5.2 / P18). Default `proto` keeps
+    /// pre-5.2 plugins running unchanged; `flatbuffers` opts in
+    /// to the zero-copy fast path that the in-tree bench measures
+    /// at ≥2× round-trip throughput on `RtpFrame`-shaped
+    /// messages.
+    #[serde(default)]
+    pub wire_format: WireFormat,
+}
+
+/// Wire format the engine uses for plugin payloads on the
+/// streaming-RTP path (slice 5.2 / P18). Serialized as
+/// `wire_format = "proto" | "flatbuffers"` in `plugin.toml`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WireFormat {
+    /// Protobuf (prost). Pre-5.2 default.
+    #[default]
+    Proto,
+    /// Flat zero-copy layout from `smiths-proto::flatbuffers_io`.
+    /// Enables a ≥2× encode/decode-throughput win on `RtpFrame`.
+    Flatbuffers,
 }
 
 /// Which DSL engine a `type = "script"` manifest selects.
@@ -171,5 +194,59 @@ abi   = "2.0"
         let err = Manifest::from_dir(dir.path()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("abi"), "{msg}");
+    }
+
+    #[test]
+    fn wire_format_defaults_to_proto_when_omitted() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("plugin.toml"),
+            r#"
+name     = "x"
+type     = "sidecar"
+entry    = "./x"
+provides = ["ai.tts"]
+"#,
+        )
+        .unwrap();
+        let m = Manifest::from_dir(dir.path()).unwrap();
+        assert_eq!(m.wire_format, WireFormat::Proto);
+    }
+
+    #[test]
+    fn wire_format_flatbuffers_parses() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("plugin.toml"),
+            r#"
+name        = "rtp-tap"
+type        = "sidecar"
+entry       = "./rtp_tap.py"
+provides    = ["media.streaming_rtp"]
+wire_format = "flatbuffers"
+"#,
+        )
+        .unwrap();
+        let m = Manifest::from_dir(dir.path()).unwrap();
+        assert_eq!(m.wire_format, WireFormat::Flatbuffers);
+    }
+
+    #[test]
+    fn wire_format_unknown_token_is_a_manifest_error() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("plugin.toml"),
+            r#"
+name        = "x"
+type        = "sidecar"
+entry       = "./x"
+wire_format = "msgpack"
+"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            Manifest::from_dir(dir.path()),
+            Err(Error::Manifest { .. })
+        ));
     }
 }

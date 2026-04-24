@@ -2,7 +2,7 @@
 name         = "rust-logger"
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 publish      = false
 description  = "Minimal WASM plugin example — calls the smiths::log host function."
 

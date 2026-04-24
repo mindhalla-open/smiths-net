@@ -318,3 +318,59 @@ pub trait MediaFabric: Send + Sync {
         bytes: &[u8],
     ) -> Result<(), MediaError>;
 }
+
+/// Cross-subsystem handle the SIP UAS uses to participate in
+/// the WebRTC tag-based rendezvous (slice 5.10-sipjoin).
+///
+/// A SIP INVITE carrying `X-Smiths-Webrtc-Tag: <tag>` asks the
+/// engine to bridge this dialog with a WebRTC leg sharing the
+/// same tag. The UAS calls [`Self::pair_sip_leg`] after
+/// negotiating its own SDP; the impl (living in the CLI's
+/// `CliWebRtcHandler`) either pairs with a pre-parked WebRTC
+/// partner (installs a bridge + returns `Some(BridgeId)`) or
+/// parks the SIP leg under `tag` awaiting its WebRTC half.
+///
+/// Lives in `smiths-core` so the UAS doesn't have to depend
+/// on `smiths-cli` — both sides see only the trait.
+#[async_trait]
+pub trait WebRtcRendezvous: Send + Sync {
+    /// Pair or park a SIP leg under `tag`.
+    ///
+    /// - **Partner present** — installs the bridge between
+    ///   this SIP leg and the parked WebRTC leg, returns
+    ///   `Ok(Some(bridge_id))`. The UAS retains the
+    ///   `BridgeId` under its dialog so BYE tears the pair
+    ///   down.
+    /// - **No partner** — parks the SIP leg with a deadline
+    ///   evictor, returns `Ok(None)`. The UAS still holds
+    ///   its endpoint; when the WebRTC partner arrives, the
+    ///   WebRTC handler reaches back through the same trait
+    ///   (different impl method) to retrieve the SIP leg's
+    ///   endpoint + install the bridge. Today that
+    ///   "WebRTC-finds-SIP" path is implemented inside the
+    ///   `CliWebRtcHandler`; SIP-finds-WebRTC (this call) is
+    ///   the other half.
+    ///
+    /// On deadline: the parked leg is evicted + the metric
+    /// `smiths_webrtc_sessions_paired_total{partner="none"}`
+    /// bumps, same as the WebRTC-parked case. Releasing the
+    /// UAS's endpoint is the UAS's job (via the separately
+    /// stored [`SipRendezvousTicket`]); the rendezvous trait
+    /// doesn't own SIP dialogs.
+    ///
+    /// # Errors
+    /// `String` — fabric allocation failure, unlikely in
+    /// practice since the UAS already allocated the endpoint.
+    async fn pair_sip_leg(
+        &self,
+        tag: &str,
+        endpoint: EndpointId,
+        peer: SocketAddr,
+        srtp: Option<crate::SrtpKeys>,
+    ) -> Result<Option<BridgeId>, String>;
+
+    /// Release a SIP leg parked under `tag` (e.g., the SIP
+    /// dialog sent BYE before the WebRTC partner arrived).
+    /// Idempotent — a tag that's not parked is a no-op.
+    async fn release_sip_leg(&self, tag: &str);
+}

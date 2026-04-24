@@ -223,10 +223,10 @@ impl InbandDtmfDetector {
             self.frame_count += 1;
             self.samples_consumed += 1;
 
-            if self.frame_count >= self.frame_samples {
-                if let Some(press) = self.close_frame() {
-                    out.push(press);
-                }
+            if self.frame_count >= self.frame_samples
+                && let Some(press) = self.close_frame()
+            {
+                out.push(press);
             }
         }
         out

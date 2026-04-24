@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<!--
+  Browser-side demo for the slice 5.10 WebRTC-native signaling
+  adapter. Fork of examples/browser-webtransport/index.html —
+  the JSON message shape (WtSignal) is shared, only the
+  transport differs: plain WebSocket here, WebTransport/QUIC
+  there.
+
+  What works today:
+
+    - session-init → session-ack round-trip
+    - offer → answer SDP (for RTP/AVP offers; DTLS-SRTP offers
+      receive `offer-rejected: DTLS-SRTP not yet supported`)
+    - ice-candidate / ice-end / echo / bye framing
+
+  What doesn't work yet (honest deferrals):
+
+    - Browsers speak DTLS-SRTP only. The engine parses WebRTC
+      offers but declines the transport until the DTLS-SRTP
+      terminator lands. Until then, use a SIP-over-WebSocket
+      client (which sends plain `RTP/AVP`) to exercise the
+      signaling path end-to-end.
+    - No SIP ⇄ WebRTC media bridge. Even an accepted offer
+      doesn't carry audio yet — that's the next slice.
+
+  See docs/deployment/webrtc.md for the full state + roadmap.
+-->
+<!doctype html>
+<meta charset="utf-8" />
+<title>smiths-net WebRTC demo</title>
+<style>
+  body   { font: 14px -apple-system, Segoe UI, sans-serif; margin: 24px; max-width: 760px; }
+  pre    { background: #f5f5f5; padding: 8px 12px; border-radius: 4px; overflow-x: auto; }
+  code   { background: #f5f5f5; padding: 1px 5px; border-radius: 3px; }
+  button { margin-right: 8px; padding: 6px 12px; }
+  #log   { border: 1px solid #ddd; padding: 8px; height: 240px;
+           overflow-y: auto; background: #fafafa; }
+  .tx    { color: #0a6; }
+  .rx    { color: #06a; }
+  .err   { color: #c33; }
+  .note  { background: #fff3cd; border-left: 4px solid #ffc107; padding: 8px 12px; }
+</style>
+
+<h1>smiths-net WebRTC demo</h1>
+
+<div class="note">
+  <strong>Signaling scaffold.</strong> Browser-sourced offers
+  (DTLS-SRTP) currently receive
+  <code>offer-rejected: DTLS-SRTP not yet supported</code> — the
+  engine parses the SDP but the DTLS terminator is a future
+  slice. See <code>docs/deployment/webrtc.md</code>.
+</div>
+
+<p>Engine WebSocket URL: <code id="engine-url"></code></p>
+
+<button id="btn-connect">Connect</button>
+<button id="btn-offer">Send offer</button>
+<button id="btn-echo">Send echo</button>
+<button id="btn-bye">Bye</button>
+
+<h3>Event log</h3>
+<div id="log"></div>
+
+<h3>Frame shapes this demo emits</h3>
+<pre>
+{ "type": "session-init", "tag": "demo-browser" }
+{ "type": "offer",        "session_id": 17,
+  "sdp": "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\n..." }
+{ "type": "ice-candidate", "session_id": 17,
+  "candidate": "candidate:1 1 UDP ...",
+  "sdp_m_line_index": 0 }
+{ "type": "echo", "session_id": 17, "payload_b64": "aGVsbG8=" }
+{ "type": "bye",  "session_id": 17, "reason": "user hung up" }
+</pre>
+
+<script>
+  // Change to your engine's WebRTC endpoint. When the engine is
+  // fronted by nginx/Caddy for TLS termination, use `wss://`.
+  const ENGINE = "ws://localhost:7881/smiths/webrtc";
+  document.getElementById("engine-url").textContent = ENGINE;
+
+  const logEl = document.getElementById("log");
+  const log = (dir, text) => {
+    const li = document.createElement("div");
+    li.className = dir;
+    li.textContent = `[${dir}] ${text}`;
+    logEl.appendChild(li);
+    logEl.scrollTop = logEl.scrollHeight;
+  };
+
+  // State we maintain across frames.
+  let socket    = null;
+  let sessionId = null;
+
+  // --- frame builders mirror the Rust-side `WtSignal` variants ---
+
+  const encode = (obj) => new TextEncoder().encode(JSON.stringify(obj));
+
+  const frameSessionInit = (tag) => encode({ type: "session-init", tag });
+  const frameOffer = (sdp)       => encode({ type: "offer", session_id: sessionId, sdp });
+  const frameEcho  = (payload)   => encode({
+    type: "echo", session_id: sessionId,
+    payload_b64: btoa(payload),
+  });
+  const frameBye   = (reason)    => encode({ type: "bye", session_id: sessionId, reason });
+
+  const send = (bytes) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      log("err", "socket not open");
+      return;
+    }
+    socket.send(bytes);
+  };
+
+  // --- click handlers ---
+
+  document.getElementById("btn-connect").onclick = () => {
+    try {
+      log("tx", `Connecting to ${ENGINE}`);
+      socket = new WebSocket(ENGINE);
+      socket.binaryType = "arraybuffer";
+      socket.onopen = () => {
+        log("tx", "session-init");
+        send(frameSessionInit("demo-browser"));
+      };
+      socket.onmessage = (ev) => {
+        const bytes = ev.data instanceof ArrayBuffer
+          ? new Uint8Array(ev.data)
+          : new TextEncoder().encode(ev.data);
+        const frame = JSON.parse(new TextDecoder().decode(bytes));
+        log("rx", frame.type);
+        handleFrame(frame);
+      };
+      socket.onerror = (e) => log("err", `socket error: ${e}`);
+      socket.onclose = () => log("rx", "socket closed");
+    } catch (e) {
+      log("err", `Connect failed: ${e}`);
+    }
+  };
+
+  document.getElementById("btn-offer").onclick = async () => {
+    if (!sessionId) { log("err", "not connected"); return; }
+    // Real browser offer — this triggers DTLS-SRTP. Today the
+    // engine will reject with `offer-rejected: DTLS-SRTP not
+    // yet supported`. That's the honest signaling scaffold.
+    const pc = new RTCPeerConnection();
+    pc.addTransceiver("audio", { direction: "sendrecv" });
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    log("tx", "offer (DTLS-SRTP — will be rejected by scaffold)");
+    send(frameOffer(pc.localDescription.sdp));
+    pc.onicecandidate = (ev) => {
+      if (!ev.candidate) {
+        send(encode({ type: "ice-end", session_id: sessionId }));
+        return;
+      }
+      log("tx", "ice-candidate");
+      send(encode({
+        type: "ice-candidate",
+        session_id: sessionId,
+        candidate: ev.candidate.candidate,
+        sdp_m_line_index: ev.candidate.sdpMLineIndex ?? 0,
+      }));
+    };
+  };
+
+  document.getElementById("btn-echo").onclick = () => {
+    if (!sessionId) { log("err", "not connected"); return; }
+    log("tx", "echo");
+    send(frameEcho("hello from browser"));
+  };
+
+  document.getElementById("btn-bye").onclick = () => {
+    if (!socket) return;
+    log("tx", "bye");
+    send(frameBye("user clicked bye"));
+    socket.close();
+    socket = null; sessionId = null;
+  };
+
+  function handleFrame(f) {
+    switch (f.type) {
+      case "session-ack":
+        sessionId = f.session_id;
+        log("rx", `session_id = ${sessionId} (proto v${f.protocol_version})`);
+        break;
+      case "answer":
+        log("rx", `answer (${f.sdp.length} bytes of SDP)`);
+        break;
+      case "ice-candidate":
+        log("rx", `candidate: ${f.candidate}`);
+        break;
+      case "echo":
+        log("rx", `echo: ${atob(f.payload_b64)}`);
+        break;
+      case "bye":
+        log("rx", `bye: ${f.reason ?? "no reason"}`);
+        break;
+      case "error":
+        log("err", `engine error ${f.code}: ${f.reason}`);
+        break;
+      default:
+        log("err", `unknown type: ${f.type}`);
+    }
+  }
+</script>

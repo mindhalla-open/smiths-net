@@ -411,12 +411,10 @@ fn spawn_rewriting_forward(
                             };
                             // RFC 4733 telephone-event path (cheap —
                             // one PT check per packet).
-                            if let Some(detector) = dtmf_detector.as_mut() {
-                                if let Some(press) =
-                                    detect_dtmf(plaintext_for_dtmf, detector)
-                                {
-                                    sink.deliver(dir, press);
-                                }
+                            if let Some(detector) = dtmf_detector.as_mut()
+                                && let Some(press) = detect_dtmf(plaintext_for_dtmf, detector)
+                            {
+                                sink.deliver(dir, press);
                             }
                             // Inband Goertzel path (opt-in). Only
                             // runs on payload type 0 (PCMU) today;

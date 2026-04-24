@@ -28,6 +28,14 @@ pub const HEADER_LEN: usize = 20;
 pub const METHOD_BINDING: u16 = 0x0001;
 /// Attribute type for `XOR-MAPPED-ADDRESS` (RFC 8489 §14.2).
 pub const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+/// Attribute type for `PRIORITY` (RFC 8445 §15.1).
+pub const ATTR_PRIORITY: u16 = 0x0024;
+/// Attribute type for `USE-CANDIDATE` (RFC 8445 §15.2).
+pub const ATTR_USE_CANDIDATE: u16 = 0x0025;
+/// Attribute type for `ICE-CONTROLLED` (RFC 8445 §15.3).
+pub const ATTR_ICE_CONTROLLED: u16 = 0x8029;
+/// Attribute type for `ICE-CONTROLLING` (RFC 8445 §15.4).
+pub const ATTR_ICE_CONTROLLING: u16 = 0x802A;
 
 /// Transaction id — 96 bits of random per RFC 8489 §6.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +119,14 @@ pub struct StunMessage {
     /// responses, absent on requests (MVP doesn't use `MAPPED-ADDRESS`
     /// or server-reflexive attributes).
     pub xor_mapped_address: Option<SocketAddr>,
+    /// Optional `PRIORITY` attribute (ICE).
+    pub priority: Option<u32>,
+    /// Optional `USE-CANDIDATE` flag (ICE).
+    pub use_candidate: bool,
+    /// Optional `ICE-CONTROLLING` tie-breaker (ICE).
+    pub ice_controlling: Option<u64>,
+    /// Optional `ICE-CONTROLLED` tie-breaker (ICE).
+    pub ice_controlled: Option<u64>,
 }
 
 impl StunMessage {
@@ -122,6 +138,10 @@ impl StunMessage {
             method: StunMethod::Binding,
             transaction_id: TransactionId::random(),
             xor_mapped_address: None,
+            priority: None,
+            use_candidate: false,
+            ice_controlling: None,
+            ice_controlled: None,
         }
     }
 
@@ -136,6 +156,10 @@ impl StunMessage {
             method: StunMethod::Binding,
             transaction_id: request.transaction_id,
             xor_mapped_address: Some(observed),
+            priority: None,
+            use_candidate: false,
+            ice_controlling: None,
+            ice_controlled: None,
         }
     }
 
@@ -145,6 +169,19 @@ impl StunMessage {
         if let Some(addr) = self.xor_mapped_address {
             write_xor_mapped_address(&mut attrs, addr, &self.transaction_id)?;
         }
+        if let Some(prio) = self.priority {
+            write_u32_attr(&mut attrs, ATTR_PRIORITY, prio)?;
+        }
+        if self.use_candidate {
+            write_attr(&mut attrs, ATTR_USE_CANDIDATE, &[])?;
+        }
+        if let Some(tie) = self.ice_controlling {
+            write_u64_attr(&mut attrs, ATTR_ICE_CONTROLLING, tie)?;
+        }
+        if let Some(tie) = self.ice_controlled {
+            write_u64_attr(&mut attrs, ATTR_ICE_CONTROLLED, tie)?;
+        }
+
         // STUN attributes are 32-bit padded, so the outer length
         // field is always a multiple of 4. `write_xor_mapped_address`
         // already pads.
@@ -186,16 +223,64 @@ impl StunMessage {
             StunError::Malformed(format!("unknown method bits: {type_bits:#06x}"))
         })?;
         let class = StunClass::from_bits(type_bits);
-        let attrs = bytes
+        let attrs_raw = bytes
             .get(HEADER_LEN..HEADER_LEN + length)
             .ok_or_else(|| StunError::Malformed("attribute block truncated".into()))?;
 
-        let xor_mapped_address = parse_xor_mapped_address(attrs, &transaction_id)?;
+        let mut xor_mapped_address = None;
+        let mut priority = None;
+        let mut use_candidate = false;
+        let mut ice_controlling = None;
+        let mut ice_controlled = None;
+
+        let mut cursor = 0;
+        while cursor + 4 <= attrs_raw.len() {
+            let ty = u16::from_be_bytes([attrs_raw[cursor], attrs_raw[cursor + 1]]);
+            let len = u16::from_be_bytes([attrs_raw[cursor + 2], attrs_raw[cursor + 3]]) as usize;
+            let value_start = cursor + 4;
+            let value_end = value_start + len;
+            let value = attrs_raw
+                .get(value_start..value_end)
+                .ok_or_else(|| StunError::Malformed("attribute value truncated".into()))?;
+
+            match ty {
+                ATTR_XOR_MAPPED_ADDRESS => {
+                    xor_mapped_address = Some(decode_xor_mapped_address(value, &transaction_id)?);
+                }
+                ATTR_PRIORITY if len == 4 => {
+                    priority = Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]));
+                }
+                ATTR_USE_CANDIDATE => {
+                    use_candidate = true;
+                }
+                ATTR_ICE_CONTROLLING if len == 8 => {
+                    ice_controlling = Some(u64::from_be_bytes([
+                        value[0], value[1], value[2], value[3], value[4], value[5], value[6],
+                        value[7],
+                    ]));
+                }
+                ATTR_ICE_CONTROLLED if len == 8 => {
+                    ice_controlled = Some(u64::from_be_bytes([
+                        value[0], value[1], value[2], value[3], value[4], value[5], value[6],
+                        value[7],
+                    ]));
+                }
+                _ => {}
+            }
+            // Skip to next attribute with padding.
+            let pad = (4 - (len % 4)) % 4;
+            cursor = value_end + pad;
+        }
+
         Ok(Self {
             class,
             method,
             transaction_id,
             xor_mapped_address,
+            priority,
+            use_candidate,
+            ice_controlling,
+            ice_controlled,
         })
     }
 }
@@ -279,6 +364,14 @@ fn write_xor_mapped_address(
     write_attr(out, ATTR_XOR_MAPPED_ADDRESS, &value)
 }
 
+fn write_u32_attr(out: &mut Vec<u8>, attr_type: u16, value: u32) -> Result<(), StunError> {
+    write_attr(out, attr_type, &value.to_be_bytes())
+}
+
+fn write_u64_attr(out: &mut Vec<u8>, attr_type: u16, value: u64) -> Result<(), StunError> {
+    write_attr(out, attr_type, &value.to_be_bytes())
+}
+
 fn write_attr(out: &mut Vec<u8>, attr_type: u16, value: &[u8]) -> Result<(), StunError> {
     let len = u16::try_from(value.len()).map_err(|_| StunError::TooLarge)?;
     out.extend_from_slice(&attr_type.to_be_bytes());
@@ -290,29 +383,6 @@ fn write_attr(out: &mut Vec<u8>, attr_type: u16, value: &[u8]) -> Result<(), Stu
         out.push(0);
     }
     Ok(())
-}
-
-fn parse_xor_mapped_address(
-    attrs: &[u8],
-    tid: &TransactionId,
-) -> Result<Option<SocketAddr>, StunError> {
-    let mut cursor = 0;
-    while cursor + 4 <= attrs.len() {
-        let ty = u16::from_be_bytes([attrs[cursor], attrs[cursor + 1]]);
-        let len = u16::from_be_bytes([attrs[cursor + 2], attrs[cursor + 3]]) as usize;
-        let value_start = cursor + 4;
-        let value_end = value_start + len;
-        let value = attrs
-            .get(value_start..value_end)
-            .ok_or_else(|| StunError::Malformed("attribute value truncated".into()))?;
-        if ty == ATTR_XOR_MAPPED_ADDRESS {
-            return Ok(Some(decode_xor_mapped_address(value, tid)?));
-        }
-        // Skip to next attribute with padding.
-        let pad = (4 - (len % 4)) % 4;
-        cursor = value_end + pad;
-    }
-    Ok(None)
 }
 
 fn decode_xor_mapped_address(value: &[u8], tid: &TransactionId) -> Result<SocketAddr, StunError> {
@@ -400,6 +470,34 @@ pub async fn binding_ping(
     response
         .xor_mapped_address
         .ok_or_else(|| StunError::Malformed("Binding Response missing XOR-MAPPED-ADDRESS".into()))
+}
+
+/// Gather server-reflexive candidates for `socket` by pinging every
+/// STUN server in `servers`. Returns the list of observed external
+/// addresses.
+pub async fn gather_srflx_candidates(
+    socket: &UdpSocket,
+    servers: &[SocketAddr],
+    timeout: Duration,
+) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    // Gather concurrently.
+    let mut futures = Vec::with_capacity(servers.len());
+    for &server in servers {
+        futures.push(binding_ping(socket, server, timeout));
+    }
+    let results = futures::future::join_all(futures).await;
+    for res in results {
+        match res {
+            Ok(addr) => {
+                if !out.contains(&addr) {
+                    out.push(addr);
+                }
+            }
+            Err(e) => debug!(?e, "STUN gathering failed for one server"),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

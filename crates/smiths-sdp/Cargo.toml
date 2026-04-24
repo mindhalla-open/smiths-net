@@ -10,6 +10,7 @@ description  = "SDP parse/generate and offer/answer negotiation."
 smiths-core = { workspace = true }
 base64      = { workspace = true }
 rand        = { workspace = true }
+sha2        = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 

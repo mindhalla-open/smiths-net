@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use prometheus_client::registry::Registry;
 use serde_json::Value;
 use smiths_core::Config;
 use smiths_core::Metrics;
@@ -19,7 +20,9 @@ use smiths_core::call::{CallOriginator, RegistrationView};
 use smiths_core::media::MediaFabric;
 use smiths_core::storage::{CdrStore, RecordingStore, VectorStore};
 use smiths_media::PromptLibrary;
+use smiths_mixer::ConferenceRegistry;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 use crate::control::ControlState;
 
@@ -70,6 +73,16 @@ pub struct ToolContext {
     /// hasn't configured a root; `record_prompt` returns a clean
     /// `NotFound` in that case.
     pub prompts: Option<PromptLibrary>,
+    /// Conference registry (slice 5.5). `None` when no mixer fabric
+    /// is wired; `create_conference` / `join_conference` /
+    /// `leave_conference` return a clean `NotFound` in that case.
+    pub conferences: Option<Arc<dyn ConferenceRegistry>>,
+    /// Shared Prometheus registry (slice 5.12). Wired by the CLI
+    /// from the same `Arc<Mutex<Registry>>` the `/metrics`
+    /// endpoint encodes from, so `list_metrics` / `get_metric`
+    /// MCP tools can never disagree with a scrape. `None` in
+    /// tests and in transport-free contexts.
+    pub metrics_registry: Option<Arc<Mutex<Registry>>>,
 }
 
 impl ToolContext {
@@ -93,7 +106,25 @@ impl ToolContext {
             vector: None,
             recording: None,
             prompts: None,
+            conferences: None,
+            metrics_registry: None,
         }
+    }
+
+    /// Attach a [`ConferenceRegistry`] so the conferencing MCP tools
+    /// become live. Without it they return a clean `NotFound`.
+    #[must_use]
+    pub fn with_conferences(mut self, registry: Arc<dyn ConferenceRegistry>) -> Self {
+        self.conferences = Some(registry);
+        self
+    }
+
+    /// Attach the shared Prometheus `Registry` so `list_metrics` /
+    /// `get_metric` become live.
+    #[must_use]
+    pub fn with_metrics_registry(mut self, registry: Arc<Mutex<Registry>>) -> Self {
+        self.metrics_registry = Some(registry);
+        self
     }
 
     /// Attach a [`PromptLibrary`] so `record_prompt` can write
