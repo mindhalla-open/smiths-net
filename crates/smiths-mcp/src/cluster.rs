@@ -23,16 +23,17 @@ impl Resource for ClusterStatusResource {
     async fn read(&self, ctx: &ToolContext) -> Result<ResourceContent, ToolError> {
         let config = &ctx.config.cluster;
 
-        // Today we return the config view; the 6.2 follow-on in smiths-cli
-        // will add live stats (last heartbeat, total deltas) to the
-        // ToolContext / GlobalState if needed.
         ResourceContent::json(&json!({
             "mode": config.mode,
             "peer_addr": config.peer_addr,
             "heartbeat_interval_secs": config.heartbeat_interval_secs,
+            "node_id": config.node_id,
+            "raft_addr": config.raft_addr,
+            "raft_dir": config.raft_dir,
+            "initial_peers": config.initial_peers,
             "status": match config.mode {
                 ClusterMode::Standalone => "standalone",
-                _ => "active", // Simplified for MVP
+                _ => "active",
             }
         }))
     }

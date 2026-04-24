@@ -5,14 +5,72 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.72.0] - 2026-04-24
+
+**Multi-node Raft cluster + snapshot support.**
+Completes the Raft consensus layer with full snapshot
+support (removing all `unimplemented!()` stubs), a TCP-based inter-node
+transport for `AppendEntries` / `InstallSnapshot` / `Vote` RPCs, and
+cluster configuration for multi-node bootstrapping.
+
+### Added — Multi-node cluster
+
+- **Snapshot support** in `DialogStateMachine`:
+  - `build_snapshot()` serializes the entire `DashMap` to JSON with last-applied metadata.
+  - `install_snapshot()` deserializes and replaces the dialog table atomically.
+  - `begin_receiving_snapshot()` returns an empty cursor for the leader to write into.
+  - `get_current_snapshot()` caches and returns the last built/installed snapshot.
+- **TCP Raft transport** (`network.rs`):
+  - `SmithsNetworkFactory` + `SmithsNetwork` implementing `openraft::RaftNetworkFactory` / `RaftNetwork`.
+  - `run_raft_server()` — TCP listener dispatching incoming RPCs to the local `Raft` node.
+  - JSON-lines protocol for all three RPC types with envelope-based multiplexing.
+- **Cluster config** additions:
+  - `node_id: u64` — unique Raft node identifier.
+  - `raft_addr: Option<SocketAddr>` — bind address for inter-node traffic.
+  - `initial_peers: Vec<String>` — `"node_id@host:port"` list for cluster bootstrap.
+- **`cluster://status`** MCP resource now exposes `node_id`, `raft_addr`, `raft_dir`, and `initial_peers`.
+- **Snapshot tests** — `snapshot_round_trip` and `begin_receiving_snapshot_returns_empty_cursor`.
+
+### Changed
+
+- **Zero `unimplemented!()`** in production code — all snapshot methods are now fully implemented.
+- Workspace version bumped to `0.72.0`.
+
+## [0.71.0] - 2026-04-24
+
+**Raft library integration — single-node consensus over the dialog table.**
+Introduces `smiths-raft`, a new workspace crate that
+wires `openraft` (with `storage-v2`) into the engine's dialog state via an
+SQLite-backed log store and a `DashMap`-backed state machine.
+
+### Added — Raft library integration
+
+- **`smiths-raft` crate** — new workspace member isolating the `openraft` dependency.
+- **`SmithsTypeConfig`** — `openraft::RaftTypeConfig` mapping `D = DialogDelta`.
+- **`SqliteLogStore`** — `RaftLogStorage` backed by rusqlite.
+  - `raft_state` table for persisting the current `Vote`.
+  - `raft_logs` table for durably storing log entries.
+  - Full `try_get_log_entries`, `save_vote`/`read_vote`, `append`, `truncate`, `purge` implementations.
+- **`DialogStateMachine`** — `RaftStateMachine` that replays `DialogDelta` entries onto the shared `DashMap`.
+  - `apply()` handles `Upsert` and `Delete` variants.
+  - `applied_state()` tracks the `last_applied` log ID.
+  - Membership changes stored for quorum bookkeeping.
+- **`ClusterConfig::raft_dir`** — new field configuring the SQLite storage path.
+- **`docs/architecture/raft.md`** — documents the log schema and boot-time replay strategy.
+
+### Changed
+
+- `ClusterConfig` gains `raft_dir: PathBuf` (default: `"raft_data"`) with `#[restart_required]`.
+- Workspace version bumped to `0.71.0`.
+
 ## [0.70.0] - 2026-04-24
 
 **HA Replication — the engine gains Primary/Secondary state synchronization.**
-Implements Slice 6.2 for high-availability. Primary nodes stream SIP dialog
+Implements for high-availability. Primary nodes stream SIP dialog
 state mutations to secondary nodes over TCP, ensuring call persistence and
 consistent state for failover consistency.
 
-### Added — 6.2: HA Replication Engine
+### Added — HA Replication Engine
 
 - **`DialogDelta`** — new core data model for serializing state transitions (`Upsert` vs `Delete`).
 - **`Replicator` trait** — decoupled interface for streaming state updates, with `NoopReplicator` and `PrimaryReplicator` (TCP) implementations.
@@ -31,11 +89,6 @@ consistent state for failover consistency.
     - `terminate_dialog` (Dialog removed)
     - `send_response` (Update for 2xx retransmissions)
 
-### Notes
-
-- **Secondary nodes are passive.** They maintain the dialog table in sync with the Primary but do not yet automatically take over VIPs or traffic.
-- **TCP-based streaming.** The current implementation uses JSON-over-newline over TCP for replication; robust for same-subnet HA pairs.
-
 ## [0.69.0] - 2026-04-24
 
 **Full ICE — the engine graduates from ICE-Lite to a full agent.**
@@ -43,7 +96,7 @@ Implements concurrent candidate gathering (host, srflx, relay),
 role determination (Controlling vs Controlled), and the connectivity
 check state machine with retransmits.
 
-### Added — 5.10-ice-full: Full ICE support
+### Added — ice-full: Full ICE support
 
 - **`CandidateGatherer::gather_all`** — concurrent gathering of `host`, `srflx` (via STUN), and `relay` (via TURN) candidates.
 - **`IceAgent`** — state machine handling candidate pairing, connectivity checks (Binding Requests) with retransmits, and nomination.
@@ -52,7 +105,7 @@ check state machine with retransmits.
 - **STUN attributes** — expanded hand-rolled STUN stack with `PRIORITY`, `USE-CANDIDATE`, `ICE-CONTROLLING`, and `ICE-CONTROLLED`.
 - **TURN Allocation** — client-side `Allocate` flow against embedded or external TURN servers to obtain `relay` candidates.
 
-### Added — 5.11-turn-gather: Relay candidate support
+### Added — turn-gather: Relay candidate support
 
 - **ICE + TURN integration** — the gatherer now emits `relay` candidates when a TURN server is configured, enabling connectivity across restrictive NATs.
 
@@ -68,7 +121,7 @@ the counterpart to the WebRTC-rendezvous work in 0.67; TURN
 Splitting into four releases would've produced four
 frozen-in-time snapshots of half-wired scaffolds.
 
-### Added — 5.10-ice: native ICE-Lite posture
+### Added — ice: native ICE-Lite posture
 
 - **`Negotiator::with_ice_enabled(bool)`** — when `true`,
   DTLS-SRTP answers carry:
@@ -97,7 +150,7 @@ frozen-in-time snapshots of half-wired scaffolds.
 - **Metrics**: `smiths_ice_candidates_gathered_total{type}` +
   `smiths_ice_binding_checks_total{outcome}`.
 
-### Added — 5.10-sipjoin: SIP INVITE joins the WebRTC rendezvous
+### Added — sipjoin: SIP INVITE joins the WebRTC rendezvous
 
 - **`WebRtcRendezvous` trait** in `smiths-core::media` —
   cross-subsystem handle the UAS uses to join the
@@ -120,7 +173,7 @@ frozen-in-time snapshots of half-wired scaffolds.
   The existing `partner="webrtc"` / `partner="none"` buckets
   stay correct.
 
-### Added — 5.11-privacy: mode enforcement
+### Added — privacy: mode enforcement
 
 - **Pre-negotiation candidate filter** — `CliWebRtcHandler`
   rejects DTLS-SRTP offers that advertise `host` / `srflx`
@@ -138,7 +191,7 @@ frozen-in-time snapshots of half-wired scaffolds.
   stays visible for triage. `smiths_webrtc_privacy_redactions_total`
   bumps per render.
 - **Hot-reload** — `privacy` is held behind
-  `Arc<Mutex<WebRtcPrivacyConfig>>`; the CLI's 5.8-b
+  `Arc<Mutex<WebRtcPrivacyConfig>>`; the CLI's
   read-through adapter flips `mode` + rotates
   `redaction_key` live via `webrtc.privacy` field
   subscription.
@@ -148,7 +201,7 @@ frozen-in-time snapshots of half-wired scaffolds.
 - **`WebRtcPrivacyConfig` gains `PartialEq + Eq`** so the
   read-through adapter's value-change comparison works.
 
-### Added — 5.11-turn: embedded RFC 8656 TURN server
+### Added — turn: embedded RFC 8656 TURN server
 
 - **New `smiths-ice::turn` module** — UDP-only, long-term
   credential mechanism (RFC 8489 §14 + RFC 8656 §3.2):

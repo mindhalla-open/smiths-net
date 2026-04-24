@@ -1451,6 +1451,18 @@ pub struct ClusterConfig {
     /// Interval between heartbeat pings between primary and secondary.
     #[reloadable]
     pub heartbeat_interval_secs: u32,
+    /// Directory to store Raft `SQLite` logs (slice 6.3a).
+    #[restart_required]
+    pub raft_dir: std::path::PathBuf,
+    /// Unique Raft node identifier (slice 6.3b).
+    #[restart_required]
+    pub node_id: u64,
+    /// Address to bind for inter-node Raft RPC traffic (slice 6.3b).
+    #[restart_required]
+    pub raft_addr: Option<SocketAddr>,
+    /// Initial cluster peers for bootstrap, format: `"node_id@host:port"` (slice 6.3b).
+    #[restart_required]
+    pub initial_peers: Vec<String>,
 }
 
 impl Default for ClusterConfig {
@@ -1459,6 +1471,10 @@ impl Default for ClusterConfig {
             mode: ClusterMode::Standalone,
             peer_addr: None,
             heartbeat_interval_secs: 5,
+            raft_dir: std::path::PathBuf::from("raft_data"),
+            node_id: 1,
+            raft_addr: None,
+            initial_peers: Vec::new(),
         }
     }
 }
