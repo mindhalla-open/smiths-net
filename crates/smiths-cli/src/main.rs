@@ -1,5 +1,6 @@
 //! smiths-net binary entry point.
 
+mod init;
 mod replication_service;
 mod webrtc;
 
@@ -166,6 +167,10 @@ enum Command {
     /// prints what the diff would look like — useful for
     /// pre-flight in CI.
     Reload(ReloadArgs),
+    /// Generate a valid config.toml through an interactive wizard
+    /// or a preset (slice 7.1). Use `--non-interactive --preset
+    /// prod` for scripted installs.
+    Init(init::InitArgs),
 }
 
 #[derive(Debug, Args)]
@@ -211,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Command::Reload(ref args)) => return run_reload(&cli.run.config, args),
+        Some(Command::Init(ref args)) => return init::run(args),
         None => {}
     }
 
