@@ -130,6 +130,7 @@ pub fn builtin_registry() -> ResourceRegistry {
     reg.register(CurrentConfigResource);
     reg.register(RegistrationsResource);
     reg.register(crate::cluster::ClusterStatusResource);
+    reg.register(crate::config_history::ConfigHistoryResource);
     reg
 }
 
@@ -238,7 +239,7 @@ impl Resource for CurrentConfigResource {
 /// Walk the config JSON and replace known secret fields with `"***"`.
 /// Today: `a2a.bearer_token` + the `[ai]` API-key block (slice 3.2).
 /// Extend as new secrets land.
-fn redact_secrets(v: &mut Value) {
+pub(crate) fn redact_secrets(v: &mut Value) {
     const SECRET_PATHS: &[&[&str]] = &[
         &["a2a", "bearer_token"],
         &["ai", "openai_api_key"],

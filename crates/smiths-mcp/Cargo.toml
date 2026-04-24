@@ -35,6 +35,7 @@ tracing       = { workspace = true }
 thiserror     = { workspace = true }
 axum          = { workspace = true }
 dashmap       = { workspace = true }
+toml          = "0.8"
 prometheus-client = { workspace = true }
 
 [dev-dependencies]

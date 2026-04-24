@@ -56,6 +56,8 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(LeaveConferenceTool);
     reg.register(ListMetricsTool);
     reg.register(GetMetricTool);
+    reg.register(crate::config_tools::GetConfigTool);
+    reg.register(crate::config_tools::PutConfigTool);
     reg
 }
 
@@ -2324,7 +2326,7 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 26);
+        assert_eq!(reg.len(), 28);
         for name in [
             "list_calls",
             "get_call_status",
@@ -2350,6 +2352,8 @@ mod tests {
             "search_calls_semantic",
             "put_script",
             "record_prompt",
+            "get_config",
+            "put_config",
         ] {
             assert!(reg.get(name).is_some(), "missing tool: {name}");
         }
