@@ -7,8 +7,9 @@
 //! control plane consumes it through the `smiths-core` seam and never
 //! links this crate.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -144,6 +145,16 @@ pub(crate) fn record_invocation<T>(
             outcome: outcome.to_owned(),
         })
         .inc();
+    // Mirror the outcome into the plugin-agnostic aggregates
+    // the 5.9 error-rate probe reads — `prometheus-client`'s
+    // `Family` doesn't expose an iter-values API, so summing
+    // the labelled counters per probe tick would be a hot-path
+    // round trip through the text encoder.
+    if result.is_ok() {
+        m.plugin_invocations_ok.inc();
+    } else {
+        m.plugin_invocations_error.inc();
+    }
     m.plugin_invoke_duration
         .get_or_create(&PluginLabel {
             plugin: plugin.to_owned(),
@@ -166,6 +177,13 @@ pub struct AiRegistry {
     providers: Arc<DashMap<String, Arc<dyn AiProvider>>>,
     sidecars: Arc<DashMap<String, Arc<PluginEntry>>>,
     scripts: Arc<DashMap<String, Arc<ScriptProvider>>>,
+    /// Env-var overrides the loader will inject into every future
+    /// sidecar spawn (slice 5.8-b read-through). Rotated by the
+    /// CLI's `ai.*_api_key` adapter on config reload. Running
+    /// sidecars keep the env they were launched with; a restart
+    /// of the specific plugin (via `AiRegistry::reload(name)`) is
+    /// required for the new value to take effect.
+    env_overrides: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 impl std::fmt::Debug for AiRegistry {
@@ -174,6 +192,7 @@ impl std::fmt::Debug for AiRegistry {
             .field("providers", &self.providers.len())
             .field("sidecars", &self.sidecars.len())
             .field("scripts", &self.scripts.len())
+            .field("env_overrides", &self.env_snapshot().len())
             .finish()
     }
 }
@@ -276,6 +295,42 @@ impl AiRegistry {
             .collect()
     }
 
+    /// Upsert an env-var override (slice 5.8-b). The loader's
+    /// next sidecar spawn injects these into the child's
+    /// environment, so a just-rotated `OPENAI_API_KEY` picks up
+    /// without an engine restart — but only for plugins that
+    /// respawn after the update. Already-live sidecars keep
+    /// their old env; they need `AiRegistry::reload(name)` to
+    /// pick up the new value.
+    pub fn set_env(&self, key: impl Into<String>, value: impl Into<String>) {
+        let mut guard = self
+            .env_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.insert(key.into(), value.into());
+    }
+
+    /// Clear an env-var override. Next sidecar spawn inherits the
+    /// engine's own env for that key (which may itself be unset).
+    pub fn clear_env(&self, key: &str) {
+        let mut guard = self
+            .env_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.remove(key);
+    }
+
+    /// Snapshot of the current env overrides. Cheap clone — the
+    /// map is typically under 10 entries. Primary consumer is
+    /// the sidecar spawn path + integration tests.
+    #[must_use]
+    pub fn env_snapshot(&self) -> BTreeMap<String, String> {
+        self.env_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Shut down every plugin. Typically called on engine shutdown.
     pub async fn shutdown_all(&self) {
         let handles: Vec<Sidecar> = self
@@ -375,5 +430,41 @@ impl AiRegistryTrait for AiRegistry {
             ))
         })?;
         reload_script(provider).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_overrides_round_trip() {
+        // The slice 5.8-b `ai.*_api_key` read-through stashes
+        // rotated credentials through these setters; a snapshot
+        // read under the shared Arc must see every prior write
+        // from any clone of the registry.
+        let reg = AiRegistry::new();
+        assert!(reg.env_snapshot().is_empty());
+        reg.set_env("OPENAI_API_KEY", "sk-one");
+        reg.set_env("ANTHROPIC_API_KEY", "sk-ant-one");
+        let snap = reg.env_snapshot();
+        assert_eq!(snap.get("OPENAI_API_KEY"), Some(&"sk-one".to_owned()));
+        assert_eq!(
+            snap.get("ANTHROPIC_API_KEY"),
+            Some(&"sk-ant-one".to_owned())
+        );
+
+        // A clone shares the underlying Arc<Mutex<..>> so either
+        // handle sees updates made through the other.
+        let twin = reg.clone();
+        twin.set_env("OPENAI_API_KEY", "sk-rotated");
+        assert_eq!(
+            reg.env_snapshot().get("OPENAI_API_KEY"),
+            Some(&"sk-rotated".to_owned())
+        );
+
+        reg.clear_env("OPENAI_API_KEY");
+        assert!(!reg.env_snapshot().contains_key("OPENAI_API_KEY"));
+        assert_eq!(reg.env_snapshot().len(), 1);
     }
 }

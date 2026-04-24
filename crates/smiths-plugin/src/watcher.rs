@@ -84,41 +84,60 @@ where
     let task_cancel = cancel.clone();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<notify::Result<Event>>();
-    let task = tokio::spawn(async move {
-        // Build the watcher inside the task so the `notify` thread
-        // outlives only as long as the task does.
-        // `with_compare_contents(true)` detects same-second edits that
-        // mtime-only polling would miss — macOS HFS+ has 1-second
-        // mtime resolution, so a quick save-reload cycle can look
-        // identical under plain metadata comparison.
-        let mut watcher = match PollWatcher::new(
-            move |res: notify::Result<Event>| {
-                let _ = tx.send(res);
-            },
-            Config::default()
-                .with_poll_interval(POLL_INTERVAL)
-                .with_compare_contents(true),
-        ) {
-            Ok(w) => w,
-            Err(err) => {
-                warn!(?err, "plugin watcher: failed to construct notify backend");
-                return;
+
+    // Build and arm the watcher synchronously before returning — if we
+    // did this inside the spawned task, there'd be a window where the
+    // caller could mutate `root` before `watcher.watch()` ran, and
+    // `PollWatcher` would bake those changes into its initial snapshot
+    // and never emit an event for them. Flaked the hot-reload test
+    // under CI load.
+    //
+    // `with_compare_contents(true)` detects same-second edits that
+    // mtime-only polling would miss — macOS HFS+ has 1-second mtime
+    // resolution, so a quick save-reload cycle can look identical
+    // under plain metadata comparison.
+    let watcher = match PollWatcher::new(
+        move |res: notify::Result<Event>| {
+            let _ = tx.send(res);
+        },
+        Config::default()
+            .with_poll_interval(POLL_INTERVAL)
+            .with_compare_contents(true),
+    ) {
+        Ok(mut w) => {
+            if root.exists() {
+                if let Err(err) = w.watch(&root, RecursiveMode::Recursive) {
+                    warn!(?err, dir = %root.display(), "plugin watcher: failed to start watch");
+                    let task = tokio::spawn(async move { task_cancel.cancelled().await });
+                    return WatcherHandle {
+                        cancel,
+                        task: Some(task),
+                    };
+                }
+                info!(dir = %root.display(), "plugin hot-reload watcher started");
+                Some(w)
+            } else {
+                debug!(dir = %root.display(), "plugin watcher: dir missing, idle");
+                // Keep the watcher around anyway so tests / callers
+                // observe consistent behaviour; we just never call
+                // `watch()` on it, so no events are produced.
+                Some(w)
             }
-        };
-
-        if !root.exists() {
-            debug!(dir = %root.display(), "plugin watcher: dir missing, idle");
-            // Still block on cancellation so the handle stays
-            // well-behaved; we just never observe any events.
-            task_cancel.cancelled().await;
-            return;
         }
-
-        if let Err(err) = watcher.watch(&root, RecursiveMode::Recursive) {
-            warn!(?err, dir = %root.display(), "plugin watcher: failed to start watch");
-            return;
+        Err(err) => {
+            warn!(?err, "plugin watcher: failed to construct notify backend");
+            let task = tokio::spawn(async move { task_cancel.cancelled().await });
+            return WatcherHandle {
+                cancel,
+                task: Some(task),
+            };
         }
-        info!(dir = %root.display(), "plugin hot-reload watcher started");
+    };
+
+    let task = tokio::spawn(async move {
+        // Move the watcher into the task so its poll thread lives as
+        // long as the task does; `PollWatcher`'s Drop joins it.
+        let _watcher = watcher;
 
         // Pending debounce timers, one per plugin name.
         let mut pending: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();

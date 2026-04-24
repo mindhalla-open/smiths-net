@@ -18,18 +18,33 @@ pub mod auth;
 pub mod error;
 pub mod rate_limit;
 pub mod response_router;
+pub mod snapshot;
 pub mod transport;
 pub mod txn;
 pub mod uac;
 pub mod uas;
+#[cfg(feature = "webtransport")]
+pub mod webrtc;
+#[cfg(feature = "webtransport")]
+pub mod webtransport;
 
 pub use error::Error;
 pub use rate_limit::SipRateLimiter;
 pub use response_router::ResponseRouter;
+pub use snapshot::{SnapshotError, read_snapshot, write_snapshot};
 pub use transport::{Datagram, Transport, tcp::TcpTransport, tls::TlsTransport, udp::UdpTransport};
 pub use txn::{
     ClientNonInviteTxn, Role, TransactionAction, TransactionDriver, TransactionEvent,
     TransactionState, TuEvent,
 };
 pub use uac::{UacClient, UacError};
-pub use uas::UasServer;
+pub use uas::{ConferenceOrchestrator, FaxOrchestrator, TranscodeOrchestrator, UasServer};
+#[cfg(feature = "webtransport")]
+pub use webrtc::{
+    WebRtcHandlerError, WebRtcListenError, WebRtcSession, WebRtcSessionHandler,
+    WebRtcSignalingListener, WebSocketSignalingListener,
+};
+#[cfg(feature = "webtransport")]
+pub use webtransport::{
+    NullWebTransportListener, WebTransportListener, WebTransportSessionId, WtSignal, WtSignalKind,
+};

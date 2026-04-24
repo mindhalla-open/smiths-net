@@ -16,38 +16,78 @@ use figment::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::Error;
+use crate::reloader::Reloadable;
 
 /// Root configuration loaded at startup.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+///
+/// Field-level attributes on nested sub-configs drive the
+/// [`crate::reloader::ApplyReport`] surface: `#[nested]` recurses,
+/// leaf fields classify with `#[reloadable]` /
+/// `#[restart_required]`, and unmarked fields are treated as
+/// out-of-scope for hot reload. Adding a new block means adding
+/// the annotations alongside the field — the macro fails to
+/// produce a matching diff string if either is missing, which is
+/// the whole point of replacing the hand-maintained `apply_report`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Runtime-wide tuning knobs (thread pools, etc.).
     pub core: CoreConfig,
     /// Logging, health endpoint, metrics bind (metrics added later).
+    #[nested]
     pub observability: ObservabilityConfig,
     /// SIP signaling configuration.
+    #[nested]
     pub sip: SipConfig,
     /// MCP control-plane server.
+    #[nested]
     pub mcp: McpConfig,
     /// A2A HTTP adapter.
+    #[nested]
     pub a2a: A2aConfig,
     /// Plugin loader settings.
+    #[nested]
     pub plugins: PluginsConfig,
     /// Auth / subscriber-DB configuration (P8, slice 2.1).
+    #[nested]
     pub auth: AuthConfig,
     /// Pluggable storage configuration (P23, slice 2.3). CDR + KV
     /// backends share this section; auth has its own `[auth]`
     /// because its lifetime + security story differs.
+    #[nested]
     pub storage: StorageConfig,
     /// Media-plane tunings (DTMF inband detection, later: jitter
     /// buffer depth, comfort-noise on silence).
+    #[nested]
     pub media: MediaConfig,
     /// AI-provider configuration (P22 / slice 3.2). Keys here are
     /// secrets — the `config://current` resource redacts them on
     /// render. Sidecars read their own API keys from environment
     /// variables; the operator threads them through here for
     /// single-source-of-truth deployments.
+    #[nested]
     pub ai: AiConfig,
+    /// WebTransport signaling listener (slice 5.7 / P19). Off by
+    /// default — the runtime is a scaffold today, matching the
+    /// `[mcp.http3]` and `[sip] transports = ["quic"]` scaffolds.
+    /// Enabling today + building without `--features webtransport`
+    /// on `smiths-sip` is a config error that surfaces at boot.
+    pub webtransport: WebTransportConfig,
+    /// Config hot-reload substrate (slice 5.8 scaffold). Off by
+    /// default; the runtime — `ArcSwap<Config>` + `#[reloadable]`
+    /// derive macro + SIGHUP handler — lands in a focused
+    /// follow-on. The config block exists today so operators can
+    /// express their intent in TOML + the future CLI knows how
+    /// to read it.
+    pub reload: ReloadConfig,
+    /// Config canary + auto-rollback (slice 5.9 scaffold).
+    /// Builds on `[reload]` — thresholds trip a rollback of the
+    /// most recent `apply` when hard-failure probes fire.
+    pub canary: CanaryConfig,
+    /// WebRTC-native signaling adapter (slice 5.10 scaffold).
+    /// Pairs with the 5.7 WebTransport scaffold; shares the
+    /// JSON-over-stream message shape. Runtime follow-on.
+    pub webrtc: WebRtcConfig,
 }
 
 /// `[ai]` TOML block — cloud-provider secrets for the reference
@@ -66,14 +106,16 @@ pub struct Config {
 /// own environment, and the sidecars inherit them. This section
 /// exists so the secrets have one canonical home on disk + a
 /// redaction-tested surface.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct AiConfig {
     /// `OpenAI` API key — consumed by `ai-llm-openai`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[reloadable]
     pub openai_api_key: Option<String>,
     /// `Anthropic` API key — consumed by `ai-llm-anthropic`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[reloadable]
     pub anthropic_api_key: Option<String>,
 }
 
@@ -83,7 +125,7 @@ pub struct AiConfig {
 /// [media]
 /// inband_dtmf = true    # run the Goertzel detector on every bridge
 /// ```
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct MediaConfig {
     /// Opt every bridge into the Goertzel inband DTMF detector
@@ -97,7 +139,49 @@ pub struct MediaConfig {
     /// refer to by relative path. When the path is empty, the
     /// `record_prompt` MCP tool returns `NotFound` — operators
     /// opt in by setting a concrete directory.
+    #[nested]
     pub prompts: PromptsConfig,
+    /// Audio transcoding CPU budget + admission control (slice 5.3).
+    /// Governs how many simultaneous calls the engine will accept
+    /// that require codec conversion (today: `Opus ↔ G.711`).
+    #[reloadable(path = "media.transcode")]
+    pub transcode: TranscodeConfig,
+}
+
+/// `[media.transcode]` TOML block — CPU budget + admission control
+/// for audio transcoding (slice 5.3).
+///
+/// ```toml
+/// [media.transcode]
+/// max_concurrent_calls  = 40    # 0 or unset = built-in default
+/// cpu_budget_ms_per_call = 50   # advisory; SLO not hard cap
+/// ```
+///
+/// Defaults target a 4-core box with ~2.5 % CPU per Opus call —
+/// raise `max_concurrent_calls` after observing the
+/// `smiths_transcode_cpu_ms_total` counter under real traffic.
+/// See `docs/architecture/11-transcoding.md` for sizing guidance.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct TranscodeConfig {
+    /// Hard cap on simultaneous transcoded calls. INVITEs past this
+    /// cap receive a `488 Not Acceptable Here` with
+    /// `Warning: 370 transcode budget exhausted`. Default: 40.
+    pub max_concurrent_calls: usize,
+    /// Advisory per-call CPU-ms budget. Drives the
+    /// `smiths_transcode_cpu_ms_total` alerting threshold but is
+    /// *not* enforced per-frame — the bridge doesn't hard-preempt a
+    /// live transcoder. Default: 50.
+    pub cpu_budget_ms_per_call: u64,
+}
+
+impl Default for TranscodeConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_calls: 40,
+            cpu_budget_ms_per_call: 50,
+        }
+    }
 }
 
 /// `[media.prompts]` — IVR prompt-library settings.
@@ -107,7 +191,7 @@ pub struct MediaConfig {
 /// root     = "/var/lib/smiths-net/prompts"
 /// capacity = 128             # LRU size (default 64)
 /// ```
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct PromptsConfig {
     /// Root directory the library resolves relative paths against.
@@ -118,6 +202,7 @@ pub struct PromptsConfig {
     /// Maximum number of decoded prompts kept hot in the LRU.
     /// `0` falls back to the library's built-in default.
     #[serde(default)]
+    #[reloadable]
     pub capacity: usize,
 }
 
@@ -135,10 +220,11 @@ pub struct PromptsConfig {
 /// the same file the `SQLite` auth store serves both surfaces
 /// (credentials + registrations + CDR + KV) from one DB — that's
 /// the default the runbook recommends.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     /// Which backend to wire up for `CdrStore` + `KvStore`.
+    #[restart_required(group = "storage backend")]
     pub backend: StorageBackend,
     /// SQLite-specific settings. Ignored when `backend != "sqlite"`.
     pub sqlite: SqliteStorageConfig,
@@ -305,10 +391,11 @@ impl Default for SqliteStorageConfig {
 ///
 /// `backend = "none"` (the default today) keeps the pre-v0.33.0 dev
 /// behaviour: REGISTER is accepted blindly, INVITE isn't challenged.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthConfig {
     /// Which subscriber-DB implementation to wire up.
+    #[restart_required(group = "auth backend")]
     pub backend: AuthBackend,
     /// Digest-auth realm the engine advertises in `WWW-Authenticate`.
     /// Must match the realm stored against each account; mismatched
@@ -435,14 +522,17 @@ pub struct CoreConfig {
 }
 
 /// Observability config — logging and the health endpoint.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct ObservabilityConfig {
     /// `tracing-subscriber` env-filter directive (e.g. `info`, `debug,smiths_sip=trace`).
+    #[reloadable]
     pub log_level: String,
     /// Log output formatter.
+    #[restart_required(group = "observability bind / log format")]
     pub log_format: LogFormat,
     /// HTTP bind address for the `/health` endpoint.
+    #[restart_required(group = "observability bind / log format")]
     pub health_bind: SocketAddr,
     /// Per-call packet-capture directory. `None` disables the pcap
     /// tap entirely. When set, each call's RTP + RTCP stream is
@@ -464,22 +554,27 @@ impl Default for ObservabilityConfig {
 }
 
 /// SIP signaling configuration.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct SipConfig {
     /// Addresses to bind for SIP signaling.
+    #[restart_required(group = "sip bind / transports / tls paths")]
     pub bind: Vec<BindSpec>,
     /// Enabled transports. Only `udp` is wired in Phase 1.
+    #[restart_required(group = "sip bind / transports / tls paths")]
     pub transports: Vec<SipTransport>,
     /// Grace period to finish in-flight transactions on shutdown.
     pub drain_timeout_secs: u64,
     /// Filesystem path to the PEM-encoded TLS server certificate.
     /// Required when `transports` contains `tls`. Ignored otherwise.
+    #[restart_required(group = "sip bind / transports / tls paths")]
     pub tls_cert_path: Option<std::path::PathBuf>,
     /// Filesystem path to the PEM-encoded TLS private key that pairs
     /// with `tls_cert_path`.
+    #[restart_required(group = "sip bind / transports / tls paths")]
     pub tls_key_path: Option<std::path::PathBuf>,
     /// Per-source-IP rate limit on inbound SIP datagrams.
+    #[reloadable(path = "sip.rate_limit")]
     pub rate_limit: SipRateLimit,
     /// Outbound proxy / VPN shim (slice 3.5). Applies to the
     /// TCP-based SIP transports (TCP, TLS inner TCP) — SOCKS5 and
@@ -608,7 +703,7 @@ pub enum ProxyMode {
 /// Datagrams from over-limit sources are dropped silently — this is
 /// anti-flood, not a protocol-level response, so we don't burn a
 /// `503 Service Unavailable` generation on every dropped packet.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SipRateLimit {
     /// Sustained datagrams/sec allowed per source IP. `0` disables.
@@ -767,13 +862,15 @@ pub enum SipTransport {
 /// `rate_limit` applies to **every** tool dispatcher — both MCP
 /// (stdio/HTTP) and A2A share the same token buckets, since the
 /// protection target is the engine, not the adapter.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpConfig {
     /// Serve MCP over HTTP JSON-RPC when `true`. stdio is always
     /// available via the `--mcp` CLI flag regardless of this setting.
+    #[restart_required(group = "mcp binds")]
     pub enabled_http: bool,
     /// HTTP bind for MCP.
+    #[restart_required(group = "mcp binds")]
     pub http_bind: SocketAddr,
     /// Token-bucket rate limit applied to tool invocations.
     pub rate_limit: RateLimitConfig,
@@ -782,6 +879,7 @@ pub struct McpConfig {
     /// runtime listener is a dedicated follow-on — 0.45.0 accepts
     /// the config + advertises `h3` in `--version` so operators
     /// aren't surprised later.
+    #[restart_required(group = "mcp binds")]
     pub http3: McpHttp3Config,
 }
 
@@ -792,7 +890,7 @@ pub struct McpConfig {
 /// enabled = true                  # requires --features mcp-http3
 /// bind    = "127.0.0.1:7879"
 /// ```
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpHttp3Config {
     /// Enable the h3 listener. Ignored when the binary was built
@@ -812,6 +910,341 @@ impl Default for McpHttp3Config {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7879),
         }
     }
+}
+
+/// `[webtransport]` TOML block — browser-native signaling listener
+/// (slice 5.7 / P19). Today a scaffold: flipping `enabled = true`
+/// with a binary built without `--features webtransport` is a config
+/// error that surfaces at boot; flipping it on *with* the feature
+/// logs a "scaffold-only" warning and refuses to bind until the
+/// runtime follow-on slice lands.
+///
+/// ```toml
+/// [webtransport]
+/// enabled   = true                # requires --features webtransport
+/// bind      = "0.0.0.0:7880"      # UDP (QUIC)
+/// cert_path = "/etc/smiths/wt.crt"
+/// key_path  = "/etc/smiths/wt.key"
+/// ```
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebTransportConfig {
+    /// Enable the WebTransport listener. Ignored when the binary
+    /// was built without `--features webtransport` on `smiths-sip`;
+    /// the CLI logs a clear warning in that case.
+    pub enabled: bool,
+    /// UDP bind for the QUIC listener. Default picks a loopback
+    /// port so accidentally flipping `enabled = true` can't
+    /// surprise-expose anything.
+    pub bind: SocketAddr,
+    /// Path to the TLS certificate (PEM) the listener serves.
+    /// Empty = unconfigured; the runtime rejects bind until the
+    /// operator points at a real cert.
+    pub cert_path: String,
+    /// Path to the matching private key (PEM).
+    pub key_path: String,
+}
+
+impl Default for WebTransportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7880),
+            cert_path: String::new(),
+            key_path: String::new(),
+        }
+    }
+}
+
+/// `[reload]` TOML block — config hot-reload substrate (slice
+/// 5.8 scaffold). The runtime — `ArcSwap<Config>`,
+/// `#[derive(Reloadable)]`, `Config::apply` returning
+/// `ApplyReport` — lands in a focused follow-on. The block
+/// exists today so the CLI can accept `--reload` on the command
+/// line without the build changing; the current behaviour is
+/// "refuse with `RestartRequired` for every field" until the
+/// derive macro lands.
+///
+/// ```toml
+/// [reload]
+/// enabled         = true     # accept SIGHUP + CLI `reload`
+/// signal          = "SIGHUP" # POSIX default; Windows uses a named event
+/// max_frequency_s = 10       # reject reloads arriving faster than this
+/// ```
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReloadConfig {
+    /// Enable SIGHUP-triggered + CLI-triggered config reload.
+    /// Scaffold only today: flipping this on logs a loud
+    /// "runtime not yet wired" warning at startup.
+    pub enabled: bool,
+    /// Minimum seconds between reload attempts; extras are
+    /// refused with a clean diagnostic rather than queued.
+    pub max_frequency_s: u64,
+}
+
+impl Default for ReloadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_frequency_s: 10,
+        }
+    }
+}
+
+/// `[canary]` TOML block — config-change canary window +
+/// auto-rollback thresholds (slice 5.9 scaffold). Depends on
+/// `[reload]`'s runtime. Once the derive macro + `Config::apply`
+/// land, this block controls:
+///
+/// - `deadline_s` — how long the new config has to prove itself
+///   before auto-rolling back to the prior snapshot.
+/// - `plugin_error_rate_ceiling` — hard-failure early rollback
+///   if the plugin error rate in a 30 s trailing window trips
+///   this.
+/// - `sip_parse_errors_per_sec_ceiling` — same, for SIP parse
+///   error rate.
+///
+/// ```toml
+/// [canary]
+/// deadline_s                        = 300
+/// plugin_error_rate_ceiling         = 0.5
+/// sip_parse_errors_per_sec_ceiling  = 10
+/// ```
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CanaryConfig {
+    /// Seconds the new config gets before auto-rollback.
+    pub deadline_s: u64,
+    /// Plugin-invocation error-rate ceiling (0.0..=1.0) that
+    /// triggers hard-failure rollback. `1.0` disables.
+    pub plugin_error_rate_ceiling: f32,
+    /// SIP parse-error rate (per second) that triggers
+    /// hard-failure rollback. `u64::MAX` disables.
+    pub sip_parse_errors_per_sec_ceiling: u64,
+}
+
+impl Default for CanaryConfig {
+    fn default() -> Self {
+        Self {
+            deadline_s: 300,
+            plugin_error_rate_ceiling: 0.5,
+            sip_parse_errors_per_sec_ceiling: 10,
+        }
+    }
+}
+
+/// `[webrtc]` TOML block — WebRTC-native signaling + privacy
+/// (slices 5.10 + 5.11 scaffold). The runtime adapter and the
+/// privacy layers land in dedicated follow-on slices; the block
+/// exists today so operators can express their intent. Pairs
+/// with the 5.7 `[webtransport]` block: the JSON message shape
+/// is shared, 5.7 is the QUIC transport substrate, 5.10 is the
+/// WebSocket baseline.
+///
+/// ```toml
+/// [webrtc]
+/// enabled  = true
+/// ws_bind  = "0.0.0.0:7881"
+/// tls_cert = "/etc/smiths/wt.crt"
+/// tls_key  = "/etc/smiths/wt.key"
+///
+/// [webrtc.privacy]
+/// mode           = "open"         # "open" | "relay_only" | "strict"
+/// redaction_key  = ""             # required for `strict`
+/// ```
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebRtcConfig {
+    /// Enable the WebRTC-native signaling adapter.
+    pub enabled: bool,
+    /// WebSocket bind for the signaling adapter.
+    pub ws_bind: SocketAddr,
+    /// Path to the TLS cert the adapter serves. Empty =
+    /// plaintext (disallowed in privacy `strict` mode).
+    pub tls_cert: String,
+    /// Matching private key.
+    pub tls_key: String,
+    /// Privacy hardening knobs (slice 5.11).
+    pub privacy: WebRtcPrivacyConfig,
+    /// ICE surface (slice 5.10-ice). Off by default —
+    /// deployments without NATs keep the pre-5.10-ice
+    /// direct-peer-address shape.
+    pub ice: WebRtcIceConfig,
+    /// TURN server / client surface (slice 5.11-turn). Off
+    /// by default. `external_url` overrides the embedded
+    /// server + redirects clients through an operator's
+    /// existing `coturn`.
+    pub turn: WebRtcTurnConfig,
+}
+
+impl Default for WebRtcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ws_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7881),
+            tls_cert: String::new(),
+            tls_key: String::new(),
+            privacy: WebRtcPrivacyConfig::default(),
+            ice: WebRtcIceConfig::default(),
+            turn: WebRtcTurnConfig::default(),
+        }
+    }
+}
+
+/// `[webrtc.ice]` — ICE candidate gathering + connectivity
+/// checks (slice 5.10-ice). When enabled, the WebRTC adapter
+/// emits `a=ice-ufrag` / `a=ice-pwd` / `a=candidate:` lines
+/// on every answer + runs a `binding_ping` per bridge install
+/// to verify the pair before audio flows. ICE-Lite posture:
+/// the engine doesn't swap roles, it just serves the peer's
+/// candidate list.
+///
+/// ```toml
+/// [webrtc.ice]
+/// enabled       = true
+/// host_binds    = ["0.0.0.0:50000"]  # empty = derive from ws_bind.ip()
+/// stun_servers  = []                  # future: gather srflx via these
+/// ```
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebRtcIceConfig {
+    /// Master switch. `false` keeps the pre-5.10-ice
+    /// "peer address lives in `c=` / `m=`" shape so deployments
+    /// without NATs don't pay for a STUN/TURN round trip.
+    pub enabled: bool,
+    /// Extra host-candidate binds the gatherer advertises. When
+    /// empty, the gatherer derives one host candidate per
+    /// allocated media endpoint (the default production shape).
+    pub host_binds: Vec<SocketAddr>,
+    /// External STUN servers the engine queries for
+    /// server-reflexive candidates. Empty = host-only gathering
+    /// (MVP). Real srflx support lands with
+    /// `smiths-ice::binding_ping` extended for asymmetric
+    /// servers.
+    pub stun_servers: Vec<SocketAddr>,
+}
+
+/// `[webrtc.turn]` — embedded RFC 8656 TURN server + optional
+/// external relay fallback (slice 5.11-turn). Off by default.
+///
+/// ```toml
+/// [webrtc.turn]
+/// enabled        = true
+/// bind           = "0.0.0.0:3478"       # standard TURN port
+/// realm          = "turn.example.com"
+/// relay_ip       = "203.0.113.1"        # public IP to hand back
+/// allocation_lifetime_s = 600
+/// # One credential per operator account. Rotate via [reload].
+/// credentials    = [
+///   { username = "alice", password = "hunter2" },
+/// ]
+/// # When set, the server is disabled and the adapter hands
+/// # clients this URL instead (typical coturn front-end).
+/// external_url   = ""
+/// ```
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebRtcTurnConfig {
+    /// Enable the embedded TURN server.
+    pub enabled: bool,
+    /// UDP bind for the embedded TURN server.
+    pub bind: SocketAddr,
+    /// RFC 7616 long-term credential realm. Echoed in 401
+    /// challenges; clients hash this into the
+    /// `MESSAGE-INTEGRITY` key per RFC 8489 §14.
+    pub realm: String,
+    /// IP the server hands clients in `XOR-RELAYED-ADDRESS`.
+    /// Defaults to the bind's IP; override to publish a
+    /// routable public IP when the server runs behind a NAT.
+    pub relay_ip: Option<IpAddr>,
+    /// How long an allocation lives (seconds) between
+    /// `REFRESH` requests. RFC 8656 §3.2 caps at 3600 s; we
+    /// cap at 600 s by default so stale allocations drain
+    /// faster.
+    pub allocation_lifetime_s: u32,
+    /// Static credentials served by the long-term
+    /// credential mechanism. Rotate via `[reload]` — the
+    /// reload driver resizes the credential map in place,
+    /// new `Allocate` requests use the refreshed set.
+    pub credentials: Vec<WebRtcTurnCredential>,
+    /// External TURN URL to hand clients instead of
+    /// spawning the embedded server. When set, `enabled`
+    /// is ignored + clients receive this URL verbatim on
+    /// the signaling channel.
+    pub external_url: String,
+}
+
+impl Default for WebRtcTurnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 3478),
+            realm: String::new(),
+            relay_ip: None,
+            allocation_lifetime_s: 600,
+            credentials: Vec::new(),
+            external_url: String::new(),
+        }
+    }
+}
+
+/// One long-term credential entry for the embedded TURN
+/// server. Passwords are held in-memory only; never logged.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebRtcTurnCredential {
+    /// `USERNAME` attribute value clients must present.
+    pub username: String,
+    /// Raw password. Hashed via RFC 8489's long-term key
+    /// derivation (`MD5(user:realm:pass)`) on load; the
+    /// plaintext doesn't live past config parse.
+    pub password: String,
+}
+
+/// `[webrtc.privacy]` — privacy hardening modes (slice 5.11
+/// scaffold). Three modes that compose additively:
+///
+/// - `open` (default) — today's behavior, no hardening.
+/// - `relay_only` — reject offers carrying `host` / `srflx`
+///   candidates; strip `host` candidates from answers; hint
+///   the client to `iceTransportPolicy = "relay"`.
+/// - `strict` — `relay_only` + keyed-hash redaction of every
+///   peer IP in audit/CDR/tracing + require TLS-only signaling.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebRtcPrivacyConfig {
+    /// Privacy mode. Scaffold only — runtime enforcement is a
+    /// follow-on slice.
+    pub mode: WebRtcPrivacyMode,
+    /// `blake3` key for source-IP redaction when
+    /// `mode = "strict"`. Rotate via
+    /// `[reload]` / `confirm_config`. Empty in `open` /
+    /// `relay_only`.
+    pub redaction_key: String,
+}
+
+impl Default for WebRtcPrivacyConfig {
+    fn default() -> Self {
+        Self {
+            mode: WebRtcPrivacyMode::Open,
+            redaction_key: String::new(),
+        }
+    }
+}
+
+/// Privacy mode selector for `[webrtc.privacy]`.
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebRtcPrivacyMode {
+    /// Default — no privacy hardening. Matches pre-5.11 behavior.
+    #[default]
+    Open,
+    /// Reject `host` / `srflx` candidates; force relay-only
+    /// ICE. Operators paying for TURN land here.
+    RelayOnly,
+    /// `relay_only` + IP redaction + TLS-only signaling.
+    Strict,
 }
 
 impl Default for McpConfig {
@@ -842,12 +1275,14 @@ pub struct RateLimitConfig {
 }
 
 /// A2A (agent-to-agent) HTTP adapter settings.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct A2aConfig {
     /// Serve the A2A HTTP API when `true`.
+    #[restart_required(group = "a2a bind")]
     pub enabled: bool,
     /// HTTP bind for A2A.
+    #[restart_required(group = "a2a bind")]
     pub bind: SocketAddr,
     /// Optional bearer token. When set, every HTTP request must carry
     /// a matching `Authorization: Bearer <token>` header or the server
@@ -867,11 +1302,12 @@ impl Default for A2aConfig {
 }
 
 /// Plugin loader settings.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct PluginsConfig {
     /// Directory the loader scans at startup. Each subdirectory is one
     /// plugin. Missing directory → no plugins loaded, no error.
+    #[restart_required]
     pub dir: std::path::PathBuf,
     /// Resource-limit sandbox applied to every sidecar subprocess.
     /// Default is permissive (no limits, no `no_new_privs`) so tests

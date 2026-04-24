@@ -326,6 +326,24 @@ fn parse_rtpmap(rest: &str, line: usize) -> Result<RtpMap, ParseError> {
     })
 }
 
+/// Public wrapper around the internal candidate-line parser
+/// (slice 5.10-ice). Accepts the wire form the trickle-ICE
+/// signaling frame carries: the part **after** the
+/// `candidate:` keyword. Strips an optional leading
+/// `candidate:` / `a=candidate:` for caller ergonomics.
+///
+/// # Errors
+/// Returns [`ParseError`] when any required field is
+/// missing or unparseable.
+pub fn parse_candidate_line(raw: &str) -> Result<IceCandidate, ParseError> {
+    let trimmed = raw.trim();
+    let inner = trimmed
+        .strip_prefix("a=candidate:")
+        .or_else(|| trimmed.strip_prefix("candidate:"))
+        .unwrap_or(trimmed);
+    parse_candidate(inner, 0)
+}
+
 /// `candidate:<foundation> <component> <transport> <priority> <ip>
 /// <port> typ <type> [raddr <ip>] [rport <port>] [<k> <v>]*`.
 fn parse_candidate(rest: &str, line: usize) -> Result<IceCandidate, ParseError> {

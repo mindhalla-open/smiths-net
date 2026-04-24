@@ -22,8 +22,11 @@ use tokio::net::UdpSocket;
 use tracing::{debug, instrument, warn};
 
 use crate::bridge::{Bridge, BridgeConfig, Leg, LegSrtp, RtcpLeg};
+use crate::dtls::{HandshakeOutcome, HandshakeResult, PeerBoundUdp, classify_error};
 use crate::port_allocator::{DEFAULT_MAX_ATTEMPTS, allocate_rtp_rtcp_pair};
 use crate::srtp::AesCmHmacSha1_80Transform;
+use smiths_core::metrics::WebRtcDtlsOutcomeLabel;
+use smiths_dtls::{DtlsHandshakeError, DtlsLeg, DtlsLegConfig};
 
 /// Derive the peer's RTCP socket address from its RTP address per
 /// RFC 3550 §11 (even RTP / odd RTCP, i.e. `port + 1`). This is the
@@ -128,6 +131,109 @@ impl UdpMediaFabric {
     fn fresh_bridge_id(&self) -> BridgeId {
         BridgeId(self.next_bridge.fetch_add(1, Ordering::Relaxed))
     }
+
+    /// Direct handle on the RTP socket allocated for `id`
+    /// (slice 5.6d-runtime + 5.6e-runtime). Trait-level
+    /// `MediaFabric::bridge` is purpose-built for the plain
+    /// SSRC-rewriting case; non-passthrough sessions
+    /// (`UdptlSession`, `ConferenceParticipantSession`,
+    /// future SRTP-transforming flows) need raw socket access
+    /// to spawn their own forwarder tasks. Returns `None` when
+    /// the endpoint was never allocated or has been released.
+    ///
+    /// Kept out of the `MediaFabric` trait because it's a
+    /// concrete-implementation escape hatch — if a future
+    /// fabric variant doesn't use UDP sockets at all (a WASM
+    /// host fabric, say), the trait shouldn't force the
+    /// concept.
+    #[must_use]
+    pub fn endpoint_socket(&self, id: EndpointId) -> Option<Arc<UdpSocket>> {
+        self.endpoints.get(&id).map(|e| Arc::clone(&e.rtp))
+    }
+
+    /// Drive the DTLS-SRTP handshake for a WebRTC leg (slice
+    /// 5.10-dtls) against the fabric's UDP endpoint. Returns
+    /// the SRTP keying material callers should thread into
+    /// [`smiths_core::BridgeLeg::with_srtp`] when they eventually
+    /// call [`MediaFabric::bridge`].
+    ///
+    /// **The socket is not `connect()`ed.** A [`PeerBoundUdp`]
+    /// adapter wraps it for the handshake and reads only the
+    /// peer's datagrams; after this returns, the same
+    /// `Arc<UdpSocket>` is still free for bridge forwarders to
+    /// use via `send_to` / `recv_from` as before.
+    ///
+    /// The metrics handle (if configured) observes the
+    /// handshake outcome on
+    /// `smiths_webrtc_dtls_handshakes_total{outcome}` with the
+    /// stable labels from [`HandshakeOutcome`]. Errors are also
+    /// logged with the endpoint id + peer address so operators
+    /// can correlate with the offer's SDP `o=` line in the
+    /// calling handler's log.
+    ///
+    /// # Errors
+    /// [`MediaError::UnknownEndpoint`] when `endpoint` was
+    /// never allocated. [`MediaError::Io`] wrapping a
+    /// `DtlsHandshakeError` message for every other failure
+    /// mode (fingerprint mismatch, cert load, transport, etc.).
+    #[instrument(skip(self, dtls), fields(?endpoint, %peer))]
+    pub async fn run_dtls_handshake(
+        &self,
+        endpoint: EndpointId,
+        peer: SocketAddr,
+        dtls: DtlsLegConfig,
+    ) -> Result<HandshakeResult, MediaError> {
+        let sock = self
+            .endpoint_socket(endpoint)
+            .ok_or(MediaError::UnknownEndpoint(endpoint))?;
+        let conn = Arc::new(PeerBoundUdp::new(sock, peer));
+        let leg = DtlsLeg::new(dtls);
+        let started = std::time::Instant::now();
+        let handshake = leg.handshake(conn).await;
+        let elapsed = started.elapsed();
+        match handshake {
+            Ok(srtp) => {
+                self.bump_dtls_metric(HandshakeOutcome::Success);
+                debug!(
+                    ?endpoint, %peer, ?elapsed,
+                    "DTLS-SRTP handshake completed"
+                );
+                Ok(HandshakeResult { srtp, elapsed })
+            }
+            Err(e) => {
+                let outcome = classify_error(&e);
+                self.bump_dtls_metric(outcome);
+                warn!(
+                    ?endpoint,
+                    %peer,
+                    ?elapsed,
+                    outcome = outcome.as_str(),
+                    err = %e,
+                    "DTLS-SRTP handshake failed"
+                );
+                Err(dtls_err_to_media(&e))
+            }
+        }
+    }
+
+    fn bump_dtls_metric(&self, outcome: HandshakeOutcome) {
+        if let Some(m) = &self.metrics {
+            m.webrtc_dtls_handshakes
+                .get_or_create(&WebRtcDtlsOutcomeLabel {
+                    outcome: outcome.as_str().to_owned(),
+                })
+                .inc();
+        }
+    }
+}
+
+/// Map a [`DtlsHandshakeError`] into the fabric's error type.
+/// Kept non-lossy: the full error string rides on the
+/// `Io::other` wrapper so operators can grep logs without
+/// losing detail, and callers can still classify via the
+/// original via [`classify_error`].
+fn dtls_err_to_media(e: &DtlsHandshakeError) -> MediaError {
+    MediaError::Io(std::io::Error::other(e.to_string()))
 }
 
 #[async_trait]

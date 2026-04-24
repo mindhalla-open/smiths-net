@@ -28,11 +28,16 @@
 pub mod error;
 pub mod negotiate;
 pub mod parse;
+pub mod privacy;
 pub mod srtp_attr;
 pub mod types;
 
 pub use error::ParseError;
 pub use negotiate::{NegotiationResult, Negotiator, fresh_sdes_key};
+pub use privacy::{
+    OfferPrivacyVerdict, redact_ip, reject_direct_candidates, strip_host_candidates,
+    strip_host_candidates_on,
+};
 pub use srtp_attr::{SdesCrypto, SdesParseError};
 pub use types::{
     ConnectionInfo, Direction, DtlsSetup, Fingerprint, IceCandidate, IcePassword, MediaDescription,

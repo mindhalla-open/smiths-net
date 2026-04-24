@@ -32,8 +32,8 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use smiths_core::metrics::{Metrics, SipCodeLabel, SipMethodLabel};
 use smiths_core::{
-    BridgeId, BridgeLeg, DialogKey, DialogRecord, DialogState, EndpointId, Event, EventBus,
-    MediaFabric, NegotiationOutcome, SdpNegotiator, SipEvent, SrtpKeys,
+    BridgeId, BridgeLeg, DialogKey, DialogRecord, DialogSessions, DialogState, EndpointId, Event,
+    EventBus, MediaFabric, NegotiatedCodec, NegotiationOutcome, SdpNegotiator, SipEvent, SrtpKeys,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -71,6 +71,11 @@ struct PendingLeg {
     /// supported `a=crypto:` line. Threaded into the bridge when the
     /// matching second INVITE lands.
     srtp: Option<SrtpKeys>,
+    /// Codec the negotiator chose for this leg (slice 5.6c).
+    /// Carried through the rendezvous so the pairing step can
+    /// detect a codec mismatch and route to the transcoded
+    /// session path instead of the plain passthrough bridge.
+    audio_codec: Option<NegotiatedCodec>,
 }
 
 /// Per-dialog CDR metadata captured at 200 OK INVITE. Consumed
@@ -82,6 +87,83 @@ struct CdrInProgress {
     from_uri: String,
     to_uri: String,
     started_at_unix: i64,
+}
+
+/// Seam the UAS uses to build a transcoded media session when a
+/// rendezvous pair's two legs speak different codecs (slice
+/// 5.6c). Keeps `smiths-sip` free of a direct
+/// `smiths-transcode` / `smiths-media` dep — the CLI wires a
+/// concrete impl (typically `smiths_media::TranscodedSession` +
+/// `smiths_transcode::CpuBudget`) at boot.
+///
+/// `try_orchestrate` is consulted only when the two legs'
+/// [`NegotiatedCodec`] values differ. Implementations return:
+///
+/// - `Ok(Some(session))` on admission success — the UAS installs
+///   the session via [`DialogSessions`] and skips the plain
+///   passthrough bridge.
+/// - `Ok(None)` when admission is refused (CPU budget
+///   exhausted). Callers emit a `488 Not Acceptable Here` plus
+///   `Warning: 370` — the UAS uses this as a signal to tear the
+///   second leg down cleanly.
+/// - `Err(_)` on fabric / codec construction failure; treated
+///   the same as a passthrough bridge failure today (logged, no
+///   bridge installed).
+#[async_trait::async_trait]
+pub trait TranscodeOrchestrator: Send + Sync {
+    /// Attempt to build a transcoded session for the two legs.
+    async fn try_orchestrate(
+        &self,
+        leg_a: BridgeLeg,
+        codec_a: NegotiatedCodec,
+        leg_b: BridgeLeg,
+        codec_b: NegotiatedCodec,
+    ) -> Result<Option<Arc<dyn smiths_core::media::MediaSession>>, smiths_core::MediaError>;
+}
+
+/// Seam the UAS uses to install a T.38 UDPTL session when a
+/// re-INVITE flips a live audio call to FAX (slice 5.6d
+/// scaffold). Parallel to [`TranscodeOrchestrator`]; the future
+/// re-INVITE handler calls `try_orchestrate_fax` on detection
+/// of `m=image udptl t38` in the offer, then
+/// `DialogSessions::swap` to atomically replace the audio
+/// session. Today's UAS doesn't yet parse re-INVITE bodies
+/// (non-scope per `handle_invite`'s module doc) — the seam
+/// exists so the future work slots in without another
+/// `UasServer` surface change.
+#[async_trait::async_trait]
+pub trait FaxOrchestrator: Send + Sync {
+    /// Build a UDPTL relay session bridging two legs that just
+    /// re-INVITEd into T.38. `leg_a` + `leg_b` carry each side's
+    /// local endpoint + peer UDPTL address from the paired
+    /// re-INVITE answers. `None` = orchestrator declined
+    /// (policy, resource exhaustion).
+    async fn try_orchestrate_fax(
+        &self,
+        leg_a: BridgeLeg,
+        leg_b: BridgeLeg,
+    ) -> Result<Option<Arc<dyn smiths_core::media::MediaSession>>, smiths_core::MediaError>;
+}
+
+/// Seam the UAS uses to install a conference-participant
+/// session when an MCP `join_conference` call fires against a
+/// live dialog (slice 5.6e scaffold). Parallel to
+/// [`TranscodeOrchestrator`]; the MCP wiring is a follow-on —
+/// today's `join_conference` tool updates the
+/// `ConferenceRegistry` but doesn't yet swap the 2-peer bridge
+/// for a conference-participant session.
+#[async_trait::async_trait]
+pub trait ConferenceOrchestrator: Send + Sync {
+    /// Install a conference-participant session on `dialog`.
+    /// `conference_id` is the opaque id minted by
+    /// `smiths_mixer::ConferenceRegistry::create`. `None` =
+    /// orchestrator declined (conference closed, etc.).
+    async fn try_orchestrate_conference(
+        &self,
+        dialog: DialogKey,
+        conference_id: u64,
+        leg: BridgeLeg,
+    ) -> Result<Option<Arc<dyn smiths_core::media::MediaSession>>, smiths_core::MediaError>;
 }
 
 /// Parsed request summary.
@@ -122,6 +204,12 @@ struct RequestSummary {
     /// Raw request bytes; the response builder copies header lines
     /// from them verbatim.
     raw: Bytes,
+    /// `X-Smiths-Webrtc-Tag:` (slice 5.10-sipjoin). Present only
+    /// on INVITEs that want to join a pre-parked WebRTC leg
+    /// sharing the same tag via the `[webrtc]` rendezvous map.
+    /// Absent on every other request + on INVITEs from clients
+    /// that don't care about WebRTC bridging.
+    webrtc_tag: Option<String>,
 }
 
 /// UAS answering a subset of RFC 3261 requests.
@@ -165,6 +253,27 @@ pub struct UasServer<T: Transport> {
     /// at the same [`BridgeId`]; the first `BYE` releases it from the
     /// fabric and clears both entries.
     bridges_by_dialog: Arc<DashMap<DialogKey, BridgeId>>,
+    /// Non-passthrough media sessions (transcoding, later FAX /
+    /// conference) keyed per-leg. Slice 5.6c uses this for the
+    /// transcoded rendezvous path only; FAX / conference wirings
+    /// are follow-on slices. Empty when no transcoded path has
+    /// fired — the plain-bridge rendezvous stays untouched.
+    dialog_sessions: DialogSessions,
+    /// Optional transcoded-session builder (slice 5.6c). `None` =
+    /// rendezvous mismatches fall back to the plain passthrough
+    /// bridge (the pre-5.6c behaviour). The CLI wires a real
+    /// orchestrator from `[media.transcode]` config.
+    transcode_orchestrator: Option<Arc<dyn TranscodeOrchestrator>>,
+    /// Optional FAX session builder (slice 5.6d scaffold).
+    /// `None` = re-INVITE to T.38 doesn't install a session (the
+    /// future re-INVITE handler logs + does nothing). CLI wires
+    /// a real orchestrator from `[media.fax]` config.
+    fax_orchestrator: Option<Arc<dyn FaxOrchestrator>>,
+    /// Optional conference-participant session builder (slice
+    /// 5.6e scaffold). `None` = `join_conference` MCP tool
+    /// updates the registry but doesn't yet bridge RTP. CLI
+    /// wires a real orchestrator from `[media.mixer]` config.
+    conference_orchestrator: Option<Arc<dyn ConferenceOrchestrator>>,
     /// Registrar: digest-auths `REGISTER` against a [`CredentialStore`].
     /// `None` = auth disabled, registrar accepts any REGISTER blindly
     /// (dev convenience; never do that in prod).
@@ -202,6 +311,15 @@ pub struct UasServer<T: Transport> {
     /// Per-source-IP token bucket. Always present — when config
     /// disables rate limiting it's a cheap always-allow.
     rate_limit: crate::rate_limit::SipRateLimiter,
+    /// Optional handle on the WebRTC rendezvous map (slice
+    /// 5.10-sipjoin). When present + an `INVITE` carries
+    /// `X-Smiths-Webrtc-Tag:`, the UAS asks the rendezvous to
+    /// bridge this SIP dialog with a WebRTC leg sharing the
+    /// same tag instead of running the normal SIP-side
+    /// rendezvous on the Request-URI user-part. `None` = the
+    /// header is silently ignored (safe fallback for
+    /// deployments without the WebRTC adapter wired).
+    webrtc_rendezvous: Option<Arc<dyn smiths_core::WebRtcRendezvous>>,
     /// Async driver hosting every server-side transaction — both
     /// INVITE (`ServerInviteTxn` with G/H/I timers, ACK correlation,
     /// 2xx bypass) and non-INVITE (`ServerNonInviteTxn` with timer J).
@@ -244,6 +362,10 @@ impl<T: Transport> UasServer<T> {
             media_bind_ip: local.ip(),
             pending_bridges: Arc::new(DashMap::new()),
             bridges_by_dialog: Arc::new(DashMap::new()),
+            dialog_sessions: DialogSessions::new(),
+            transcode_orchestrator: None,
+            fax_orchestrator: None,
+            conference_orchestrator: None,
             registrar: None,
             registration_store: None,
             cdr_store: None,
@@ -252,8 +374,22 @@ impl<T: Transport> UasServer<T> {
             response_router: None,
             drain: None,
             rate_limit: crate::rate_limit::SipRateLimiter::disabled(),
+            webrtc_rendezvous: None,
             txn_driver,
         })
+    }
+
+    /// Attach a [`smiths_core::WebRtcRendezvous`] handle so
+    /// `INVITE` requests carrying `X-Smiths-Webrtc-Tag:` can
+    /// bridge with a pre-parked WebRTC leg (slice
+    /// 5.10-sipjoin). `None` = the header is ignored.
+    #[must_use]
+    pub fn with_webrtc_rendezvous(
+        mut self,
+        rendezvous: Arc<dyn smiths_core::WebRtcRendezvous>,
+    ) -> Self {
+        self.webrtc_rendezvous = Some(rendezvous);
+        self
     }
 
     /// Attach a digest registrar — `REGISTER` now requires valid auth.
@@ -330,6 +466,93 @@ impl<T: Transport> UasServer<T> {
     pub fn with_rate_limit(mut self, rate_limit: crate::rate_limit::SipRateLimiter) -> Self {
         self.rate_limit = rate_limit;
         self
+    }
+
+    /// Attach a [`TranscodeOrchestrator`] so rendezvous pairs with
+    /// different per-leg codecs route through a transcoded session
+    /// instead of a plain passthrough bridge (slice 5.6c). Without
+    /// this, a codec mismatch falls through to the passthrough
+    /// path — which forwards bytes but won't be audible to the peer
+    /// that expected a different codec.
+    #[must_use]
+    pub fn with_transcode_orchestrator(
+        mut self,
+        orchestrator: Arc<dyn TranscodeOrchestrator>,
+    ) -> Self {
+        self.transcode_orchestrator = Some(orchestrator);
+        self
+    }
+
+    /// Attach a [`FaxOrchestrator`] (slice 5.6d scaffold). Today's
+    /// UAS has no re-INVITE parser so this field is read-only
+    /// until the future handler lands; the accessor is a
+    /// forward-compat hook so a deployment that's ready with an
+    /// orchestrator can wire it today and have it activate when
+    /// the re-INVITE path does.
+    #[must_use]
+    pub fn with_fax_orchestrator(mut self, orchestrator: Arc<dyn FaxOrchestrator>) -> Self {
+        self.fax_orchestrator = Some(orchestrator);
+        self
+    }
+
+    /// Attach a [`ConferenceOrchestrator`] (slice 5.6e scaffold).
+    /// Same forward-compat story as [`Self::with_fax_orchestrator`].
+    #[must_use]
+    pub fn with_conference_orchestrator(
+        mut self,
+        orchestrator: Arc<dyn ConferenceOrchestrator>,
+    ) -> Self {
+        self.conference_orchestrator = Some(orchestrator);
+        self
+    }
+
+    /// Snapshot handle on the runtime session table (slice 5.6c).
+    /// Useful for tests asserting which transcoded / FAX /
+    /// conference sessions have been installed.
+    #[must_use]
+    pub fn dialog_sessions(&self) -> &DialogSessions {
+        &self.dialog_sessions
+    }
+
+    /// Shared handle on the dialog table (slice 6.1). Cloned out
+    /// so the CLI can take a live-dialog snapshot on graceful
+    /// shutdown — the UAS's `run()` consumes `self`, so without
+    /// this accessor the snapshot path would need to live inside
+    /// the UAS and duplicate the shutdown plumbing. The `Arc` +
+    /// `DashMap` are cheap to share; concurrent read from the
+    /// snapshot writer doesn't interfere with the live UAS
+    /// modifying its own dialogs because `DashMap::iter` yields
+    /// a consistent per-shard view.
+    #[must_use]
+    pub fn dialogs_handle(&self) -> Arc<DashMap<DialogKey, DialogRecord>> {
+        Arc::clone(&self.dialogs)
+    }
+
+    /// Prime the dialog table with a set of pre-existing records
+    /// (slice 6.1 — snapshot replay). Called by the CLI at boot
+    /// before `run()` if a snapshot file was loaded. Each restored
+    /// dialog gets its record slot re-populated; the UAS then
+    /// processes subsequent in-dialog requests (ACK, BYE,
+    /// re-INVITE) exactly as if the record had been built by a
+    /// live INVITE.
+    ///
+    /// Returns the number of records restored so the caller can
+    /// emit a log or increment its own counter.
+    ///
+    /// Does **not** re-bind media endpoints or rebuild bridges —
+    /// a failover primary restarts the media plane from cold, which
+    /// is correct: an in-flight RTP flow belonging to a pre-crash
+    /// primary can't be resumed without the socket state, and a
+    /// sane BYE (from either side) will tear the restored record
+    /// down cleanly.
+    pub fn restore_dialogs(&self, records: impl IntoIterator<Item = DialogRecord>) -> usize {
+        let mut n = 0;
+        for rec in records {
+            let key = rec.key();
+            self.dialogs.insert(key, rec);
+            n += 1;
+        }
+        n
     }
 
     /// Run the UAS event loop. Exits when `cancel` fires or `rx` closes.
@@ -426,8 +649,10 @@ impl<T: Transport> UasServer<T> {
         // of the INVITE transaction; ACK for 2xx is end-to-end per
         // §13.3.1.4). [`Self::handle_ack`] reaches into the INVITE
         // FSM directly for the non-2xx → Confirmed transition.
-        if let Some(branch) = req.branch.as_deref() {
-            if req.method != "ACK" {
+        if let Some(branch) = req.branch.as_deref()
+            && req.method != "ACK"
+        {
+            {
                 let key = server_txn_key(branch, &req.method);
                 if self.txn_driver.is_alive(&key) {
                     // Retransmit: FSM replays its cached response.
@@ -660,117 +885,223 @@ impl<T: Transport> UasServer<T> {
         // Allocate a media endpoint first (so we can include its port
         // in the answer), then negotiate. On any failure the endpoint
         // is released so the fabric's table doesn't grow unbounded.
-        let (endpoint, sdp_answer_body, remote_media, srtp_keys) = if has_offer {
-            let endpoint = match self.media_fabric.allocate(self.media_bind_ip).await {
-                Ok(ep) => ep,
-                Err(e) => {
-                    warn!(?e, "failed to allocate media endpoint for INVITE");
-                    self.respond(
-                        req,
-                        500,
-                        "Server Internal Error",
-                        Some(&next_tag()),
-                        &[],
-                        &[],
-                        peer,
-                    )
-                    .await;
-                    return;
-                }
-            };
-            // Safe unwrap: `has_offer` verified Some(body) above.
-            let body = req.body.as_deref().unwrap_or_default();
-            // When the signaling transport is bound to a wildcard
-            // (0.0.0.0 / ::), `media_bind_ip` is unroutable. Ask the
-            // kernel which local address it would use to reach `peer`
-            // and publish *that* in SDP — otherwise the remote UA
-            // tries to sendto(0.0.0.0) and fails.
-            let effective_local_ip = resolve_local_ip_for(self.media_bind_ip, peer).await;
-            match self.negotiator.negotiate_audio(
-                body,
-                effective_local_ip,
-                endpoint.local_addr().port(),
-            ) {
-                NegotiationOutcome::Accepted {
-                    answer_body,
-                    remote_media,
-                    srtp,
-                } => (Some(endpoint), Some(answer_body), remote_media, srtp),
-                NegotiationOutcome::Mismatch => {
-                    self.media_fabric.release_endpoint(endpoint.id()).await;
-                    info!(%peer, "SDP offer had no acceptable codec; 488");
-                    self.respond(
-                        req,
-                        488,
-                        "Not Acceptable Here",
-                        Some(&next_tag()),
-                        &[],
-                        &[],
-                        peer,
-                    )
-                    .await;
-                    return;
-                }
-                NegotiationOutcome::UnsupportedTransport { reason } => {
-                    self.media_fabric.release_endpoint(endpoint.id()).await;
-                    info!(%peer, %reason, "SDP offer used an unsupported transport; 488 + Warning");
-                    // RFC 3261 §20.43: `Warning: <code> <host> "<text>"`.
-                    // Code 399 is the "miscellaneous" catch-all; the
-                    // quoted text carries the human-readable reason so
-                    // the peer sees *why* we rejected.
-                    let warning = format_warning(&reason);
-                    let warning_hdr: [(&str, &str); 1] = [("Warning", warning.as_str())];
-                    self.respond(
-                        req,
-                        488,
-                        "Not Acceptable Here",
-                        Some(&next_tag()),
-                        &warning_hdr,
-                        &[],
-                        peer,
-                    )
-                    .await;
-                    return;
-                }
-                NegotiationOutcome::Malformed(err) => {
-                    self.media_fabric.release_endpoint(endpoint.id()).await;
-                    warn!(%peer, %err, "malformed SDP offer");
-                    self.respond(req, 400, "Bad Request", Some(&next_tag()), &[], &[], peer)
+        let (endpoint, sdp_answer_body, remote_media, srtp_keys, audio_codec, video_codec) =
+            if has_offer {
+                let endpoint = match self.media_fabric.allocate(self.media_bind_ip).await {
+                    Ok(ep) => ep,
+                    Err(e) => {
+                        warn!(?e, "failed to allocate media endpoint for INVITE");
+                        self.respond(
+                            req,
+                            500,
+                            "Server Internal Error",
+                            Some(&next_tag()),
+                            &[],
+                            &[],
+                            peer,
+                        )
                         .await;
-                    return;
+                        return;
+                    }
+                };
+                // Safe unwrap: `has_offer` verified Some(body) above.
+                let body = req.body.as_deref().unwrap_or_default();
+                // When the signaling transport is bound to a wildcard
+                // (0.0.0.0 / ::), `media_bind_ip` is unroutable. Ask the
+                // kernel which local address it would use to reach `peer`
+                // and publish *that* in SDP — otherwise the remote UA
+                // tries to sendto(0.0.0.0) and fails.
+                let effective_local_ip = resolve_local_ip_for(self.media_bind_ip, peer).await;
+                // Slice 5.1 / P11: call the multi-stream path with
+                // `video_port = None`. The negotiator preserves m-line
+                // ordering when the offer carries `m=video` by emitting
+                // an RFC 3264 port-0 decline — dual-bridge wiring that
+                // actually relays video is a follow-on, but the
+                // declining answer shape is right today.
+                match self.negotiator.negotiate(
+                    body,
+                    effective_local_ip,
+                    endpoint.local_addr().port(),
+                    None,
+                ) {
+                    NegotiationOutcome::Accepted {
+                        answer_body,
+                        remote_media,
+                        // Slice 5.1: video endpoint surfaces on the
+                        // outcome; the UAS's dual-bridge wiring is a
+                        // follow-on. Peers that offered video see a
+                        // declining `m=video 0 ...` in the answer, so
+                        // this binding isn't used yet but keeps the
+                        // destructure exhaustive.
+                        video_media: _video_media,
+                        srtp,
+                        // Slice 5.10-dtls: DTLS-SRTP parameters surface
+                        // here when the SIP offer used the WebRTC
+                        // transport profile. The SIP UAS proper
+                        // doesn't drive the DTLS handshake today —
+                        // the WebRTC-native adapter (5.10-bridge) is
+                        // the consumer; SIP-side handshake wiring is
+                        // a dedicated follow-on. Bound so the
+                        // destructure stays exhaustive.
+                        dtls: _dtls,
+                        // Slice 5.6: per-leg codec goes into
+                        // DialogRecord.per_leg_codec so the
+                        // transcoding router (5.6b) can compare legs.
+                        audio_codec,
+                        video_codec,
+                    } => (
+                        Some(endpoint),
+                        Some(answer_body),
+                        remote_media,
+                        srtp,
+                        audio_codec,
+                        video_codec,
+                    ),
+                    NegotiationOutcome::Mismatch => {
+                        self.media_fabric.release_endpoint(endpoint.id()).await;
+                        info!(%peer, "SDP offer had no acceptable codec; 488");
+                        self.respond(
+                            req,
+                            488,
+                            "Not Acceptable Here",
+                            Some(&next_tag()),
+                            &[],
+                            &[],
+                            peer,
+                        )
+                        .await;
+                        return;
+                    }
+                    NegotiationOutcome::UnsupportedTransport { reason } => {
+                        self.media_fabric.release_endpoint(endpoint.id()).await;
+                        info!(%peer, %reason, "SDP offer used an unsupported transport; 488 + Warning");
+                        // RFC 3261 §20.43: `Warning: <code> <host> "<text>"`.
+                        // Code 399 is the "miscellaneous" catch-all; the
+                        // quoted text carries the human-readable reason so
+                        // the peer sees *why* we rejected.
+                        let warning = format_warning(&reason);
+                        let warning_hdr: [(&str, &str); 1] = [("Warning", warning.as_str())];
+                        self.respond(
+                            req,
+                            488,
+                            "Not Acceptable Here",
+                            Some(&next_tag()),
+                            &warning_hdr,
+                            &[],
+                            peer,
+                        )
+                        .await;
+                        return;
+                    }
+                    NegotiationOutcome::Malformed(err) => {
+                        self.media_fabric.release_endpoint(endpoint.id()).await;
+                        warn!(%peer, %err, "malformed SDP offer");
+                        self.respond(req, 400, "Bad Request", Some(&next_tag()), &[], &[], peer)
+                            .await;
+                        return;
+                    }
                 }
-            }
-        } else {
-            (None, None, None, None)
-        };
+            } else {
+                (None, None, None, None, None, None)
+            };
 
         let local_tag = next_tag();
         let rendezvous = req.ruri_user.clone();
         let dialog_key: DialogKey = (call_id.clone(), local_tag.clone(), remote_tag.clone());
 
+        // Slice 5.10-sipjoin: when an `X-Smiths-Webrtc-Tag:`
+        // header is present + the WebRTC rendezvous is wired,
+        // the SIP dialog joins the shared pending-legs map
+        // instead of the local Request-URI-user-part one. A
+        // match installs the bridge through the WebRTC handler;
+        // a miss parks the SIP leg there until its WebRTC
+        // partner arrives. Header without rendezvous wired =
+        // silent ignore (honest fallback for deployments that
+        // don't run WebRTC).
+        let mut webrtc_bridged = false;
+        if let (Some(tag), Some(rdv), Some(ep), Some(remote_rtp)) = (
+            req.webrtc_tag.as_deref(),
+            self.webrtc_rendezvous.as_ref(),
+            endpoint.as_ref(),
+            remote_media,
+        ) {
+            match rdv
+                .pair_sip_leg(tag, ep.id(), remote_rtp, srtp_keys.clone())
+                .await
+            {
+                Ok(Some(bid)) => {
+                    self.bridges_by_dialog.insert(dialog_key.clone(), bid);
+                    info!(
+                        %tag,
+                        ?bid,
+                        "webrtc rendezvous: SIP dialog bridged to WebRTC partner"
+                    );
+                    webrtc_bridged = true;
+                }
+                Ok(None) => {
+                    info!(%tag, "webrtc rendezvous: SIP leg parked awaiting WebRTC partner");
+                    // The WebRTC handler holds the SIP leg;
+                    // the SIP UAS stores the tag on the
+                    // DialogRecord so BYE can tell the
+                    // rendezvous to release.
+                    webrtc_bridged = true; // skip the SIP-side rendezvous
+                }
+                Err(e) => {
+                    warn!(%tag, ?e, "webrtc rendezvous: pair_sip_leg failed; falling through");
+                }
+            }
+        }
+
         // Rendezvous pairing: need a key, an endpoint, and the peer RTP
         // address from the offer.
-        if let (Some(key), Some(ep), Some(remote_rtp)) =
-            (rendezvous.as_ref(), endpoint.as_ref(), remote_media)
+        if !webrtc_bridged
+            && let (Some(key), Some(ep), Some(remote_rtp)) =
+                (rendezvous.as_ref(), endpoint.as_ref(), remote_media)
         {
             if let Some((_, pending)) = self.pending_bridges.remove(key) {
                 let leg_a = BridgeLeg {
                     endpoint: pending.endpoint,
                     peer: pending.remote_media,
-                    srtp: pending.srtp,
+                    srtp: pending.srtp.clone(),
                 };
                 let leg_b = BridgeLeg {
                     endpoint: ep.id(),
                     peer: remote_rtp,
                     srtp: srtp_keys.clone(),
                 };
-                match self.media_fabric.bridge(leg_a, leg_b).await {
-                    Ok(bid) => {
-                        self.bridges_by_dialog.insert(pending.dialog_key, bid);
-                        self.bridges_by_dialog.insert(dialog_key.clone(), bid);
-                        info!(rendezvous = %key, "rendezvous bridge established");
+                // Slice 5.6c: detect codec mismatch at pair time.
+                // When both codecs are known and differ AND a
+                // `TranscodeOrchestrator` is wired, route through
+                // the transcoded session path; otherwise fall
+                // through to the plain passthrough bridge (pre-5.6c
+                // behaviour).
+                let codec_mismatch = match (pending.audio_codec.as_ref(), audio_codec.as_ref()) {
+                    (Some(a), Some(b)) => a != b,
+                    _ => false,
+                };
+                let orchestrated = if codec_mismatch {
+                    self.try_orchestrate_transcoded(
+                        key,
+                        &pending.dialog_key,
+                        &dialog_key,
+                        leg_a.clone(),
+                        pending.audio_codec.clone().unwrap_or(NegotiatedCodec::Pcmu),
+                        leg_b.clone(),
+                        audio_codec.clone().unwrap_or(NegotiatedCodec::Pcmu),
+                    )
+                    .await
+                } else {
+                    false
+                };
+                if !orchestrated {
+                    match self.media_fabric.bridge(leg_a, leg_b).await {
+                        Ok(bid) => {
+                            self.bridges_by_dialog.insert(pending.dialog_key, bid);
+                            self.bridges_by_dialog.insert(dialog_key.clone(), bid);
+                            info!(rendezvous = %key, "rendezvous bridge established");
+                        }
+                        Err(e) => warn!(?e, rendezvous = %key, "rendezvous bridge failed"),
                     }
-                    Err(e) => warn!(?e, rendezvous = %key, "rendezvous bridge failed"),
                 }
             } else {
                 self.pending_bridges.insert(
@@ -780,12 +1111,31 @@ impl<T: Transport> UasServer<T> {
                         endpoint: ep.id(),
                         remote_media: remote_rtp,
                         srtp: srtp_keys.clone(),
+                        audio_codec: audio_codec.clone(),
                     },
                 );
                 info!(rendezvous = %key, "rendezvous leg parked, awaiting peer");
             }
         }
 
+        // Slice 5.6: populate per-leg codec from the negotiator's
+        // output. `LegId(0)` is the answerer's own leg — that's the
+        // leg whose codec the negotiator just chose. The far-end
+        // leg's codec is learned at bridge time (today's 2-peer
+        // bridge uses the same codec both sides; 5.6b will refine
+        // this when transcoding wires through).
+        let mut per_leg_codec = std::collections::BTreeMap::new();
+        if let Some(c) = audio_codec.clone() {
+            per_leg_codec.insert(smiths_core::LegId(0), c);
+        }
+        if let Some(c) = video_codec.clone() {
+            // Video-leg codec under LegId(0) would collide with the
+            // audio entry; use LegId(1) to keep both entries alive.
+            // The LegId namespace is process-scoped, not
+            // cross-dialog, so collision with a future remote leg
+            // is impossible within this record.
+            per_leg_codec.insert(smiths_core::LegId(1), c);
+        }
         let record = DialogRecord {
             call_id: call_id.clone(),
             local_tag: local_tag.clone(),
@@ -796,6 +1146,7 @@ impl<T: Transport> UasServer<T> {
             media: endpoint.as_ref().map(|ep| ep.id()),
             remote_media,
             pending_2xx: None,
+            per_leg_codec,
         };
         self.dialogs.insert(dialog_key.clone(), record);
         self.metrics.dialogs_active.inc();
@@ -837,6 +1188,87 @@ impl<T: Transport> UasServer<T> {
             media_endpoint: endpoint.as_ref().map(|ep| ep.id()),
             remote_rtp: remote_media,
         }));
+    }
+
+    /// Slice 5.6c: try to route a codec-mismatched rendezvous pair
+    /// through a transcoded session. Returns `true` if the
+    /// orchestrator admitted the call and the session was installed
+    /// into [`DialogSessions`] — in that case the caller skips the
+    /// plain passthrough bridge. Returns `false` when no
+    /// orchestrator is wired, admission was refused, or
+    /// construction errored — the caller then falls through to the
+    /// passthrough path (pre-5.6c behaviour).
+    #[allow(clippy::too_many_arguments)]
+    async fn try_orchestrate_transcoded(
+        &self,
+        rendezvous_key: &str,
+        dialog_a: &DialogKey,
+        dialog_b: &DialogKey,
+        leg_a: BridgeLeg,
+        codec_a: NegotiatedCodec,
+        leg_b: BridgeLeg,
+        codec_b: NegotiatedCodec,
+    ) -> bool {
+        let Some(orch) = self.transcode_orchestrator.as_ref() else {
+            warn!(
+                rendezvous = rendezvous_key,
+                %codec_a,
+                %codec_b,
+                "codec mismatch at rendezvous but no TranscodeOrchestrator wired; \
+                 falling through to passthrough bridge (audio will not be audible)",
+            );
+            return false;
+        };
+        match orch
+            .try_orchestrate(leg_a, codec_a.clone(), leg_b, codec_b.clone())
+            .await
+        {
+            Ok(Some(session)) => {
+                // Install the same session handle under both legs'
+                // keys. `(LegId(0), Audio)` for the first-in leg,
+                // `(LegId(1), Audio)` for the second — matches
+                // slice 5.6's `per_leg_codec` convention.
+                use smiths_core::{LegId, MediaKindTag};
+                let key_a = (LegId(0), MediaKindTag::Audio);
+                let key_b = (LegId(1), MediaKindTag::Audio);
+                self.dialog_sessions
+                    .install(dialog_a.clone(), key_a, Arc::clone(&session));
+                self.dialog_sessions
+                    .install(dialog_b.clone(), key_b, session);
+                info!(
+                    rendezvous = rendezvous_key,
+                    %codec_a,
+                    %codec_b,
+                    "rendezvous transcoded session installed",
+                );
+                true
+            }
+            Ok(None) => {
+                warn!(
+                    rendezvous = rendezvous_key,
+                    %codec_a,
+                    %codec_b,
+                    "transcode admission refused (budget exhausted); \
+                     passthrough fallback will not produce audible audio",
+                );
+                // NOTE: a future slice should respond 488 + `Warning:
+                // 370` here instead of silently falling through, but
+                // that path needs to unwind leg-A's already-200-OK'd
+                // dialog too. Out of scope for 5.6c.
+                false
+            }
+            Err(e) => {
+                warn!(
+                    rendezvous = rendezvous_key,
+                    %codec_a,
+                    %codec_b,
+                    error = %e,
+                    "transcoded session construction failed; \
+                     falling back to passthrough",
+                );
+                false
+            }
+        }
     }
 
     fn handle_ack(&self, req: &RequestSummary, peer: SocketAddr) {
@@ -906,6 +1338,15 @@ impl<T: Transport> UasServer<T> {
                     self.bridges_by_dialog.retain(|_, other| *other != bid);
                     self.media_fabric.release_bridge(bid).await;
                     debug!(call_id = %record.call_id, "rendezvous bridge stopped");
+                }
+                // Slice 5.6c: drain any non-passthrough sessions
+                // (transcoded, and later FAX / conference) that
+                // belong to this dialog. `remove_dialog` returns
+                // every handle we owned; we stop each one so the
+                // forwarder tasks exit and the admission lease
+                // (if any) releases.
+                for session in self.dialog_sessions.remove_dialog(&key) {
+                    session.stop().await;
                 }
                 if let Some(ep) = record.media {
                     self.media_fabric.release_endpoint(ep).await;
@@ -1259,6 +1700,7 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
     let mut expires: Option<u32> = None;
     let mut from_uri: Option<String> = None;
     let mut to_uri: Option<String> = None;
+    let mut webrtc_tag: Option<String> = None;
 
     for line in lines {
         if line.is_empty() {
@@ -1310,6 +1752,15 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
             if let Ok(n) = v.parse::<u32>() {
                 expires = Some(n);
             }
+        } else if webrtc_tag.is_none() && lower.starts_with("x-smiths-webrtc-tag:") {
+            // Slice 5.10-sipjoin: custom extension header asking
+            // the UAS to bridge this dialog with a WebRTC leg
+            // sharing the same tag. Case-insensitive prefix
+            // match; value trimmed of surrounding whitespace.
+            let v = line.split_once(':').map_or("", |(_, v)| v).trim();
+            if !v.is_empty() {
+                webrtc_tag = Some(v.to_owned());
+            }
         }
     }
 
@@ -1329,6 +1780,7 @@ fn summarize_request(raw: &Bytes) -> RequestSummary {
         to_uri,
         body: (!body.is_empty()).then(|| body.to_owned()),
         raw: raw.clone(),
+        webrtc_tag,
     }
 }
 

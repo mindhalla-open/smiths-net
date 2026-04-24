@@ -158,6 +158,20 @@ pub struct Metrics {
     /// Plugin invocation outcomes (AI sidecar or WASM), keyed by
     /// plugin name + outcome (`ok` / `error`).
     pub plugin_invocations: Family<PluginOutcomeLabel, Counter>,
+    /// Aggregate of `plugin_invocations{outcome="ok"}` across
+    /// every plugin. Shadows the labelled family so the 5.9
+    /// error-rate probe can sum "ok" invocations in one atomic
+    /// read — `prometheus-client` 0.24's `Family` has no
+    /// iter-values API, which would otherwise force a whole-
+    /// registry text-encode + parse round-trip per probe tick.
+    /// Incremented in tandem with the labelled counter by
+    /// `record_invocation` in the plugin crate.
+    pub plugin_invocations_ok: Counter,
+    /// Aggregate of `plugin_invocations{outcome="error"}` across
+    /// every plugin — paired with
+    /// [`Self::plugin_invocations_ok`]. See that field's doc
+    /// for the probe-read rationale.
+    pub plugin_invocations_error: Counter,
     /// Plugin invoke latency, keyed by plugin name.
     pub plugin_invoke_duration: Family<PluginLabel, Histogram, fn() -> Histogram>,
     /// Sidecar supervisor respawns, keyed by plugin name.
@@ -184,6 +198,181 @@ pub struct Metrics {
     /// once per tool invocation regardless of how many dispatcher
     /// hops the pipeline made.
     pub ai_pipeline_duration: Family<AiPipelineLabel, Histogram, fn() -> Histogram>,
+    /// `smiths_snapshot_replay_dialogs_total` — cumulative count
+    /// of dialog records restored from the HA snapshot file on
+    /// startup (slice 6.1). Zero on a cold boot (no snapshot);
+    /// bumps by the snapshot's record count when a prior shutdown
+    /// left one.
+    pub snapshot_replay_dialogs: Counter,
+    /// `smiths_config_canary_active` — `1` while a config
+    /// change is in its canary window (between `apply` and
+    /// `confirm`/`rollback`), `0` otherwise (slice 5.9-mvp).
+    /// Dashboards alert when this stays at `1` past the
+    /// configured deadline — something ate the operator's
+    /// confirm signal.
+    pub config_canary_active: Gauge,
+    /// `smiths_config_rollbacks_total{reason}` — counter of
+    /// rolled-back changes keyed by reason
+    /// (`manual` / `timeout` / `error_budget`). Slice 5.9-mvp.
+    pub config_rollbacks: Family<ConfigRollbackLabel, Counter>,
+    /// `smiths_config_reloaded_fields_total{field}` — bumped by
+    /// each subsystem's read-through adapter when it actually
+    /// applied a live change (slice 5.8-b). Shows operators
+    /// which fields the engine treated as hot-reloadable on
+    /// the most recent apply — distinct from
+    /// `ApplyReport::reloaded` (which says "the engine said it
+    /// could") because a cautious adapter might decline a
+    /// suspect value and leave it on the restart-required pile.
+    pub config_reloaded_fields: Family<ConfigFieldLabel, Counter>,
+    /// `smiths_config_probe_triggered_total{probe}` — counter
+    /// bumped every time the 5.9 error-rate probe tripped a
+    /// configured ceiling and called `rollback_with_metrics`.
+    /// Labelled by probe name (`plugin_error_rate` /
+    /// `sip_parse_errors`) so dashboards can tell which safety
+    /// net fired. Counter bumps exactly once per rollback —
+    /// if both probes cross at the same tick only the one that
+    /// wins the rollback races is credited.
+    pub config_probe_triggered: Family<ConfigProbeLabel, Counter>,
+    /// `smiths_webrtc_dtls_handshakes_total{outcome}` —
+    /// counter of DTLS-SRTP handshakes the media fabric ran
+    /// for a WebRTC leg, keyed by outcome. Incremented exactly
+    /// once per handshake attempt — regardless of whether the
+    /// SDP answer already made it out. Operators watch the
+    /// `success`-vs-total ratio as the health signal for the
+    /// DTLS terminator.
+    pub webrtc_dtls_handshakes: Family<WebRtcDtlsOutcomeLabel, Counter>,
+    /// `smiths_webrtc_sessions_paired_total{partner}` —
+    /// counter of WebRTC legs that successfully joined a
+    /// bridge via the rendezvous map (slice 5.10-bridge),
+    /// keyed by the partner leg's type.
+    pub webrtc_sessions_paired: Family<WebRtcPartnerLabel, Counter>,
+    /// `smiths_ice_candidates_gathered_total{type}` — counter
+    /// of ICE candidates the engine emitted in SDP answers
+    /// (slice 5.10-ice). Labelled by RFC 8445 type so
+    /// operators can see the `host` / `srflx` / `relay` mix.
+    pub ice_candidates_gathered: Family<IceCandidateTypeLabel, Counter>,
+    /// `smiths_ice_binding_checks_total{outcome}` — counter
+    /// per `STUN Binding` connectivity check. Slice 5.10-ice
+    /// runs exactly one per bridge install; a richer
+    /// ICE-agent pair check loop is future scope.
+    pub ice_binding_checks: Family<IceBindingCheckLabel, Counter>,
+    /// `smiths_turn_allocations_total{outcome}` — counter
+    /// per `Allocate` response the embedded TURN server
+    /// emitted (slice 5.11-turn).
+    pub turn_allocations: Family<TurnAllocationOutcomeLabel, Counter>,
+    /// `smiths_turn_active_allocations` — gauge of live TURN
+    /// allocations (slice 5.11-turn). Matches the size of
+    /// the server's allocation map; bumps on `Allocate`,
+    /// decrements on `REFRESH lifetime=0` or expiry.
+    pub turn_active_allocations: Gauge,
+    /// `smiths_webrtc_candidates_rejected_total{reason}` —
+    /// counter per candidate the privacy filter dropped
+    /// (slice 5.11-privacy). Rising slope in the
+    /// `"host"` bucket against `relay_only` deployments
+    /// usually means clients aren't forcing their
+    /// `iceTransportPolicy = "relay"` correctly.
+    pub webrtc_candidates_rejected: Family<PrivacyRejectReasonLabel, Counter>,
+    /// `smiths_webrtc_privacy_redactions_total` — counter of
+    /// peer-IP strings the engine redacted before emitting
+    /// them into a log / CDR / tracing span (slice
+    /// 5.11-privacy). Active only in `strict` mode.
+    pub webrtc_privacy_redactions: Counter,
+}
+
+/// `{field}` label on `smiths_config_reloaded_fields_total`.
+/// Fixed per-field vocabulary (`observability.log_level`,
+/// `sip.rate_limit`, …) so cardinality stays bounded.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ConfigFieldLabel {
+    /// Dotted field path — matches the
+    /// `ApplyReport::reloaded` entries.
+    pub field: String,
+}
+
+/// `{reason}` label on `smiths_config_rollbacks_total`. Fixed
+/// vocabulary so Prometheus cardinality stays bounded.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ConfigRollbackLabel {
+    /// `"manual"` / `"timeout"` / `"error_budget"` —
+    /// matches `RollbackReason::as_str`.
+    pub reason: String,
+}
+
+/// `{probe}` label on `smiths_config_probe_triggered_total`.
+/// Two concrete values today — `"plugin_error_rate"` and
+/// `"sip_parse_errors"` — so cardinality is bounded at 2.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ConfigProbeLabel {
+    /// Which probe fired.
+    pub probe: String,
+}
+
+/// `{outcome}` label on `smiths_webrtc_dtls_handshakes_total`
+/// (slice 5.10-dtls). Bounded vocabulary: `"success"`,
+/// `"peer_timeout"`, `"fingerprint_mismatch"`,
+/// `"cert_load_failed"`, `"other"`. Distinguished from the
+/// handshake's underlying `webrtc-dtls` error enum so
+/// dashboards stay stable when the library classifies a new
+/// edge.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct WebRtcDtlsOutcomeLabel {
+    /// Wire token — see the per-value comments on
+    /// `Metrics::webrtc_dtls_handshakes`.
+    pub outcome: String,
+}
+
+/// `{partner}` label on `smiths_webrtc_sessions_paired_total`
+/// (slice 5.10-bridge). `"sip"` — the other leg is a SIP
+/// dialog bridged to this WebRTC session. `"webrtc"` — peer
+/// is another WebRTC leg via the same handler. `"none"` —
+/// reserved for the deadline-evicted case; bumped when an
+/// unpaired leg ages past `[webrtc] rendezvous_deadline_s`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct WebRtcPartnerLabel {
+    /// Wire token.
+    pub partner: String,
+}
+
+/// `{type}` label on `smiths_ice_candidates_gathered_total`
+/// (slice 5.10-ice). `"host"` / `"srflx"` / `"relay"` /
+/// `"prflx"` — RFC 8445 candidate-type vocabulary.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct IceCandidateTypeLabel {
+    /// RFC 8445 candidate type.
+    pub ty: String,
+}
+
+/// `{outcome}` label on `smiths_ice_binding_checks_total`
+/// (slice 5.10-ice). `"success"` — peer replied with the
+/// expected `XOR-MAPPED-ADDRESS`. `"timeout"` — no reply
+/// within the per-check window. `"mismatch"` — reply came
+/// from an unexpected address (possible spoof / NAT hairpin).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct IceBindingCheckLabel {
+    /// Outcome token.
+    pub outcome: String,
+}
+
+/// `{outcome}` label on `smiths_turn_allocations_total`
+/// (slice 5.11-turn). `"success"` — `Allocate` succeeded
+/// with a relay address. `"auth_failed"` — `401` challenge
+/// or `MESSAGE-INTEGRITY` mismatch. `"forbidden"` — `403`
+/// for an unauthorized transport/realm. `"other"` —
+/// catch-all for malformed / resource-exhausted paths.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TurnAllocationOutcomeLabel {
+    /// Outcome token.
+    pub outcome: String,
+}
+
+/// `{reason}` label on `smiths_webrtc_candidates_rejected_total`
+/// (slice 5.11-privacy). `"host"` / `"srflx"` — the privacy
+/// filter rejected the offer because it carried a direct
+/// candidate in a mode that forbids them.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PrivacyRejectReasonLabel {
+    /// Offending candidate type the filter caught.
+    pub reason: String,
 }
 
 impl Metrics {
@@ -205,6 +394,8 @@ impl Metrics {
         let tool_duration: Family<ToolLabel, Histogram, fn() -> Histogram> =
             Family::new_with_constructor(default_histogram);
         let plugin_invocations = Family::<PluginOutcomeLabel, Counter>::default();
+        let plugin_invocations_ok = Counter::default();
+        let plugin_invocations_error = Counter::default();
         let plugin_invoke_duration: Family<PluginLabel, Histogram, fn() -> Histogram> =
             Family::new_with_constructor(default_histogram);
         let sidecar_restarts = Family::<PluginLabel, Counter>::default();
@@ -213,6 +404,19 @@ impl Metrics {
         let ai_tokens = Family::<AiTokensLabel, Counter>::default();
         let ai_pipeline_duration: Family<AiPipelineLabel, Histogram, fn() -> Histogram> =
             Family::new_with_constructor(default_histogram);
+        let snapshot_replay_dialogs = Counter::default();
+        let config_canary_active = Gauge::default();
+        let config_rollbacks = Family::<ConfigRollbackLabel, Counter>::default();
+        let config_reloaded_fields = Family::<ConfigFieldLabel, Counter>::default();
+        let config_probe_triggered = Family::<ConfigProbeLabel, Counter>::default();
+        let webrtc_dtls_handshakes = Family::<WebRtcDtlsOutcomeLabel, Counter>::default();
+        let webrtc_sessions_paired = Family::<WebRtcPartnerLabel, Counter>::default();
+        let ice_candidates_gathered = Family::<IceCandidateTypeLabel, Counter>::default();
+        let ice_binding_checks = Family::<IceBindingCheckLabel, Counter>::default();
+        let turn_allocations = Family::<TurnAllocationOutcomeLabel, Counter>::default();
+        let turn_active_allocations = Gauge::default();
+        let webrtc_candidates_rejected = Family::<PrivacyRejectReasonLabel, Counter>::default();
+        let webrtc_privacy_redactions = Counter::default();
 
         registry.register(
             "sip_requests",
@@ -272,6 +476,10 @@ impl Metrics {
             "AiProvider::invoke outcomes, per plugin",
             plugin_invocations.clone(),
         );
+        // The aggregate shadows aren't re-registered: rendering
+        // both would duplicate the same totals in `/metrics` and
+        // confuse dashboards. The probe reads them via the
+        // `Metrics` struct handle directly.
         registry.register(
             "plugin_invoke_duration_seconds",
             "AiProvider::invoke latency, per plugin",
@@ -302,6 +510,71 @@ impl Metrics {
             "End-to-end wall-clock of composite AI pipelines (e.g. transcribe_call, summarize_call).",
             ai_pipeline_duration.clone(),
         );
+        registry.register(
+            "smiths_snapshot_replay_dialogs",
+            "Dialogs restored from the HA snapshot file at startup (slice 6.1).",
+            snapshot_replay_dialogs.clone(),
+        );
+        registry.register(
+            "smiths_config_canary_active",
+            "1 while a config change is inside its canary window; 0 otherwise (slice 5.9).",
+            config_canary_active.clone(),
+        );
+        registry.register(
+            "smiths_config_rollbacks",
+            "Config changes rolled back, keyed by reason (manual / timeout / error_budget).",
+            config_rollbacks.clone(),
+        );
+        registry.register(
+            "smiths_config_reloaded_fields",
+            "Live-reloadable fields a subsystem adapter actually applied, per field (slice 5.8-b).",
+            config_reloaded_fields.clone(),
+        );
+        registry.register(
+            "smiths_config_probe_triggered",
+            "Error-rate probe trips, keyed by probe name (slice 5.9).",
+            config_probe_triggered.clone(),
+        );
+        registry.register(
+            "smiths_webrtc_dtls_handshakes",
+            "DTLS-SRTP handshakes driven by the WebRTC media fabric, keyed by outcome (slice 5.10-dtls).",
+            webrtc_dtls_handshakes.clone(),
+        );
+        registry.register(
+            "smiths_webrtc_sessions_paired",
+            "WebRTC legs that completed the tag-based rendezvous, keyed by partner kind (slice 5.10-bridge).",
+            webrtc_sessions_paired.clone(),
+        );
+        registry.register(
+            "smiths_ice_candidates_gathered",
+            "ICE candidates the engine emitted, keyed by RFC 8445 type (slice 5.10-ice).",
+            ice_candidates_gathered.clone(),
+        );
+        registry.register(
+            "smiths_ice_binding_checks",
+            "STUN Binding connectivity checks, keyed by outcome (slice 5.10-ice).",
+            ice_binding_checks.clone(),
+        );
+        registry.register(
+            "smiths_turn_allocations",
+            "TURN Allocate response outcomes, keyed by outcome (slice 5.11-turn).",
+            turn_allocations.clone(),
+        );
+        registry.register(
+            "smiths_turn_active_allocations",
+            "Live TURN allocations held by the embedded server (slice 5.11-turn).",
+            turn_active_allocations.clone(),
+        );
+        registry.register(
+            "smiths_webrtc_candidates_rejected",
+            "WebRTC offer candidates dropped by the privacy filter, keyed by reason (slice 5.11-privacy).",
+            webrtc_candidates_rejected.clone(),
+        );
+        registry.register(
+            "smiths_webrtc_privacy_redactions",
+            "Peer IPs redacted before emission in strict privacy mode (slice 5.11-privacy).",
+            webrtc_privacy_redactions.clone(),
+        );
 
         Arc::new(Self {
             sip_requests,
@@ -316,12 +589,27 @@ impl Metrics {
             tool_invocations,
             tool_duration,
             plugin_invocations,
+            plugin_invocations_ok,
+            plugin_invocations_error,
             plugin_invoke_duration,
             sidecar_restarts,
             ai_failovers,
             ai_invocations,
             ai_tokens,
             ai_pipeline_duration,
+            snapshot_replay_dialogs,
+            config_canary_active,
+            config_rollbacks,
+            config_reloaded_fields,
+            config_probe_triggered,
+            webrtc_dtls_handshakes,
+            webrtc_sessions_paired,
+            ice_candidates_gathered,
+            ice_binding_checks,
+            turn_allocations,
+            turn_active_allocations,
+            webrtc_candidates_rejected,
+            webrtc_privacy_redactions,
         })
     }
 

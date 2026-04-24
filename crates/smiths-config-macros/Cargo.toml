@@ -1,0 +1,18 @@
+[package]
+name         = "smiths-config-macros"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+license      = { workspace = true }
+description  = "Proc-macro crate for smiths-net: #[derive(Reloadable)] generates config-diff logic."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote       = "1"
+syn         = { version = "2", features = ["full", "extra-traits"] }
+
+[lints]
+workspace = true

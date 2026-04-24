@@ -51,6 +51,11 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(SearchCallsSemanticTool);
     reg.register(PutScriptTool);
     reg.register(RecordPromptTool);
+    reg.register(CreateConferenceTool);
+    reg.register(JoinConferenceTool);
+    reg.register(LeaveConferenceTool);
+    reg.register(ListMetricsTool);
+    reg.register(GetMetricTool);
     reg
 }
 
@@ -1835,6 +1840,327 @@ impl Tool for EndCallTool {
     }
 }
 
+// ---- Conferencing (slice 5.5) --------------------------------------
+
+/// `create_conference()` — allocate a fresh N-participant mixer.
+///
+/// Returns the new conference id. Subsequent `join_conference` calls
+/// attach participants.
+pub struct CreateConferenceTool;
+
+#[async_trait]
+impl Tool for CreateConferenceTool {
+    fn name(&self) -> &'static str {
+        "create_conference"
+    }
+
+    fn description(&self) -> &'static str {
+        "Create a new audio conference (leave-one-out N:N mixer with \
+         per-participant AGC + VAD-based dominant-speaker selection). \
+         Returns the conference id to pass to `join_conference`."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, _args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let reg = ctx.conferences.as_ref().ok_or_else(|| {
+            ToolError::NotFound("no conference registry wired; enable the mixer fabric".into())
+        })?;
+        let id = reg.create(smiths_mixer::ConferenceConfig::default()).await;
+        Ok(json!({ "conference_id": id.0 }))
+    }
+}
+
+/// `join_conference(conference_id)` — attach a participant.
+///
+/// The RTP-level wiring (binding a participant's media to the
+/// mixer's ingress/egress channels) is the slice-level follow-on
+/// shared with slices 5.1 / 5.3 / 5.4. For now the tool returns the
+/// new participant id so downstream orchestration can track the
+/// attachment; the bridge wiring activates once the FSM refactor
+/// lands.
+pub struct JoinConferenceTool;
+
+#[async_trait]
+impl Tool for JoinConferenceTool {
+    fn name(&self) -> &'static str {
+        "join_conference"
+    }
+
+    fn description(&self) -> &'static str {
+        "Attach a participant to an existing conference. Returns the \
+         participant id. RTP wiring to the mixer's ingress/egress \
+         channels ships with the shared bridge-integration follow-on."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "conference_id": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Id returned by `create_conference`."
+                }
+            },
+            "required": ["conference_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let conf_id = args
+            .get("conference_id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ToolError::InvalidArguments("conference_id required".into()))?;
+        let reg = ctx.conferences.as_ref().ok_or_else(|| {
+            ToolError::NotFound("no conference registry wired; enable the mixer fabric".into())
+        })?;
+        let (pid, _egress) = reg
+            .join(smiths_mixer::ConferenceId(conf_id))
+            .await
+            .map_err(map_conference_error)?;
+        // The egress Receiver is dropped here on purpose: until the
+        // bridge-integration follow-on wires it to an RTP payloader
+        // task, there's no consumer for the frames. Returning the
+        // participant id lets orchestration track the attachment
+        // without plumbing a channel through the control plane.
+        Ok(json!({
+            "conference_id": conf_id,
+            "participant_id": pid.0,
+        }))
+    }
+}
+
+/// `leave_conference(conference_id, participant_id)` — detach a
+/// participant; closes their ingress/egress channels.
+pub struct LeaveConferenceTool;
+
+#[async_trait]
+impl Tool for LeaveConferenceTool {
+    fn name(&self) -> &'static str {
+        "leave_conference"
+    }
+
+    fn description(&self) -> &'static str {
+        "Detach a participant from a conference. Idempotent across \
+         unknown participant ids via a clean `NotFound`."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "conference_id": { "type": "integer", "minimum": 0 },
+                "participant_id": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["conference_id", "participant_id"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let conf_id = args
+            .get("conference_id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ToolError::InvalidArguments("conference_id required".into()))?;
+        let part_id = args
+            .get("participant_id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ToolError::InvalidArguments("participant_id required".into()))?;
+        let reg = ctx.conferences.as_ref().ok_or_else(|| {
+            ToolError::NotFound("no conference registry wired; enable the mixer fabric".into())
+        })?;
+        reg.leave(
+            smiths_mixer::ConferenceId(conf_id),
+            smiths_mixer::ParticipantId(part_id),
+        )
+        .await
+        .map_err(map_conference_error)?;
+        Ok(json!({
+            "conference_id": conf_id,
+            "participant_id": part_id,
+            "status": "left",
+        }))
+    }
+}
+
+fn map_conference_error(e: smiths_mixer::ConferenceRegistryError) -> ToolError {
+    use smiths_mixer::ConferenceRegistryError as E;
+    match e {
+        E::UnknownConference(id) => ToolError::NotFound(format!("unknown conference: {id}")),
+        E::Conference(c) => match c {
+            smiths_mixer::ConferenceError::UnknownParticipant(p) => {
+                ToolError::NotFound(format!("unknown participant: {p}"))
+            }
+            other => ToolError::Internal(other.to_string()),
+        },
+    }
+}
+
+// ---- Observability (slice 5.12) -----------------------------------
+
+/// `list_metrics()` — return every Prometheus series the engine
+/// publishes as JSON. Same registry the `/metrics` endpoint
+/// encodes from, so tool output and scrape output can't diverge.
+pub struct ListMetricsTool;
+
+#[async_trait]
+impl Tool for ListMetricsTool {
+    fn name(&self) -> &'static str {
+        "list_metrics"
+    }
+
+    fn description(&self) -> &'static str {
+        "Return every Prometheus metric the engine publishes as \
+         JSON. Reads from the same registry `/metrics` encodes from."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, _args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let registry = ctx.metrics_registry.as_ref().ok_or_else(|| {
+            ToolError::NotFound("metrics registry not wired on this engine".into())
+        })?;
+        let text = encode_registry_as_text(registry).await?;
+        let series = parse_prometheus_text(&text);
+        Ok(json!({
+            "count": series.len(),
+            "series": series,
+        }))
+    }
+}
+
+/// `get_metric(name)` — return just the series whose name matches
+/// `name`. Returns `NotFound` when no series does; returns every
+/// matching label combination when multiple do.
+pub struct GetMetricTool;
+
+#[async_trait]
+impl Tool for GetMetricTool {
+    fn name(&self) -> &'static str {
+        "get_metric"
+    }
+
+    fn description(&self) -> &'static str {
+        "Return one Prometheus metric by name. Name matches the \
+         series' `# TYPE` identifier (e.g. `sip_dialogs_active`, \
+         `smiths_mixer_conferences_active`)."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Metric name, e.g. `smiths_fax_sessions_active`."
+                }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("name required".into()))?;
+        let registry = ctx.metrics_registry.as_ref().ok_or_else(|| {
+            ToolError::NotFound("metrics registry not wired on this engine".into())
+        })?;
+        let text = encode_registry_as_text(registry).await?;
+        let series: Vec<_> = parse_prometheus_text(&text)
+            .into_iter()
+            .filter(|s| {
+                s.get("metric")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m == name || m == format!("{name}_total"))
+            })
+            .collect();
+        if series.is_empty() {
+            return Err(ToolError::NotFound(format!("no such metric: {name}")));
+        }
+        Ok(json!({
+            "name": name,
+            "series": series,
+        }))
+    }
+}
+
+async fn encode_registry_as_text(
+    registry: &std::sync::Arc<tokio::sync::Mutex<prometheus_client::registry::Registry>>,
+) -> Result<String, ToolError> {
+    let guard = registry.lock().await;
+    let mut out = String::new();
+    prometheus_client::encoding::text::encode(&mut out, &guard)
+        .map_err(|e| ToolError::Internal(format!("metrics encode: {e}")))?;
+    Ok(out)
+}
+
+/// Parse the Prometheus text-format output the encoder produces
+/// into `[{"metric":..., "labels":..., "value":...}, ...]`. Skips
+/// `# HELP` / `# TYPE` / `# EOF` lines and blank lines. Tolerates
+/// float / integer values; rejects histograms (we don't render
+/// them here — `/metrics` still does).
+fn parse_prometheus_text(text: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((lhs, value_part)) = line.rsplit_once(' ') else {
+            continue;
+        };
+        let Ok(value) = value_part.parse::<f64>() else {
+            continue;
+        };
+        let (metric, labels) = if let Some(brace_open) = lhs.find('{') {
+            let metric = &lhs[..brace_open];
+            let labels_str = &lhs[brace_open + 1..lhs.len().saturating_sub(1)];
+            (metric, parse_label_set(labels_str))
+        } else {
+            (lhs, serde_json::Map::new())
+        };
+        out.push(json!({
+            "metric": metric,
+            "labels": Value::Object(labels),
+            "value": value,
+        }));
+    }
+    out
+}
+
+/// Parse the key-value pairs inside a Prometheus label set
+/// (`k="v",k2="v2"`). Values are always quoted; commas inside
+/// quoted values are rare enough in our cardinality space that we
+/// don't bother with a full escape-aware parser.
+fn parse_label_set(s: &str) -> serde_json::Map<String, Value> {
+    let mut map = serde_json::Map::new();
+    for pair in s.split(',') {
+        let Some((k, v)) = pair.trim().split_once('=') else {
+            continue;
+        };
+        let v = v.trim().trim_start_matches('"').trim_end_matches('"');
+        map.insert(k.to_owned(), Value::String(v.to_owned()));
+    }
+    map
+}
+
 /// Translate a `CallError` into a `ToolError` the adapters already
 /// know how to wire.
 fn map_call_error(e: smiths_core::call::CallError) -> ToolError {
@@ -1925,6 +2251,69 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn list_metrics_without_registry_is_not_found() {
+        let (ctx, _c) = ctx_with_state();
+        let err = ListMetricsTool.call(json!({}), &ctx).await.unwrap_err();
+        assert!(matches!(err, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_metrics_returns_empty_series_for_empty_registry() {
+        use prometheus_client::registry::Registry;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        let (mut ctx, _c) = ctx_with_state();
+        ctx.metrics_registry = Some(Arc::new(Mutex::new(Registry::default())));
+        let out = ListMetricsTool.call(json!({}), &ctx).await.unwrap();
+        assert_eq!(out["count"], 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_metrics_renders_series_from_shared_registry() {
+        use prometheus_client::metrics::counter::Counter;
+        use prometheus_client::metrics::gauge::Gauge;
+        use prometheus_client::registry::Registry;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        let (mut ctx, _c) = ctx_with_state();
+        let mut reg = Registry::default();
+        let gauge: Gauge<i64, std::sync::atomic::AtomicI64> = Gauge::default();
+        gauge.set(7);
+        let ctr: Counter<u64, std::sync::atomic::AtomicU64> = Counter::default();
+        ctr.inc_by(42);
+        reg.register("sip_dialogs_active", "Dialogs", gauge);
+        reg.register("plugin_invocations", "Plugin invocations", ctr);
+        ctx.metrics_registry = Some(Arc::new(Mutex::new(reg)));
+
+        let out = ListMetricsTool.call(json!({}), &ctx).await.unwrap();
+        assert!(out["count"].as_u64().unwrap() >= 2);
+
+        let got = GetMetricTool
+            .call(json!({"name": "sip_dialogs_active"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(got["name"], "sip_dialogs_active");
+        let series = got["series"].as_array().unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0]["value"], 7.0);
+
+        let ctr_got = GetMetricTool
+            .call(json!({"name": "plugin_invocations"}), &ctx)
+            .await
+            .unwrap();
+        // Counter emits `_total` suffix; matcher accepts both names.
+        let series = ctr_got["series"].as_array().unwrap();
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0]["value"], 42.0);
+
+        let missing = GetMetricTool
+            .call(json!({"name": "nope_not_here"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, ToolError::NotFound(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn health_returns_ok_schema() {
         let (ctx, _c) = ctx_with_state();
         let out = HealthTool.call(json!({}), &ctx).await.unwrap();
@@ -1935,13 +2324,16 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 21);
+        assert_eq!(reg.len(), 26);
         for name in [
             "list_calls",
             "get_call_status",
             "health",
             "list_ai_providers",
             "describe_provider",
+            "create_conference",
+            "join_conference",
+            "leave_conference",
             "synthesize",
             "transcribe",
             "llm_chat",

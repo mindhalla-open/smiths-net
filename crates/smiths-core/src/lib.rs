@@ -25,6 +25,7 @@ pub mod bus;
 pub mod call;
 pub mod codec;
 pub mod config;
+pub mod dialog_sessions;
 pub mod drain;
 pub mod dtls;
 pub mod dtmf;
@@ -33,6 +34,8 @@ pub mod error;
 pub mod event;
 pub mod media;
 pub mod metrics;
+pub mod probe;
+pub mod reloader;
 pub mod rtp;
 pub mod sdp;
 pub mod shutdown;
@@ -46,18 +49,21 @@ pub use ai::{
 };
 pub use bus::EventBus;
 pub use call::{
-    CallError, CallLookup, CallOriginator, DialogKey, DialogRecord, DialogState,
-    RegistrationSnapshot, RegistrationView,
+    CallError, CallLookup, CallOriginator, DialogKey, DialogRecord, DialogState, LegId,
+    MediaKindTag, NegotiatedCodec, RegistrationSnapshot, RegistrationView, SessionKey,
 };
 pub use codec::{linear_to_ulaw, pcm16_to_pcmu, pcmu_to_pcm16, ulaw_to_linear};
 pub use config::{
-    A2aConfig, AiConfig, AuthBackend, AuthConfig, BindSpec, BindSpecError, Config, CoreConfig,
-    FsRecordingConfig, HttpAuthConfig, HttpFailureMode, LogFormat, McpConfig, McpHttp3Config,
-    MediaConfig, ObservabilityConfig, PluginsConfig, PromptsConfig, ProxyMode, RateLimitConfig,
-    RecordingBackend, RecordingStoreConfig, SandboxConfig, SeccompPolicy, SipConfig,
-    SipProxyConfig, SipRateLimit, SipTransport, SipVpnConfig, SqliteAuthConfig,
-    SqliteStorageConfig, StorageBackend, StorageConfig, VectorBackend, VectorStoreConfig, VpnMode,
+    A2aConfig, AiConfig, AuthBackend, AuthConfig, BindSpec, BindSpecError, CanaryConfig, Config,
+    CoreConfig, FsRecordingConfig, HttpAuthConfig, HttpFailureMode, LogFormat, McpConfig,
+    McpHttp3Config, MediaConfig, ObservabilityConfig, PluginsConfig, PromptsConfig, ProxyMode,
+    RateLimitConfig, RecordingBackend, RecordingStoreConfig, ReloadConfig, SandboxConfig,
+    SeccompPolicy, SipConfig, SipProxyConfig, SipRateLimit, SipTransport, SipVpnConfig,
+    SqliteAuthConfig, SqliteStorageConfig, StorageBackend, StorageConfig, TranscodeConfig,
+    VectorBackend, VectorStoreConfig, VpnMode, WebRtcConfig, WebRtcIceConfig, WebRtcPrivacyConfig,
+    WebRtcPrivacyMode, WebRtcTurnConfig, WebRtcTurnCredential, WebTransportConfig,
 };
+pub use dialog_sessions::DialogSessions;
 pub use drain::Drain;
 pub use dtls::{DtlsCertError, SelfSignedCert};
 pub use dtmf::{
@@ -69,12 +75,16 @@ pub use error::Error;
 pub use event::{Event, MediaSecurityFailure, PluginEvent, SipEvent, SystemEvent};
 pub use media::{
     BridgeId, BridgeLeg, Endpoint, EndpointId, EndpointKind, MediaEndpoint, MediaError,
-    MediaFabric, MediaSession, SrtpError, SrtpSuite, SrtpTransform,
+    MediaFabric, MediaSession, SrtpError, SrtpSuite, SrtpTransform, WebRtcRendezvous,
 };
 pub use metrics::Metrics;
+pub use probe::{ErrorRateProbe, ProbeConfig, ProbeSample, ProbeVerdict};
+pub use reloader::{
+    ApplyError, ApplyReport, CanaryError, ChangeId, ChangeReceipt, ConfigReloader, RollbackReason,
+};
 pub use rtp::RtpPacket;
-pub use sdp::{NegotiationOutcome, SdpNegotiator, SrtpKeys};
-pub use shutdown::Shutdown;
+pub use sdp::{DtlsParams, DtlsRole, NegotiationOutcome, SdpNegotiator, SrtpKeys};
+pub use shutdown::{HangupStream, Shutdown, hangup_stream};
 pub use storage::{
     CallDetailRecord, CdrFilter, CdrStore, FsRecordingStore, KvStore, MemoryVectorStore,
     RecordingStore, StorageError, VectorHit, VectorRecord, VectorStore,

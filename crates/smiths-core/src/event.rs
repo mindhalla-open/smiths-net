@@ -150,6 +150,23 @@ pub enum SipEvent {
         /// Keypress details — digit, duration, leg.
         keypress: crate::dtmf::DtmfKeypress,
     },
+    /// WebTransport signaling frame arrived / left (slice 5.7 /
+    /// P19). Stringly-typed on the bus so subscribers that don't
+    /// link `smiths-sip` (testkit, MCP observability) don't pull
+    /// in `WtSignal` just to render an event feed. Rich views —
+    /// parsed SDP, typed ICE candidate — live behind the SIP
+    /// crate's own `WtSignal` decoder.
+    WebTransportSignal {
+        /// Session id — `Some` after `SessionAck`, `None` before.
+        session_id: Option<u64>,
+        /// Signal kind token matching [`WtSignalKind::as_str`] in
+        /// `smiths_sip::webtransport`: `"session-init"`,
+        /// `"offer"`, `"answer"`, `"ice-candidate"`, `"bye"`, etc.
+        kind: String,
+        /// Direction relative to the engine: `"inbound"` (client →
+        /// engine) or `"outbound"` (engine → client).
+        direction: &'static str,
+    },
 }
 
 /// Media-plane security failure kinds. Stable — operators' dashboards

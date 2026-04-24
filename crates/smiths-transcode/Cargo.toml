@@ -1,0 +1,30 @@
+[package]
+name         = "smiths-transcode"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+license      = { workspace = true }
+description  = "Audio transcoding (slice 5.3 / P12): G.711 baseline + Opus ↔ PCM path, per-call CPU budget + admission control."
+
+[features]
+# Slice 5.3. Opus is off by default because the `opus` crate
+# links a system libopus at build time — most CI images don't
+# have it. Opt in with `--features opus` on deployments that
+# either (a) have libopus installed or (b) vendor it separately.
+# When off, [`OpusCodec::new`] returns a clean runtime error so
+# the absence surfaces at admission time, not at boot.
+default = []
+opus    = ["dep:opus"]
+
+[dependencies]
+smiths-core       = { workspace = true }
+thiserror         = { workspace = true }
+tracing           = { workspace = true }
+prometheus-client = { workspace = true }
+opus              = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "test-util", "time"] }
+
+[lints]
+workspace = true

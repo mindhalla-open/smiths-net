@@ -31,7 +31,11 @@
 pub mod candidate;
 pub mod config;
 pub mod stun;
+pub mod turn;
 
 pub use candidate::{CandidateError, CandidateGatherer, gather_host_candidates};
 pub use config::IceConfig;
 pub use stun::{StunClass, StunError, StunMessage, StunMethod, TransactionId, binding_ping};
+pub use turn::{
+    AllocateOutcome, DEFAULT_LIFETIME_S, LongTermCredential, TurnServer, TurnServerConfig,
+};

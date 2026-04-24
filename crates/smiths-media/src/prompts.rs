@@ -140,14 +140,29 @@ impl PromptLibrary {
     /// cap is below the current population.
     #[must_use]
     pub fn with_capacity(self, capacity: usize) -> Self {
-        {
-            let mut guard = self.lock();
-            guard.capacity = capacity.max(1);
-            while guard.entries.len() > guard.capacity {
-                guard.evict_oldest();
-            }
-        }
+        self.resize(capacity);
         self
+    }
+
+    /// Resize the LRU in place (slice 5.8-b read-through). Called
+    /// by the CLI's config adapter when `media.prompts.capacity`
+    /// changes live. Shares a clone-able handle — every
+    /// `PromptLibrary` clone reads the new cap on the next `get`,
+    /// no teardown. Capacity is clamped at `1` (a zero-cap LRU
+    /// would discard every insert).
+    pub fn resize(&self, capacity: usize) {
+        let mut guard = self.lock();
+        guard.capacity = capacity.max(1);
+        while guard.entries.len() > guard.capacity {
+            guard.evict_oldest();
+        }
+    }
+
+    /// Current capacity snapshot — primarily for the config read-
+    /// through adapter's metrics + tests.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.lock().capacity
     }
 
     /// Root the library was created with.
@@ -340,7 +355,7 @@ fn decode_wav(bytes: &[u8]) -> Result<(u32, Vec<i16>), String> {
                 if bits != 16 {
                     return Err(format!("{bits}-bit samples; 16-bit only"));
                 }
-                if body.len() % 2 != 0 {
+                if !body.len().is_multiple_of(2) {
                     return Err("data chunk length is odd".into());
                 }
                 let mut out = Vec::with_capacity(body.len() / 2);
@@ -468,6 +483,38 @@ mod tests {
             Err(PromptError::NotFound { .. }) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resize_evicts_oldest_to_new_cap() {
+        // Start at cap 3, populate 3, shrink to 1 — only the
+        // most-recently-touched entry survives. Matches the LRU
+        // semantics `with_capacity` already guarantees, but through
+        // the live `resize(&self)` entry point the config adapter
+        // uses.
+        let lib = PromptLibrary::with_root("");
+        lib.insert_raw("/a.wav", 8000, vec![1]);
+        lib.insert_raw("/b.wav", 8000, vec![2]);
+        lib.insert_raw("/c.wav", 8000, vec![3]);
+        assert_eq!(lib.len(), 3);
+        lib.resize(1);
+        assert_eq!(lib.capacity(), 1);
+        assert_eq!(lib.len(), 1);
+        // `/c.wav` (the newest insert) is the one that survives —
+        // `evict_oldest` drops the smallest insertion ordinal.
+        let surviving = lib.get("/c.wav").unwrap();
+        assert_eq!(&*surviving.samples, &[3]);
+    }
+
+    #[test]
+    fn resize_clamps_zero_to_one() {
+        // Zero would make every insert instantly evict — the clamp
+        // is what keeps the "not configured yet" operator state
+        // (`capacity = 0` in the default config) from silently
+        // disabling the cache.
+        let lib = PromptLibrary::with_root("");
+        lib.resize(0);
+        assert_eq!(lib.capacity(), 1);
     }
 
     #[test]

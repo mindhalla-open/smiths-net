@@ -183,6 +183,11 @@ impl DtlsLeg {
         &self,
         socket: Arc<dyn Conn + Send + Sync>,
     ) -> Result<SrtpKeys, DtlsHandshakeError> {
+        // Rustls 0.23 requires a `CryptoProvider`; install the
+        // `ring` one on the first handshake (see the helper's
+        // doc comment for the CI feature-unification story).
+        install_default_crypto_provider();
+
         *self.state.lock().await = LegState::Handshaking;
 
         let config = self.build_dtls_config()?;
@@ -260,14 +265,24 @@ impl DtlsLeg {
     }
 
     fn load_cert(&self) -> Result<Certificate, DtlsHandshakeError> {
-        // `webrtc_dtls::crypto::Certificate` wants a Vec<CertificateDer>
-        // + a CryptoPrivateKey. We've minted the cert via rcgen (slice
-        // 1.2); round-trip through PEM so the types line up without
-        // re-implementing DER → Certificate conversion. The `pem`
-        // feature of webrtc-dtls lights up `from_pem`.
+        // `webrtc_dtls::crypto::Certificate::from_pem` expects the
+        // bundle to lead with a `PRIVATE_KEY` block (underscore
+        // in the tag), followed by one or more `CERTIFICATE`
+        // blocks — that's webrtc-dtls 0.12's contract. Concretely:
+        //
+        //   -----BEGIN PRIVATE_KEY-----
+        //   ...
+        //   -----END PRIVATE_KEY-----
+        //   -----BEGIN CERTIFICATE-----
+        //   ...
+        //   -----END CERTIFICATE-----
+        //
+        // We mint DER via rcgen (slice 1.2); round-trip through
+        // PEM so the types line up without re-implementing DER →
+        // Certificate conversion.
+        let key_pem = der_to_pem("PRIVATE_KEY", &self.config.local_cert.key_der);
         let cert_pem = der_to_pem("CERTIFICATE", &self.config.local_cert.cert_der);
-        let key_pem = der_to_pem("PRIVATE KEY", &self.config.local_cert.key_der);
-        let bundle = format!("{cert_pem}{key_pem}");
+        let bundle = format!("{key_pem}{cert_pem}");
         Certificate::from_pem(&bundle)
             .map_err(|e: DtlsError| DtlsHandshakeError::CertLoad(e.to_string()))
     }
@@ -294,6 +309,37 @@ impl DtlsLeg {
 
 fn stringify_dtls(e: &DtlsError) -> DtlsHandshakeError {
     DtlsHandshakeError::Dtls(e.to_string())
+}
+
+/// Ensure rustls has a process-wide [`CryptoProvider`] installed
+/// before any DTLS handshake runs.
+///
+/// `webrtc-dtls` 0.12 uses rustls internally; rustls 0.23 refuses
+/// to pick a provider unless exactly one of its `aws-lc-rs` /
+/// `ring` features is active **or** the process pre-installs a
+/// provider via `CryptoProvider::install_default`. On a CI image
+/// where Cargo's feature unification doesn't end up with either
+/// (the workspace pins `rustls` with `ring`, but the transitive
+/// graph via `webrtc-dtls` can resolve differently depending on
+/// which crate the `ring` feature request enters through), a
+/// handshake panics mid-flight with "Could not automatically
+/// determine the process-level `CryptoProvider`".
+///
+/// We install the `ring` provider here explicitly, once per
+/// process via `std::sync::Once`. Subsequent calls are cheap
+/// no-ops; only the first resolves. The workspace already pins
+/// `rustls` with `default-features = false, features = ["ring"]`,
+/// so the `ring` provider's code is always in the build — the
+/// fix is purely about the install-default decision that
+/// `webrtc-dtls` doesn't make on its own.
+fn install_default_crypto_provider() {
+    use std::sync::Once;
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        // `install_default` errors on "already installed" — ignore it;
+        // the process-wide default is what matters, not who won.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 /// Encode DER bytes as a PEM block with the given label. Pure so
