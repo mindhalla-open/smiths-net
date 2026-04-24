@@ -8,7 +8,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ## [0.73.0] - 2026-04-24
 
 **`smiths-net init` config wizard — first-run onboarding.**
-Implements Slice 7.1 (P25 Developer Experience). Adds an interactive
+Implements  Developer Experience. Adds mcp and an interactive
 `init` subcommand that generates a valid `config.toml` through
 terminal prompts, with preset support for scripted installs.
 
