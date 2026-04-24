@@ -5,6 +5,34 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.73.0] - 2026-04-24
+
+**`smiths-net init` config wizard — first-run onboarding.**
+Implements Slice 7.1 (P25 Developer Experience). Adds an interactive
+`init` subcommand that generates a valid `config.toml` through
+terminal prompts, with preset support for scripted installs.
+
+### Added — 7.1: Config wizard
+
+- **`smiths-net init`** subcommand in `smiths-cli`:
+  - Interactive prompts for SIP bind/transports, TLS paths, auth backend,
+    log level/format, health bind, WebRTC/ICE, plugin sandbox, HA cluster mode.
+  - `--preset dev` — relaxed defaults (debug/pretty, no TLS, no sandbox).
+  - `--preset prod` — hardened defaults (info/JSON, TLS, `no_new_privs`,
+    seccomp allowlist, conservative rlimits).
+  - `--non-interactive` — skip prompts, use preset values directly.
+  - `--force` — overwrite existing output file.
+  - `--output <path>` — configurable output path (default: `config.toml`).
+  - Round-trip validation: generated TOML is loaded back through
+    `Config::load` + `Config::validate` before exit.
+- **Integration tests**: dev/prod preset validation, overwrite protection,
+  default-fallback behavior.
+- **Dependencies**: `dialoguer` 0.11, `toml` 0.8 added to `smiths-cli`.
+
+### Changed
+
+- Workspace version bumped to `0.73.0`.
+
 ## [0.72.0] - 2026-04-24
 
 **Multi-node Raft cluster + snapshot support.**

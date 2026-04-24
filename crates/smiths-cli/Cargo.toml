@@ -61,6 +61,8 @@ serde_json         = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
+dialoguer          = "0.11"
+toml               = "0.8"
 # Slice 5.8-c: `smiths-net reload` uses `rustix::process::kill_process`
 # to deliver SIGHUP to a running engine. `smiths-sidecar` already
 # pulls rustix through the workspace pin (v1.1) for sandbox

@@ -8,12 +8,14 @@
 //! transport.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use prometheus_client::registry::Registry;
 use serde_json::Value;
 use smiths_core::Config;
+use smiths_core::ConfigReloader;
 use smiths_core::Metrics;
 use smiths_core::ai::AiRegistry;
 use smiths_core::call::{CallOriginator, RegistrationView};
@@ -83,6 +85,16 @@ pub struct ToolContext {
     /// MCP tools can never disagree with a scrape. `None` in
     /// tests and in transport-free contexts.
     pub metrics_registry: Option<Arc<Mutex<Registry>>>,
+    /// Config hot-reload handle (slice 7.3). `None` in test contexts;
+    /// `put_config` returns `NotFound` without it.
+    pub reloader: Option<Arc<ConfigReloader>>,
+    /// Filesystem path the engine loaded its config from (slice 7.3).
+    /// Used by `put_config(persist=true)` to write back to the same file.
+    pub config_path: Option<PathBuf>,
+    /// In-memory ring buffer of `put_config` calls (slice 7.3).
+    /// Shared between the `put_config` tool and the `config://history`
+    /// resource.
+    pub config_history: Option<crate::config_history::ConfigHistory>,
 }
 
 impl ToolContext {
@@ -108,6 +120,9 @@ impl ToolContext {
             prompts: None,
             conferences: None,
             metrics_registry: None,
+            reloader: None,
+            config_path: None,
+            config_history: None,
         }
     }
 
@@ -187,6 +202,22 @@ impl ToolContext {
     #[must_use]
     pub fn with_cdr(mut self, store: Arc<dyn CdrStore>) -> Self {
         self.cdr = Some(store);
+        self
+    }
+
+    /// Attach the [`ConfigReloader`] so `put_config` can drive live
+    /// config changes through the same `apply` path SIGHUP uses.
+    #[must_use]
+    pub fn with_reloader(mut self, reloader: Arc<ConfigReloader>) -> Self {
+        self.reloader = Some(reloader);
+        self
+    }
+
+    /// Store the config file path so `put_config(persist=true)` can
+    /// write back to the same TOML file the engine booted from.
+    #[must_use]
+    pub fn with_config_path(mut self, path: PathBuf) -> Self {
+        self.config_path = Some(path);
         self
     }
 }

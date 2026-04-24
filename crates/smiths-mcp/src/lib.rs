@@ -21,6 +21,8 @@
 pub mod a2a;
 pub mod audit;
 pub mod cluster;
+pub mod config_history;
+pub mod config_tools;
 pub mod control;
 pub mod control_protocol;
 pub mod dispatch;
