@@ -28,11 +28,13 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod agent;
 pub mod candidate;
 pub mod config;
 pub mod stun;
 pub mod turn;
 
+pub use agent::{IceAgent, IcePair, PairState};
 pub use candidate::{CandidateError, CandidateGatherer, gather_host_candidates};
 pub use config::IceConfig;
 pub use stun::{StunClass, StunError, StunMessage, StunMethod, TransactionId, binding_ping};

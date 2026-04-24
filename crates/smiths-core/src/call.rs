@@ -247,6 +247,23 @@ pub struct DialogRecord {
     /// default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub per_leg_codec: BTreeMap<LegId, NegotiatedCodec>,
+    /// ICE parameters (slice 5.10-ice). Populated when the
+    /// dialog uses native ICE connectivity checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ice: Option<crate::sdp::IceParams>,
+}
+
+/// Dialog state mutation for replication (slice 6.2).
+///
+/// Primary sends these to the secondary; secondary replays into its
+/// local `DashMap`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DialogDelta {
+    /// Create or update a dialog record.
+    Upsert(Box<DialogRecord>),
+    /// Remove a dialog record.
+    Delete(DialogKey),
 }
 
 impl DialogRecord {
@@ -432,6 +449,7 @@ mod tests {
             remote_media: None,
             pending_2xx: None,
             per_leg_codec: codecs.clone(),
+            ice: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: DialogRecord = serde_json::from_str(&json).unwrap();

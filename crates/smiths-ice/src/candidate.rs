@@ -61,6 +61,55 @@ impl CandidateGatherer {
         }
         Ok(out)
     }
+
+    /// Gather host, srflx, and relay candidates concurrently.
+    /// - `socket`: bound socket to gather from.
+    /// - `stun_servers`: list of STUN servers for srflx gathering.
+    /// - `turn_server`: optional TURN server + credentials for relay gathering.
+    pub async fn gather_all(
+        &self,
+        socket: &tokio::net::UdpSocket,
+        stun_servers: &[SocketAddr],
+        turn_server: Option<(SocketAddr, crate::turn::LongTermCredential)>,
+        component: u8,
+    ) -> Result<Vec<IceCandidate>, CandidateError> {
+        let mut out = self.gather(component)?;
+        let local_addr = socket
+            .local_addr()
+            .map_err(|e| CandidateError::Io(e.to_string()))?;
+
+        // 1. Gather srflx candidates.
+        if !stun_servers.is_empty() {
+            let srflx_addrs = crate::stun::gather_srflx_candidates(
+                socket,
+                stun_servers,
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+            for (idx, addr) in srflx_addrs.into_iter().enumerate() {
+                out.push(make_srflx_candidate(addr, local_addr, component, idx));
+            }
+        }
+
+        // 2. Gather relay candidates.
+        if let Some((server, cred)) = turn_server {
+            match crate::turn::allocate_relay_addr(
+                socket,
+                server,
+                &cred,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            {
+                Ok(relay_addr) => {
+                    out.push(make_relay_candidate(relay_addr, local_addr, component, 0));
+                }
+                Err(e) => tracing::debug!(?e, "TURN allocation failed during gathering"),
+            }
+        }
+
+        Ok(out)
+    }
 }
 
 /// Convenience for the common case — one bind, one candidate.
@@ -76,10 +125,8 @@ pub fn gather_host_candidates(binds: &[SocketAddr], component: u8) -> Vec<IceCan
 fn make_host_candidate(bind: SocketAddr, component: u8, idx: usize) -> IceCandidate {
     // Foundation: per RFC 8445 §5.1.1.3, equal for candidates with the
     // same (type, base address, transport protocol, STUN/TURN server).
-    // For host-only we collapse it to index — each bind gets its own
-    // foundation string.
     let foundation = format!("host{idx}");
-    let priority = host_candidate_priority(&bind.ip(), component);
+    let priority = candidate_priority(126, &bind.ip(), component);
     IceCandidate {
         foundation,
         component,
@@ -94,20 +141,56 @@ fn make_host_candidate(bind: SocketAddr, component: u8, idx: usize) -> IceCandid
     }
 }
 
-/// RFC 8445 §5.1.2.1 priority formula, restricted to host candidates:
+fn make_srflx_candidate(
+    addr: SocketAddr,
+    base: SocketAddr,
+    component: u8,
+    idx: usize,
+) -> IceCandidate {
+    let foundation = format!("srflx{idx}");
+    let priority = candidate_priority(100, &base.ip(), component);
+    IceCandidate {
+        foundation,
+        component,
+        transport: "UDP".to_owned(),
+        priority,
+        address: addr.ip(),
+        port: addr.port(),
+        candidate_type: "srflx".to_owned(),
+        related_address: Some(base.ip()),
+        related_port: Some(base.port()),
+        raw_params: Vec::new(),
+    }
+}
+
+fn make_relay_candidate(
+    addr: SocketAddr,
+    base: SocketAddr,
+    component: u8,
+    idx: usize,
+) -> IceCandidate {
+    let foundation = format!("relay{idx}");
+    let priority = candidate_priority(0, &base.ip(), component);
+    IceCandidate {
+        foundation,
+        component,
+        transport: "UDP".to_owned(),
+        priority,
+        address: addr.ip(),
+        port: addr.port(),
+        candidate_type: "relay".to_owned(),
+        related_address: Some(base.ip()),
+        related_port: Some(base.port()),
+        raw_params: Vec::new(),
+    }
+}
+
+/// RFC 8445 §5.1.2.1 priority formula:
 ///
 /// ```text
 ///   priority = (2^24) * type-pref + (2^8) * local-pref + (256 - component)
 /// ```
-///
-/// With `type-pref = 126` for host, `local-pref = 65535` for the single
-/// interface we picked, and `component` typically 1 (RTP). Returns a
-/// plain `u32` — the ICE tie-breaker only needs the ordering, not the
-/// exact value.
-fn host_candidate_priority(ip: &IpAddr, component: u8) -> u32 {
-    // Slight nudge for IPv6 to match browsers' default preference
-    // when dual-stacking; irrelevant on IPv4-only deployments.
-    let type_pref: u32 = 126;
+fn candidate_priority(type_pref: u32, ip: &IpAddr, component: u8) -> u32 {
     let local_pref: u32 = if matches!(ip, IpAddr::V6(_)) {
         65_535
     } else {
@@ -120,6 +203,10 @@ fn host_candidate_priority(ip: &IpAddr, component: u8) -> u32 {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn host_candidate_priority(ip: &IpAddr, component: u8) -> u32 {
+        candidate_priority(126, ip, component)
+    }
 
     #[test]
     fn gather_single_ipv4_bind_yields_host_candidate() {

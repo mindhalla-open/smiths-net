@@ -9,6 +9,7 @@ description  = "ICE / STUN MVP (host candidates only) for smiths-net."
 [dependencies]
 smiths-core = { workspace = true }
 smiths-sdp  = { workspace = true }
+futures     = { workspace = true }
 
 tokio      = { workspace = true }
 tokio-util = { workspace = true }

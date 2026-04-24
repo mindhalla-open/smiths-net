@@ -47,6 +47,37 @@ pub struct DtlsParams {
     pub local_role: DtlsRole,
 }
 
+/// ICE parameters extracted from an SDP offer/answer (slice
+/// 5.10-ice). For Full ICE, the media layer needs the roles and
+/// credentials to perform connectivity checks and authenticate
+/// STUN packets.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct IceParams {
+    /// Local user fragment (a=ice-ufrag).
+    pub local_ufrag: String,
+    /// Local password (a=ice-pwd).
+    pub local_pwd: String,
+    /// Remote user fragment.
+    pub remote_ufrag: String,
+    /// Remote password.
+    pub remote_pwd: String,
+    /// The role the engine plays (Controlling vs Controlled)
+    /// per RFC 8445 §6.1.1.
+    pub role: IceRole,
+    /// Tie-breaker for role determination (RFC 8445 §6.1.1).
+    pub tie_breaker: u64,
+}
+
+/// ICE agent role (RFC 8445 §6).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IceRole {
+    /// Agent that nominates the candidate pair to be used.
+    Controlling,
+    /// Agent that waits for the controlling agent to nominate.
+    Controlled,
+}
+
 /// DTLS-SRTP handshake role at the media layer. Mirrors
 /// [`smiths_dtls::DtlsRole`] but lives in `smiths-core` so the
 /// SDP trait seam doesn't force every crate that consumes
@@ -168,6 +199,10 @@ pub enum NegotiationOutcome {
         /// negotiator accepted a `m=video` block; `None` when
         /// video was declined or absent.
         video_codec: Option<NegotiatedCodec>,
+        /// ICE parameters (slice 5.10-ice). Populated when
+        /// `ice_enabled` is true and the offer/answer both carry
+        /// ICE attributes.
+        ice: Option<IceParams>,
     },
     /// No common codec — responder should send `488 Not Acceptable Here`.
     Mismatch,
