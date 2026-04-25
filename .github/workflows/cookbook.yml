@@ -1,0 +1,66 @@
+name: cookbook
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "plugins/cookbook/**"
+      - ".github/workflows/cookbook.yml"
+  pull_request:
+    paths:
+      - "plugins/cookbook/**"
+      - ".github/workflows/cookbook.yml"
+
+# Cancel in-progress runs for the same PR/branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────────────
+  # C-1 · Cookbook examples — WASM Rust
+  # ──────────────────────────────────────────────────────
+  wasm-examples:
+    name: "WASM Rust examples"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            plugins/cookbook/wasm/rust/hello-world
+            plugins/cookbook/wasm/rust/canonical-hook
+
+      - name: Build hello-world (WASM)
+        working-directory: plugins/cookbook/wasm/rust/hello-world
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Build canonical-hook (WASM)
+        working-directory: plugins/cookbook/wasm/rust/canonical-hook
+        run: cargo build --target wasm32-unknown-unknown --release
+
+  # ──────────────────────────────────────────────────────
+  # C-1 · Cookbook examples — Python sidecar
+  # ──────────────────────────────────────────────────────
+  sidecar-examples:
+    name: "Python sidecar examples"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test hello-world sidecar
+        working-directory: plugins/cookbook/sidecar/python/hello-world
+        run: python3 test_hello.py
+
+      - name: Test canonical-hook sidecar
+        working-directory: plugins/cookbook/sidecar/python/canonical-hook
+        run: python3 test_canonical_hook.py
