@@ -1,0 +1,10 @@
+# plugin.toml — Sidecar plugin manifest for hello-world-py.
+name        = "hello-world-py"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./hello.py"
+description = "Minimal Python sidecar plugin — echoes method names."
+
+[sidecar]
+command = "python3"
+args    = ["hello.py"]

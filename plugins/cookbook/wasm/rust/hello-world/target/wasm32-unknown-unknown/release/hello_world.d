@@ -1,0 +1,1 @@
+/Users/shkabenkov/Documents/coding/own/mindhalla/smiths-net/plugins/cookbook/wasm/rust/hello-world/target/wasm32-unknown-unknown/release/hello_world.wasm: /Users/shkabenkov/Documents/coding/own/mindhalla/smiths-net/plugins/cookbook/wasm/rust/hello-world/src/lib.rs

@@ -1,0 +1,8 @@
+name        = "hello-world"
+version     = "0.1.0"
+type        = "wasm"
+entry       = "./hello_world.wasm"
+provides    = []
+permissions = []
+abi         = "1.0"
+description = "Minimal hello-world WASM plugin."

@@ -1,0 +1,11 @@
+# plugin.toml — Sidecar plugin manifest for canonical-hook-py.
+name        = "canonical-hook-py"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./canonical_hook.py"
+provides    = ["ai.summarize"]
+description = "Full sidecar protocol: describe + invoke + shutdown."
+
+[sidecar]
+command = "python3"
+args    = ["canonical_hook.py"]
