@@ -1,0 +1,1 @@
+/Users/shkabenkov/Documents/coding/own/mindhalla/smiths-net/plugins/cookbook/wasm/rust/canonical-hook/target/wasm32-unknown-unknown/release/canonical_hook.wasm: /Users/shkabenkov/Documents/coding/own/mindhalla/smiths-net/plugins/cookbook/wasm/rust/canonical-hook/src/lib.rs

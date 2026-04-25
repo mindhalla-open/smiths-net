@@ -1,0 +1,8 @@
+name        = "canonical-hook"
+version     = "0.1.0"
+type        = "wasm"
+entry       = "./canonical_hook.wasm"
+provides    = ["ai.echo"]
+permissions = []
+abi         = "1.0"
+description = "Full ABI example: describe + alloc + invoke + run."
