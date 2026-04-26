@@ -1,0 +1,7 @@
+name        = "canonical-hook-nodejs"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./canonical_hook.mjs"
+provides    = ["ai.summarize"]
+abi         = "1.0"
+description = "Node.js canonical-hook sidecar — ai.summarize tool."

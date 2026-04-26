@@ -1,0 +1,8 @@
+name        = "multi-tool"
+version     = "0.1.0"
+type        = "wasm"
+entry       = "./multi_tool.wasm"
+provides    = ["text.upper", "text.reverse", "text.length"]
+permissions = []
+abi         = "1.0"
+description = "Multi-tool WASM plugin: uppercase, reverse, and length."

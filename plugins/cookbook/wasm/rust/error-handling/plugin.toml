@@ -1,0 +1,8 @@
+name        = "error-handling"
+version     = "0.1.0"
+type        = "wasm"
+entry       = "./error_handling.wasm"
+provides    = ["math.divide"]
+permissions = []
+abi         = "1.0"
+description = "WASM plugin demonstrating structured error handling patterns."
