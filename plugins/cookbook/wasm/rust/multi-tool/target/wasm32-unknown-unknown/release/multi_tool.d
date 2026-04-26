@@ -1,0 +1,1 @@
+/Users/shkabenkov/Documents/coding/own/mindhalla/smiths-net/plugins/cookbook/wasm/rust/multi-tool/target/wasm32-unknown-unknown/release/multi_tool.wasm: /Users/shkabenkov/Documents/coding/own/mindhalla/smiths-net/plugins/cookbook/wasm/rust/multi-tool/src/lib.rs

@@ -1,0 +1,7 @@
+name        = "hello-world-nodejs"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./hello.mjs"
+provides    = []
+abi         = "1.0"
+description = "Minimal Node.js hello-world sidecar plugin."
