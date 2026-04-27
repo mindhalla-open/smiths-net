@@ -1,0 +1,27 @@
+# Crowdin configuration for Smiths-Net docs site.
+#
+# Workflow:
+#   1. `node scripts/extract-strings.mjs`        → generates l10n/ source files
+#   2. `crowdin upload sources`                   → uploads to Crowdin
+#   3. Translators work in Crowdin dashboard
+#   4. `crowdin download translations`            → downloads to l10n/<locale>/
+#   5. `node scripts/merge-translations.mjs <locale>` → merges into site
+#   6. `npm run build`                            → verify build
+#
+# See site/README.md for the full workflow.
+
+project_id_env: CROWDIN_PROJECT_ID
+api_token_env: CROWDIN_API_TOKEN
+
+preserve_hierarchy: true
+
+files:
+  # UI strings (flattened JSON key-value pairs)
+  - source: /site/l10n/ui-strings.json
+    translation: /site/l10n/%two_letters_code%/ui-strings.json
+    type: json
+
+  # Recipe prose (per-recipe JSON files)
+  - source: /site/l10n/recipes/*.json
+    translation: /site/l10n/%two_letters_code%/recipes/%original_file_name%
+    type: json
