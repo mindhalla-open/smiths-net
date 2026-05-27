@@ -1,0 +1,219 @@
+---
+title: "Hello World"
+description: "Your first WASM plugin — compile a minimal Rust crate to .wasm and load it into Smiths-Net."
+track: wasm
+lang: rust
+locale: en
+order: 1
+updatedAt: "2026-04-25"
+---
+
+## Overview
+
+This recipe walks you through building the simplest possible WASM
+plugin for Smiths-Net: a `#![no_std]` Rust crate that compiles to
+`wasm32-unknown-unknown` and calls the engine's `smiths::log` host
+function when it starts up.
+
+By the end you will have:
+
+1. A standalone Rust crate that compiles to a `.wasm` module.
+2. A `plugin.toml` manifest the engine reads at boot.
+3. A working plugin that prints a greeting to the engine's tracing log.
+
+## Prerequisites
+
+- Rust toolchain (via `rustup`) with the `wasm32-unknown-unknown` target:
+
+  ```bash
+  rustup target add wasm32-unknown-unknown
+  ```
+
+- A running `smiths-net` instance — the quickest way is:
+
+  ```bash
+  smiths-net init --preset dev --non-interactive
+  smiths-net --config config.toml
+  ```
+
+## 1. Scaffold the crate
+
+```bash
+mkdir -p hello-world/src
+cd hello-world
+```
+
+Create `Cargo.toml`:
+
+```toml
+# Cargo.toml
+[package]
+name         = "hello-world"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.95"
+publish      = false
+description  = "Minimal WASM plugin — calls smiths::log."
+
+# Independent workspace root so this crate builds in isolation.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto           = true
+codegen-units = 1
+opt-level     = "s"
+strip         = "symbols"
+```
+
+Key points:
+
+- **`crate-type = ["cdylib"]`** — produces a shared-library `.wasm`
+  with only the exports we mark `#[unsafe(no_mangle)]`.
+- **`[workspace]`** — an empty workspace block makes this crate
+  independent from the parent smiths-net workspace.
+- **Release profile** — `lto = true` + `opt-level = "s"` keeps the
+  output under 1 KiB.
+
+## 2. Write the plugin
+
+```rust
+// src/lib.rs
+#![no_std]
+#![no_main]
+
+// Import the host's log function. The `wasm_import_module` attribute
+// tells the linker to look for this symbol under the `smiths` module
+// — the engine provides it automatically.
+#[link(wasm_import_module = "smiths")]
+unsafe extern "C" {
+    fn log(ptr: *const u8, len: usize);
+}
+
+/// Thin wrapper so call sites stay safe.
+fn host_log(msg: &str) {
+    unsafe {
+        log(msg.as_ptr(), msg.len());
+    }
+}
+
+const GREETING: &str = "hello-world: hook fired";
+
+/// Entry point the engine invokes via `WasmEngine::run_entry`.
+#[unsafe(no_mangle)]
+pub extern "C" fn run() {
+    host_log(GREETING);
+}
+
+/// Panics must not unwind into host code — abort to a trap.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    core::arch::wasm32::unreachable()
+}
+```
+
+Walk-through:
+
+| Item | Purpose |
+|------|---------|
+| `#![no_std]` | No standard library — WASM guests have no OS. |
+| `#![no_main]` | No `main()` — the engine calls `run()` directly. |
+| `#[link(wasm_import_module = "smiths")]` | Binds the `log` extern to the `smiths.log` host import. |
+| `#[unsafe(no_mangle)]` | Preserves the symbol name so the engine can find it. |
+| `extern "C" fn run()` | The C ABI export the engine invokes at plugin load. |
+| `#[panic_handler]` | Required on `no_std` targets — traps instead of unwinding. |
+
+## 3. Build
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+```
+
+The output lands at:
+
+```
+target/wasm32-unknown-unknown/release/hello_world.wasm
+```
+
+Verify the size — it should be tiny (< 1 KiB):
+
+```bash
+ls -lh target/wasm32-unknown-unknown/release/hello_world.wasm
+```
+
+## 4. Create the plugin manifest
+
+Every plugin needs a `plugin.toml` that tells the engine what it is
+loading:
+
+```toml
+# plugin.toml
+name        = "hello-world"
+version     = "0.1.0"
+type        = "wasm"
+entry       = "./hello_world.wasm"
+provides    = []
+permissions = []
+abi         = "1.0"
+description = "Minimal hello-world WASM plugin."
+```
+
+| Field | Meaning |
+|-------|---------|
+| `type` | `"wasm"` tells the engine to use the WASM loader. |
+| `entry` | Relative path from `plugin.toml` to the `.wasm` binary. |
+| `provides` | Capabilities this plugin advertises (empty for now). |
+| `permissions` | Host resources the plugin may access (empty = log only). |
+| `abi` | ABI version — must match the engine's expected version. |
+
+## 5. Load into the engine
+
+Copy the artefacts into the engine's plugin directory and restart
+(or hot-reload):
+
+```bash
+mkdir -p plugins/hello-world
+cp target/wasm32-unknown-unknown/release/hello_world.wasm plugins/hello-world/
+cp plugin.toml plugins/hello-world/
+```
+
+Then either restart:
+
+```bash
+smiths-net --config config.toml
+```
+
+Or hot-reload the running engine:
+
+```bash
+smiths-net reload --pid $(pgrep smiths-net)
+```
+
+You should see in the engine logs:
+
+```
+INFO smiths_wasm: plugin loaded name="hello-world"
+INFO smiths_wasm: hello-world: hook fired
+```
+
+## What we skipped
+
+This hello-world plugin only exports `run()`. A production plugin
+also exports:
+
+- **`describe()`** — returns a JSON capability descriptor so the
+  engine knows what tools the plugin provides.
+- **`alloc(len)`** — a bump allocator the engine uses to write data
+  into guest memory.
+- **`invoke(method_ptr, method_len, params_ptr, params_len)`** —
+  the tool dispatcher the engine calls when an MCP/A2A client
+  invokes one of the plugin's tools.
+
+## Next steps
+
+- Add the full four-export ABI — see the
+  [Canonical Hook](/cookbook/wasm/rust/canonical-hook/) recipe.
+- Explore the complete plugin ABI in the
+  [Plugin Authoring Guide](https://github.com/friday-mindhalla/smiths-net/blob/main/docs/tool-authoring.md).

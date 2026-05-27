@@ -1,0 +1,46 @@
+---
+title: "CLI Reference"
+description: "All smiths-net subcommands, flags, and environment variables."
+section: "getting-started"
+locale: en
+order: 3
+updatedAt: "2026-04-25"
+---
+
+## Usage
+
+```
+smiths-net [OPTIONS] [COMMAND]
+```
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `validate` | Load + validate the config without starting the engine. |
+| `reload` | Hot-reload a running engine's config via SIGHUP. |
+| `init` | Generate a valid `config.toml` through a wizard or preset. |
+
+## Global options
+
+| Flag | Env | Description |
+|------|-----|-------------|
+| `--config <PATH>` | `SMITHS_CONFIG` | Path to TOML config (default: `examples/config.toml`). |
+| `--log <LEVEL>` | `SMITHS_LOG` | Override `observability.log_level`. |
+| `--mcp stdio` | — | Run as a clean MCP stdio server. |
+| `--snapshot-path <PATH>` | `SMITHS_SNAPSHOT` | HA snapshot file for dialog persistence. |
+| `--no-reload-signal` | — | Disable SIGHUP hot-reload trigger. |
+
+## `init` subcommand
+
+```bash
+smiths-net init --preset dev --non-interactive --output config.toml
+```
+
+| Flag | Description |
+|------|-------------|
+| `--preset dev` | Relaxed defaults (debug, pretty logs, no TLS). |
+| `--preset prod` | Hardened defaults (info/JSON, TLS, sandbox). |
+| `--non-interactive` | Skip prompts, use preset values. |
+| `--force` | Overwrite existing output file. |
+| `--output <PATH>` | Output path (default: `config.toml`). |

@@ -1,0 +1,64 @@
+---
+title: "Quickstart"
+description: "Install Smiths-Net, generate a config, and place your first SIP call in under 5 minutes."
+section: "getting-started"
+locale: en
+order: 1
+updatedAt: "2026-04-25"
+---
+
+## Install
+
+```bash
+cargo install smiths-net
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/friday-mindhalla/smiths-net.git
+cd smiths-net
+cargo build --release
+```
+
+## Generate a config
+
+```bash
+smiths-net init --preset dev --non-interactive
+```
+
+This creates a `config.toml` with development defaults: debug logging,
+no TLS, no auth, no sandbox.
+
+## Start the engine
+
+```bash
+smiths-net --config config.toml
+```
+
+You should see:
+
+```
+INFO smiths_net: SIP UAS listening on udp://0.0.0.0:5060
+INFO smiths_net: health endpoint listening addr=127.0.0.1:8080
+```
+
+## Verify
+
+```bash
+curl -s http://127.0.0.1:8080/health | jq .
+```
+
+## Place a test call
+
+Using `pjsua`:
+
+```bash
+pjsua --null-audio --local-port=6070 sip:test@127.0.0.1:5060
+```
+
+## Next steps
+
+- [Configuration Reference](/guide/configuration/) — full `config.toml` walkthrough
+- [CLI Reference](/guide/cli/) — all subcommands and flags
+- [Plugin Cookbook](/cookbook/) — extend the engine with WASM and sidecar plugins

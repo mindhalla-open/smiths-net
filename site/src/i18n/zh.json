@@ -1,0 +1,86 @@
+{
+  "site": {
+    "title": "Smiths-Net 文档",
+    "description": "Smiths-Net AI 优先 SIP 引擎文档。"
+  },
+  "nav": {
+    "home": "首页",
+    "guide": "指南",
+    "cookbook": "食谱",
+    "reference": "参考",
+    "operations": "运维",
+    "architecture": "架构",
+    "search": "搜索…",
+    "github": "GitHub"
+  },
+  "hero": {
+    "title": "Smiths-Net 文档",
+    "subtitle": "安装、配置、扩展和运维 AI 优先 SIP 引擎所需的一切。",
+    "cta": "快速开始",
+    "cta_secondary": "在 GitHub 上查看"
+  },
+  "sections": {
+    "guide": {
+      "title": "快速入门",
+      "description": "几分钟内安装、配置并启动引擎。",
+      "icon": "🚀"
+    },
+    "cookbook": {
+      "title": "插件食谱",
+      "description": "经过实战检验的 WASM、sidecar 和脚本插件食谱。",
+      "icon": "📖"
+    },
+    "reference": {
+      "title": "参考手册",
+      "description": "MCP 工具、资源、SIP 传输、WebRTC 和配置模式。",
+      "icon": "📋"
+    },
+    "operations": {
+      "title": "运维指南",
+      "description": "可观测性、高可用集群、热重载和部署。",
+      "icon": "⚙️"
+    },
+    "architecture": {
+      "title": "架构设计",
+      "description": "深入分析 crate 布局、插件系统和呼叫状态机。",
+      "icon": "🏗️"
+    }
+  },
+  "tracks": {
+    "wasm": {
+      "title": "WASM 插件",
+      "description": "编译为 WebAssembly，实现沙箱化的进程内插件。Rust、TinyGo、Zig、AssemblyScript。",
+      "badge": "wasm"
+    },
+    "sidecar": {
+      "title": "Sidecar 插件",
+      "description": "作为协同进程在引擎旁运行。Python、Node.js、Go、Ruby、Erlang。",
+      "badge": "sidecar"
+    },
+    "script": {
+      "title": "脚本插件",
+      "description": "嵌入式脚本，用于轻量级逻辑。Rhai、Lua、Starlark。",
+      "badge": "script"
+    }
+  },
+  "recipe": {
+    "toc": "目录",
+    "prerequisites": "前置条件",
+    "source_code": "查看源码",
+    "edit_page": "编辑此页",
+    "not_translated": "此页面尚未翻译。您正在查看英文版本。",
+    "last_updated": "最后更新"
+  },
+  "footer": {
+    "copyright": "© {year} Smiths-Net 贡献者",
+    "license": "Apache-2.0",
+    "docs": "文档",
+    "github": "GitHub",
+    "changelog": "更新日志"
+  },
+  "404": {
+    "title": "页面未找到",
+    "description": "您访问的页面不存在或已被移动。",
+    "back": "返回首页"
+  }
+}

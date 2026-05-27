@@ -1,0 +1,217 @@
+---
+/**
+ * /demo — Interactive demo hub with module cards.
+ */
+import BaseLayout from '@/layouts/BaseLayout.astro';
+
+const modules = [
+  {
+    title: 'Call Flow Simulator',
+    description: 'Step through a complete SIP/WebRTC call and see where plugin hooks fire.',
+    href: '/demo/call-flow/',
+    icon: '📞',
+    color: 'hsl(142, 60%, 45%)',
+    status: 'live',
+  },
+  {
+    title: 'MCP / A2A Explorer',
+    description: 'Build and validate JSON-RPC requests for MCP tools, resources, and A2A federation.',
+    href: '/demo/protocol-explorer/',
+    icon: '🌐',
+    color: 'hsl(215, 80%, 58%)',
+    status: 'live',
+  },
+  {
+    title: 'Rhai Live REPL',
+    description: 'Write routing scripts and execute them against mock SIP requests — in your browser.',
+    href: '#',
+    icon: '🧪',
+    color: 'hsl(28, 92%, 56%)',
+    status: 'soon',
+  },
+  {
+    title: 'Plugin Lifecycle',
+    description: 'Animated walkthrough of load → describe → invoke → hot-reload → unload.',
+    href: '#',
+    icon: '🔄',
+    color: 'hsl(270, 60%, 58%)',
+    status: 'soon',
+  },
+  {
+    title: 'Config Builder',
+    description: 'Interactive config.toml generator with live topology preview.',
+    href: '#',
+    icon: '⚙️',
+    color: 'hsl(340, 65%, 55%)',
+    status: 'soon',
+  },
+];
+---
+
+<BaseLayout
+  title="Interactive Demos — Smiths-Net"
+  description="Explore Smiths-Net features through interactive browser-based demos — no engine required."
+>
+  <div class="demo-page">
+    <header class="demo-hero">
+      <div class="hero-badge">Interactive</div>
+      <h1>Explore Smiths-Net</h1>
+      <p class="hero-desc">
+        Hands-on demos for every major feature — call flows, plugin hooks,
+        protocol building, and more. Everything runs in your browser.
+      </p>
+    </header>
+
+    <div class="demo-grid">
+      {modules.map(({ title, description, href, icon, color, status }) => (
+        <a
+          href={href}
+          class={`demo-card ${status === 'soon' ? 'demo-card--soon' : ''}`}
+          style={`--card-accent: ${color};`}
+          aria-disabled={status === 'soon' ? 'true' : undefined}
+        >
+          {status === 'soon' && <span class="soon-badge">Coming Soon</span>}
+          <span class="demo-card-icon">{icon}</span>
+          <h2 class="demo-card-title">{title}</h2>
+          <p class="demo-card-desc">{description}</p>
+          {status === 'live' && <span class="demo-card-arrow">→</span>}
+        </a>
+      ))}
+    </div>
+  </div>
+</BaseLayout>
+
+<style>
+  .demo-page {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: var(--space-8) var(--space-6) var(--space-24);
+  }
+
+  .demo-hero {
+    text-align: center;
+    margin-bottom: var(--space-12);
+  }
+
+  .hero-badge {
+    display: inline-block;
+    font-size: var(--text-xs);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--color-accent);
+    background: var(--color-accent-muted);
+    padding: var(--space-1) var(--space-3);
+    border-radius: var(--radius-full);
+    margin-bottom: var(--space-4);
+  }
+
+  .demo-hero h1 {
+    font-size: var(--text-4xl);
+    font-weight: 800;
+    background: linear-gradient(135deg, var(--color-text), var(--color-accent));
+    background-clip: text;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: var(--space-4);
+  }
+
+  .hero-desc {
+    font-size: var(--text-lg);
+    color: var(--color-text-muted);
+    max-width: 40rem;
+    margin: 0 auto;
+  }
+
+  .demo-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: var(--space-6);
+  }
+
+  .demo-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    padding: var(--space-8);
+    background: var(--color-bg-surface);
+    border: 1px solid var(--color-border-subtle);
+    border-radius: var(--radius-2xl);
+    text-decoration: none;
+    overflow: hidden;
+    transition: all var(--duration-normal) var(--ease-out);
+  }
+
+  .demo-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(
+      ellipse 120% 80% at 100% 0%,
+      color-mix(in srgb, var(--card-accent) 8%, transparent) 0%,
+      transparent 60%
+    );
+    pointer-events: none;
+  }
+
+  .demo-card:hover:not(.demo-card--soon) {
+    border-color: var(--card-accent);
+    box-shadow: 0 0 0 1px var(--card-accent), var(--shadow-lg);
+    transform: translateY(-3px);
+    text-decoration: none;
+  }
+
+  .demo-card--soon {
+    opacity: 0.55;
+    cursor: default;
+    pointer-events: none;
+  }
+
+  .soon-badge {
+    position: absolute;
+    top: var(--space-4);
+    right: var(--space-4);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-text-faint);
+    background: var(--color-bg-elevated);
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--color-border);
+  }
+
+  .demo-card-icon {
+    font-size: 2.5rem;
+    margin-bottom: var(--space-4);
+  }
+
+  .demo-card-title {
+    font-size: var(--text-xl);
+    font-weight: 700;
+    color: var(--color-text);
+    margin-bottom: var(--space-2);
+  }
+
+  .demo-card-desc {
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+    line-height: var(--leading-relaxed);
+    flex: 1;
+  }
+
+  .demo-card-arrow {
+    position: absolute;
+    bottom: var(--space-6);
+    right: var(--space-6);
+    font-size: var(--text-xl);
+    color: var(--color-text-faint);
+    transition: all var(--duration-fast) var(--ease-out);
+  }
+
+  .demo-card:hover .demo-card-arrow {
+    color: var(--card-accent);
+    transform: translateX(4px);
+  }
+</style>

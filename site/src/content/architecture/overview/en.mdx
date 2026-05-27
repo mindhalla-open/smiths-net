@@ -1,0 +1,30 @@
+---
+title: "System Overview"
+description: "High-level architecture of the Smiths-Net engine — crates, subsystems, and data flow."
+section: "overview"
+locale: en
+order: 1
+updatedAt: "2026-04-25"
+---
+
+## Overview
+
+Smiths-Net is a lightweight, AI-first SIP engine built in Rust on Tokio. The codebase is organized as a Cargo workspace with focused crates for each subsystem.
+
+## Crate layout
+
+| Crate | Purpose |
+|-------|---------|
+| `smiths-core` | Config, errors, shared types |
+| `smiths-sip` | SIP parser, transaction FSM, UAS/UAC |
+| `smiths-sdp` | SDP offer/answer engine |
+| `smiths-media` | RTP bridge, DTLS-SRTP, RTCP |
+| `smiths-ice` | ICE agent, TURN server |
+| `smiths-wasm` | WASM plugin engine (wasmtime) |
+| `smiths-sidecar` | Sidecar plugin runner (JSON-RPC subprocess) |
+| `smiths-plugin` | Plugin loader, registry, hot-reload |
+| `smiths-mcp` | MCP tools, resources, adapters |
+| `smiths-raft` | Raft consensus (SQLite storage) |
+| `smiths-cli` | Binary entry point, CLI, config reloader |
+
+Architecture deep-dives coming soon.

@@ -1,0 +1,86 @@
+{
+  "site": {
+    "title": "وثائق Smiths-Net",
+    "description": "وثائق محرك SIP المبني على الذكاء الاصطناعي Smiths-Net."
+  },
+  "nav": {
+    "home": "الرئيسية",
+    "guide": "الدليل",
+    "cookbook": "الوصفات",
+    "reference": "المرجع",
+    "operations": "التشغيل",
+    "architecture": "الهندسة",
+    "search": "بحث…",
+    "github": "GitHub"
+  },
+  "hero": {
+    "title": "وثائق Smiths-Net",
+    "subtitle": "كل ما تحتاجه لتثبيت وتهيئة وتوسيع وتشغيل محرك SIP المبني على الذكاء الاصطناعي.",
+    "cta": "ابدأ الآن",
+    "cta_secondary": "عرض على GitHub"
+  },
+  "sections": {
+    "guide": {
+      "title": "البداية السريعة",
+      "description": "قم بتثبيت المحرك وتهيئته وتشغيله في دقائق.",
+      "icon": "🚀"
+    },
+    "cookbook": {
+      "title": "وصفات الإضافات",
+      "description": "وصفات مجربة لإضافات WASM و sidecar والنصوص البرمجية.",
+      "icon": "📖"
+    },
+    "reference": {
+      "title": "المرجع",
+      "description": "أدوات MCP والموارد وبروتوكولات SIP و WebRTC ومخطط التهيئة.",
+      "icon": "📋"
+    },
+    "operations": {
+      "title": "التشغيل",
+      "description": "المراقبة والتجميع عالي التوفر وإعادة التحميل السريع والنشر.",
+      "icon": "⚙️"
+    },
+    "architecture": {
+      "title": "الهندسة المعمارية",
+      "description": "تحليل عميق لهيكل الحزم ونظام الإضافات وآلة حالة المكالمات.",
+      "icon": "🏗️"
+    }
+  },
+  "tracks": {
+    "wasm": {
+      "title": "إضافات WASM",
+      "description": "تجميع إلى WebAssembly لإضافات معزولة داخل العملية. Rust, TinyGo, Zig, AssemblyScript.",
+      "badge": "wasm"
+    },
+    "sidecar": {
+      "title": "إضافات Sidecar",
+      "description": "تشغيل كعملية مرافقة بجانب المحرك. Python, Node.js, Go, Ruby, Erlang.",
+      "badge": "sidecar"
+    },
+    "script": {
+      "title": "إضافات النصوص",
+      "description": "نصوص مضمنة للمنطق الخفيف. Rhai, Lua, Starlark.",
+      "badge": "script"
+    }
+  },
+  "recipe": {
+    "toc": "جدول المحتويات",
+    "prerequisites": "المتطلبات الأساسية",
+    "source_code": "عرض المصدر",
+    "edit_page": "تعديل الصفحة",
+    "not_translated": "هذه الصفحة لم تُترجم بعد. أنت تشاهد النسخة الإنجليزية.",
+    "last_updated": "آخر تحديث"
+  },
+  "footer": {
+    "copyright": "© {year} مساهمو Smiths-Net",
+    "license": "Apache-2.0",
+    "docs": "الوثائق",
+    "github": "GitHub",
+    "changelog": "سجل التغييرات"
+  },
+  "404": {
+    "title": "الصفحة غير موجودة",
+    "description": "الصفحة التي تبحث عنها غير موجودة أو تم نقلها.",
+    "back": "العودة للرئيسية"
+  }
+}

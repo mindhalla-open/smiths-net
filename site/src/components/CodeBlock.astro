@@ -1,0 +1,53 @@
+---
+/**
+ * <CodeBlock> — wraps Astro's built-in syntax highlighting with a
+ * language label and copy button.  Used in recipe layouts when you
+ * need the label overlay; Astro's <Code /> works fine for inline
+ * snippets.
+ */
+
+interface Props {
+  language?: string;
+  filename?: string;
+}
+
+const { language, filename } = Astro.props;
+const label = filename ?? language;
+---
+
+<div class="code-block">
+  {label && <span class="code-block-label">{label}</span>}
+  <div class="code-block-body">
+    <slot />
+  </div>
+</div>
+
+<style>
+  .code-block {
+    position: relative;
+    margin-block: var(--space-6);
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--color-border);
+    background: var(--color-bg-surface);
+    overflow: hidden;
+  }
+
+  .code-block-label {
+    display: block;
+    padding: var(--space-2) var(--space-4);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-weight: 500;
+    color: var(--color-text-faint);
+    background: var(--color-bg-elevated);
+    border-block-end: 1px solid var(--color-border-subtle);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .code-block-body :global(pre) {
+    margin: 0;
+    border: none;
+    border-radius: 0;
+  }
+</style>

@@ -1,0 +1,35 @@
+---
+title: "MCP Tools"
+description: "Complete reference for all 28+ MCP tools exposed by the engine."
+section: "mcp"
+locale: en
+order: 1
+updatedAt: "2026-04-25"
+---
+
+## Overview
+
+Every tool is reachable via MCP stdio, MCP HTTP, A2A HTTP, and the webhook adapter. Full tool reference coming soon.
+
+## Tool list
+
+| Tool | Description |
+|------|-------------|
+| `health` | Engine health status |
+| `list_calls` | List active calls |
+| `get_call_status` | Get status of a specific call |
+| `make_call` | Initiate an outbound call |
+| `end_call` | Terminate an active call |
+| `speak` | Inject audio into a live call |
+| `send_dtmf` | Send DTMF tones |
+| `get_config` | Get current engine configuration |
+| `put_config` | Update engine configuration live |
+| `list_cdr` | List call detail records |
+| `list_ai_providers` | List loaded AI plugins |
+| `synthesize` | Text-to-speech via AI plugin |
+| `transcribe` | Speech-to-text via AI plugin |
+| `llm_chat` | Chat completion via AI plugin |
+| `embed` | Text embedding via AI plugin |
+| `create_conference` | Create a conference room |
+| `join_conference` | Add a call to a conference |
+| `leave_conference` | Remove a call from a conference |

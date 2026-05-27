@@ -1,0 +1,51 @@
+---
+/**
+ * Guide section landing — lists all guide articles.
+ */
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { t, DEFAULT_LOCALE } from '@/i18n';
+import { getCollection } from 'astro:content';
+
+const locale = DEFAULT_LOCALE;
+const guides = await getCollection('guide');
+const sorted = guides
+  .filter((g) => g.data.locale === 'en')
+  .sort((a, b) => (a.data.order ?? 100) - (b.data.order ?? 100));
+---
+
+<BaseLayout
+  title="Getting Started — Smiths-Net"
+  description="Install, configure, and run Smiths-Net."
+  locale={locale}
+>
+  <section class="section-landing">
+    <div class="container">
+      <h1 class="section-title" data-i18n="sections.guide.title">{t(locale, 'sections.guide.title')}</h1>
+      <p class="section-desc" data-i18n="sections.guide.description">{t(locale, 'sections.guide.description')}</p>
+
+      <div class="card-grid">
+        {sorted.map((entry) => (
+          <a href={`/guide/${entry.id.replace(/\/en$/, '')}/`} class="doc-card">
+            <h3 class="doc-card-title">{entry.data.title}</h3>
+            <p class="doc-card-desc">{entry.data.description}</p>
+          </a>
+        ))}
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .section-landing { padding-block: var(--space-12) var(--space-20); }
+  .section-title { font-size: var(--text-4xl); font-weight: 800; margin-block-end: var(--space-3); }
+  .section-desc { font-size: var(--text-lg); color: var(--color-text-muted); margin-block-end: var(--space-10); max-width: 40rem; }
+  .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: var(--space-5); }
+  .doc-card {
+    display: block; padding: var(--space-6); background: var(--color-bg-surface);
+    border: 1px solid var(--color-border-subtle); border-radius: var(--radius-xl);
+    text-decoration: none; transition: border-color var(--duration-fast) var(--ease-out), box-shadow var(--duration-fast) var(--ease-out);
+  }
+  .doc-card:hover { border-color: var(--color-accent); box-shadow: var(--shadow-md); text-decoration: none; }
+  .doc-card-title { font-size: var(--text-lg); font-weight: 600; color: var(--color-text); margin-block-end: var(--space-2); }
+  .doc-card-desc { font-size: var(--text-sm); color: var(--color-text-muted); line-height: var(--leading-relaxed); }
+</style>

@@ -1,0 +1,47 @@
+---
+/**
+ * Dynamic recipe route: /[track]/[lang]/[recipe]/
+ *
+ * Generates a static page for every recipe in the cookbook
+ * content collection.
+ */
+import RecipeLayout from '@/layouts/RecipeLayout.astro';
+import { getCollection, render } from 'astro:content';
+
+export async function getStaticPaths() {
+  const recipes = await getCollection('cookbook');
+
+  // Only generate routes for English (canonical) entries.
+  // Translated locale files (ru.mdx, ar.mdx) are content variants,
+  // not separate routes — they share the same URL.
+  return recipes
+    .filter((entry) => entry.data.locale === 'en')
+    .map((entry) => {
+      // entry.id is like "wasm/rust/hello-world/en"
+      const parts = entry.id.split('/');
+      const track = parts[0];
+      const lang = parts[1];
+      const recipe = parts[2];
+
+      return {
+        params: { track, lang, recipe },
+        props: { entry },
+      };
+    });
+}
+
+const { entry } = Astro.props;
+const { Content } = await render(entry);
+---
+
+<RecipeLayout
+  title={entry.data.title}
+  description={entry.data.description}
+  track={entry.data.track}
+  lang={entry.data.lang}
+  locale={entry.data.locale as any}
+  pageLocale={entry.data.locale as any}
+  entryId={entry.id}
+>
+  <Content />
+</RecipeLayout>

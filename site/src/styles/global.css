@@ -1,0 +1,358 @@
+/* ─────────────────────────────────────────────────────────
+   Smiths-Net Cookbook — Design System Tokens & Base Styles
+   ───────────────────────────────────────────────────────── */
+
+/* ── Fonts ─────────────────────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root {
+  /* ── Palette ───────────────────────────────────────── */
+  --color-bg:            hsl(228, 18%, 8%);
+  --color-bg-surface:    hsl(228, 16%, 12%);
+  --color-bg-elevated:   hsl(228, 14%, 18%);
+  --color-bg-hover:      hsl(228, 14%, 22%);
+
+  --color-border:        hsl(228, 12%, 26%);
+  --color-border-subtle: hsl(228, 10%, 18%);
+
+  --color-text:          hsl(220, 16%, 90%);
+  --color-text-muted:    hsl(220, 10%, 58%);
+  --color-text-faint:    hsl(220, 8%, 42%);
+
+  /* Accent — warm amber / orange, complements the forge theme */
+  --color-accent:        hsl(28, 92%, 56%);
+  --color-accent-hover:  hsl(28, 92%, 62%);
+  --color-accent-muted:  hsl(28, 60%, 24%);
+  --color-accent-text:   hsl(28, 92%, 72%);
+
+  /* Secondary — cool blue for links, info */
+  --color-secondary:       hsl(215, 80%, 58%);
+  --color-secondary-hover: hsl(215, 80%, 65%);
+  --color-secondary-muted: hsl(215, 40%, 20%);
+
+  /* Semantic */
+  --color-success:       hsl(142, 60%, 48%);
+  --color-warning:       hsl(38, 92%, 52%);
+  --color-error:         hsl(0, 72%, 56%);
+
+  /* ── Typography ────────────────────────────────────── */
+  --font-sans:  'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono:  'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --font-cjk:   'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+
+  --text-xs:    0.75rem;   /* 12px */
+  --text-sm:    0.875rem;  /* 14px */
+  --text-base:  1rem;      /* 16px */
+  --text-lg:    1.125rem;  /* 18px */
+  --text-xl:    1.25rem;   /* 20px */
+  --text-2xl:   1.5rem;    /* 24px */
+  --text-3xl:   1.875rem;  /* 30px */
+  --text-4xl:   2.25rem;   /* 36px */
+  --text-5xl:   3rem;      /* 48px */
+
+  --leading-tight:  1.2;
+  --leading-normal: 1.6;
+  --leading-relaxed: 1.75;
+
+  /* ── Spacing ───────────────────────────────────────── */
+  --space-1:  0.25rem;
+  --space-2:  0.5rem;
+  --space-3:  0.75rem;
+  --space-4:  1rem;
+  --space-5:  1.25rem;
+  --space-6:  1.5rem;
+  --space-8:  2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+  --space-20: 5rem;
+  --space-24: 6rem;
+
+  /* ── Radii ─────────────────────────────────────────── */
+  --radius-sm:  0.375rem;
+  --radius-md:  0.5rem;
+  --radius-lg:  0.75rem;
+  --radius-xl:  1rem;
+  --radius-2xl: 1.25rem;
+  --radius-full: 9999px;
+
+  /* ── Shadows ───────────────────────────────────────── */
+  --shadow-sm:  0 1px 2px hsla(0, 0%, 0%, 0.3);
+  --shadow-md:  0 4px 12px hsla(0, 0%, 0%, 0.35);
+  --shadow-lg:  0 8px 24px hsla(0, 0%, 0%, 0.4);
+  --shadow-glow: 0 0 20px hsla(28, 92%, 56%, 0.15);
+
+  /* ── Transitions ───────────────────────────────────── */
+  --ease-out:    cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --duration-fast:   150ms;
+  --duration-normal: 250ms;
+  --duration-slow:   400ms;
+
+  /* ── Layout ────────────────────────────────────────── */
+  --content-width:  72rem;
+  --sidebar-width:  16rem;
+  --header-height:  4rem;
+}
+
+/* ── Light mode ──────────────────────────────────────── */
+[data-theme="light"] {
+    --color-bg:            hsl(220, 20%, 98%);
+    --color-bg-surface:    hsl(220, 18%, 95%);
+    --color-bg-elevated:   hsl(0, 0%, 100%);
+    --color-bg-hover:      hsl(220, 16%, 92%);
+
+    --color-border:        hsl(220, 12%, 85%);
+    --color-border-subtle: hsl(220, 10%, 90%);
+
+    --color-text:          hsl(220, 20%, 14%);
+    --color-text-muted:    hsl(220, 10%, 44%);
+    --color-text-faint:    hsl(220, 8%, 62%);
+
+    --color-accent:        hsl(28, 88%, 48%);
+    --color-accent-hover:  hsl(28, 88%, 42%);
+    --color-accent-muted:  hsl(28, 60%, 90%);
+    --color-accent-text:   hsl(28, 88%, 36%);
+
+    --color-secondary:       hsl(215, 72%, 48%);
+    --color-secondary-hover: hsl(215, 72%, 40%);
+    --color-secondary-muted: hsl(215, 40%, 92%);
+
+    --shadow-sm:  0 1px 2px hsla(0, 0%, 0%, 0.06);
+    --shadow-md:  0 4px 12px hsla(0, 0%, 0%, 0.08);
+    --shadow-lg:  0 8px 24px hsla(0, 0%, 0%, 0.12);
+    --shadow-glow: 0 0 20px hsla(28, 88%, 48%, 0.1);
+}
+
+/* ── CJK font loading ───────────────────────────────── */
+:root:lang(zh) {
+  --font-sans: var(--font-cjk), 'Inter', system-ui, sans-serif;
+}
+
+/* ── Reset & Base ────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-family: var(--font-sans);
+  font-size: 16px;
+  line-height: var(--leading-normal);
+  color: var(--color-text);
+  background-color: var(--color-bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  scroll-behavior: smooth;
+}
+
+body {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── RTL overrides ───────────────────────────────────── */
+[dir="rtl"] {
+  direction: rtl;
+  text-align: right;
+}
+
+[dir="rtl"] .flow-ltr {
+  direction: ltr;
+  text-align: left;
+}
+
+/* ── CJK overrides ──────────────────────────────────── */
+[lang="zh"] {
+  word-break: break-all;
+  overflow-wrap: break-word;
+  line-break: strict;
+  letter-spacing: 0.02em;
+}
+
+[lang="zh"] h1,
+[lang="zh"] h2,
+[lang="zh"] h3 {
+  letter-spacing: 0.04em;
+}
+
+/* ── Links ───────────────────────────────────────────── */
+a {
+  color: var(--color-secondary);
+  text-decoration: none;
+  transition: color var(--duration-fast) var(--ease-out);
+}
+
+a:hover {
+  color: var(--color-secondary-hover);
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
+/* ── Headings ────────────────────────────────────────── */
+h1, h2, h3, h4 {
+  line-height: var(--leading-tight);
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+h1 { font-size: var(--text-4xl); }
+h2 { font-size: var(--text-2xl); }
+h3 { font-size: var(--text-xl); }
+h4 { font-size: var(--text-lg); }
+
+/* ── Code ────────────────────────────────────────────── */
+code {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  background: var(--color-bg-elevated);
+  padding: 0.2em 0.45em;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  color: var(--color-accent-text);
+}
+
+pre {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+  padding: var(--space-5) var(--space-5);
+  padding-right: var(--space-12);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-elevated) !important;
+  overflow-x: auto;
+  position: relative;
+  color: var(--color-text);
+}
+pre code {
+  background: none;
+  padding: 0;
+  border: none;
+  font-size: inherit;
+  color: inherit;
+}
+
+/* ── Shiki dual-theme switching ─────────────────────── *
+ * Astro/Shiki outputs --shiki-dark and --shiki-dark-bg
+ * CSS custom properties for the dark theme, but does NOT
+ * auto-switch them. We activate them via [data-theme]. */
+[data-theme="dark"] .astro-code span {
+  color: var(--shiki-dark) !important;
+  font-style: var(--shiki-dark-font-style) !important;
+  font-weight: var(--shiki-dark-font-weight) !important;
+}
+
+/* ── Copy button (injected by client JS) ────────────── */
+.code-copy-btn {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-surface);
+  color: var(--color-text-faint);
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity var(--duration-fast) var(--ease-out),
+    color var(--duration-fast) var(--ease-out),
+    background var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out);
+  z-index: 2;
+}
+
+pre:hover .code-copy-btn,
+.code-copy-btn:focus-visible {
+  opacity: 1;
+}
+
+.code-copy-btn:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text);
+  border-color: var(--color-text-faint);
+}
+
+.code-copy-btn[data-copied="true"] {
+  color: var(--color-success);
+  border-color: var(--color-success);
+  opacity: 1;
+}
+
+[dir="rtl"] .code-copy-btn {
+  right: auto;
+  left: var(--space-2);
+}
+
+[dir="rtl"] pre {
+  direction: ltr;
+  text-align: left;
+  padding-right: var(--space-12);
+  padding-left: var(--space-5);
+}
+
+[dir="rtl"] pre code {
+  direction: ltr;
+  text-align: left;
+}
+
+/* Tables inside RTL should keep LTR for code-heavy content */
+[dir="rtl"] table code {
+  direction: ltr;
+  unicode-bidi: embed;
+}
+
+/* ── Utility: container ──────────────────────────────── */
+.container {
+  width: 100%;
+  max-width: var(--content-width);
+  margin-inline: auto;
+  padding-inline: var(--space-6);
+}
+
+/* ── Utility: visually hidden ────────────────────────── */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+/* ── Selection ───────────────────────────────────────── */
+::selection {
+  background: var(--color-accent-muted);
+  color: var(--color-accent-text);
+}
+
+/* ── Scrollbar (WebKit) ──────────────────────────────── */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: var(--radius-full);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-faint);
+}

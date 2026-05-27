@@ -1,0 +1,293 @@
+---
+/**
+ * <RecipeSidebar> — collapsible recipe tree navigation.
+ *
+ * Groups recipes by track → language → recipe, sorted by `order`.
+ * Highlights the current page. Collapses on mobile with a toggle.
+ */
+import { getCollection } from 'astro:content';
+
+interface Props {
+  currentId?: string;
+}
+
+const { currentId } = Astro.props;
+
+const allRecipes = await getCollection('cookbook');
+
+// Only show English (canonical) entries in the sidebar — other locales
+// are alternate renderings of the same recipe, not separate nav items.
+const enRecipes = allRecipes.filter((e) => e.data.locale === 'en');
+
+// Build tree: track → lang → recipe[]
+type Recipe = { id: string; title: string; href: string; order: number };
+type LangGroup = { lang: string; recipes: Recipe[] };
+type TrackGroup = { track: string; langs: LangGroup[] };
+
+const trackMap = new Map<string, Map<string, Recipe[]>>();
+
+for (const entry of enRecipes) {
+  const parts = entry.id.split('/');
+  const track = parts[0];
+  const lang = parts[1];
+  const slug = parts[2];
+
+  if (!trackMap.has(track)) trackMap.set(track, new Map());
+  const langMap = trackMap.get(track)!;
+  if (!langMap.has(lang)) langMap.set(lang, []);
+
+  langMap.get(lang)!.push({
+    id: entry.id,
+    title: entry.data.title,
+    href: `/cookbook/${track}/${lang}/${slug}/`,
+    order: entry.data.order,
+  });
+}
+
+// Sort and build final tree
+const tree: TrackGroup[] = [];
+const trackOrder = ['wasm', 'sidecar', 'script'];
+
+for (const track of trackOrder) {
+  const langMap = trackMap.get(track);
+  if (!langMap) continue;
+
+  const langs: LangGroup[] = [];
+  for (const [lang, recipes] of langMap) {
+    recipes.sort((a, b) => a.order - b.order);
+    langs.push({ lang, recipes });
+  }
+  langs.sort((a, b) => a.lang.localeCompare(b.lang));
+  tree.push({ track, langs });
+}
+
+const trackLabels: Record<string, string> = {
+  wasm: '🔧 WASM',
+  sidecar: '🐍 Sidecar',
+  script: '📜 Script',
+};
+---
+
+<aside class="recipe-sidebar" id="recipe-sidebar">
+  <button
+    class="sidebar-toggle"
+    id="sidebar-toggle"
+    type="button"
+    aria-label="Toggle sidebar"
+    aria-expanded="false"
+  >
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="20" height="20" aria-hidden="true">
+      <line x1="3" y1="12" x2="21" y2="12" />
+      <line x1="3" y1="6" x2="21" y2="6" />
+      <line x1="3" y1="18" x2="21" y2="18" />
+    </svg>
+    <span>Recipes</span>
+  </button>
+
+  <nav class="sidebar-nav" id="sidebar-nav" aria-label="Recipe navigation">
+    <div class="sidebar-header">
+      <a href="/cookbook/" class="sidebar-back">← Cookbook</a>
+    </div>
+
+    {tree.map((trackGroup) => (
+      <details class="sidebar-track" open>
+        <summary class="sidebar-track-label">
+          {trackLabels[trackGroup.track] ?? trackGroup.track}
+        </summary>
+
+        {trackGroup.langs.map((langGroup) => (
+          <details class="sidebar-lang" open>
+            <summary class="sidebar-lang-label">{langGroup.lang}</summary>
+            <ul class="sidebar-recipes">
+              {langGroup.recipes.map((recipe) => (
+                <li>
+                  <a
+                    href={recipe.href}
+                    class:list={[
+                      'sidebar-link',
+                      { 'sidebar-link--active': recipe.id === currentId },
+                    ]}
+                    aria-current={recipe.id === currentId ? 'page' : undefined}
+                  >
+                    {recipe.title}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </details>
+        ))}
+      </details>
+    ))}
+  </nav>
+</aside>
+
+<script>
+  function initSidebar() {
+    const toggle = document.getElementById('sidebar-toggle');
+    const nav = document.getElementById('sidebar-nav');
+    if (!toggle || !nav) return;
+
+    toggle.addEventListener('click', () => {
+      const expanded = toggle.getAttribute('aria-expanded') === 'true';
+      toggle.setAttribute('aria-expanded', String(!expanded));
+      nav.classList.toggle('sidebar-nav--open');
+    });
+  }
+
+  initSidebar();
+  document.addEventListener('astro:after-swap', initSidebar);
+</script>
+
+<style>
+  .recipe-sidebar {
+    position: relative;
+  }
+
+  .sidebar-toggle {
+    display: none;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    background: var(--color-bg-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    color: var(--color-text-muted);
+    font-size: var(--text-sm);
+    font-weight: 500;
+    cursor: pointer;
+    transition: all var(--duration-fast) var(--ease-out);
+    margin-bottom: var(--space-4);
+  }
+
+  .sidebar-toggle:hover {
+    color: var(--color-text);
+    border-color: var(--color-text-faint);
+  }
+
+  .sidebar-nav {
+    width: var(--sidebar-width);
+    position: sticky;
+    top: calc(var(--header-height) + var(--space-6));
+    max-height: calc(100vh - var(--header-height) - var(--space-12));
+    overflow-y: auto;
+    padding-right: var(--space-4);
+  }
+
+  .sidebar-header {
+    margin-bottom: var(--space-4);
+  }
+
+  .sidebar-back {
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+    text-decoration: none;
+    transition: color var(--duration-fast) var(--ease-out);
+  }
+
+  .sidebar-back:hover {
+    color: var(--color-text);
+    text-decoration: none;
+  }
+
+  .sidebar-track {
+    margin-bottom: var(--space-3);
+  }
+
+  .sidebar-track-label {
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--color-text);
+    cursor: pointer;
+    padding: var(--space-1) 0;
+    list-style: none;
+    user-select: none;
+  }
+
+  .sidebar-track-label::-webkit-details-marker {
+    display: none;
+  }
+
+  .sidebar-track-label::before {
+    content: '▸ ';
+    font-size: 0.75em;
+    transition: transform var(--duration-fast) var(--ease-out);
+    display: inline-block;
+  }
+
+  .sidebar-track[open] > .sidebar-track-label::before {
+    content: '▾ ';
+  }
+
+  .sidebar-lang {
+    margin-left: var(--space-3);
+    margin-top: var(--space-1);
+  }
+
+  .sidebar-lang-label {
+    font-size: var(--text-xs);
+    font-weight: 500;
+    color: var(--color-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    cursor: pointer;
+    padding: var(--space-1) 0;
+    list-style: none;
+    user-select: none;
+  }
+
+  .sidebar-lang-label::-webkit-details-marker {
+    display: none;
+  }
+
+  .sidebar-recipes {
+    list-style: none;
+    padding: 0;
+    margin: var(--space-1) 0 var(--space-2) var(--space-3);
+  }
+
+  .sidebar-link {
+    display: block;
+    padding: var(--space-1) var(--space-2);
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+    text-decoration: none;
+    border-radius: var(--radius-sm);
+    border-left: 2px solid transparent;
+    transition: all var(--duration-fast) var(--ease-out);
+  }
+
+  .sidebar-link:hover {
+    color: var(--color-text);
+    background: var(--color-bg-hover);
+    text-decoration: none;
+  }
+
+  .sidebar-link--active {
+    color: var(--color-accent);
+    border-left-color: var(--color-accent);
+    background: var(--color-accent-muted);
+    font-weight: 500;
+  }
+
+  /* ── Mobile ──────────────────────────────────────── */
+  @media (max-width: 960px) {
+    .sidebar-toggle {
+      display: flex;
+    }
+
+    .sidebar-nav {
+      display: none;
+      position: static;
+      width: 100%;
+      max-height: none;
+      padding-right: 0;
+      padding-bottom: var(--space-4);
+      border-bottom: 1px solid var(--color-border);
+      margin-bottom: var(--space-6);
+    }
+
+    .sidebar-nav--open {
+      display: block;
+    }
+  }
+</style>

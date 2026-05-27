@@ -1,0 +1,209 @@
+---
+/**
+ * /demo/call-flow — Interactive SIP call flow simulator.
+ */
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import CallFlowSimulator from '@/components/CallFlowSimulator.astro';
+---
+
+<BaseLayout
+  title="Call Flow Simulator — Smiths-Net"
+  description="Step through a complete SIP/WebRTC call and see where plugin hooks fire at each stage."
+>
+  <div class="flow-page">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="sep">/</span>
+      <a href="/demo/">Demo</a>
+      <span class="sep">/</span>
+      <span class="current">Call Flow</span>
+    </nav>
+
+    <header class="flow-hero">
+      <div class="hero-badge">Interactive</div>
+      <h1>Call Flow Simulator</h1>
+      <p class="hero-desc">
+        Step through a complete SIP call — from INVITE to BYE — and see
+        exactly where your plugin hooks fire. Each step shows the Rhai code
+        that executes at that point.
+      </p>
+    </header>
+
+    <CallFlowSimulator />
+
+    <section class="flow-legend">
+      <h2>Legend</h2>
+      <div class="legend-grid">
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: hsl(215, 80%, 58%);"></span>
+          <span>Request (INVITE, ACK)</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: hsl(142, 60%, 50%);"></span>
+          <span>Response (100, 180, 200)</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: hsl(0, 65%, 55%);"></span>
+          <span>Teardown (BYE)</span>
+        </div>
+        <div class="legend-item">
+          <span class="legend-swatch" style="background: var(--color-accent);"></span>
+          <span>🔥 Plugin Hook</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="flow-links">
+      <h2>Related recipes</h2>
+      <div class="links-grid">
+        <a href="/cookbook/script/rhai/canonical-hook/" class="link-card">
+          <strong>Rhai Canonical Hook</strong>
+          <span>Write route() and on_load() hooks in Rhai.</span>
+        </a>
+        <a href="/cookbook/wasm/rust/canonical-hook/" class="link-card">
+          <strong>WASM Canonical Hook</strong>
+          <span>Implement the full ABI in Rust.</span>
+        </a>
+        <a href="/cookbook/sidecar/nodejs/canonical-hook/" class="link-card">
+          <strong>Node.js Canonical Hook</strong>
+          <span>Sidecar with ai.summarize tool.</span>
+        </a>
+      </div>
+    </section>
+  </div>
+</BaseLayout>
+
+<style>
+  .flow-page {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: var(--space-8) var(--space-6) var(--space-24);
+  }
+
+  .breadcrumb {
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+    margin-bottom: var(--space-6);
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .breadcrumb a {
+    color: var(--color-secondary);
+    text-decoration: none;
+  }
+
+  .breadcrumb a:hover { color: var(--color-secondary-hover); }
+  .breadcrumb .sep { color: var(--color-text-faint); }
+  .breadcrumb .current { color: var(--color-text); font-weight: 500; }
+
+  .flow-hero {
+    text-align: center;
+    margin-bottom: var(--space-10);
+  }
+
+  .hero-badge {
+    display: inline-block;
+    font-size: var(--text-xs);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--color-accent);
+    background: var(--color-accent-muted);
+    padding: var(--space-1) var(--space-3);
+    border-radius: var(--radius-full);
+    margin-bottom: var(--space-4);
+  }
+
+  .flow-hero h1 {
+    font-size: var(--text-4xl);
+    font-weight: 800;
+    margin-bottom: var(--space-4);
+  }
+
+  .hero-desc {
+    font-size: var(--text-lg);
+    color: var(--color-text-muted);
+    max-width: 40rem;
+    margin: 0 auto;
+  }
+
+  /* ── Legend ──────────────────────────────────────────── */
+  .flow-legend {
+    margin-top: var(--space-10);
+  }
+
+  .flow-legend h2 {
+    font-size: var(--text-xl);
+    font-weight: 700;
+    margin-bottom: var(--space-4);
+  }
+
+  .legend-grid {
+    display: flex;
+    gap: var(--space-6);
+    flex-wrap: wrap;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+  }
+
+  .legend-swatch {
+    width: 16px;
+    height: 3px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+
+  /* ── Related recipes ────────────────────────────────── */
+  .flow-links {
+    margin-top: var(--space-10);
+  }
+
+  .flow-links h2 {
+    font-size: var(--text-xl);
+    font-weight: 700;
+    margin-bottom: var(--space-4);
+  }
+
+  .links-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: var(--space-4);
+  }
+
+  .link-card {
+    display: block;
+    padding: var(--space-5);
+    background: var(--color-bg-elevated);
+    border: 1px solid var(--color-border-subtle);
+    border-radius: var(--radius-lg);
+    text-decoration: none;
+    transition: all var(--duration-fast) var(--ease-out);
+  }
+
+  .link-card:hover {
+    border-color: var(--color-accent);
+    box-shadow: var(--shadow-md);
+    transform: translateY(-2px);
+    text-decoration: none;
+  }
+
+  .link-card strong {
+    display: block;
+    font-size: var(--text-base);
+    color: var(--color-accent-text);
+    margin-bottom: var(--space-1);
+  }
+
+  .link-card span {
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+  }
+</style>

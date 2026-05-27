@@ -1,0 +1,26 @@
+---
+title: "Observability"
+description: "Prometheus metrics, structured logging, health endpoint, and pcap traces."
+section: "observability"
+locale: en
+order: 1
+updatedAt: "2026-04-25"
+---
+
+## Health endpoint
+
+```bash
+curl -s http://127.0.0.1:8080/health | jq .
+```
+
+## Prometheus metrics
+
+```bash
+curl -s http://127.0.0.1:8080/metrics | head -20
+```
+
+## Structured logging
+
+The engine uses `tracing` with JSON or pretty output controlled by `observability.log_format`.
+
+Full observability guide coming soon.

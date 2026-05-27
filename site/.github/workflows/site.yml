@@ -1,0 +1,48 @@
+name: site
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# Cancel in-progress runs for the same PR/branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────────────
+  # C-2 · Site build gate
+  # ──────────────────────────────────────────────────────
+  build:
+    name: "Build"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build site
+        run: npm run build
+
+  # ──────────────────────────────────────────────────────
+  # C-3 · Translation sanity check
+  # ──────────────────────────────────────────────────────
+  translations:
+    name: "Translation coverage"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Check translation coverage
+        run: node scripts/check-translations.mjs

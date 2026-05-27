@@ -1,0 +1,146 @@
+---
+title: "Hello World"
+description: "Your first Rhai script plugin — a minimal hot-reloadable script that logs a greeting."
+track: script
+lang: rhai
+locale: en
+order: 1
+updatedAt: "2026-04-26"
+---
+
+## Overview
+
+This recipe walks you through building the simplest possible **Rhai
+script plugin** for Smiths-Net. Unlike WASM plugins (which compile to
+a binary), Rhai scripts are plain text files the engine loads and
+interprets directly — no compiler needed.
+
+By the end you will have:
+
+1. A `.rhai` script that exports `describe_capabilities()` and `on_load()`.
+2. A `plugin.toml` manifest the engine reads at boot.
+3. A working plugin that prints a greeting to the engine log.
+
+## Why Rhai?
+
+| Property | Benefit |
+|----------|---------|
+| No compilation | Edit → save → engine hot-reloads. |
+| Sandboxed | Configurable operation limits and wall-clock budgets. |
+| Familiar syntax | Rust-like, with dynamic typing. |
+| First-class maps | `#{ key: value }` literals map directly to JSON. |
+
+## Prerequisites
+
+- A running `smiths-net` instance:
+
+  ```bash
+  smiths-net init --preset dev --non-interactive
+  smiths-net --config config.toml
+  ```
+
+## 1. Create the script
+
+Create a directory for your plugin:
+
+```bash
+mkdir -p hello-world-rhai
+cd hello-world-rhai
+```
+
+Write `main.rhai`:
+
+```rhai
+// main.rhai
+fn describe_capabilities() {
+    [#{
+        "capability": "greeting.hello",
+        "plugin": "hello-world-rhai",
+        "model_id": "hello-rhai-v1",
+        "abi": "1.0",
+        "description": "Minimal Rhai plugin — logs a greeting.",
+        "priority": 50,
+    }]
+}
+
+fn on_load() {
+    print("hello-world-rhai: plugin loaded ✓");
+}
+```
+
+Walk-through:
+
+| Function | Purpose |
+|----------|---------|
+| `describe_capabilities()` | Returns an array of capability descriptors (one map per capability). The engine calls this at registration time. |
+| `on_load()` | Called once when the script is first loaded. Use it for initialisation logging or setup. |
+| `print(...)` | Writes to the engine's tracing log (mapped to `INFO` level). |
+
+## 2. Create the manifest
+
+```toml
+# plugin.toml
+name        = "hello-world-rhai"
+version     = "0.1.0"
+type        = "script"
+entry       = "./main.rhai"
+provides    = ["greeting.hello"]
+abi         = "1.0"
+description = "Minimal Rhai hello-world — logs a greeting at load time."
+
+script_max_operations = 100000
+script_wall_clock_ms  = 50
+```
+
+| Field | Meaning |
+|-------|---------|
+| `type` | `"script"` tells the engine to use the Rhai runtime. |
+| `entry` | Relative path from `plugin.toml` to the `.rhai` file. |
+| `script_max_operations` | Ops budget per invocation (prevents infinite loops). |
+| `script_wall_clock_ms` | Wall-clock timeout (prevents runaway scripts). |
+
+## 3. Load into the engine
+
+Copy the artefacts into the engine's plugin directory:
+
+```bash
+mkdir -p plugins/hello-world-rhai
+cp main.rhai plugin.toml plugins/hello-world-rhai/
+```
+
+Restart or hot-reload:
+
+```bash
+smiths-net --config config.toml
+```
+
+You should see in the logs:
+
+```
+INFO smiths_script: script loaded name="hello-world-rhai"
+INFO smiths_script: hello-world-rhai: plugin loaded ✓
+```
+
+## Hot reload
+
+Edit `main.rhai`, change the greeting, and save. The engine's file
+watcher detects the change and reloads the script — no restart needed.
+
+If five consecutive invocations fail after an edit, the engine
+automatically rolls back to the previous version.
+
+## What we skipped
+
+This hello-world only exports `describe_capabilities()` and `on_load()`.
+A production Rhai plugin also exports:
+
+- **`route(req)`** — handle inbound SIP routing decisions.
+- **`on_dtmf(session, digit)`** — react to IVR keypad input.
+- **`on_event(event)`** — process engine lifecycle events.
+
+## Next steps
+
+- Add SIP routing logic — see the
+  [Canonical Hook](/cookbook/script/rhai/canonical-hook/) recipe.
+- Compare with [WASM plugins](/cookbook/wasm/rust/hello-world/) for
+  performance-critical workloads.

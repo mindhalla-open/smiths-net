@@ -1,0 +1,20 @@
+---
+title: "Configuration"
+description: "Complete reference for config.toml — every section, key, and default value."
+section: "getting-started"
+locale: en
+order: 2
+updatedAt: "2026-04-25"
+---
+
+## Overview
+
+Smiths-Net uses a layered configuration system: **defaults → TOML file → environment variables**.
+
+Environment variables use the `SMITHS__` prefix with double-underscore nesting:
+
+```bash
+SMITHS__OBSERVABILITY__LOG_LEVEL=debug smiths-net --config config.toml
+```
+
+Full configuration reference coming soon. See `examples/config.toml` for all available options.

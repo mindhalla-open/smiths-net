@@ -1,0 +1,86 @@
+---
+/**
+ * DocsLayout — prose-focused layout for guide, reference,
+ * operations, and architecture pages.
+ *
+ * Reuses BaseLayout chrome. Adds a section badge, breadcrumb,
+ * and the standard prose styling from recipe.css.
+ */
+import BaseLayout from './BaseLayout.astro';
+import { DEFAULT_LOCALE } from '@/i18n';
+import type { Locale } from '@/i18n';
+
+import '@/styles/recipe.css';
+
+interface Props {
+  title: string;
+  description: string;
+  section: string;
+  sectionLabel: string;
+  locale?: Locale;
+}
+
+const {
+  title,
+  description,
+  section,
+  sectionLabel,
+  locale = DEFAULT_LOCALE,
+} = Astro.props;
+---
+
+<BaseLayout title={`${title} — Smiths-Net`} description={description} locale={locale}>
+  <div class="container" style="padding-block: var(--space-10);">
+    <nav class="docs-breadcrumb" aria-label="Breadcrumb">
+      <a href="/">Docs</a>
+      <span class="separator" aria-hidden="true">›</span>
+      <a href={`/${section}/`}>{sectionLabel}</a>
+      <span class="separator" aria-hidden="true">›</span>
+      <span aria-current="page">{title}</span>
+    </nav>
+
+    <article class="recipe-content">
+      <header class="recipe-header">
+        <div class="recipe-meta">
+          <span class="recipe-badge recipe-badge--section">{sectionLabel}</span>
+        </div>
+        <h1>{title}</h1>
+        <p class="description">{description}</p>
+      </header>
+
+      <slot />
+    </article>
+  </div>
+</BaseLayout>
+
+<style>
+  .docs-breadcrumb {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+    margin-block-end: var(--space-6);
+  }
+
+  .docs-breadcrumb a {
+    color: var(--color-text-muted);
+    text-decoration: none;
+    transition: color var(--duration-fast) var(--ease-out);
+  }
+
+  .docs-breadcrumb a:hover {
+    color: var(--color-accent);
+  }
+
+  .separator {
+    color: var(--color-text-faint);
+    user-select: none;
+  }
+
+  .recipe-badge--section {
+    background: var(--color-bg-elevated);
+    color: var(--color-secondary);
+    border: 1px solid var(--color-border);
+  }
+</style>

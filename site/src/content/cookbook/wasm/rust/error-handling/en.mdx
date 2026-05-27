@@ -1,0 +1,127 @@
+---
+title: "Error Handling"
+description: "Return structured JSON-RPC errors from a WASM plugin — validation, error codes, and graceful failures."
+track: wasm
+lang: rust
+locale: en
+order: 4
+updatedAt: "2026-04-26"
+---
+
+## Overview
+
+This recipe demonstrates how a WASM plugin should **report structured
+errors** back to the host engine. Instead of trapping or returning
+garbage, well-behaved plugins return JSON-RPC error envelopes with
+standard error codes.
+
+By the end you will have:
+
+1. A `math.divide` tool that validates inputs before processing.
+2. Proper JSON-RPC error responses with `code` + `message`.
+3. Distinct handling for missing params, division by zero, and unknown methods.
+
+## Prerequisites
+
+- Completed the [Multi-Tool Plugin](/cookbook/wasm/rust/multi-tool/) recipe.
+- Understanding of the `invoke` ABI.
+
+## Error codes
+
+The plugin uses standard JSON-RPC 2.0 error codes:
+
+| Code | Constant | Meaning |
+|------|----------|---------|
+| `-32601` | `METHOD_NOT_FOUND` | The method name isn't recognized. |
+| `-32602` | `INVALID_PARAMS` | Required parameters are missing or malformed. |
+| `-32603` | `INTERNAL_ERROR` | A runtime error (e.g. division by zero). |
+
+## 1. Validate before processing
+
+The `do_divide()` function extracts `a` and `b` from the params JSON,
+validates them, and only then performs the division:
+
+```rust
+fn do_divide(params: &[u8]) -> i64 {
+    let a = extract_number(params, b"\"a\":");
+    let b = extract_number(params, b"\"b\":");
+
+    match (a, b) {
+        (None, _) | (_, None) => {
+            host_log("error-handling: missing or invalid params");
+            pack_response(error_json(INVALID_PARAMS, b"missing a or b"))
+        }
+        (_, Some(0)) => {
+            host_log("error-handling: division by zero");
+            pack_response(error_json(INTERNAL_ERROR, b"division by zero"))
+        }
+        (Some(a_val), Some(b_val)) => {
+            let result = a_val / b_val;
+            pack_response(result_json(result))
+        }
+    }
+}
+```
+
+## 2. Error response format
+
+Success and error responses follow different shapes:
+
+**Success:**
+
+```json
+{"result": 5}
+```
+
+**Error:**
+
+```json
+{"error": {"code": -32602, "message": "missing a or b"}}
+```
+
+The engine reads the top-level key (`result` vs `error`) to determine
+whether the invocation succeeded. Error responses are forwarded to
+the MCP/A2A client unchanged.
+
+## 3. Build and test
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+```
+
+```toml
+# plugin.toml
+name        = "error-handling"
+version     = "0.1.0"
+type        = "wasm"
+entry       = "./error_handling.wasm"
+provides    = ["math.divide"]
+permissions = []
+abi         = "1.0"
+description = "Integer division with proper error handling."
+```
+
+### Test scenarios
+
+| Input | Expected output |
+|-------|----------------|
+| `{"a":10,"b":2}` | `{"result":5}` |
+| `{"a":10,"b":0}` | `{"error":{"code":-32603,"message":"division by zero"}}` |
+| `{"a":10}` | `{"error":{"code":-32602,"message":"missing a or b"}}` |
+| `{}` | `{"error":{"code":-32602,"message":"missing a or b"}}` |
+
+## Error handling checklist
+
+When building production plugins, follow this checklist:
+
+- [ ] **Validate all inputs** — never trust the params shape.
+- [ ] **Use standard codes** — JSON-RPC 2.0 codes are well-known.
+- [ ] **Log before returning** — `host_log()` helps operators debug.
+- [ ] **Never panic** — traps crash the WASM guest and leak no context.
+- [ ] **Keep errors concise** — the message is for operators, not end users.
+
+## Next steps
+
+- Try the Script (Rhai) track for simpler error handling —
+  [Rhai Hello World](/cookbook/script/rhai/hello-world/).
+- Add network I/O with a sidecar — [Node.js Hello World](/cookbook/sidecar/nodejs/hello-world/).

@@ -1,0 +1,86 @@
+{
+  "site": {
+    "title": "Smiths-Net Docs",
+    "description": "Documentation for the Smiths-Net AI-first SIP engine."
+  },
+  "nav": {
+    "home": "Home",
+    "guide": "Guide",
+    "cookbook": "Cookbook",
+    "reference": "Reference",
+    "operations": "Operations",
+    "architecture": "Architecture",
+    "search": "Search…",
+    "github": "GitHub"
+  },
+  "hero": {
+    "title": "Smiths-Net Documentation",
+    "subtitle": "Everything you need to install, configure, extend, and operate the AI-first SIP engine.",
+    "cta": "Get Started",
+    "cta_secondary": "View on GitHub"
+  },
+  "sections": {
+    "guide": {
+      "title": "Getting Started",
+      "description": "Install, configure, and run the engine in minutes.",
+      "icon": "🚀"
+    },
+    "cookbook": {
+      "title": "Plugin Cookbook",
+      "description": "Battle-tested recipes for WASM, sidecar, and script plugins.",
+      "icon": "📖"
+    },
+    "reference": {
+      "title": "Reference",
+      "description": "MCP tools, resources, SIP transports, WebRTC, and config schema.",
+      "icon": "📋"
+    },
+    "operations": {
+      "title": "Operations",
+      "description": "Observability, HA clustering, hot-reload, and deployment.",
+      "icon": "⚙️"
+    },
+    "architecture": {
+      "title": "Architecture",
+      "description": "Design deep-dives into crate layout, plugin system, and call FSM.",
+      "icon": "🏗️"
+    }
+  },
+  "tracks": {
+    "wasm": {
+      "title": "WASM Plugins",
+      "description": "Compile to WebAssembly for sandboxed, in-process plugins. Rust, TinyGo, Zig, AssemblyScript.",
+      "badge": "wasm"
+    },
+    "sidecar": {
+      "title": "Sidecar Plugins",
+      "description": "Run as a co-process alongside the engine. Python, Node.js, Go, Ruby, Erlang.",
+      "badge": "sidecar"
+    },
+    "script": {
+      "title": "Script Plugins",
+      "description": "Embedded scripting for lightweight logic. Rhai, Lua, Starlark.",
+      "badge": "script"
+    }
+  },
+  "recipe": {
+    "toc": "Table of Contents",
+    "prerequisites": "Prerequisites",
+    "source_code": "View Source",
+    "edit_page": "Edit this page",
+    "not_translated": "This page is not yet translated. You are viewing the English version.",
+    "last_updated": "Last updated"
+  },
+  "footer": {
+    "copyright": "© {year} Smiths-Net Contributors",
+    "license": "Apache-2.0",
+    "docs": "Docs",
+    "github": "GitHub",
+    "changelog": "Changelog"
+  },
+  "404": {
+    "title": "Page not found",
+    "description": "The page you're looking for doesn't exist or has been moved.",
+    "back": "Back to Home"
+  }
+}

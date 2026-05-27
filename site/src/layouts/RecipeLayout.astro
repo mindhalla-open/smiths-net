@@ -1,0 +1,81 @@
+---
+/**
+ * RecipeLayout — wraps individual recipe pages.
+ * Two-column layout: sidebar (left) + recipe content (right).
+ * Adds recipe header (title, description, badges), locale-fallback
+ * banner, prose styling, and prev/next navigation.
+ */
+import BaseLayout from './BaseLayout.astro';
+import LocaleBanner from '@/components/LocaleBanner.astro';
+import RecipeSidebar from '@/components/RecipeSidebar.astro';
+import RecipeNav from '@/components/RecipeNav.astro';
+import { DEFAULT_LOCALE } from '@/i18n';
+import type { Locale } from '@/i18n';
+
+import '@/styles/recipe.css';
+
+interface Props {
+  title: string;
+  description: string;
+  track: 'wasm' | 'sidecar' | 'script';
+  lang: string;
+  locale?: Locale;
+  pageLocale?: Locale;
+  entryId?: string;
+}
+
+const {
+  title,
+  description,
+  track,
+  lang,
+  locale = DEFAULT_LOCALE,
+  pageLocale = DEFAULT_LOCALE,
+  entryId = '',
+} = Astro.props;
+---
+
+<BaseLayout title={title} description={description} locale={locale}>
+  <div class="container recipe-page">
+    <RecipeSidebar currentId={entryId} />
+
+    <div class="recipe-main">
+      <LocaleBanner locale={locale} pageLocale={pageLocale} />
+
+      <article class="recipe-content">
+        <header class="recipe-header">
+          <div class="recipe-meta">
+            <span class="recipe-badge recipe-badge--track">{track}</span>
+            <span class="recipe-badge recipe-badge--lang">{lang}</span>
+          </div>
+          <h1>{title}</h1>
+          <p class="description">{description}</p>
+        </header>
+
+        <slot />
+      </article>
+
+      <RecipeNav currentId={entryId} track={track} lang={lang} />
+    </div>
+  </div>
+</BaseLayout>
+
+<style>
+  .recipe-page {
+    display: flex;
+    gap: var(--space-8);
+    padding-block: var(--space-10);
+    align-items: flex-start;
+  }
+
+  .recipe-main {
+    flex: 1;
+    min-width: 0;
+  }
+
+  @media (max-width: 960px) {
+    .recipe-page {
+      flex-direction: column;
+    }
+  }
+</style>

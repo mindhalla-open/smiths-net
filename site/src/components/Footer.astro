@@ -1,0 +1,95 @@
+---
+/**
+ * <Footer> — site-wide footer with copyright, links, and license.
+ */
+import { t, DEFAULT_LOCALE } from '@/i18n';
+import type { Locale } from '@/i18n';
+
+interface Props {
+  locale?: Locale;
+}
+
+const { locale = DEFAULT_LOCALE } = Astro.props;
+const year = new Date().getFullYear();
+const copyright = t(locale, 'footer.copyright').replace('{year}', String(year));
+---
+
+<footer class="site-footer">
+  <div class="container footer-inner">
+    <p class="footer-copy" data-i18n="footer.copyright" data-i18n-replace="{year}" data-i18n-value={String(year)}>{copyright}</p>
+    <nav class="footer-links" aria-label="Footer navigation">
+      <a
+        href="https://github.com/friday-mindhalla/smiths-net"
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        {t(locale, 'footer.github')}
+      </a>
+      <span class="footer-sep" aria-hidden="true">·</span>
+      <a
+        href="https://github.com/friday-mindhalla/smiths-net/blob/main/CHANGELOG.md"
+        target="_blank"
+        rel="noopener noreferrer"
+        data-i18n="footer.changelog"
+      >
+        {t(locale, 'footer.changelog')}
+      </a>
+      <span class="footer-sep" aria-hidden="true">·</span>
+      <span class="footer-license" data-i18n="footer.license">{t(locale, 'footer.license')}</span>
+    </nav>
+  </div>
+</footer>
+
+<style>
+  .site-footer {
+    margin-block-start: auto;
+    padding-block: var(--space-8);
+    border-block-start: 1px solid var(--color-border-subtle);
+    background: var(--color-bg);
+  }
+
+  .footer-inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-4);
+  }
+
+  .footer-copy {
+    font-size: var(--text-sm);
+    color: var(--color-text-faint);
+  }
+
+  .footer-links {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-sm);
+  }
+
+  .footer-links a {
+    color: var(--color-text-muted);
+    text-decoration: none;
+    transition: color var(--duration-fast) var(--ease-out);
+  }
+
+  .footer-links a:hover {
+    color: var(--color-text);
+  }
+
+  .footer-sep {
+    color: var(--color-text-faint);
+  }
+
+  .footer-license {
+    color: var(--color-text-faint);
+  }
+
+  @media (max-width: 640px) {
+    .footer-inner {
+      flex-direction: column;
+      text-align: center;
+    }
+  }
+</style>

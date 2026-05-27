@@ -1,0 +1,139 @@
+---
+/**
+ * <RecipeCard> — a card linking to a single recipe.
+ * Used on track listing pages and the landing page.
+ */
+
+interface Props {
+  title: string;
+  description: string;
+  href: string;
+  track: 'wasm' | 'sidecar' | 'script';
+  lang: string;
+}
+
+const { title, description, href, track, lang } = Astro.props;
+
+const trackColors: Record<string, string> = {
+  wasm: 'var(--color-accent)',
+  sidecar: 'var(--color-secondary)',
+  script: 'var(--color-success)',
+};
+
+const accentColor = trackColors[track] ?? 'var(--color-accent)';
+---
+
+<a href={href} class="recipe-card" style={`--card-accent: ${accentColor}`}>
+  <div class="recipe-card-badges">
+    <span class="recipe-card-badge recipe-card-badge--track">{track}</span>
+    <span class="recipe-card-badge recipe-card-badge--lang">{lang}</span>
+  </div>
+  <h3 class="recipe-card-title">{title}</h3>
+  <p class="recipe-card-desc">{description}</p>
+  <span class="recipe-card-arrow" aria-hidden="true">→</span>
+</a>
+
+<style>
+  .recipe-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: var(--space-6);
+    background: var(--color-bg-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
+    text-decoration: none;
+    color: inherit;
+    transition:
+      transform var(--duration-normal) var(--ease-out),
+      border-color var(--duration-normal) var(--ease-out),
+      box-shadow var(--duration-normal) var(--ease-out);
+    overflow: hidden;
+  }
+
+  .recipe-card::before {
+    content: '';
+    position: absolute;
+    inset-block-start: 0;
+    inset-inline-start: 0;
+    inset-inline-end: 0;
+    height: 3px;
+    background: var(--card-accent);
+    opacity: 0;
+    transition: opacity var(--duration-normal) var(--ease-out);
+  }
+
+  .recipe-card:hover {
+    transform: translateY(-2px);
+    border-color: var(--card-accent);
+    box-shadow: var(--shadow-md);
+    text-decoration: none;
+  }
+
+  .recipe-card:hover::before {
+    opacity: 1;
+  }
+
+  .recipe-card-badges {
+    display: flex;
+    gap: var(--space-2);
+  }
+
+  .recipe-card-badge {
+    display: inline-block;
+    padding: var(--space-1) var(--space-2);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-radius: var(--radius-sm);
+  }
+
+  .recipe-card-badge--track {
+    background: var(--color-accent-muted);
+    color: var(--color-accent-text);
+  }
+
+  .recipe-card-badge--lang {
+    background: var(--color-secondary-muted);
+    color: var(--color-secondary);
+  }
+
+  .recipe-card-title {
+    font-size: var(--text-lg);
+    font-weight: 700;
+    color: var(--color-text);
+    line-height: var(--leading-tight);
+  }
+
+  .recipe-card-desc {
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+    line-height: var(--leading-normal);
+    flex: 1;
+  }
+
+  .recipe-card-arrow {
+    align-self: flex-end;
+    font-size: var(--text-lg);
+    color: var(--color-text-faint);
+    transition:
+      transform var(--duration-normal) var(--ease-spring),
+      color var(--duration-normal) var(--ease-out);
+  }
+
+  [dir="rtl"] .recipe-card-arrow {
+    transform: scaleX(-1);
+    align-self: flex-start;
+  }
+
+  .recipe-card:hover .recipe-card-arrow {
+    transform: translateX(4px);
+    color: var(--card-accent);
+  }
+
+  [dir="rtl"] .recipe-card:hover .recipe-card-arrow {
+    transform: scaleX(-1) translateX(4px);
+  }
+</style>

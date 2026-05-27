@@ -1,0 +1,133 @@
+---
+title: "Hello World"
+description: "Your first Node.js sidecar plugin — a minimal JSON-RPC service over stdin/stdout."
+track: sidecar
+lang: nodejs
+locale: en
+order: 1
+updatedAt: "2026-04-26"
+---
+
+## Overview
+
+This recipe builds a **Node.js sidecar plugin** for Smiths-Net using
+the same JSON-RPC 2.0 protocol as the Python sidecar track. Node.js
+sidecars are ideal when you want to leverage the npm ecosystem or
+build event-driven, I/O-heavy plugins.
+
+By the end you will have:
+
+1. An ESM module (`.mjs`) that speaks JSON-RPC over stdin/stdout.
+2. A `plugin.toml` manifest for the engine.
+3. A test script that exercises the contract.
+
+## Prerequisites
+
+- Node.js ≥ 22 installed.
+- A running `smiths-net` instance.
+
+## 1. Write the plugin
+
+```javascript
+// hello.mjs
+import { createInterface } from "node:readline";
+
+function send(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\n");
+}
+
+function respond(id, result) {
+  send({ jsonrpc: "2.0", id, result });
+}
+
+function handle(request) {
+  const { id, method } = request;
+
+  switch (method) {
+    case "describe_capabilities":
+      respond(id, {
+        name: "hello-world-nodejs",
+        version: "0.1.0",
+        capabilities: [],
+      });
+      break;
+
+    case "shutdown":
+      respond(id, { ok: true });
+      process.exit(0);
+      break;
+
+    default:
+      respond(id, { echo: method });
+  }
+}
+
+const rl = createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  try {
+    handle(JSON.parse(trimmed));
+  } catch {
+    process.stderr.write(`bad frame: ${trimmed}\n`);
+  }
+});
+```
+
+### Walk-through
+
+| Item | Purpose |
+|------|---------|
+| `createInterface` | Reads stdin line-by-line (newline-delimited JSON-RPC). |
+| `send()` | Writes one JSON-RPC frame + `\n` to stdout. |
+| `describe_capabilities` | Returns plugin metadata — the engine calls this at boot. |
+| `shutdown` | Graceful exit — the engine calls this before stopping the sidecar. |
+| Default case | Echoes the method name back — proves the plugin is alive. |
+
+## 2. Create the manifest
+
+```toml
+# plugin.toml
+name        = "hello-world-nodejs"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./hello.mjs"
+provides    = []
+abi         = "1.0"
+description = "Minimal Node.js hello-world sidecar plugin."
+```
+
+## 3. Test
+
+Run the test script that exercises the contract:
+
+```bash
+node test_hello.mjs
+```
+
+Expected output:
+
+```
+✓ describe_capabilities
+✓ echo unknown method
+✓ shutdown
+
+3 passed, 0 failed
+```
+
+## Comparison with Python sidecar
+
+| Aspect | Node.js | Python |
+|--------|:---:|:---:|
+| Runtime | `node` | `python3` |
+| Module format | ESM (`.mjs`) | Script (`.py`) |
+| Async model | Event loop (native) | `for line in stdin` |
+| Ecosystem | npm | PyPI |
+| Best for | WebSocket bridges, event streams | AI/ML, data processing |
+
+## Next steps
+
+- Add a real tool — see
+  [Canonical Hook](/cookbook/sidecar/nodejs/canonical-hook/).
+- Compare with the Python version —
+  [Python Hello World](/cookbook/sidecar/python/hello-world/).

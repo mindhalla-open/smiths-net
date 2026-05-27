@@ -1,0 +1,86 @@
+{
+  "site": {
+    "title": "Documentación de Smiths-Net",
+    "description": "Documentación del motor SIP basado en IA Smiths-Net."
+  },
+  "nav": {
+    "home": "Inicio",
+    "guide": "Guía",
+    "cookbook": "Recetas",
+    "reference": "Referencia",
+    "operations": "Operaciones",
+    "architecture": "Arquitectura",
+    "search": "Buscar…",
+    "github": "GitHub"
+  },
+  "hero": {
+    "title": "Documentación de Smiths-Net",
+    "subtitle": "Todo lo que necesitas para instalar, configurar, extender y operar el motor SIP basado en IA.",
+    "cta": "Comenzar",
+    "cta_secondary": "Ver en GitHub"
+  },
+  "sections": {
+    "guide": {
+      "title": "Inicio rápido",
+      "description": "Instala, configura y ejecuta el motor en minutos.",
+      "icon": "🚀"
+    },
+    "cookbook": {
+      "title": "Recetas de plugins",
+      "description": "Recetas probadas para plugins WASM, sidecar y de scripts.",
+      "icon": "📖"
+    },
+    "reference": {
+      "title": "Referencia",
+      "description": "Herramientas MCP, recursos, transportes SIP, WebRTC y esquema de configuración.",
+      "icon": "📋"
+    },
+    "operations": {
+      "title": "Operaciones",
+      "description": "Observabilidad, clustering de alta disponibilidad, recarga en caliente y despliegue.",
+      "icon": "⚙️"
+    },
+    "architecture": {
+      "title": "Arquitectura",
+      "description": "Análisis profundo del diseño de crates, sistema de plugins y FSM de llamadas.",
+      "icon": "🏗️"
+    }
+  },
+  "tracks": {
+    "wasm": {
+      "title": "Plugins WASM",
+      "description": "Compila a WebAssembly para plugins aislados en proceso. Rust, TinyGo, Zig, AssemblyScript.",
+      "badge": "wasm"
+    },
+    "sidecar": {
+      "title": "Plugins Sidecar",
+      "description": "Ejecuta como proceso auxiliar junto al motor. Python, Node.js, Go, Ruby, Erlang.",
+      "badge": "sidecar"
+    },
+    "script": {
+      "title": "Plugins de scripts",
+      "description": "Scripts embebidos para lógica ligera. Rhai, Lua, Starlark.",
+      "badge": "script"
+    }
+  },
+  "recipe": {
+    "toc": "Índice",
+    "prerequisites": "Requisitos previos",
+    "source_code": "Ver código fuente",
+    "edit_page": "Editar esta página",
+    "not_translated": "Esta página aún no ha sido traducida. Estás viendo la versión en inglés.",
+    "last_updated": "Última actualización"
+  },
+  "footer": {
+    "copyright": "© {year} Colaboradores de Smiths-Net",
+    "license": "Apache-2.0",
+    "docs": "Documentación",
+    "github": "GitHub",
+    "changelog": "Historial de cambios"
+  },
+  "404": {
+    "title": "Página no encontrada",
+    "description": "La página que buscas no existe o ha sido movida.",
+    "back": "Volver al inicio"
+  }
+}

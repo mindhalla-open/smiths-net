@@ -1,0 +1,319 @@
+---
+title: "Canonical Hook"
+description: "Implement the full plugin ABI — describe, alloc, invoke, and run — for a production-ready WASM plugin."
+track: wasm
+lang: rust
+locale: en
+order: 2
+updatedAt: "2026-04-25"
+---
+
+## Overview
+
+The [Hello World](/cookbook/wasm/rust/hello-world/) recipe exported only
+`run()`. A production plugin needs **four exports** so the engine
+can discover its capabilities and dispatch tool calls:
+
+| Export | Signature | When called | Purpose |
+|--------|-----------|-------------|---------|
+| `run` | `() -> ()` | Plugin start | One-shot initialisation (log, warm caches). |
+| `describe` | `() -> i64` | Plugin load | Return a JSON capability descriptor. |
+| `alloc` | `(len: i32) -> i32` | Before `invoke` | Reserve guest memory for method + params. |
+| `invoke` | `(method_ptr, method_len, params_ptr, params_len) -> i64` | Tool call | Handle an MCP/A2A tool invocation. |
+
+This recipe implements all four. The example plugin advertises an
+`ai.echo` capability and echoes the method name back in its response.
+
+## The packed `(ptr << 32) | len` convention
+
+Both `describe` and `invoke` return an `i64` that encodes a
+pointer and a length:
+
+```
+ 63        32 31         0
+┌───────────┬────────────┐
+│  ptr (u32) │  len (u32) │
+└───────────┴────────────┘
+```
+
+The engine reads `[ptr .. ptr + len)` from the guest's exported
+`memory` and interprets it as UTF-8 JSON. This avoids multi-value
+returns (which not all WASM runtimes support) while keeping the
+ABI minimal.
+
+In Rust:
+
+```rust
+let ptr = data.as_ptr() as u32 as i64;
+let len = data.len() as u32 as i64;
+(ptr << 32) | len
+```
+
+## Prerequisites
+
+- Completed the [Hello World](/cookbook/wasm/rust/hello-world/) recipe
+- Familiarity with `plugin.toml` manifests
+
+## 1. Scaffold the crate
+
+```bash
+mkdir -p canonical-hook/src
+cd canonical-hook
+```
+
+```toml
+# Cargo.toml
+[package]
+name         = "canonical-hook"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.95"
+publish      = false
+description  = "Full ABI WASM plugin — describe + alloc + invoke + run."
+
+# Independent workspace root.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto           = true
+codegen-units = 1
+opt-level     = "s"
+strip         = "symbols"
+```
+
+## 2. Host imports and `run`
+
+Same pattern as hello-world — import `smiths::log` and call it
+from `run()`:
+
+```rust
+// src/lib.rs — part 1: imports + run
+#![no_std]
+#![no_main]
+
+#[link(wasm_import_module = "smiths")]
+unsafe extern "C" {
+    /// Write a UTF-8 log line to the engine's tracing output.
+    fn log(ptr: *const u8, len: usize);
+}
+
+fn host_log(msg: &str) {
+    unsafe {
+        log(msg.as_ptr(), msg.len());
+    }
+}
+
+const GREETING: &str = "canonical-hook: plugin loaded";
+
+#[unsafe(no_mangle)]
+pub extern "C" fn run() {
+    host_log(GREETING);
+}
+```
+
+## 3. The `describe` export
+
+The engine calls `describe()` once at load time. Store the JSON
+capability descriptor as a static byte slice and return its
+location using the packed convention:
+
+```rust
+// src/lib.rs — part 2: describe
+static DESCRIBE_JSON: &[u8] = br#"{"capability":"ai.echo","plugin":"canonical-hook","abi":"1.0","description":"Echo the method name back - canonical ABI example."}"#;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn describe() -> i64 {
+    let ptr = DESCRIBE_JSON.as_ptr() as u32 as i64;
+    let len = DESCRIBE_JSON.len() as u32 as i64;
+    (ptr << 32) | len
+}
+```
+
+The JSON must match the `CapabilityDescriptor` schema:
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `capability` | string | yes | Dot-separated capability name (e.g. `ai.echo`). |
+| `plugin` | string | yes | Plugin name — must match `plugin.toml`. |
+| `abi` | string | yes | ABI version — must match the engine's expectation. |
+| `description` | string | no | Human-readable one-liner. |
+
+## 4. The bump allocator
+
+Before calling `invoke`, the host needs to write the method name
+and params JSON into guest memory. It does this by calling
+`alloc(n)` — your plugin returns a pointer to `n` reserved bytes.
+
+The simplest implementation is a bump allocator over a fixed
+static buffer:
+
+```rust
+// src/lib.rs — part 3: alloc
+const BUMP_CAP: usize = 4096;
+static mut BUMP: [u8; BUMP_CAP] = [0u8; BUMP_CAP];
+static mut BUMP_POS: usize = 0;
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn alloc(len: i32) -> i32 {
+    unsafe {
+        let Ok(req) = usize::try_from(len) else {
+            core::arch::wasm32::unreachable();
+        };
+        let pos = BUMP_POS;
+        let Some(end) = pos.checked_add(req) else {
+            core::arch::wasm32::unreachable();
+        };
+        if end > BUMP_CAP {
+            core::arch::wasm32::unreachable();
+        }
+        BUMP_POS = end;
+        let base = (&raw const BUMP).cast::<u8>() as usize;
+        (base + pos) as i32
+    }
+}
+```
+
+Key design decisions:
+
+- **4 KiB buffer** — plenty for typical method + params strings.
+  A production plugin with large payloads would use `wee_alloc`
+  or reset the bump pointer between calls.
+- **Trap on exhaustion** — `core::arch::wasm32::unreachable()`
+  produces a WASM trap the engine catches gracefully.
+- **Single-threaded** — WASM guests are single-threaded, so
+  `static mut` is safe here.
+
+## 5. The `invoke` dispatcher
+
+The engine calls `invoke` each time an MCP/A2A client invokes one
+of the plugin's tools. The four parameters point at the method
+name and params JSON already written into guest memory via `alloc`.
+
+This example echoes the method name in a `{"result":"echo: …"}`
+envelope:
+
+```rust
+// src/lib.rs — part 4: invoke
+static mut RESPONSE: [u8; 512] = [0u8; 512];
+
+#[unsafe(no_mangle)]
+pub extern "C" fn invoke(
+    method_ptr: i32,
+    method_len: i32,
+    _params_ptr: i32,
+    _params_len: i32,
+) -> i64 {
+    // Read the method name from guest memory.
+    let method = unsafe {
+        let ptr = method_ptr as usize as *const u8;
+        let len = method_len as usize;
+        core::slice::from_raw_parts(ptr, len)
+    };
+
+    // Build: {"result":"echo: <method>"}
+    let prefix = br#"{"result":"echo: "#;
+    let suffix = br#""}"#;
+
+    let total = prefix.len() + method.len() + suffix.len();
+
+    // Safety: single-threaded WASM guest — no concurrent access.
+    let out = unsafe {
+        let buf = &mut RESPONSE[..total];
+        let mut cursor = 0;
+
+        buf[cursor..cursor + prefix.len()].copy_from_slice(prefix);
+        cursor += prefix.len();
+
+        buf[cursor..cursor + method.len()].copy_from_slice(method);
+        cursor += method.len();
+
+        buf[cursor..cursor + suffix.len()].copy_from_slice(suffix);
+
+        buf.as_ptr()
+    };
+
+    let ptr = out as u32 as i64;
+    let len = total as u32 as i64;
+    (ptr << 32) | len
+}
+```
+
+The response envelope must be one of:
+
+- `{"result": <any JSON value>}` — success.
+- `{"error": "<message>"}` — failure.
+
+The engine parses this envelope and maps it to the appropriate
+MCP/A2A outcome.
+
+## 6. Panic handler
+
+Required on `#![no_std]` targets:
+
+```rust
+// src/lib.rs — part 5: panic handler
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    core::arch::wasm32::unreachable()
+}
+```
+
+## 7. Plugin manifest
+
+```toml
+# plugin.toml
+name        = "canonical-hook"
+version     = "0.1.0"
+type        = "wasm"
+entry       = "./canonical_hook.wasm"
+provides    = ["ai.echo"]
+permissions = []
+abi         = "1.0"
+description = "Full ABI example: describe + alloc + invoke + run."
+```
+
+Note `provides = ["ai.echo"]` — must match the `capability` field
+in the `describe` JSON.
+
+## 8. Build and load
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+
+mkdir -p plugins/canonical-hook
+cp target/wasm32-unknown-unknown/release/canonical_hook.wasm plugins/canonical-hook/
+cp plugin.toml plugins/canonical-hook/
+
+smiths-net --config config.toml
+```
+
+In the engine logs:
+
+```
+INFO smiths_wasm: plugin loaded name="canonical-hook"
+INFO smiths_wasm: canonical-hook: plugin loaded
+INFO smiths_wasm: capability registered capability="ai.echo" plugin="canonical-hook"
+```
+
+## Export summary
+
+| Export | Signature | Returns |
+|--------|-----------|---------|
+| `run` | `() -> ()` | — |
+| `describe` | `() -> i64` | `(ptr << 32) \| len` → JSON `CapabilityDescriptor` |
+| `alloc` | `(i32) -> i32` | Pointer into guest memory |
+| `invoke` | `(i32, i32, i32, i32) -> i64` | `(ptr << 32) \| len` → JSON `{"result":…}` or `{"error":…}` |
+
+## Next steps
+
+- Parse the `params` JSON in `invoke` to handle multiple tools
+  with branching logic.
+- Add the `"state"` permission and use `smiths::state_get` /
+  `smiths::state_set` host imports for persistent KV storage.
+- See the [Sidecar Python Hello World](/cookbook/sidecar/python/hello-world/)
+  for the out-of-process alternative.
+- Read the full plugin ABI reference in the
+  [Plugin Authoring Guide](https://github.com/friday-mindhalla/smiths-net/blob/main/docs/tool-authoring.md).

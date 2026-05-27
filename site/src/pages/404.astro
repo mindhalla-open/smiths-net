@@ -1,0 +1,89 @@
+---
+/**
+ * 404 page — shown for unknown routes.
+ */
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import { t, DEFAULT_LOCALE } from '@/i18n';
+
+const locale = DEFAULT_LOCALE;
+---
+
+<BaseLayout
+  title={t(locale, '404.title')}
+  description={t(locale, '404.description')}
+  locale={locale}
+>
+  <section class="not-found">
+    <div class="container not-found-inner">
+      <span class="not-found-code" aria-hidden="true">404</span>
+      <h1 class="not-found-title" data-i18n="404.title">{t(locale, '404.title')}</h1>
+      <p class="not-found-desc" data-i18n="404.description">{t(locale, '404.description')}</p>
+      <a href="/" class="not-found-link" data-i18n="404.back">{t(locale, '404.back')}</a>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .not-found {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 60vh;
+    text-align: center;
+  }
+
+  .not-found-inner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-4);
+  }
+
+  .not-found-code {
+    font-size: 8rem;
+    font-weight: 800;
+    line-height: 1;
+    background: linear-gradient(
+      135deg,
+      var(--color-accent-muted) 0%,
+      var(--color-border) 100%
+    );
+    background-clip: text;
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    user-select: none;
+  }
+
+  .not-found-title {
+    font-size: var(--text-2xl);
+  }
+
+  .not-found-desc {
+    color: var(--color-text-muted);
+    max-width: 28rem;
+  }
+
+  .not-found-link {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-block-start: var(--space-4);
+    padding: var(--space-3) var(--space-6);
+    font-weight: 600;
+    font-size: var(--text-sm);
+    color: hsl(228, 18%, 8%);
+    background: var(--color-accent);
+    border-radius: var(--radius-lg);
+    text-decoration: none;
+    transition:
+      transform var(--duration-fast) var(--ease-out),
+      background var(--duration-fast) var(--ease-out);
+  }
+
+  .not-found-link:hover {
+    transform: translateY(-1px);
+    background: var(--color-accent-hover);
+    text-decoration: none;
+    color: hsl(228, 18%, 8%);
+  }
+</style>

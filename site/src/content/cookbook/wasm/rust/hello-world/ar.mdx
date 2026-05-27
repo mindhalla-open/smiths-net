@@ -1,0 +1,217 @@
+---
+title: "مرحباً بالعالم"
+description: "أول إضافة WASM — قم بتجميع حزمة Rust بسيطة إلى .wasm وحمّلها في Smiths-Net."
+track: wasm
+lang: rust
+locale: ar
+order: 1
+updatedAt: "2026-04-28"
+---
+
+## نظرة عامة
+
+في هذه الوصفة سنمر بجميع خطوات بناء أبسط إضافة WASM ممكنة
+لـ Smiths-Net: حزمة Rust مع `#![no_std]` يتم تجميعها إلى
+`wasm32-unknown-unknown` وتستدعي دالة المضيف `smiths::log`
+عند بدء التشغيل.
+
+في نهاية الوصفة سيكون لديك:
+
+1. حزمة Rust مستقلة يتم تجميعها إلى وحدة `.wasm`.
+2. ملف `plugin.toml` الذي يقرأه المحرك عند التحميل.
+3. إضافة تعمل وتطبع تحية في سجل المحرك.
+
+## المتطلبات الأساسية
+
+- سلسلة أدوات Rust (عبر `rustup`) مع هدف `wasm32-unknown-unknown`:
+
+  ```bash
+  rustup target add wasm32-unknown-unknown
+  ```
+
+- نسخة تعمل من `smiths-net` — أسرع طريقة:
+
+  ```bash
+  smiths-net init --preset dev --non-interactive
+  smiths-net --config config.toml
+  ```
+
+## 1. إنشاء الحزمة
+
+```bash
+mkdir -p hello-world/src
+cd hello-world
+```
+
+أنشئ `Cargo.toml`:
+
+```toml
+# Cargo.toml
+[package]
+name         = "hello-world"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.95"
+publish      = false
+description  = "Minimal WASM plugin — calls smiths::log."
+
+# Independent workspace root so this crate builds in isolation.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto           = true
+codegen-units = 1
+opt-level     = "s"
+strip         = "symbols"
+```
+
+النقاط الرئيسية:
+
+- **`crate-type = ["cdylib"]`** — ينتج ملف `.wasm` كمكتبة مشتركة
+  تصدر فقط الرموز المعلّمة بـ `#[unsafe(no_mangle)]`.
+- **`[workspace]`** — كتلة workspace فارغة تجعل الحزمة مستقلة عن
+  workspace الأم لـ smiths-net.
+- **ملف Release** — `lto = true` + `opt-level = "s"` يبقي حجم
+  الملف الناتج أقل من 1 KiB.
+
+## 2. كود الإضافة
+
+```rust
+// src/lib.rs
+#![no_std]
+#![no_main]
+
+// استيراد دالة log من المضيف. سمة `wasm_import_module`
+// تخبر الرابط بالبحث عن هذا الرمز تحت وحدة `smiths`
+// — يوفره المحرك تلقائياً.
+#[link(wasm_import_module = "smiths")]
+unsafe extern "C" {
+    fn log(ptr: *const u8, len: usize);
+}
+
+/// غلاف رقيق للاستدعاء الآمن.
+fn host_log(msg: &str) {
+    unsafe {
+        log(msg.as_ptr(), msg.len());
+    }
+}
+
+const GREETING: &str = "hello-world: hook fired";
+
+/// نقطة الدخول التي يستدعيها المحرك عبر `WasmEngine::run_entry`.
+#[unsafe(no_mangle)]
+pub extern "C" fn run() {
+    host_log(GREETING);
+}
+
+/// يجب ألا تنفك الأخطاء في كود المضيف — نوقف عبر trap.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    core::arch::wasm32::unreachable()
+}
+```
+
+تحليل الكود:
+
+| العنصر | الغرض |
+|--------|-------|
+| `#![no_std]` | بدون المكتبة القياسية — ضيوف WASM ليس لديهم نظام تشغيل. |
+| `#![no_main]` | بدون `main()` — المحرك يستدعي `run()` مباشرة. |
+| `#[link(wasm_import_module = "smiths")]` | ربط extern `log` باستيراد المضيف `smiths.log`. |
+| `#[unsafe(no_mangle)]` | يحافظ على اسم الرمز ليتمكن المحرك من العثور عليه. |
+| `extern "C" fn run()` | تصدير C ABI يستدعيه المحرك عند تحميل الإضافة. |
+| `#[panic_handler]` | مطلوب لأهداف `no_std` — يوقف بدلاً من فك المكدس. |
+
+## 3. البناء
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+```
+
+الناتج يوجد في:
+
+```
+target/wasm32-unknown-unknown/release/hello_world.wasm
+```
+
+تحقق من الحجم — يجب أن يكون صغيراً جداً (< 1 KiB):
+
+```bash
+ls -lh target/wasm32-unknown-unknown/release/hello_world.wasm
+```
+
+## 4. ملف البيان
+
+كل إضافة تحتاج `plugin.toml` يصفها للمحرك:
+
+```toml
+# plugin.toml
+name        = "hello-world"
+version     = "0.1.0"
+type        = "wasm"
+entry       = "./hello_world.wasm"
+provides    = []
+permissions = []
+abi         = "1.0"
+description = "Minimal hello-world WASM plugin."
+```
+
+| الحقل | الوصف |
+|-------|-------|
+| `type` | `"wasm"` يخبر المحرك باستخدام محمل WASM. |
+| `entry` | المسار النسبي من `plugin.toml` إلى ملف `.wasm`. |
+| `provides` | القدرات التي توفرها الإضافة (فارغ حالياً). |
+| `permissions` | موارد المضيف التي يمكن للإضافة الوصول إليها (فارغ = السجل فقط). |
+| `abi` | إصدار ABI — يجب أن يتطابق مع الإصدار المتوقع من المحرك. |
+
+## 5. التحميل في المحرك
+
+انسخ الملفات إلى مجلد إضافات المحرك وأعد التشغيل
+(أو قم بإعادة التحميل السريع):
+
+```bash
+mkdir -p plugins/hello-world
+cp target/wasm32-unknown-unknown/release/hello_world.wasm plugins/hello-world/
+cp plugin.toml plugins/hello-world/
+```
+
+ثم أعد التشغيل:
+
+```bash
+smiths-net --config config.toml
+```
+
+أو قم بإعادة التحميل السريع للمحرك العامل:
+
+```bash
+smiths-net reload --pid $(pgrep smiths-net)
+```
+
+في سجلات المحرك سترى:
+
+```
+INFO smiths_wasm: plugin loaded name="hello-world"
+INFO smiths_wasm: hello-world: hook fired
+```
+
+## ما تجاوزناه
+
+هذه الإضافة تصدر فقط `run()`. إضافة الإنتاج تصدر أيضاً:
+
+- **`describe()`** — تعيد واصف JSON للقدرات ليعرف المحرك
+  الأدوات التي توفرها الإضافة.
+- **`alloc(len)`** — مخصص ذاكرة يستخدمه المحرك لكتابة البيانات
+  في ذاكرة الضيف.
+- **`invoke(method_ptr, method_len, params_ptr, params_len)`** —
+  موزع الأدوات الذي يستدعيه المحرك عند استدعاء عميل MCP/A2A
+  لأحد أدوات الإضافة.
+
+## الخطوات التالية
+
+- أضف ABI الكامل بأربعة تصديرات — راجع وصفة
+  [Canonical Hook](/cookbook/wasm/rust/canonical-hook/).
+- استكشف ABI الإضافات الكامل في
+  [دليل إنشاء الإضافات](https://github.com/friday-mindhalla/smiths-net/blob/main/docs/tool-authoring.md).

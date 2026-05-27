@@ -1,0 +1,619 @@
+---
+/**
+ * CallFlowSimulator — animated SIP/WebRTC call flow with plugin hooks.
+ *
+ * Renders an SVG sequence diagram with animated messages,
+ * play/pause/step controls, and hook code panel.
+ */
+---
+
+<div class="sim" id="sim-root">
+  <!-- Controls -->
+  <div class="sim-controls">
+    <button class="sim-btn" id="btn-play" title="Play">▶</button>
+    <button class="sim-btn" id="btn-pause" title="Pause" disabled>⏸</button>
+    <button class="sim-btn" id="btn-step" title="Step forward">⏭</button>
+    <button class="sim-btn" id="btn-reset" title="Reset">⟲</button>
+    <label class="sim-speed">
+      <span>Speed</span>
+      <input type="range" id="speed-slider" min="1" max="5" value="3" />
+    </label>
+    <span class="sim-step-label" id="step-label">Ready</span>
+  </div>
+
+  <!-- Diagram + Code split -->
+  <div class="sim-split">
+    <!-- SVG diagram -->
+    <div class="sim-diagram">
+      <svg viewBox="0 0 700 520" id="sim-svg" xmlns="http://www.w3.org/2000/svg">
+        <!-- Node headers -->
+        <rect x="40" y="10" width="100" height="36" rx="8" class="node-box node-uac" />
+        <text x="90" y="33" class="node-label">UAC</text>
+
+        <rect x="300" y="10" width="100" height="36" rx="8" class="node-box node-engine" />
+        <text x="350" y="33" class="node-label">Engine</text>
+
+        <rect x="560" y="10" width="100" height="36" rx="8" class="node-box node-uas" />
+        <text x="610" y="33" class="node-label">UAS</text>
+
+        <!-- Lifelines -->
+        <line x1="90" y1="46" x2="90" y2="510" class="lifeline" />
+        <line x1="350" y1="46" x2="350" y2="510" class="lifeline" />
+        <line x1="610" y1="46" x2="610" y2="510" class="lifeline" />
+
+        <!-- Message arrows (initially hidden) -->
+        <g id="msg-0" class="msg hidden">
+          <line x1="90" y1="90" x2="350" y2="90" class="msg-line msg-line--req" />
+          <polygon points="345,85 355,90 345,95" class="msg-arrow msg-arrow--req" />
+          <text x="220" y="82" class="msg-text">INVITE</text>
+        </g>
+
+        <g id="msg-1" class="msg hidden">
+          <rect x="320" y="100" width="60" height="24" rx="6" class="hook-box" />
+          <text x="350" y="116" class="hook-label">route()</text>
+        </g>
+
+        <g id="msg-2" class="msg hidden">
+          <line x1="350" y1="140" x2="610" y2="140" class="msg-line msg-line--req" />
+          <polygon points="605,135 615,140 605,145" class="msg-arrow msg-arrow--req" />
+          <text x="480" y="132" class="msg-text">INVITE</text>
+        </g>
+
+        <g id="msg-3" class="msg hidden">
+          <line x1="610" y1="190" x2="350" y2="190" class="msg-line msg-line--res" />
+          <polygon points="355,185 345,190 355,195" class="msg-arrow msg-arrow--res" />
+          <text x="480" y="182" class="msg-text">100 Trying</text>
+        </g>
+
+        <g id="msg-4" class="msg hidden">
+          <line x1="350" y1="220" x2="90" y2="220" class="msg-line msg-line--res" />
+          <polygon points="95,215 85,220 95,225" class="msg-arrow msg-arrow--res" />
+          <text x="220" y="212" class="msg-text">100 Trying</text>
+        </g>
+
+        <g id="msg-5" class="msg hidden">
+          <line x1="610" y1="260" x2="350" y2="260" class="msg-line msg-line--res" />
+          <polygon points="355,255 345,260 355,265" class="msg-arrow msg-arrow--res" />
+          <text x="480" y="252" class="msg-text">180 Ringing</text>
+        </g>
+
+        <g id="msg-6" class="msg hidden">
+          <rect x="320" y="270" width="60" height="24" rx="6" class="hook-box" />
+          <text x="350" y="286" class="hook-label">on_ring()</text>
+        </g>
+
+        <g id="msg-7" class="msg hidden">
+          <line x1="350" y1="310" x2="90" y2="310" class="msg-line msg-line--res" />
+          <polygon points="95,305 85,310 95,315" class="msg-arrow msg-arrow--res" />
+          <text x="220" y="302" class="msg-text">180 Ringing</text>
+        </g>
+
+        <g id="msg-8" class="msg hidden">
+          <line x1="610" y1="350" x2="350" y2="350" class="msg-line msg-line--res" />
+          <polygon points="355,345 345,350 355,355" class="msg-arrow msg-arrow--res" />
+          <text x="480" y="342" class="msg-text">200 OK</text>
+        </g>
+
+        <g id="msg-9" class="msg hidden">
+          <rect x="315" y="360" width="70" height="24" rx="6" class="hook-box" />
+          <text x="350" y="376" class="hook-label">on_answer()</text>
+        </g>
+
+        <g id="msg-10" class="msg hidden">
+          <line x1="350" y1="400" x2="90" y2="400" class="msg-line msg-line--res" />
+          <polygon points="95,395 85,400 95,405" class="msg-arrow msg-arrow--res" />
+          <text x="220" y="392" class="msg-text">200 OK</text>
+        </g>
+
+        <g id="msg-11" class="msg hidden">
+          <line x1="90" y1="440" x2="350" y2="440" class="msg-line msg-line--req" />
+          <polygon points="345,435 355,440 345,445" class="msg-arrow msg-arrow--req" />
+          <text x="220" y="432" class="msg-text">ACK</text>
+        </g>
+
+        <g id="msg-12" class="msg hidden">
+          <line x1="350" y1="440" x2="610" y2="440" class="msg-line msg-line--req" />
+          <polygon points="605,435 615,440 605,445" class="msg-arrow msg-arrow--req" />
+          <text x="480" y="432" class="msg-text">ACK</text>
+        </g>
+
+        <g id="msg-13" class="msg hidden">
+          <line x1="90" y1="480" x2="350" y2="480" class="msg-line msg-line--bye" />
+          <polygon points="345,475 355,480 345,485" class="msg-arrow msg-arrow--bye" />
+          <text x="220" y="472" class="msg-text">BYE</text>
+        </g>
+
+        <g id="msg-14" class="msg hidden">
+          <rect x="315" y="488" width="70" height="24" rx="6" class="hook-box" />
+          <text x="350" y="504" class="hook-label">on_bye()</text>
+        </g>
+      </svg>
+    </div>
+
+    <!-- Hook code panel -->
+    <div class="sim-code">
+      <div class="code-header">
+        <span class="code-badge">Rhai Hook</span>
+        <span class="code-filename" id="code-filename">—</span>
+      </div>
+      <pre class="code-body" id="code-body"><code>// Select a step to see the hook code
+// that fires at each point in the call.</code></pre>
+    </div>
+  </div>
+</div>
+
+<style>
+  .sim {
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    background: var(--color-bg-surface);
+  }
+
+  /* ── Controls ─────────────────────────────────────────── */
+  .sim-controls {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    background: var(--color-bg-elevated);
+    border-bottom: 1px solid var(--color-border);
+    flex-wrap: wrap;
+  }
+
+  .sim-btn {
+    width: 36px;
+    height: 36px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: var(--text-base);
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    color: var(--color-text);
+    cursor: pointer;
+    transition: all var(--duration-fast) var(--ease-out);
+  }
+
+  .sim-btn:hover:not(:disabled) {
+    background: var(--color-bg-hover);
+    border-color: var(--color-accent);
+    color: var(--color-accent);
+  }
+
+  .sim-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  .sim-speed {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-size: var(--text-xs);
+    color: var(--color-text-muted);
+    margin-inline-start: var(--space-2);
+  }
+
+  .sim-speed input[type="range"] {
+    width: 80px;
+    accent-color: var(--color-accent);
+  }
+
+  .sim-step-label {
+    margin-inline-start: auto;
+    font-size: var(--text-sm);
+    font-family: var(--font-mono);
+    color: var(--color-accent-text);
+    font-weight: 600;
+  }
+
+  /* ── Split layout ───────────────────────────────────────── */
+  .sim-split {
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    min-height: 420px;
+  }
+
+  @media (max-width: 900px) {
+    .sim-split {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  /* ── SVG diagram ────────────────────────────────────────── */
+  .sim-diagram {
+    padding: var(--space-4);
+    overflow-x: auto;
+  }
+
+  .sim-diagram svg {
+    width: 100%;
+    height: auto;
+  }
+
+  .node-box {
+    fill: var(--color-bg-elevated);
+    stroke: var(--color-border);
+    stroke-width: 1.5;
+  }
+
+  .node-uac { stroke: hsl(215, 80%, 58%); }
+  .node-engine { stroke: var(--color-accent); }
+  .node-uas { stroke: hsl(142, 60%, 45%); }
+
+  .node-label {
+    fill: var(--color-text);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    font-weight: 700;
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+
+  .lifeline {
+    stroke: var(--color-border);
+    stroke-width: 1;
+    stroke-dasharray: 6 4;
+  }
+
+  /* Messages */
+  .msg { transition: opacity 0.3s ease; }
+  .msg.hidden { opacity: 0; }
+  .msg.visible { opacity: 1; }
+  .msg.active .msg-line { stroke-width: 2.5; filter: drop-shadow(0 0 4px var(--color-accent)); }
+
+  .msg-line { stroke-width: 1.5; }
+  .msg-line--req { stroke: hsl(215, 80%, 58%); }
+  .msg-line--res { stroke: hsl(142, 60%, 50%); }
+  .msg-line--bye { stroke: hsl(0, 65%, 55%); }
+
+  .msg-arrow--req { fill: hsl(215, 80%, 58%); }
+  .msg-arrow--res { fill: hsl(142, 60%, 50%); }
+  .msg-arrow--bye { fill: hsl(0, 65%, 55%); }
+
+  .msg-text {
+    fill: var(--color-text);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 500;
+    text-anchor: middle;
+  }
+
+  /* Hook boxes */
+  .hook-box {
+    fill: hsla(28, 92%, 56%, 0.15);
+    stroke: var(--color-accent);
+    stroke-width: 1.5;
+  }
+
+  .hook-label {
+    fill: var(--color-accent);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    text-anchor: middle;
+    dominant-baseline: central;
+  }
+
+  .msg.active .hook-box {
+    fill: hsla(28, 92%, 56%, 0.3);
+    filter: drop-shadow(0 0 8px hsla(28, 92%, 56%, 0.5));
+  }
+
+  /* ── Code panel ─────────────────────────────────────────── */
+  .sim-code {
+    border-inline-start: 1px solid var(--color-border);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .code-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    background: var(--color-bg-elevated);
+    border-bottom: 1px solid var(--color-border-subtle);
+  }
+
+  .code-badge {
+    font-size: var(--text-xs);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-accent);
+    background: var(--color-accent-muted);
+    padding: var(--space-1) var(--space-2);
+    border-radius: var(--radius-sm);
+  }
+
+  .code-filename {
+    font-size: var(--text-sm);
+    font-family: var(--font-mono);
+    color: var(--color-text-muted);
+  }
+
+  .code-body {
+    flex: 1;
+    padding: var(--space-4);
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    line-height: var(--leading-relaxed);
+    color: var(--color-text);
+    overflow-y: auto;
+    white-space: pre-wrap;
+    background: var(--color-bg);
+  }
+</style>
+
+<script is:inline>
+  // ── Step definitions ────────────────────────────────────
+  var STEPS = [
+    {
+      msgIds: ['msg-0'],
+      label: '1. UAC → INVITE',
+      filename: 'on_invite.rhai',
+      code:
+'// UAC sends INVITE to the engine.\n' +
+'// The engine receives the request and\n' +
+'// prepares to route it.\n\n' +
+'// SIP message:\n' +
+'// INVITE sip:alice@example.com SIP/2.0\n' +
+'// From: <sip:bob@client.local>\n' +
+'// To: <sip:alice@example.com>\n' +
+'// Call-ID: abc123@client.local',
+    },
+    {
+      msgIds: ['msg-1'],
+      label: '2. 🔥 route() hook',
+      filename: 'route.rhai',
+      code:
+'// The route() hook fires — your plugin\n' +
+'// decides where to send the call.\n\n' +
+'fn route(req) {\n' +
+'  let target = req.uri.host;\n' +
+'  log(`routing call to ${target}`);\n\n' +
+'  if target == "ai.local" {\n' +
+'    // Forward to AI backend\n' +
+'    req.forward("sip:llm@backend:5060");\n' +
+'  } else {\n' +
+'    // Normal routing\n' +
+'    req.forward(req.uri);\n' +
+'  }\n' +
+'}',
+    },
+    {
+      msgIds: ['msg-2'],
+      label: '3. Engine → INVITE → UAS',
+      filename: 'route.rhai',
+      code:
+'// After route() returns, the engine\n' +
+'// forwards INVITE to the destination.\n\n' +
+'// The UAS (User Agent Server) receives\n' +
+'// the INVITE and begins processing.',
+    },
+    {
+      msgIds: ['msg-3', 'msg-4'],
+      label: '4. 100 Trying',
+      filename: '—',
+      code:
+'// UAS replies with 100 Trying.\n' +
+'// This is a provisional response —\n' +
+'// no plugin hook fires here.\n\n' +
+'// The engine relays it back to the UAC\n' +
+'// to stop retransmissions.',
+    },
+    {
+      msgIds: ['msg-5'],
+      label: '5. 180 Ringing',
+      filename: 'on_ring.rhai',
+      code:
+'// UAS sends 180 Ringing — the phone\n' +
+'// is actually ringing.',
+    },
+    {
+      msgIds: ['msg-6'],
+      label: '6. 🔥 on_ring() hook',
+      filename: 'on_ring.rhai',
+      code:
+'// The on_ring() hook fires — you can\n' +
+'// log, start a timer, or play ringback.\n\n' +
+'fn on_ring(call) {\n' +
+'  log(`call ${call.id} is ringing`);\n\n' +
+'  // Start a 30-second no-answer timer\n' +
+'  call.set_timer("no_answer", 30);\n\n' +
+'  // Play ringback tone to caller\n' +
+'  call.play_tone("ringback");\n' +
+'}',
+    },
+    {
+      msgIds: ['msg-7'],
+      label: '7. 180 → UAC',
+      filename: '—',
+      code:
+'// Engine relays 180 Ringing to UAC.\n' +
+'// The caller hears the ringback tone\n' +
+'// (from the on_ring hook or the UAS).',
+    },
+    {
+      msgIds: ['msg-8'],
+      label: '8. 200 OK',
+      filename: 'on_answer.rhai',
+      code:
+'// UAS answers the call with 200 OK.\n' +
+'// This triggers media negotiation.',
+    },
+    {
+      msgIds: ['msg-9'],
+      label: '9. 🔥 on_answer() hook',
+      filename: 'on_answer.rhai',
+      code:
+'// The on_answer() hook fires — the call\n' +
+'// is now connected.\n\n' +
+'fn on_answer(call) {\n' +
+'  log(`call ${call.id} answered`);\n\n' +
+'  // Cancel the no-answer timer\n' +
+'  call.cancel_timer("no_answer");\n\n' +
+'  // Start call recording (if enabled)\n' +
+'  if call.config.recording {\n' +
+'    call.start_recording();\n' +
+'  }\n\n' +
+'  // Inject ASR for transcription\n' +
+'  call.attach("asr", #{model: "whisper"});\n' +
+'}',
+    },
+    {
+      msgIds: ['msg-10'],
+      label: '10. 200 OK → UAC',
+      filename: '—',
+      code:
+'// Engine relays 200 OK to UAC.\n' +
+'// Both sides now have SDP for media.\n\n' +
+'// Media flows directly:\n' +
+'// UAC ←→ Engine (mixer) ←→ UAS',
+    },
+    {
+      msgIds: ['msg-11', 'msg-12'],
+      label: '11. ACK',
+      filename: '—',
+      code:
+'// UAC confirms with ACK.\n' +
+'// The 3-way handshake is complete.\n\n' +
+'// At this point RTP/SRTP media is\n' +
+'// flowing through the engine\'s mixer.\n' +
+'// Plugins can tap into the media\n' +
+'// pipeline for ASR, recording, etc.',
+    },
+    {
+      msgIds: ['msg-13'],
+      label: '12. BYE',
+      filename: 'on_bye.rhai',
+      code:
+'// UAC hangs up with BYE.\n' +
+'// This ends the dialog.',
+    },
+    {
+      msgIds: ['msg-14'],
+      label: '13. 🔥 on_bye() hook',
+      filename: 'on_bye.rhai',
+      code:
+'// The on_bye() hook fires — cleanup.\n\n' +
+'fn on_bye(call) {\n' +
+'  log(`call ${call.id} ended`);\n\n' +
+'  // Stop recording\n' +
+'  call.stop_recording();\n\n' +
+'  // Detach ASR\n' +
+'  call.detach("asr");\n\n' +
+'  // Post CDR (Call Detail Record)\n' +
+'  let cdr = #{\n' +
+'    call_id: call.id,\n' +
+'    duration: call.duration(),\n' +
+'    from: call.from,\n' +
+'    to: call.to,\n' +
+'  };\n' +
+'  call.emit("cdr.created", cdr);\n' +
+'}',
+    },
+  ];
+
+  var currentStep = -1;
+  var playing = false;
+  var playTimer = null;
+
+  function getSpeed() {
+    var val = document.getElementById('speed-slider').value;
+    return [2000, 1500, 1000, 600, 300][val - 1] || 1000;
+  }
+
+  function showStep(idx) {
+    // Remove active from all
+    for (var i = 0; i < STEPS.length; i++) {
+      var step = STEPS[i];
+      for (var j = 0; j < step.msgIds.length; j++) {
+        var el = document.getElementById(step.msgIds[j]);
+        if (el) {
+          el.classList.remove('active');
+          if (i > idx) el.classList.add('hidden');
+          else el.classList.remove('hidden');
+          if (i <= idx) el.classList.add('visible');
+        }
+      }
+    }
+
+    // Set active on current
+    if (idx >= 0 && idx < STEPS.length) {
+      var s = STEPS[idx];
+      for (var k = 0; k < s.msgIds.length; k++) {
+        var el2 = document.getElementById(s.msgIds[k]);
+        if (el2) el2.classList.add('active');
+      }
+      document.getElementById('step-label').textContent = s.label;
+      document.getElementById('code-filename').textContent = s.filename;
+      document.getElementById('code-body').innerHTML = '<code>' + escHtml(s.code) + '</code>';
+    }
+
+    currentStep = idx;
+  }
+
+  function stepForward() {
+    if (currentStep < STEPS.length - 1) {
+      showStep(currentStep + 1);
+    } else {
+      stopPlaying();
+    }
+  }
+
+  function startPlaying() {
+    playing = true;
+    document.getElementById('btn-play').disabled = true;
+    document.getElementById('btn-pause').disabled = false;
+    playTick();
+  }
+
+  function playTick() {
+    if (!playing) return;
+    stepForward();
+    if (currentStep < STEPS.length - 1) {
+      playTimer = setTimeout(playTick, getSpeed());
+    } else {
+      stopPlaying();
+    }
+  }
+
+  function stopPlaying() {
+    playing = false;
+    clearTimeout(playTimer);
+    document.getElementById('btn-play').disabled = false;
+    document.getElementById('btn-pause').disabled = true;
+  }
+
+  function resetSim() {
+    stopPlaying();
+    currentStep = -1;
+    // Hide all messages
+    var msgs = document.querySelectorAll('.msg');
+    for (var i = 0; i < msgs.length; i++) {
+      msgs[i].classList.add('hidden');
+      msgs[i].classList.remove('visible', 'active');
+    }
+    document.getElementById('step-label').textContent = 'Ready';
+    document.getElementById('code-filename').textContent = '—';
+    document.getElementById('code-body').innerHTML = '<code>// Press ▶ to start the call flow\n// or ⏭ to step through manually.</code>';
+  }
+
+  function escHtml(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // Wire up
+  document.getElementById('btn-play').addEventListener('click', startPlaying);
+  document.getElementById('btn-pause').addEventListener('click', stopPlaying);
+  document.getElementById('btn-step').addEventListener('click', function() {
+    stopPlaying();
+    stepForward();
+  });
+  document.getElementById('btn-reset').addEventListener('click', resetSim);
+</script>

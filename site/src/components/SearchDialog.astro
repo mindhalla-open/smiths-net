@@ -1,0 +1,219 @@
+---
+/**
+ * <SearchDialog> — modal search powered by Pagefind.
+ *
+ * Opens with ⌘K / Ctrl+K or the search button in the header.
+ * Uses Pagefind's default UI, styled to match the site theme.
+ */
+---
+
+<div class="search-wrapper" id="search-wrapper">
+  <dialog class="search-dialog" id="search-dialog">
+    <div class="search-dialog-inner">
+      <div id="search-container">
+        <p class="search-loading" id="search-loading">Loading search…</p>
+      </div>
+      <button
+        class="search-close"
+        id="search-close"
+        type="button"
+        aria-label="Close search"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="20" height="20" aria-hidden="true">
+          <line x1="18" y1="6" x2="6" y2="18" />
+          <line x1="6" y1="6" x2="18" y2="18" />
+        </svg>
+      </button>
+    </div>
+  </dialog>
+</div>
+
+<script is:inline>
+  (function() {
+    var pagefindLoaded = false;
+
+    function initSearch() {
+      var dialog = document.getElementById('search-dialog');
+      var container = document.getElementById('search-container');
+      var closeBtn = document.getElementById('search-close');
+      var loading = document.getElementById('search-loading');
+      if (!dialog || !container) return;
+
+      function loadPagefind() {
+        if (pagefindLoaded) return;
+        pagefindLoaded = true;
+
+        // Load via script tag to bypass Vite's module interception
+        var script = document.createElement('script');
+        script.src = '/pagefind/pagefind-ui.js';
+        script.onload = function() {
+          if (loading) loading.style.display = 'none';
+          if (typeof window.PagefindUI === 'undefined') {
+            showFallback();
+            return;
+          }
+          new window.PagefindUI({
+            element: container,
+            showSubResults: true,
+            showImages: false,
+            resetStyles: false,
+          });
+          setTimeout(function() {
+            var input = container.querySelector('input');
+            if (input) input.focus();
+          }, 100);
+        };
+        script.onerror = function() {
+          showFallback();
+        };
+        document.head.appendChild(script);
+      }
+
+      function showFallback() {
+        if (loading) {
+          loading.innerHTML = '<p style="color: var(--color-text-muted); font-size: var(--text-sm);">Search is only available in production builds.</p>'
+            + '<p style="color: var(--color-text-faint); font-size: var(--text-xs); margin-top: 0.5rem;">Run <code style="font-size: inherit;">npm run build && npm run preview</code> to test search.</p>';
+        }
+      }
+
+      function openSearch() {
+        dialog.showModal();
+        loadPagefind();
+        setTimeout(function() {
+          var input = container.querySelector('input');
+          if (input) input.focus();
+        }, 100);
+      }
+
+      function closeSearch() {
+        dialog.close();
+      }
+
+      closeBtn.addEventListener('click', closeSearch);
+
+      dialog.addEventListener('click', function(e) {
+        if (e.target === dialog) closeSearch();
+      });
+
+      document.addEventListener('keydown', function(e) {
+        if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+          e.preventDefault();
+          if (dialog.open) closeSearch();
+          else openSearch();
+        }
+      });
+
+      document.querySelectorAll('[data-search-trigger]').forEach(function(btn) {
+        btn.addEventListener('click', openSearch);
+      });
+    }
+
+    initSearch();
+    document.addEventListener('astro:after-swap', initSearch);
+  })();
+</script>
+
+<style>
+  .search-dialog {
+    position: fixed;
+    top: 10vh;
+    left: 50%;
+    transform: translateX(-50%);
+    width: min(90vw, 640px);
+    max-height: 70vh;
+    padding: 0;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-xl);
+    background: var(--color-bg-surface);
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+    z-index: 1000;
+  }
+
+  .search-dialog::backdrop {
+    background: hsla(0, 0%, 0%, 0.5);
+    backdrop-filter: blur(4px);
+  }
+
+  .search-dialog-inner {
+    position: relative;
+    padding: var(--space-4);
+    max-height: 70vh;
+    overflow-y: auto;
+  }
+
+  .search-close {
+    position: absolute;
+    top: var(--space-3);
+    right: var(--space-3);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    border: none;
+    border-radius: var(--radius-md);
+    background: transparent;
+    color: var(--color-text-muted);
+    cursor: pointer;
+    transition: all var(--duration-fast) var(--ease-out);
+    z-index: 1;
+  }
+
+  .search-close:hover {
+    color: var(--color-text);
+    background: var(--color-bg-hover);
+  }
+
+  .search-loading {
+    color: var(--color-text-muted);
+    font-size: var(--text-sm);
+    text-align: center;
+    padding: var(--space-6) var(--space-4);
+  }
+</style>
+
+<!-- Pagefind UI theme overrides -->
+<style is:global>
+  .pagefind-ui {
+    --pagefind-ui-scale: 0.9;
+    --pagefind-ui-primary: var(--color-accent);
+    --pagefind-ui-text: var(--color-text);
+    --pagefind-ui-background: var(--color-bg-surface);
+    --pagefind-ui-border: var(--color-border);
+    --pagefind-ui-tag: var(--color-accent-muted);
+    --pagefind-ui-border-width: 1px;
+    --pagefind-ui-border-radius: var(--radius-md);
+    --pagefind-ui-font: var(--font-sans);
+  }
+
+  .pagefind-ui .pagefind-ui__search-input {
+    font-family: var(--font-sans);
+    color: var(--color-text);
+    background: var(--color-bg-elevated);
+    border-color: var(--color-border);
+  }
+
+  .pagefind-ui .pagefind-ui__search-input:focus {
+    border-color: var(--color-accent);
+    outline: none;
+    box-shadow: 0 0 0 2px var(--color-accent-muted);
+  }
+
+  .pagefind-ui .pagefind-ui__result-link {
+    color: var(--color-secondary);
+  }
+
+  .pagefind-ui .pagefind-ui__result-link:hover {
+    color: var(--color-secondary-hover);
+  }
+
+  .pagefind-ui .pagefind-ui__result-excerpt {
+    color: var(--color-text-muted);
+  }
+
+  .pagefind-ui .pagefind-ui__message {
+    color: var(--color-text-muted);
+    font-family: var(--font-sans);
+  }
+</style>

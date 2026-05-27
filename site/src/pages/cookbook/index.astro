@@ -1,0 +1,129 @@
+---
+/**
+ * Cookbook section landing — plugin recipe track grid.
+ * Relocated from the old root index.
+ */
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import RecipeCard from '@/components/RecipeCard.astro';
+import { t, DEFAULT_LOCALE } from '@/i18n';
+import { getCollection } from 'astro:content';
+
+const locale = DEFAULT_LOCALE;
+const recipes = await getCollection('cookbook');
+const sortedRecipes = recipes.sort((a, b) => (a.data.order ?? 100) - (b.data.order ?? 100));
+---
+
+<BaseLayout
+  title="Plugin Cookbook — Smiths-Net"
+  description="Battle-tested recipes for extending Smiths-Net with WASM, sidecar, and script plugins."
+  locale={locale}
+>
+  <section class="section-landing">
+    <div class="container">
+      <h1 class="section-title" data-i18n="sections.cookbook.title">{t(locale, 'sections.cookbook.title')}</h1>
+      <p class="section-desc" data-i18n="sections.cookbook.description">{t(locale, 'sections.cookbook.description')}</p>
+
+      <a href="/playground/" class="playground-cta">
+        <span class="cta-icon">🛠️</span>
+        <span>
+          <strong>Plugin Playground</strong>
+          <small>Validate your plugin envelopes interactively</small>
+        </span>
+        <span class="cta-arrow">→</span>
+      </a>
+
+      <div class="track-grid">
+        {(['wasm', 'sidecar', 'script'] as const).map((track) => (
+          <div class="track-section">
+            <div class="track-header">
+              <span class={`track-icon track-icon--${track}`} aria-hidden="true">
+                {track === 'wasm' ? '⚡' : track === 'sidecar' ? '🔗' : '📜'}
+              </span>
+              <div>
+                <h3 class="track-name" data-i18n={`tracks.${track}.title`}>{t(locale, `tracks.${track}.title`)}</h3>
+                <p class="track-desc" data-i18n={`tracks.${track}.description`}>{t(locale, `tracks.${track}.description`)}</p>
+              </div>
+            </div>
+
+            <div class="recipe-grid">
+              {sortedRecipes
+                .filter((r) => r.data.track === track && r.data.locale === 'en')
+                .map((recipe) => (
+                  <RecipeCard
+                    title={recipe.data.title}
+                    description={recipe.data.description}
+                    href={`/cookbook/${recipe.data.track}/${recipe.data.lang}/${recipe.id.split('/').slice(-2, -1)[0]}/`}
+                    track={recipe.data.track}
+                    lang={recipe.data.lang}
+                  />
+                ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .section-landing { padding-block: var(--space-12) var(--space-20); }
+  .section-title { font-size: var(--text-4xl); font-weight: 800; margin-block-end: var(--space-3); }
+  .section-desc { font-size: var(--text-lg); color: var(--color-text-muted); margin-block-end: var(--space-10); max-width: 40rem; }
+  .track-grid { display: flex; flex-direction: column; gap: var(--space-12); }
+  .track-section { padding: var(--space-8); background: var(--color-bg-surface); border: 1px solid var(--color-border-subtle); border-radius: var(--radius-2xl); }
+  .track-header { display: flex; align-items: flex-start; gap: var(--space-4); margin-block-end: var(--space-6); padding-block-end: var(--space-6); border-block-end: 1px solid var(--color-border-subtle); }
+  .track-icon { font-size: var(--text-3xl); flex-shrink: 0; width: 3rem; height: 3rem; display: flex; align-items: center; justify-content: center; border-radius: var(--radius-lg); background: var(--color-bg-elevated); }
+  .track-name { font-size: var(--text-xl); font-weight: 700; margin-block-end: var(--space-1); }
+  .track-desc { font-size: var(--text-sm); color: var(--color-text-muted); line-height: var(--leading-normal); }
+  .recipe-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--space-4); }
+
+  .playground-cta {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    padding: var(--space-4) var(--space-6);
+    margin-block-end: var(--space-10);
+    background: linear-gradient(135deg, var(--color-accent-muted), var(--color-bg-elevated));
+    border: 1px solid var(--color-accent);
+    border-radius: var(--radius-xl);
+    text-decoration: none;
+    color: var(--color-text);
+    transition: all var(--duration-normal) var(--ease-out);
+    max-width: 28rem;
+  }
+
+  .playground-cta:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-glow);
+    border-color: var(--color-accent-hover);
+    text-decoration: none;
+  }
+
+  .cta-icon {
+    font-size: var(--text-2xl);
+    flex-shrink: 0;
+  }
+
+  .playground-cta strong {
+    display: block;
+    font-size: var(--text-base);
+    font-weight: 700;
+    color: var(--color-accent-text);
+  }
+
+  .playground-cta small {
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+  }
+
+  .cta-arrow {
+    margin-inline-start: auto;
+    font-size: var(--text-xl);
+    color: var(--color-accent);
+    transition: transform var(--duration-fast) var(--ease-out);
+  }
+
+  .playground-cta:hover .cta-arrow {
+    transform: translateX(4px);
+  }
+</style>

@@ -1,0 +1,218 @@
+---
+title: "Привет, мир"
+description: "Ваш первый WASM плагин — скомпилируйте минимальный Rust крейт в .wasm и загрузите в Smiths-Net."
+track: wasm
+lang: rust
+locale: ru
+order: 1
+updatedAt: "2026-04-25"
+---
+
+## Обзор
+
+В этом рецепте мы пройдём все этапы создания простейшего WASM плагина
+для Smiths-Net: Rust крейт с `#![no_std]`, который компилируется в
+`wasm32-unknown-unknown` и вызывает хост-функцию `smiths::log` движка
+при запуске.
+
+К концу рецепта у вас будет:
+
+1. Самостоятельный Rust крейт, компилируемый в `.wasm` модуль.
+2. Манифест `plugin.toml`, который движок читает при загрузке.
+3. Работающий плагин, выводящий приветствие в лог движка.
+
+## Предварительные требования
+
+- Rust тулчейн (через `rustup`) с таргетом `wasm32-unknown-unknown`:
+
+  ```bash
+  rustup target add wasm32-unknown-unknown
+  ```
+
+- Запущенный экземпляр `smiths-net` — быстрый старт:
+
+  ```bash
+  smiths-net init --preset dev --non-interactive
+  smiths-net --config config.toml
+  ```
+
+## 1. Создание крейта
+
+```bash
+mkdir -p hello-world/src
+cd hello-world
+```
+
+Создайте `Cargo.toml`:
+
+```toml
+# Cargo.toml
+[package]
+name         = "hello-world"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.95"
+publish      = false
+description  = "Minimal WASM plugin — calls smiths::log."
+
+# Independent workspace root so this crate builds in isolation.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto           = true
+codegen-units = 1
+opt-level     = "s"
+strip         = "symbols"
+```
+
+Ключевые моменты:
+
+- **`crate-type = ["cdylib"]`** — создаёт `.wasm` файл с разделяемой
+  библиотекой, экспортирующий только символы с `#[unsafe(no_mangle)]`.
+- **`[workspace]`** — пустой блок воркспейса делает крейт
+  независимым от родительского воркспейса smiths-net.
+- **Release профиль** — `lto = true` + `opt-level = "s"` поддерживает
+  размер выходного файла менее 1 KiB.
+
+## 2. Код плагина
+
+```rust
+// src/lib.rs
+#![no_std]
+#![no_main]
+
+// Импортируем хост-функцию log. Атрибут `wasm_import_module`
+// указывает линкеру искать этот символ в модуле `smiths`
+// — движок предоставляет его автоматически.
+#[link(wasm_import_module = "smiths")]
+unsafe extern "C" {
+    fn log(ptr: *const u8, len: usize);
+}
+
+/// Тонкая обёртка для безопасного вызова.
+fn host_log(msg: &str) {
+    unsafe {
+        log(msg.as_ptr(), msg.len());
+    }
+}
+
+const GREETING: &str = "hello-world: hook fired";
+
+/// Точка входа, которую движок вызывает через `WasmEngine::run_entry`.
+#[unsafe(no_mangle)]
+pub extern "C" fn run() {
+    host_log(GREETING);
+}
+
+/// Паники не должны раскручиваться в хост-код — прерываем через trap.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    core::arch::wasm32::unreachable()
+}
+```
+
+Разбор кода:
+
+| Элемент | Назначение |
+|---------|------------|
+| `#![no_std]` | Без стандартной библиотеки — у WASM гостей нет ОС. |
+| `#![no_main]` | Без `main()` — движок вызывает `run()` напрямую. |
+| `#[link(wasm_import_module = "smiths")]` | Привязывает extern `log` к хост-импорту `smiths.log`. |
+| `#[unsafe(no_mangle)]` | Сохраняет имя символа, чтобы движок мог его найти. |
+| `extern "C" fn run()` | C ABI экспорт, вызываемый движком при загрузке плагина. |
+| `#[panic_handler]` | Обязателен для `no_std` — прерывает вместо раскрутки стека. |
+
+## 3. Сборка
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+```
+
+Результат находится в:
+
+```
+target/wasm32-unknown-unknown/release/hello_world.wasm
+```
+
+Проверьте размер — он должен быть минимальным (< 1 KiB):
+
+```bash
+ls -lh target/wasm32-unknown-unknown/release/hello_world.wasm
+```
+
+## 4. Манифест плагина
+
+Каждому плагину нужен `plugin.toml`, описывающий его для движка:
+
+```toml
+# plugin.toml
+name        = "hello-world"
+version     = "0.1.0"
+type        = "wasm"
+entry       = "./hello_world.wasm"
+provides    = []
+permissions = []
+abi         = "1.0"
+description = "Minimal hello-world WASM plugin."
+```
+
+| Поле | Описание |
+|------|----------|
+| `type` | `"wasm"` указывает движку использовать WASM загрузчик. |
+| `entry` | Относительный путь от `plugin.toml` к `.wasm` бинарнику. |
+| `provides` | Возможности, которые плагин предоставляет (пока пусто). |
+| `permissions` | Хост-ресурсы, к которым плагин может обращаться (пусто = только log). |
+| `abi` | Версия ABI — должна совпадать с ожидаемой версией движка. |
+
+## 5. Загрузка в движок
+
+Скопируйте артефакты в директорию плагинов движка и перезапустите
+(или выполните горячую перезагрузку):
+
+```bash
+mkdir -p plugins/hello-world
+cp target/wasm32-unknown-unknown/release/hello_world.wasm plugins/hello-world/
+cp plugin.toml plugins/hello-world/
+```
+
+Затем перезапустите:
+
+```bash
+smiths-net --config config.toml
+```
+
+Или выполните горячую перезагрузку работающего движка:
+
+```bash
+smiths-net reload --pid $(pgrep smiths-net)
+```
+
+В логах движка вы увидите:
+
+```
+INFO smiths_wasm: plugin loaded name="hello-world"
+INFO smiths_wasm: hello-world: hook fired
+```
+
+## Что мы пропустили
+
+Этот hello-world плагин экспортирует только `run()`. Продакшн плагин
+также экспортирует:
+
+- **`describe()`** — возвращает JSON дескриптор возможностей, чтобы
+  движок знал, какие инструменты предоставляет плагин.
+- **`alloc(len)`** — bump аллокатор, который движок использует для
+  записи данных в гостевую память.
+- **`invoke(method_ptr, method_len, params_ptr, params_len)`** —
+  диспетчер инструментов, вызываемый движком при обращении MCP/A2A
+  клиента к одному из инструментов плагина.
+
+## Следующие шаги
+
+- Добавьте полный ABI с четырьмя экспортами — см. рецепт
+  [Canonical Hook](/cookbook/wasm/rust/canonical-hook/).
+- Изучите полный ABI плагинов в
+  [Руководстве по созданию плагинов](https://github.com/friday-mindhalla/smiths-net/blob/main/docs/tool-authoring.md).

@@ -1,0 +1,86 @@
+{
+  "site": {
+    "title": "Документация Smiths-Net",
+    "description": "Документация для AI-first SIP движка Smiths-Net."
+  },
+  "nav": {
+    "home": "Главная",
+    "guide": "Руководство",
+    "cookbook": "Рецепты",
+    "reference": "Справочник",
+    "operations": "Эксплуатация",
+    "architecture": "Архитектура",
+    "search": "Поиск…",
+    "github": "GitHub"
+  },
+  "hero": {
+    "title": "Документация Smiths-Net",
+    "subtitle": "Всё, что нужно для установки, настройки, расширения и эксплуатации AI-first SIP движка.",
+    "cta": "Начать",
+    "cta_secondary": "Смотреть на GitHub"
+  },
+  "sections": {
+    "guide": {
+      "title": "Быстрый старт",
+      "description": "Установите, настройте и запустите движок за несколько минут.",
+      "icon": "🚀"
+    },
+    "cookbook": {
+      "title": "Рецепты плагинов",
+      "description": "Проверенные рецепты для WASM, sidecar и скриптовых плагинов.",
+      "icon": "📖"
+    },
+    "reference": {
+      "title": "Справочник",
+      "description": "MCP инструменты, ресурсы, SIP транспорты, WebRTC и схема конфигурации.",
+      "icon": "📋"
+    },
+    "operations": {
+      "title": "Эксплуатация",
+      "description": "Наблюдаемость, кластеризация, горячая перезагрузка и развёртывание.",
+      "icon": "⚙️"
+    },
+    "architecture": {
+      "title": "Архитектура",
+      "description": "Глубокий разбор структуры крейтов, системы плагинов и FSM вызовов.",
+      "icon": "🏗️"
+    }
+  },
+  "tracks": {
+    "wasm": {
+      "title": "WASM плагины",
+      "description": "Компиляция в WebAssembly для изолированных плагинов внутри процесса. Rust, TinyGo, Zig, AssemblyScript.",
+      "badge": "wasm"
+    },
+    "sidecar": {
+      "title": "Sidecar плагины",
+      "description": "Запуск как сопутствующий процесс рядом с движком. Python, Node.js, Go, Ruby, Erlang.",
+      "badge": "sidecar"
+    },
+    "script": {
+      "title": "Скриптовые плагины",
+      "description": "Встроенные скрипты для лёгкой логики. Rhai, Lua, Starlark.",
+      "badge": "script"
+    }
+  },
+  "recipe": {
+    "toc": "Содержание",
+    "prerequisites": "Предварительные требования",
+    "source_code": "Исходный код",
+    "edit_page": "Редактировать страницу",
+    "not_translated": "Эта страница ещё не переведена. Вы видите английскую версию.",
+    "last_updated": "Обновлено"
+  },
+  "footer": {
+    "copyright": "© {year} Контрибьюторы Smiths-Net",
+    "license": "Apache-2.0",
+    "docs": "Документация",
+    "github": "GitHub",
+    "changelog": "Журнал изменений"
+  },
+  "404": {
+    "title": "Страница не найдена",
+    "description": "Запрашиваемая страница не существует или была перемещена.",
+    "back": "На главную"
+  }
+}

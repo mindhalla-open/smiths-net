@@ -1,0 +1,169 @@
+---
+/**
+ * /demo/protocol-explorer — MCP / A2A protocol explorer.
+ */
+import BaseLayout from '@/layouts/BaseLayout.astro';
+import ProtocolExplorer from '@/components/ProtocolExplorer.astro';
+---
+
+<BaseLayout
+  title="MCP / A2A Protocol Explorer — Smiths-Net"
+  description="Build and explore JSON-RPC requests for MCP tools, resources, and A2A agent federation."
+>
+  <div class="proto-page">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="sep">/</span>
+      <a href="/demo/">Demo</a>
+      <span class="sep">/</span>
+      <span class="current">Protocol Explorer</span>
+    </nav>
+
+    <header class="proto-hero">
+      <div class="hero-badge">Interactive</div>
+      <h1>MCP / A2A Protocol Explorer</h1>
+      <p class="hero-desc">
+        Browse every MCP tool, resource, and A2A federation endpoint with
+        real request/response examples. Understand the JSON-RPC 2.0
+        protocol before writing a single line of code.
+      </p>
+    </header>
+
+    <ProtocolExplorer />
+
+    <section class="proto-info">
+      <h2>Protocol overview</h2>
+      <div class="info-grid">
+        <div class="info-card">
+          <h3>🔧 MCP Tools</h3>
+          <p>
+            Tools are callable functions exposed by the engine via the
+            <strong>Model Context Protocol</strong>. AI agents invoke tools
+            to make calls, send DTMF, manage config, and control plugins.
+          </p>
+        </div>
+        <div class="info-card">
+          <h3>📁 MCP Resources</h3>
+          <p>
+            Resources are read-only data sources: live config, change history,
+            Prometheus metrics. AI agents read resources to understand the
+            engine's current state.
+          </p>
+        </div>
+        <div class="info-card">
+          <h3>🤖 A2A Federation</h3>
+          <p>
+            The <strong>Agent-to-Agent</strong> protocol enables cross-agent
+            task delegation. Agents discover each other via
+            <code>/.well-known/agent.json</code> cards and exchange tasks
+            using JSON-RPC.
+          </p>
+        </div>
+      </div>
+    </section>
+  </div>
+</BaseLayout>
+
+<style>
+  .proto-page {
+    max-width: var(--content-width);
+    margin: 0 auto;
+    padding: var(--space-8) var(--space-6) var(--space-24);
+  }
+
+  .breadcrumb {
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+    margin-bottom: var(--space-6);
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .breadcrumb a { color: var(--color-secondary); text-decoration: none; }
+  .breadcrumb a:hover { color: var(--color-secondary-hover); }
+  .breadcrumb .sep { color: var(--color-text-faint); }
+  .breadcrumb .current { color: var(--color-text); font-weight: 500; }
+
+  .proto-hero {
+    text-align: center;
+    margin-bottom: var(--space-10);
+  }
+
+  .hero-badge {
+    display: inline-block;
+    font-size: var(--text-xs);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--color-accent);
+    background: var(--color-accent-muted);
+    padding: var(--space-1) var(--space-3);
+    border-radius: var(--radius-full);
+    margin-bottom: var(--space-4);
+  }
+
+  .proto-hero h1 {
+    font-size: var(--text-4xl);
+    font-weight: 800;
+    margin-bottom: var(--space-4);
+  }
+
+  .hero-desc {
+    font-size: var(--text-lg);
+    color: var(--color-text-muted);
+    max-width: 42rem;
+    margin: 0 auto;
+  }
+
+  .proto-info {
+    margin-top: var(--space-12);
+  }
+
+  .proto-info h2 {
+    font-size: var(--text-2xl);
+    font-weight: 700;
+    margin-bottom: var(--space-6);
+  }
+
+  .info-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: var(--space-6);
+  }
+
+  .info-card {
+    background: var(--color-bg-elevated);
+    border: 1px solid var(--color-border-subtle);
+    border-radius: var(--radius-lg);
+    padding: var(--space-6);
+    transition: all var(--duration-normal) var(--ease-out);
+  }
+
+  .info-card:hover {
+    border-color: var(--color-border);
+    box-shadow: var(--shadow-md);
+    transform: translateY(-2px);
+  }
+
+  .info-card h3 {
+    font-size: var(--text-lg);
+    font-weight: 700;
+    margin-bottom: var(--space-3);
+  }
+
+  .info-card p {
+    font-size: var(--text-sm);
+    color: var(--color-text-muted);
+    line-height: var(--leading-relaxed);
+  }
+
+  .info-card code {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    padding: 0.15em 0.4em;
+    background: var(--color-bg);
+    border-radius: var(--radius-sm);
+    color: var(--color-accent-text);
+  }
+</style>

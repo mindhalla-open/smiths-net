@@ -1,0 +1,78 @@
+---
+/**
+ * BaseLayout — HTML shell for every page.
+ * Sets <html lang>, dir, loads global CSS, and wraps content
+ * in Header + Footer.
+ */
+import Head from '@/components/Head.astro';
+import Header from '@/components/Header.astro';
+import Footer from '@/components/Footer.astro';
+import SearchDialog from '@/components/SearchDialog.astro';
+import { DEFAULT_LOCALE, getDir } from '@/i18n';
+import type { Locale } from '@/i18n';
+
+import '@/styles/global.css';
+
+interface Props {
+  title: string;
+  description: string;
+  locale?: Locale;
+  currentPath?: string;
+}
+
+const {
+  title,
+  description,
+  locale = DEFAULT_LOCALE,
+  currentPath = Astro.url.pathname,
+} = Astro.props;
+
+const dir = getDir(locale);
+---
+
+<!doctype html>
+<html lang={locale} dir={dir}>
+  <head>
+    <script is:inline src="/scripts/theme-init.js"></script>
+    <Head
+      title={title}
+      description={description}
+      locale={locale}
+      currentPath={currentPath}
+    />
+  </head>
+  <body>
+    <Header locale={locale} />
+    <main id="main-content">
+      <slot />
+    </main>
+    <Footer locale={locale} />
+    <SearchDialog />
+    <script src="@/scripts/copy-code.ts"></script>
+    <script src="@/scripts/mermaid-render.ts"></script>
+  </body>
+</html>
+
+<style>
+  main {
+    flex: 1;
+  }
+</style>
+
+<style is:global>
+  .mermaid-diagram {
+    margin-block: var(--space-6);
+    padding: var(--space-5);
+    background: var(--color-bg-elevated);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    overflow-x: auto;
+    display: flex;
+    justify-content: center;
+  }
+
+  .mermaid-diagram svg {
+    max-width: 100%;
+    height: auto;
+  }
+</style>

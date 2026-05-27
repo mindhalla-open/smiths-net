@@ -1,0 +1,211 @@
+---
+title: "你好，世界"
+description: "你的第一个 WASM 插件 — 将一个最小的 Rust crate 编译为 .wasm 并加载到 Smiths-Net 中。"
+track: wasm
+lang: rust
+locale: zh
+order: 1
+updatedAt: "2026-04-28"
+---
+
+## 概述
+
+本食谱将引导你构建最简单的 Smiths-Net WASM 插件：一个 `#![no_std]`
+的 Rust crate，编译为 `wasm32-unknown-unknown` 目标，并在启动时调用
+引擎的 `smiths::log` 宿主函数。
+
+完成后你将拥有：
+
+1. 一个可编译为 `.wasm` 模块的独立 Rust crate。
+2. 一个引擎在启动时读取的 `plugin.toml` 清单文件。
+3. 一个能在引擎日志中打印问候语的工作插件。
+
+## 前置条件
+
+- Rust 工具链（通过 `rustup`），并安装 `wasm32-unknown-unknown` 目标：
+
+  ```bash
+  rustup target add wasm32-unknown-unknown
+  ```
+
+- 一个运行中的 `smiths-net` 实例 — 最快的方式：
+
+  ```bash
+  smiths-net init --preset dev --non-interactive
+  smiths-net --config config.toml
+  ```
+
+## 1. 创建 crate
+
+```bash
+mkdir -p hello-world/src
+cd hello-world
+```
+
+创建 `Cargo.toml`：
+
+```toml
+# Cargo.toml
+[package]
+name         = "hello-world"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.95"
+publish      = false
+description  = "Minimal WASM plugin — calls smiths::log."
+
+# 独立工作空间根，使此 crate 可以独立构建。
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto           = true
+codegen-units = 1
+opt-level     = "s"
+strip         = "symbols"
+```
+
+关键要点：
+
+- **`crate-type = ["cdylib"]`** — 生成共享库 `.wasm` 文件，
+  只导出标记了 `#[unsafe(no_mangle)]` 的符号。
+- **`[workspace]`** — 空的 workspace 块使此 crate 独立于
+  smiths-net 父工作空间。
+- **Release 配置** — `lto = true` + `opt-level = "s"` 使输出
+  文件保持在 1 KiB 以下。
+
+## 2. 编写插件代码
+
+```rust
+// src/lib.rs
+#![no_std]
+#![no_main]
+
+// 导入宿主的 log 函数。`wasm_import_module` 属性告诉
+// 链接器在 `smiths` 模块下查找此符号 — 引擎会自动提供。
+#[link(wasm_import_module = "smiths")]
+unsafe extern "C" {
+    fn log(ptr: *const u8, len: usize);
+}
+
+/// 安全调用的薄封装。
+fn host_log(msg: &str) {
+    unsafe {
+        log(msg.as_ptr(), msg.len());
+    }
+}
+
+const GREETING: &str = "hello-world: hook fired";
+
+/// 引擎通过 `WasmEngine::run_entry` 调用的入口点。
+#[unsafe(no_mangle)]
+pub extern "C" fn run() {
+    host_log(GREETING);
+}
+
+/// panic 不能展开到宿主代码 — 通过 trap 中止。
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    core::arch::wasm32::unreachable()
+}
+```
+
+代码解析：
+
+| 元素 | 作用 |
+|------|------|
+| `#![no_std]` | 不使用标准库 — WASM 客体没有操作系统。 |
+| `#![no_main]` | 没有 `main()` — 引擎直接调用 `run()`。 |
+| `#[link(wasm_import_module = "smiths")]` | 将 `log` extern 绑定到 `smiths.log` 宿主导入。 |
+| `#[unsafe(no_mangle)]` | 保留符号名称以便引擎找到它。 |
+| `extern "C" fn run()` | 引擎在加载插件时调用的 C ABI 导出。 |
+| `#[panic_handler]` | `no_std` 目标必需 — trap 而非展开栈。 |
+
+## 3. 构建
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+```
+
+输出位于：
+
+```
+target/wasm32-unknown-unknown/release/hello_world.wasm
+```
+
+验证大小 — 应该非常小（< 1 KiB）：
+
+```bash
+ls -lh target/wasm32-unknown-unknown/release/hello_world.wasm
+```
+
+## 4. 创建插件清单
+
+每个插件都需要一个 `plugin.toml` 来告诉引擎它加载的是什么：
+
+```toml
+# plugin.toml
+name        = "hello-world"
+version     = "0.1.0"
+type        = "wasm"
+entry       = "./hello_world.wasm"
+provides    = []
+permissions = []
+abi         = "1.0"
+description = "Minimal hello-world WASM plugin."
+```
+
+| 字段 | 含义 |
+|------|------|
+| `type` | `"wasm"` 告诉引擎使用 WASM 加载器。 |
+| `entry` | 从 `plugin.toml` 到 `.wasm` 二进制文件的相对路径。 |
+| `provides` | 此插件提供的能力（目前为空）。 |
+| `permissions` | 插件可以访问的宿主资源（空 = 仅日志）。 |
+| `abi` | ABI 版本 — 必须与引擎期望的版本匹配。 |
+
+## 5. 加载到引擎
+
+将文件复制到引擎的插件目录并重启（或热重载）：
+
+```bash
+mkdir -p plugins/hello-world
+cp target/wasm32-unknown-unknown/release/hello_world.wasm plugins/hello-world/
+cp plugin.toml plugins/hello-world/
+```
+
+然后重启：
+
+```bash
+smiths-net --config config.toml
+```
+
+或热重载正在运行的引擎：
+
+```bash
+smiths-net reload --pid $(pgrep smiths-net)
+```
+
+你将在引擎日志中看到：
+
+```
+INFO smiths_wasm: plugin loaded name="hello-world"
+INFO smiths_wasm: hello-world: hook fired
+```
+
+## 我们跳过的内容
+
+这个 hello-world 插件只导出了 `run()`。生产级插件还会导出：
+
+- **`describe()`** — 返回 JSON 能力描述符，让引擎知道插件提供了
+  哪些工具。
+- **`alloc(len)`** — 引擎用来向客体内存写入数据的 bump 分配器。
+- **`invoke(method_ptr, method_len, params_ptr, params_len)`** —
+  当 MCP/A2A 客户端调用插件工具时，引擎调用的工具分发器。
+
+## 下一步
+
+- 添加完整的四导出 ABI — 参见
+  [Canonical Hook](/cookbook/wasm/rust/canonical-hook/) 食谱。
+- 在[插件编写指南](https://github.com/friday-mindhalla/smiths-net/blob/main/docs/tool-authoring.md)中探索完整的插件 ABI。
