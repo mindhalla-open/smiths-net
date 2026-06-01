@@ -16,6 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # cpal's ALSA backend (via smiths-softphone) needs the ALSA dev
+      # headers to build on Linux; macOS uses CoreAudio and needs none.
+      - name: install system deps
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -37,6 +42,8 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v4
+      - name: install system deps
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release

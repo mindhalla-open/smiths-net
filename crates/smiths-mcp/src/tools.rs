@@ -48,6 +48,8 @@ pub fn builtin_registry() -> crate::ToolRegistry {
     reg.register(TranslateTool);
     reg.register(TranscribeCallTool);
     reg.register(SummarizeCallTool);
+    reg.register(ListStylePresetsTool);
+    reg.register(RestyleCallTool);
     reg.register(SearchCallsSemanticTool);
     reg.register(PutScriptTool);
     reg.register(RecordPromptTool);
@@ -624,6 +626,325 @@ async fn summarize_call_inner(args: &Value, ctx: &ToolContext) -> Result<Value, 
         "transcript": transcript,
         "summary":    summary,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Voice style presets: "speak → restyle → speak".
+// ---------------------------------------------------------------------------
+
+/// A named voice-transformation preset. Bundles a **text-rewrite
+/// style** (the LLM system prompt) with a **TTS voice**, so a single
+/// preset changes both *what* is said and *how* it sounds.
+struct StylePreset {
+    name: &'static str,
+    description: &'static str,
+    /// LLM system prompt that rewrites the transcript into this style.
+    system_prompt: &'static str,
+    /// TTS voice id passed to the `ai.tts` provider.
+    voice: &'static str,
+}
+
+/// Built-in presets. Voices map to the in-tree `ai-tts-mock` catalog
+/// (`irina` / `dmitri` / `alice`); real TTS plugins expose their own.
+const STYLE_PRESETS: &[StylePreset] = &[
+    StylePreset {
+        name: "formal",
+        description: "Polished, professional wording in a neutral narrator voice.",
+        system_prompt: "Rewrite the user's message in polished, formal, professional English. \
+                        Preserve the meaning and any names or numbers. Reply with only the \
+                        rewritten text — no preamble, no quotes.",
+        voice: "irina",
+    },
+    StylePreset {
+        name: "casual",
+        description: "Relaxed, friendly wording.",
+        system_prompt: "Rewrite the user's message in a relaxed, friendly, conversational tone. \
+                        Keep it natural and short. Reply with only the rewritten text.",
+        voice: "alice",
+    },
+    StylePreset {
+        name: "pirate",
+        description: "Swashbuckling pirate speak in a gruff voice.",
+        system_prompt: "Rewrite the user's message as a swashbuckling pirate would say it \
+                        (arr, matey, ahoy). Keep the underlying meaning. Reply with only the \
+                        rewritten text.",
+        voice: "dmitri",
+    },
+    StylePreset {
+        name: "concise",
+        description: "Trimmed to the essentials.",
+        system_prompt: "Rewrite the user's message as concisely as possible without losing \
+                        meaning or key facts. Reply with only the rewritten text.",
+        voice: "irina",
+    },
+    StylePreset {
+        name: "polite",
+        description: "Extra-courteous phrasing.",
+        system_prompt: "Rewrite the user's message to be warm, courteous and polite, while \
+                        keeping its meaning. Reply with only the rewritten text.",
+        voice: "alice",
+    },
+];
+
+fn lookup_preset(name: &str) -> Option<&'static StylePreset> {
+    STYLE_PRESETS
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+}
+
+fn preset_names() -> String {
+    STYLE_PRESETS
+        .iter()
+        .map(|p| p.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Map a dispatcher error onto the tool error vocabulary, matching the
+/// other AI-pipeline tools.
+fn dispatch_err(e: smiths_core::DispatchError) -> ToolError {
+    match e {
+        smiths_core::DispatchError::NoProvider(cap) => ToolError::NotFound(format!(
+            "no `{cap}` provider is loaded — install the matching ai.* plugin"
+        )),
+        e @ smiths_core::DispatchError::AllFailed { .. } => ToolError::Internal(e.to_string()),
+    }
+}
+
+/// Stream PCM16 (at `sample_rate`) into a live call leg as paced PCMU
+/// RTP frames. Mirrors the `speak` tool's injection loop. Returns the
+/// number of 20 ms frames sent.
+async fn inject_pcm16_into_call(
+    ctx: &ToolContext,
+    endpoint: smiths_core::EndpointId,
+    remote: std::net::SocketAddr,
+    samples: &[i16],
+    sample_rate: u32,
+) -> Result<usize, ToolError> {
+    let samples_8k = downsample_to_8k(samples, sample_rate);
+    let mulaw = smiths_core::pcm16_to_pcmu(&samples_8k);
+    let ssrc = fresh_ssrc();
+    let mut seq: u16 = fresh_seq();
+    let mut ts: u32 = 0;
+    let mut frames_sent = 0usize;
+    let total = mulaw.chunks(FRAME_SAMPLES).len();
+    for (i, chunk) in mulaw.chunks(FRAME_SAMPLES).enumerate() {
+        let pkt = smiths_core::RtpPacket {
+            marker: i == 0,
+            payload_type: PT_PCMU,
+            sequence: seq,
+            timestamp: ts,
+            ssrc,
+            payload: chunk.to_vec(),
+        };
+        ctx.media
+            .send_packet(endpoint, remote, &pkt.encode())
+            .await
+            .map_err(|e| ToolError::Internal(format!("send_packet: {e}")))?;
+        frames_sent += 1;
+        seq = seq.wrapping_add(1);
+        ts = ts.wrapping_add(FRAME_SAMPLES as u32);
+        if i + 1 < total {
+            tokio::time::sleep(FRAME_INTERVAL).await;
+        }
+    }
+    Ok(frames_sent)
+}
+
+/// `list_style_presets` — enumerate the built-in voice presets so an
+/// agent (or UI) can show the available styles.
+pub struct ListStylePresetsTool;
+
+#[async_trait]
+impl Tool for ListStylePresetsTool {
+    fn name(&self) -> &'static str {
+        "list_style_presets"
+    }
+
+    fn description(&self) -> &'static str {
+        "List the built-in voice style presets for `restyle_call`. Each \
+         bundles a text-rewrite style with a TTS voice."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+
+    async fn call(&self, _args: Value, _ctx: &ToolContext) -> Result<Value, ToolError> {
+        let presets: Vec<Value> = STYLE_PRESETS
+            .iter()
+            .map(|p| json!({ "name": p.name, "description": p.description, "voice": p.voice }))
+            .collect();
+        Ok(json!({ "presets": presets }))
+    }
+}
+
+/// `restyle_call` — the "speak → restyle → speak" pipeline. Transcribes
+/// an utterance (`ai.asr`), rewrites it into a preset style
+/// (`ai.llm.chat`), synthesizes it in the preset's voice (`ai.tts`),
+/// and — when a live `call_id` is given — streams it back into the
+/// call. Without `call_id` (or with `speak: false`) it returns the
+/// styled audio instead, so the same tool drives "type → styled
+/// speech" too.
+pub struct RestyleCallTool;
+
+#[async_trait]
+impl Tool for RestyleCallTool {
+    fn name(&self) -> &'static str {
+        "restyle_call"
+    }
+
+    fn description(&self) -> &'static str {
+        "Restyle an utterance into a preset voice (text + voice) via \
+         ASR → LLM-rewrite → TTS. Provide `audio_base64` (an utterance) \
+         or `text`. With a live `call_id` the styled speech is injected \
+         into the call; otherwise the styled audio is returned. See \
+         `list_style_presets`."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "preset":       { "type": "string", "description": "Style preset name (see list_style_presets)." },
+                "call_id":      { "type": "string", "description": "Live call to inject the styled speech into." },
+                "audio_base64": { "type": "string", "description": "PCM16 LE utterance to restyle (base64)." },
+                "text":         { "type": "string", "description": "Text to restyle directly, skipping ASR." },
+                "sample_rate":  { "type": "integer", "description": "Sample rate of audio_base64 (default 8000)." },
+                "language":     { "type": "string",  "description": "ASR language hint (BCP-47 or `auto`)." },
+                "speak":        { "type": "boolean", "description": "Inject into the call. Default: true when call_id is set." }
+            },
+            "required": ["preset"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+        let started = Instant::now();
+        let result = restyle_call_inner(&args, ctx).await;
+        observe_pipeline(ctx, "restyle_call", started.elapsed());
+        result
+    }
+}
+
+async fn restyle_call_inner(args: &Value, ctx: &ToolContext) -> Result<Value, ToolError> {
+    let preset_name = args
+        .get("preset")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::InvalidArguments("preset required".into()))?;
+    let preset = lookup_preset(preset_name).ok_or_else(|| {
+        ToolError::InvalidArguments(format!(
+            "unknown preset `{preset_name}` — try: {}",
+            preset_names()
+        ))
+    })?;
+
+    let dispatcher = smiths_core::AiDispatcher::new(Arc::clone(&ctx.plugins));
+
+    // 1. Transcript: explicit `text` wins; otherwise transcribe audio.
+    let transcript = if let Some(text) = args.get("text").and_then(Value::as_str) {
+        text.to_owned()
+    } else {
+        let call_id = args.get("call_id").and_then(Value::as_str).unwrap_or("");
+        let audio = resolve_audio_base64(call_id, args, ctx)?;
+        let asr = dispatcher
+            .invoke(
+                "ai.asr",
+                "transcribe",
+                json!({
+                    "audio_base64": audio,
+                    "sample_rate":  args.get("sample_rate"),
+                    "language":     args.get("language"),
+                }),
+            )
+            .await
+            .map_err(dispatch_err)?;
+        asr.get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    if transcript.trim().is_empty() {
+        return Err(ToolError::Internal(
+            "nothing to restyle: empty transcript".into(),
+        ));
+    }
+
+    // 2. Rewrite into the preset's text style.
+    let llm = dispatcher
+        .invoke(
+            "ai.llm.chat",
+            "chat",
+            json!({
+                "messages": [
+                    {"role": "system", "content": preset.system_prompt},
+                    {"role": "user",   "content": transcript.clone()},
+                ]
+            }),
+        )
+        .await
+        .map_err(dispatch_err)?;
+    let styled = extract_chat_content(&llm).unwrap_or_else(|| transcript.clone());
+
+    // 3. Synthesize in the preset's voice.
+    let synth = dispatcher
+        .invoke(
+            "ai.tts",
+            "synthesize",
+            json!({
+                "text":  styled,
+                "voice": preset.voice,
+                "output": {"codec": "pcm_s16le", "sample_rate": 16000},
+            }),
+        )
+        .await
+        .map_err(dispatch_err)?;
+
+    // 4. Inject into the live call, or return the styled audio.
+    let call_id = args.get("call_id").and_then(Value::as_str);
+    let do_speak = args
+        .get("speak")
+        .and_then(Value::as_bool)
+        .unwrap_or(call_id.is_some());
+
+    if do_speak {
+        let call_id = call_id
+            .ok_or_else(|| ToolError::InvalidArguments("speak=true requires a call_id".into()))?;
+        let snap = ctx
+            .state
+            .get_call(call_id)
+            .ok_or_else(|| ToolError::NotFound(format!("call {call_id}")))?;
+        if !matches!(snap.phase, CallPhase::Live) {
+            return Err(ToolError::InvalidArguments(format!(
+                "call {call_id} is not live (phase = {:?})",
+                snap.phase
+            )));
+        }
+        let endpoint = snap.media_endpoint.ok_or_else(|| {
+            ToolError::InvalidArguments(format!("call {call_id} has no media endpoint"))
+        })?;
+        let remote = snap.remote_rtp.ok_or_else(|| {
+            ToolError::InvalidArguments(format!("call {call_id} has no remote RTP address"))
+        })?;
+        let (samples, sample_rate) = decode_pcm16(&synth)?;
+        let frames = inject_pcm16_into_call(ctx, endpoint, remote, &samples, sample_rate).await?;
+        Ok(json!({
+            "call_id":     call_id,
+            "preset":      preset.name,
+            "voice":       preset.voice,
+            "transcript":  transcript,
+            "styled_text": styled,
+            "frames_sent": frames,
+        }))
+    } else {
+        Ok(json!({
+            "preset":      preset.name,
+            "voice":       preset.voice,
+            "transcript":  transcript,
+            "styled_text": styled,
+            "audio":       synth,
+        }))
+    }
 }
 
 /// `translate` — render `text` into language `to` by routing through
@@ -2326,7 +2647,7 @@ mod tests {
     #[test]
     fn registry_contains_builtins() {
         let reg = builtin_registry();
-        assert_eq!(reg.len(), 28);
+        assert_eq!(reg.len(), 30);
         for name in [
             "list_calls",
             "get_call_status",
@@ -2349,6 +2670,8 @@ mod tests {
             "translate",
             "transcribe_call",
             "summarize_call",
+            "list_style_presets",
+            "restyle_call",
             "search_calls_semantic",
             "put_script",
             "record_prompt",

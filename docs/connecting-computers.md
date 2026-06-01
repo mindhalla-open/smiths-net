@@ -37,6 +37,34 @@ cargo run --release -p smiths-softphone -- loopback
 
 ---
 
+## One-command host (`--host`)
+
+Don't want to start the engine separately? Pass `--host` to the
+softphone — it launches the engine for you, waits until it's listening,
+prints the address others should dial, then joins it. The engine is
+shut down when you quit (Ctrl-C).
+
+```bash
+# you become the host AND a participant, in one command
+cargo run --release -p smiths-softphone -- call --host --room demo
+```
+
+It prints something like:
+
+```
+Local engine is up on 0.0.0.0:5060.
+Others on your network can join with:
+  smiths-softphone call --engine 192.168.1.42:5060 --room demo
+```
+
+Everyone else just runs that line. `--host` enables conference rooms
+(prefix `conf`) automatically, so `--room conf-anything` is a group
+call. (`--host` needs the `smiths-net` binary next to `smiths-softphone`
+or on your `PATH` — `cargo build --release` produces both.)
+
+The rest of this guide is the manual, two-process version (run the
+engine yourself), which gives you full control over `config.toml`.
+
 ## Scenario A — two people on the same network (LAN)
 
 ### 1. Host: start the engine
@@ -134,6 +162,30 @@ the VPN option. Full ICE/TURN for those is not yet implemented on the
 SIP leg.
 
 ---
+
+## Change your voice in real time
+
+The softphone can modulate your **outgoing** audio so the other side
+hears a different voice. Start with an effect:
+
+```bash
+smiths-softphone call --engine HOST:5060 --room demo --voice deep
+```
+
+…and switch it **live during the call** by typing a name and pressing
+Enter:
+
+```
+deep      # lower pitch
+high      # higher pitch
+chipmunk  # much higher
+robot     # metallic ring-mod
+none      # back to your normal voice
+```
+
+Effects run per 20 ms frame and preserve call timing, so you can flip
+between them mid-sentence. (Pitch shifting adds a little warble — it's a
+fun real-time changer, not studio quality.)
 
 ## Ports & firewall
 

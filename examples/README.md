@@ -19,12 +19,20 @@ whoever runs the engine; everyone else just runs the softphone.
 # validate your mic → speaker chain (no network)
 cargo run -p smiths-softphone -- loopback
 
-# two people, one room, bridged by the engine — you hear each other
+# one command: start the engine AND join it (others dial your LAN IP).
+# Prints the exact command for others; conf-* rooms are conferences.
+cargo run -p smiths-softphone -- call --host --room demo
+
+# or point at an already-running engine
 cargo run -p smiths-softphone -- call --engine 127.0.0.1:5060 --room demo
 # cross-machine: swap 127.0.0.1 for the host's LAN IP
 ```
 
 Use headphones — there's no echo cancellation yet.
+
+**Real-time voice changer:** add `--voice deep|high|chipmunk|robot` to
+modulate your outgoing audio, and switch it live mid-call by typing a
+name + Enter (`none` to go back). Effects preserve call timing.
 
 ## Group calls — conference rooms
 
