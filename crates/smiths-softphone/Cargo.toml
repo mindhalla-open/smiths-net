@@ -1,0 +1,26 @@
+[package]
+name         = "smiths-softphone"
+edition      = { workspace = true }
+rust-version = { workspace = true }
+version      = { workspace = true }
+license      = { workspace = true }
+description  = "Live-audio SIP softphone client for smiths-net: mic/speaker ↔ G.711 RTP."
+
+[[bin]]
+name = "smiths-softphone"
+path = "src/main.rs"
+
+[dependencies]
+# G.711 μ-law codec — reuse the engine's bit-exact implementation
+# rather than re-derive it, so client and engine agree byte-for-byte.
+smiths-core = { workspace = true }
+cpal        = { workspace = true }
+tokio       = { workspace = true }
+clap        = { workspace = true }
+anyhow      = { workspace = true }
+rand        = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

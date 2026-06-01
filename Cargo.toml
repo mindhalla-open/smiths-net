@@ -126,6 +126,12 @@ prometheus-client = "0.24.1"
 # audio helpers
 base64 = "0.22"
 
+# Local mic/speaker capture + playback for the `smiths-softphone`
+# client (Phase 1 of the SIP-client work). Pure-Rust host backends
+# (CoreAudio / WASAPI / ALSA) — no `unsafe` in our code, so the
+# workspace `unsafe_code = "deny"` posture is unaffected.
+cpal = "0.17"
+
 # async stream utilities (SSE bridge)
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures      = "0.3"

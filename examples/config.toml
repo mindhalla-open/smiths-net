@@ -30,6 +30,14 @@ transports = ["udp"]
 # Grace period (seconds) to finish in-flight transactions on shutdown.
 drain_timeout_secs = 10
 
+# Conference rooms (slice 5.6e). When set, an INVITE whose Request-URI
+# user-part starts with this prefix joins an N-party audio mixer (one
+# participant per INVITE) instead of the classic 2-peer bridge — so
+# `sip:conf-standup@engine` becomes a group call. Unset (the default)
+# = every room bridges 2-peer as before. Pairs with the
+# `smiths-softphone` client (`--room conf-standup`).
+# conference_prefix = "conf"
+
 # Outbound-connect proxy for SIP over TCP / TLS (slice 3.5 / P16).
 # SOCKS5 and HTTP-CONNECT are stream protocols, so UDP can't ride
 # them — UDP transports ignore this block.
@@ -114,6 +122,16 @@ retention_days = 0        # 0 disables the hourly sweeper; >0 deletes blobs olde
 [media]
 inband_dtmf = false
 
+# RTP/RTCP media port window. Unset (default) = ephemeral OS-assigned
+# ports — simplest, but you can't open a tidy firewall rule. Set a
+# fixed range to pin media to known ports: RTP uses even ports, RTCP
+# the odd `port + 1`, so each concurrent call consumes two ports
+# (a 100-port window ≈ 50 simultaneous legs). Open this range as
+# `udp/min-max` in the host firewall.
+# [media.rtp_ports]
+# min = 16384
+# max = 16484
+
 # IVR prompt library (slice 4.2 / P9). Point `root` at a directory
 # of WAV files (PCM16 LE, mono) — IVR scripts reference prompts
 # relative to this root (`prompts/welcome.wav`). Leave the root
@@ -147,6 +165,14 @@ cpu_budget_ms_per_call = 50
 # `plugin.toml` becomes one sidecar or WASM plugin. Defaults to
 # "plugins" (relative to cwd).
 dir = "plugins"
+
+# Call-event hooks (slice 5.6e / P24). Plugins listed here are invoked
+# automatically when a SIP dialog goes live: the engine calls each
+# one's `on_dialog_created` method with params {call_id, remote_rtp}.
+# Lets a call-control plugin (e.g. the `sip-client` example) react to
+# inbound calls without an explicit MCP request. Empty = no consumer
+# spawned.
+call_event_hooks = []
 
 # Sidecar sandbox (v0.23.0). Every field is optional; omit or set to
 # the default to leave that knob at "inherit". All are applied in the

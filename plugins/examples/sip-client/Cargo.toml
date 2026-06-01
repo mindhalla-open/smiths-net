@@ -1,0 +1,20 @@
+[package]
+name         = "sip-client"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.95"
+publish      = false
+description  = "WASM call-control plugin: dials SIP calls via the smiths::originate host fn."
+
+# Independent workspace root — targets wasm32, own release profile,
+# must not inherit the parent workspace's lints / deps.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto           = true
+codegen-units = 1
+opt-level     = "s"
+strip         = "symbols"

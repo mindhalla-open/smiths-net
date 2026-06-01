@@ -33,3 +33,15 @@ Every tool is reachable via MCP stdio, MCP HTTP, A2A HTTP, and the webhook adapt
 | `create_conference` | Create a conference room |
 | `join_conference` | Add a call to a conference |
 | `leave_conference` | Remove a call from a conference |
+
+## Conferencing
+
+`create_conference` / `join_conference` / `leave_conference` operate on
+a live leave-one-out audio mixer. `create_conference` returns a
+`conference_id`; `join_conference` mints a participant slot in it.
+
+For a hands-off setup, you don't need MCP at all: set
+`sip.conference_prefix` and any SIP call to a room under that prefix
+(e.g. `sip:conf-standup@engine`) is mixed into an N-party conference
+automatically — one participant per INVITE. See the
+[Quickstart](/guide/quickstart/) group-call section.

@@ -20,6 +20,7 @@
 
 pub mod dispatcher;
 pub mod error;
+pub mod event_hook;
 pub mod loader;
 pub mod manifest;
 pub mod registry;
@@ -42,6 +43,7 @@ pub use smiths_core::ai::{
 
 pub use dispatcher::{Dispatcher, Hook, HookReport, MemoryDispatcher};
 pub use error::Error;
+pub use event_hook::spawn_call_event_hooks;
 pub use loader::{LoadReport, LoaderOpts, load_plugins};
 pub use manifest::{Manifest, PluginType, ScriptEngine, WireFormat};
 pub use registry::{AiRegistry, PluginEntry};

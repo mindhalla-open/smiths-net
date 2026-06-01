@@ -149,6 +149,33 @@ pub struct MediaConfig {
     /// that require codec conversion (today: `Opus ↔ G.711`).
     #[reloadable(path = "media.transcode")]
     pub transcode: TranscodeConfig,
+    /// Restrict RTP/RTCP media ports to a fixed range so operators can
+    /// open exactly these UDP ports in a firewall. Unset (default) =
+    /// ephemeral OS-assigned ports. RTP binds even ports, RTCP the
+    /// odd `port + 1`.
+    ///
+    /// ```toml
+    /// [media.rtp_ports]
+    /// min = 16384
+    /// max = 16484
+    /// ```
+    #[restart_required(group = "media rtp port range")]
+    pub rtp_ports: Option<RtpPortRange>,
+}
+
+/// `[media.rtp_ports]` — inclusive UDP port window for RTP/RTCP.
+///
+/// Each call consumes one even RTP port and the adjacent odd RTCP
+/// port, so a range of `N` ports supports up to `N / 2` concurrent
+/// media legs. Pick a window large enough for peak concurrency and
+/// open it in the host firewall (`udp/min-max`).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RtpPortRange {
+    /// Lowest port the allocator may use (rounded up to even).
+    pub min: u16,
+    /// Highest port the allocator may use (inclusive).
+    pub max: u16,
 }
 
 /// `[media.transcode]` TOML block — CPU budget + admission control
@@ -589,6 +616,12 @@ pub struct SipConfig {
     /// leave this `mode = "none"`; operators on appliance-style
     /// hosts enable it to bring up the tunnel in-process.
     pub vpn: SipVpnConfig,
+    /// Request-URI user-part prefix that marks *conference rooms*
+    /// (slice 5.6e-runtime). When set, an INVITE to
+    /// `sip:<prefix>…@engine` joins an N-party audio mixer (one
+    /// participant per INVITE) instead of the classic 2-peer bridge.
+    /// `None` (the default) = every room bridges as before.
+    pub conference_prefix: Option<String>,
 }
 
 /// `[sip.vpn]` — embedded userspace `WireGuard` device. Gated behind
@@ -729,6 +762,7 @@ impl Default for SipConfig {
             rate_limit: SipRateLimit::default(),
             proxy: SipProxyConfig::default(),
             vpn: SipVpnConfig::default(),
+            conference_prefix: None,
         }
     }
 }
@@ -1317,6 +1351,12 @@ pub struct PluginsConfig {
     /// and dev runs aren't surprised; production deployments should
     /// set conservative caps per the operator runbook.
     pub sandbox: SandboxConfig,
+    /// Plugin names to notify when a SIP dialog goes live. The engine
+    /// invokes each one's `on_dialog_created` method (params
+    /// `{call_id, remote_rtp}`) so a call-control plugin can react to
+    /// inbound calls without an explicit MCP request. Empty (default)
+    /// = no call-event consumer is spawned.
+    pub call_event_hooks: Vec<String>,
 }
 
 impl Default for PluginsConfig {
@@ -1324,6 +1364,7 @@ impl Default for PluginsConfig {
         Self {
             dir: std::path::PathBuf::from("plugins"),
             sandbox: SandboxConfig::default(),
+            call_event_hooks: Vec::new(),
         }
     }
 }

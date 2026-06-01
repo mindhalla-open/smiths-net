@@ -20,7 +20,7 @@ use smiths_core::{BridgeLeg, DialogKey};
 use smiths_media::UdpMediaFabric;
 use smiths_sip::ConferenceOrchestrator;
 
-use crate::conference::ConferenceId;
+use crate::conference::{ConferenceConfig, ConferenceId};
 use crate::participant::ConferenceParticipantSession;
 use crate::registry::ConferenceRegistry;
 
@@ -31,6 +31,12 @@ use crate::registry::ConferenceRegistry;
 pub struct MixerConferenceOrchestrator {
     fabric: Arc<UdpMediaFabric>,
     conferences: Arc<dyn ConferenceRegistry>,
+    /// Maps a conference *room name* (Request-URI user-part) to the
+    /// conference id minted on its first join. Behind a `Mutex` so
+    /// the get-or-create is atomic across the `await` on
+    /// `registry.create` — two racing first-joins to the same room
+    /// must land on the same conference.
+    room_map: tokio::sync::Mutex<std::collections::HashMap<String, ConferenceId>>,
     next_bridge_id: AtomicU64,
     next_ssrc: AtomicU32,
 }
@@ -42,9 +48,23 @@ impl MixerConferenceOrchestrator {
         Self {
             fabric,
             conferences,
+            room_map: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             next_bridge_id: AtomicU64::new(0),
             next_ssrc: AtomicU32::new(0xF0F0_0000),
         }
+    }
+
+    /// Resolve the conference id for `room`, creating the conference
+    /// on first use. Holds the room-map lock across the create so
+    /// concurrent first-joins to the same room share one conference.
+    async fn conference_for_room(&self, room: &str) -> ConferenceId {
+        let mut map = self.room_map.lock().await;
+        if let Some(id) = map.get(room) {
+            return *id;
+        }
+        let id = self.conferences.create(ConferenceConfig::default()).await;
+        map.insert(room.to_owned(), id);
+        id
     }
 
     fn fresh_bridge_id(&self) -> BridgeId {
@@ -68,40 +88,46 @@ impl ConferenceOrchestrator for MixerConferenceOrchestrator {
             return Err(MediaError::UnknownEndpoint(leg.endpoint));
         };
         let conf_id = ConferenceId(conference_id);
-        let (participant_id, egress) = match self.conferences.join(conf_id).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!(conference_id, error = %e, "conference join failed");
-                return Ok(None);
-            }
+        // Resolve the live conference handle the participant session
+        // needs for `push_frame` / `leave` (slice follow-on:
+        // `ConferenceRegistry::get_conference`). A missing handle means
+        // the conference was never created or already shut down —
+        // decline so the caller can fall back to a 2-peer bridge.
+        let Some(conference) = self.conferences.get_conference(conf_id) else {
+            tracing::warn!(
+                conference_id,
+                "conference not found; declining to orchestrate"
+            );
+            return Ok(None);
         };
-        // `ConferenceRegistry` doesn't expose the `Conference`
-        // handle directly — and `ConferenceParticipantSession`
-        // needs one for `push_frame` / `leave`. The registry
-        // holds Arc<Conference> internally; for the
-        // orchestrator path we depend on callers wiring a
-        // registry impl that exposes the handle.
-        // `InMemoryConferenceRegistry` doesn't today, so this
-        // path returns `Ok(None)` and logs — operators wiring a
-        // concrete registry get the seam populated.
-        //
-        // Following-slice work: extend `ConferenceRegistry` with
-        // `get(id) -> Option<Arc<Conference>>` so the orchestrator
-        // can build the session directly. The trait change is
-        // tiny but affects every registry impl.
-        let _ = (participant_id, egress);
+        let (participant_id, egress) = conference.join().await;
+        let session = ConferenceParticipantSession::spawn(
+            self.fresh_bridge_id(),
+            conference,
+            participant_id,
+            egress,
+            socket,
+            leg.peer,
+            self.fresh_ssrc(),
+        );
         tracing::info!(
             conference_id,
+            participant_id = participant_id.0,
             endpoint = ?leg.endpoint,
-            "conference participant minted; session spawn pending `ConferenceRegistry::get`",
+            "conference participant session spawned",
         );
-        // Use the scratch socket + ssrc so unused-assign lints
-        // stay quiet — real activation is the follow-on trait
-        // extension.
-        let _ = socket;
-        let _ = self.fresh_bridge_id();
-        let _ = self.fresh_ssrc();
-        Ok(None)
+        Ok(Some(session as Arc<dyn MediaSession>))
+    }
+
+    async fn orchestrate_room(
+        &self,
+        dialog: DialogKey,
+        room: &str,
+        leg: BridgeLeg,
+    ) -> Result<Option<Arc<dyn MediaSession>>, MediaError> {
+        let conf_id = self.conference_for_room(room).await;
+        self.try_orchestrate_conference(dialog, conf_id.0, leg)
+            .await
     }
 }
 
@@ -171,6 +197,17 @@ impl ConferenceOrchestrator for DirectConferenceOrchestrator {
         );
         Ok(Some(session as Arc<dyn MediaSession>))
     }
+
+    async fn orchestrate_room(
+        &self,
+        dialog: DialogKey,
+        _room: &str,
+        leg: BridgeLeg,
+    ) -> Result<Option<Arc<dyn MediaSession>>, MediaError> {
+        // Single-conference orchestrator: every room maps to the one
+        // conference handle it holds, so ignore the room name.
+        self.try_orchestrate_conference(dialog, 0, leg).await
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +245,66 @@ mod tests {
         // `stop()` drops the participant from the conference.
         assert_eq!(conf.stats().await.participants, 0);
         conf.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mixer_orchestrator_spawns_session_via_registry() {
+        use crate::registry::{ConferenceRegistry, InMemoryConferenceRegistry};
+
+        let fabric = Arc::new(UdpMediaFabric::new());
+        let registry = Arc::new(InMemoryConferenceRegistry::new());
+        let conf_id = registry
+            .create(ConferenceConfig {
+                frame_interval: Duration::from_millis(20),
+                ..Default::default()
+            })
+            .await;
+        let orch = MixerConferenceOrchestrator::new(
+            Arc::clone(&fabric),
+            Arc::clone(&registry) as Arc<dyn ConferenceRegistry>,
+        );
+
+        let ep = fabric.allocate(IpAddr::from([127, 0, 0, 1])).await.unwrap();
+        let peer_addr = "127.0.0.1:30100".parse().unwrap();
+        let dialog: DialogKey = ("c@x".into(), "lt".into(), "rt".into());
+
+        let session = orch
+            .try_orchestrate_conference(dialog, conf_id.0, BridgeLeg::plain(ep.id(), peer_addr))
+            .await
+            .unwrap()
+            .expect("registry-backed orchestrator spawns a session");
+
+        let conf = registry
+            .get_conference(conf_id)
+            .expect("conference handle resolvable via get_conference");
+        assert_eq!(conf.stats().await.participants, 1);
+        session.stop().await;
+        assert_eq!(conf.stats().await.participants, 0);
+        registry.shutdown(conf_id).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mixer_orchestrator_declines_unknown_conference() {
+        use crate::registry::{ConferenceRegistry, InMemoryConferenceRegistry};
+
+        let fabric = Arc::new(UdpMediaFabric::new());
+        let registry = Arc::new(InMemoryConferenceRegistry::new());
+        let orch = MixerConferenceOrchestrator::new(
+            Arc::clone(&fabric),
+            registry as Arc<dyn ConferenceRegistry>,
+        );
+        let ep = fabric.allocate(IpAddr::from([127, 0, 0, 1])).await.unwrap();
+        let dialog: DialogKey = ("c@x".into(), "lt".into(), "rt".into());
+        // Conference 42 was never created → decline (Ok(None)), not error.
+        let out = orch
+            .try_orchestrate_conference(
+                dialog,
+                42,
+                BridgeLeg::plain(ep.id(), "127.0.0.1:30101".parse().unwrap()),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -59,11 +59,11 @@ pub use config::{
     ClusterConfig, ClusterMode, Config, CoreConfig, FsRecordingConfig, HttpAuthConfig,
     HttpFailureMode, LogFormat, McpConfig, McpHttp3Config, MediaConfig, ObservabilityConfig,
     PluginsConfig, PromptsConfig, ProxyMode, RateLimitConfig, RecordingBackend,
-    RecordingStoreConfig, ReloadConfig, SandboxConfig, SeccompPolicy, SipConfig, SipProxyConfig,
-    SipRateLimit, SipTransport, SipVpnConfig, SqliteAuthConfig, SqliteStorageConfig,
-    StorageBackend, StorageConfig, TranscodeConfig, VectorBackend, VectorStoreConfig, VpnMode,
-    WebRtcConfig, WebRtcIceConfig, WebRtcPrivacyConfig, WebRtcPrivacyMode, WebRtcTurnConfig,
-    WebRtcTurnCredential, WebTransportConfig,
+    RecordingStoreConfig, ReloadConfig, RtpPortRange, SandboxConfig, SeccompPolicy, SipConfig,
+    SipProxyConfig, SipRateLimit, SipTransport, SipVpnConfig, SqliteAuthConfig,
+    SqliteStorageConfig, StorageBackend, StorageConfig, TranscodeConfig, VectorBackend,
+    VectorStoreConfig, VpnMode, WebRtcConfig, WebRtcIceConfig, WebRtcPrivacyConfig,
+    WebRtcPrivacyMode, WebRtcTurnConfig, WebRtcTurnCredential, WebTransportConfig,
 };
 pub use dialog_sessions::DialogSessions;
 pub use drain::Drain;
