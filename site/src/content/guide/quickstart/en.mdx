@@ -57,8 +57,41 @@ Using `pjsua`:
 pjsua --null-audio --local-port=6070 sip:test@127.0.0.1:5060
 ```
 
+## Talk through your computer
+
+The bundled **`smiths-softphone`** client captures your microphone,
+G.711-encodes it into RTP, and plays the peer's audio through your
+speakers — no external softphone required. The "server" is whoever runs
+the engine; everyone else runs the softphone.
+
+```bash
+# validate your mic → speaker chain (no network)
+cargo run -p smiths-softphone -- loopback
+
+# two people, one room — bridged by the engine
+cargo run -p smiths-softphone -- call --engine 127.0.0.1:5060 --room demo
+```
+
+Use headphones — there is no echo cancellation yet.
+
+## Group call (conference)
+
+Set a **conference-room prefix** on the engine, then everyone who dials
+a room under that prefix is mixed into one N-party call instead of a
+2-peer bridge:
+
+```bash
+SMITHS__SIP__CONFERENCE_PREFIX=conf smiths-net --config config.toml
+# each participant, in their own terminal / machine:
+cargo run -p smiths-softphone -- call --engine 127.0.0.1:5060 --room conf-standup
+```
+
+Rooms that don't match the prefix keep the classic 2-peer bridge. You
+can also manage conferences over MCP (`create_conference`,
+`join_conference`).
+
 ## Next steps
 
 - [Configuration Reference](/guide/configuration/) — full `config.toml` walkthrough
 - [CLI Reference](/guide/cli/) — all subcommands and flags
-- [Plugin Cookbook](/cookbook/) — extend the engine with WASM and sidecar plugins
+- [Plugin Cookbook](/cookbook/) — extend the engine with WASM and sidecar plugins, including a [call-control plugin](/cookbook/wasm/rust/call-control/) that places and answers calls

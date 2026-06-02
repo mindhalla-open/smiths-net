@@ -39,10 +39,10 @@ async fn peer_socket() -> (Arc<UdpSocket>, std::net::SocketAddr) {
 async fn dtmf_stream_on_leg_a_emits_one_keypress() {
     // Engine's two RTP endpoints. `PortPair` returns the raw
     // `UdpSocket` values — wrap in `Arc` for the bridge API.
-    let engine_a = allocate_rtp_rtcp_pair("127.0.0.1".parse().unwrap(), DEFAULT_MAX_ATTEMPTS)
+    let engine_a = allocate_rtp_rtcp_pair("127.0.0.1".parse().unwrap(), None, DEFAULT_MAX_ATTEMPTS)
         .await
         .unwrap();
-    let engine_b = allocate_rtp_rtcp_pair("127.0.0.1".parse().unwrap(), DEFAULT_MAX_ATTEMPTS)
+    let engine_b = allocate_rtp_rtcp_pair("127.0.0.1".parse().unwrap(), None, DEFAULT_MAX_ATTEMPTS)
         .await
         .unwrap();
     let engine_a_addr = engine_a.rtp_addr;

@@ -617,6 +617,89 @@ async fn send_rtp_without_permission_traps() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn originate_dispatches_through_call_originator() {
+    use async_trait::async_trait;
+    use smiths_core::call::{CallError, CallOriginator};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    // Records the targets a guest asks the host to dial.
+    #[derive(Default)]
+    struct RecordingOriginator {
+        dialed: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl CallOriginator for RecordingOriginator {
+        async fn place_call(&self, target: &str) -> Result<String, CallError> {
+            self.dialed.lock().unwrap().push(target.to_owned());
+            Ok("call-xyz".into())
+        }
+        async fn hangup(&self, _: &str) -> Result<(), CallError> {
+            Ok(())
+        }
+    }
+
+    // "sip:bob@host:5060" is 17 bytes at offset 0.
+    let wat = r#"
+(module
+  (import "smiths" "originate" (func $orig (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "sip:bob@host:5060")
+  (func (export "run")
+    (call $orig (i32.const 0) (i32.const 17))
+    drop))
+"#;
+    let originator = Arc::new(RecordingOriginator::default());
+    let dialed = Arc::clone(&originator.dialed);
+
+    let engine = WasmEngine::new().unwrap();
+    engine
+        .originator_slot()
+        .set(originator as Arc<dyn CallOriginator>)
+        .ok()
+        .expect("set originator");
+    engine.set_plugin_permissions("dialer", ["send_sip"]);
+    let module = compile(&engine, wat);
+    engine
+        .run_entry(&module, "run", FUEL, "dialer")
+        .expect("run_entry");
+
+    // place_call is dispatched fire-and-forget — yield to let it land.
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if !dialed.lock().unwrap().is_empty() {
+            break;
+        }
+    }
+    let recorded = dialed.lock().unwrap().clone();
+    assert_eq!(recorded, vec!["sip:bob@host:5060".to_owned()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn originate_without_permission_traps() {
+    let wat = r#"
+(module
+  (import "smiths" "originate" (func $orig (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "sip:x@y")
+  (func (export "run")
+    (call $orig (i32.const 0) (i32.const 7))
+    drop))
+"#;
+    // No originator bound and no permission registered — the
+    // permission check fires first, before the originator lookup.
+    let engine = WasmEngine::new().unwrap();
+    let module = compile(&engine, wat);
+    let err = engine
+        .run_entry(&module, "run", FUEL, "no-perm")
+        .unwrap_err();
+    assert!(
+        matches!(err, WasmError::PermissionDenied { ref permission, .. } if permission == "send_sip"),
+        "expected PermissionDenied(send_sip), got {err:?}"
+    );
+}
+
 #[test]
 fn call_invoke_error_envelope_becomes_plugin_error() {
     let wat = r#"

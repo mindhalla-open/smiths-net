@@ -95,7 +95,16 @@ pub enum TranscodeError {
 /// bridge calls into it from a Tokio task, but that task is scheduled
 /// onto a blocking pool when the job is expensive (Opus); cheap codecs
 /// (G.711) run inline on the existing per-bridge task.
-pub trait Codec: Send + Sync {
+///
+/// Bound is `Send` only, not `Send + Sync`: every method takes
+/// `&mut self`, and codecs are owned exclusively by a single
+/// [`CallTranscoder`](crate::CallTranscoder) which is itself reached
+/// through an `Arc<Mutex<_>>`. That makes the shared handle `Sync`
+/// (a `Mutex<T>` is `Sync` whenever `T: Send`) without ever sharing a
+/// codec by shared reference. Requiring `Sync` here would needlessly
+/// exclude libopus, whose encoder/decoder hold non-`Sync` raw
+/// pointers.
+pub trait Codec: Send {
     /// Codec this instance speaks on the wire.
     fn kind(&self) -> CodecKind;
     /// Encode one RTP payload worth of 16-bit PCM samples. The caller
@@ -230,7 +239,7 @@ fn alaw_to_linear(alaw: u8) -> i16 {
 /// Behind the `opus` Cargo feature; absent that, [`OpusCodec::new`]
 /// returns [`TranscodeError::CodecUnavailable`] so the failure
 /// surfaces at admission time rather than silently miscompiling. The
-/// encoder is configured for VoIP (lowest-latency mode, 20 ms frames)
+/// encoder is configured for `VoIP` (lowest-latency mode, 20 ms frames)
 /// which is what an RTP bridge wants — music/archival streaming would
 /// pick different knobs.
 #[cfg(feature = "opus")]

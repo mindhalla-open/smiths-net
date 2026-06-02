@@ -33,3 +33,47 @@ Every tool is reachable via MCP stdio, MCP HTTP, A2A HTTP, and the webhook adapt
 | `create_conference` | Create a conference room |
 | `join_conference` | Add a call to a conference |
 | `leave_conference` | Remove a call from a conference |
+| `list_style_presets` | List voice style presets for `restyle_call` |
+| `restyle_call` | Restyle an utterance (ASR → LLM rewrite → TTS) and speak it |
+
+## Voice restyling — speak → restyle → speak
+
+`restyle_call` runs the full pipeline behind one tool: it transcribes
+an utterance (`ai.asr`), rewrites the text into a chosen **preset
+style** (`ai.llm.chat`), and synthesizes it in the **preset's voice**
+(`ai.tts`). A preset bundles both — *what* is said (wording) and *how*
+it sounds (voice).
+
+```jsonc
+// tools/call  restyle_call
+{
+  "preset":  "pirate",          // see list_style_presets
+  "call_id": "cid-abc",          // live call → styled speech is injected
+  "audio_base64": "…PCM16…"     // the utterance to restyle
+  // or: "text": "hello there"  // skip ASR, restyle text directly
+}
+```
+
+With a live `call_id` the styled speech is streamed into the call (same
+RTP path as `speak`); without it (or `speak: false`) the tool returns
+`{ transcript, styled_text, audio }`. Built-in presets: `formal`,
+`casual`, `pirate`, `concise`, `polite` — list them with
+`list_style_presets`. Restyle quality follows the configured `ai.llm.*`
+provider (the mock LLM returns canned text; wire a real one for genuine
+rewriting).
+
+> The engine doesn't yet tap a live call's inbound audio on demand, so
+> the utterance is supplied as `audio_base64` (as `summarize_call`
+> does). Injection into the call is live.
+
+## Conferencing
+
+`create_conference` / `join_conference` / `leave_conference` operate on
+a live leave-one-out audio mixer. `create_conference` returns a
+`conference_id`; `join_conference` mints a participant slot in it.
+
+For a hands-off setup, you don't need MCP at all: set
+`sip.conference_prefix` and any SIP call to a room under that prefix
+(e.g. `sip:conf-standup@engine`) is mixed into an N-party conference
+automatically — one participant per INVITE. See the
+[Quickstart](/guide/quickstart/) group-call section.

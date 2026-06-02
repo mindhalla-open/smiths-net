@@ -1,0 +1,202 @@
+---
+title: "Call Control"
+description: "Place outbound calls and react to inbound ones from a sandboxed WASM plugin using the smiths::originate host function and the on_dialog_created event hook."
+track: wasm
+lang: rust
+locale: en
+order: 5
+updatedAt: "2026-06-01"
+---
+
+## Overview
+
+The [Canonical Hook](/cookbook/wasm/rust/canonical-hook/) recipe handled
+MCP tool calls. This recipe is a **call-control brain**: a plugin that
+drives SIP signaling — placing outbound calls and reacting to inbound
+ones — entirely from inside the WASM sandbox.
+
+It carries **no media**. A WASM guest has no sockets and no audio
+devices, so it can never touch RTP or your microphone. The voice rides
+the engine plus a native client (the
+[`smiths-softphone`](https://github.com/friday-mindhalla/smiths-net/tree/main/crates/smiths-softphone)).
+This plugin is the decision-maker: it tells the engine *who to call* and
+*what to do when a call arrives*.
+
+Two new pieces of the host surface make this possible:
+
+| Host import | Permission | Purpose |
+|-------------|-----------|---------|
+| `smiths::originate(ptr, len)` | `send_sip` | Place an outbound call to a SIP URI. |
+| `smiths::hangup(ptr, len)` | `send_sip` | Tear down an outbound call by Call-ID. |
+
+Plus one event method the engine **calls on your plugin**:
+
+| Method | Delivered when | Params |
+|--------|----------------|--------|
+| `on_dialog_created` | A SIP dialog goes live | `{"call_id": "...", "remote_rtp": "ip:port"}` |
+
+## The `send_sip` permission
+
+`originate` / `hangup` are gated. Declare the permission in
+`plugin.toml` or the engine traps the guest's first call with
+`PermissionDenied { permission: "send_sip" }`:
+
+```toml
+permissions = ["send_sip"]
+```
+
+## 1. Host imports
+
+```rust
+// src/lib.rs — imports
+#![no_std]
+#![no_main]
+
+#[link(wasm_import_module = "smiths")]
+unsafe extern "C" {
+    fn log(ptr: *const u8, len: usize);
+    /// Place an outbound call to the SIP URI at [ptr, ptr+len).
+    /// Returns 0 on dispatch. Requires the `send_sip` permission.
+    fn originate(ptr: *const u8, len: usize) -> i32;
+}
+
+fn host_log(msg: &str) {
+    unsafe { log(msg.as_ptr(), msg.len()) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn run() {
+    host_log("call-control: plugin loaded");
+}
+```
+
+`originate` is **fire-and-forget**: it returns as soon as the engine
+accepts the request, while the INVITE round-trip runs asynchronously.
+The guest learns the outcome (and the allocated Call-ID) from the
+`on_dialog_created` event, not from the return value — call setup takes
+a SIP round-trip the guest can't block on.
+
+## 2. Describe the capability
+
+Call origination lives in the `routing.*` namespace:
+
+```rust
+static DESCRIBE_JSON: &[u8] = br#"{"capability":"routing.dial","plugin":"call-control","abi":"1.0","description":"Place outbound SIP calls via smiths::originate."}"#;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn describe() -> i64 {
+    pack(DESCRIBE_JSON)
+}
+```
+
+(See the [Canonical Hook](/cookbook/wasm/rust/canonical-hook/) recipe for
+the `alloc` bump allocator and the `(ptr << 32) | len` packing helper —
+they're identical here.)
+
+## 3. Dispatch: dial vs. inbound event
+
+`invoke` branches on the method name. `dial` originates a call;
+`on_dialog_created` (auto-delivered by the engine) lets the plugin react
+to a live call:
+
+```rust
+static OK:        &[u8] = br#"{"result":"dialing"}"#;
+static ACK:       &[u8] = br#"{"result":"ack"}"#;
+static ERR_EMPTY: &[u8] = br#"{"error":"dial: empty target URI"}"#;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn invoke(
+    method_ptr: i32, method_len: i32,
+    params_ptr: i32, params_len: i32,
+) -> i64 {
+    let method = unsafe {
+        core::slice::from_raw_parts(method_ptr as usize as *const u8, method_len as usize)
+    };
+    let params = unsafe {
+        core::slice::from_raw_parts(params_ptr as usize as *const u8, params_len as usize)
+    };
+
+    if method == b"dial" {
+        let target = unquote(params);          // strip JSON-string quotes
+        if target.is_empty() {
+            return pack(ERR_EMPTY);
+        }
+        unsafe { originate(target.as_ptr(), target.len()) };
+        return pack(OK);
+    }
+
+    // Inbound call event — the brain "saw" a call. A richer plugin
+    // would parse `params`, decide whether to bridge it into a
+    // conference, kick off transcription, etc.
+    host_log("call-control: on_dialog_created");
+    if let Ok(s) = core::str::from_utf8(params) {
+        host_log(s);
+    }
+    pack(ACK)
+}
+```
+
+## 4. Manifest
+
+```toml
+# plugin.toml
+name        = "call-control"
+version     = "0.1.0"
+type        = "wasm"
+entry       = "./call_control.wasm"
+provides    = ["routing.dial"]
+permissions = ["send_sip"]
+abi         = "1.0"
+description = "Place outbound SIP calls; react to inbound calls."
+```
+
+## 5. Build and load
+
+```bash
+cargo build --target wasm32-unknown-unknown --release
+
+mkdir -p plugins/call-control
+cp target/wasm32-unknown-unknown/release/call_control.wasm plugins/call-control/
+cp plugin.toml plugins/call-control/
+
+smiths-net --config config.toml
+# INFO smiths_plugin::loader: plugin loaded plugin="call-control"
+```
+
+## 6. Auto-invoke on inbound calls
+
+To have the engine call `on_dialog_created` automatically when a dialog
+goes live, list the plugin under `call_event_hooks`:
+
+```toml
+# config.toml
+[plugins]
+call_event_hooks = ["call-control"]
+```
+
+Now place a call into the engine (e.g. with the `smiths-softphone`
+client) and watch the guest log fire:
+
+```
+INFO smiths_wasm::guest: call-control: on_dialog_created plugin="call-control"
+INFO smiths_wasm::guest: {"call_id":"...","remote_rtp":"127.0.0.1:54778"} plugin="call-control"
+```
+
+## 7. Dial on demand
+
+The `dial` method is reachable through the MCP/A2A tool surface like any
+`routing.*` capability — invoke it with the target URI as params and the
+engine places the call:
+
+```json
+{"name": "call-control", "method": "dial", "params": "sip:bob@192.168.1.20:5060"}
+```
+
+## Next steps
+
+- Bridge inbound calls into an N-party mixer with
+  [conference rooms](/guide/quickstart/) (`sip.conference_prefix`).
+- Combine with the [Multi-Tool](/cookbook/wasm/rust/multi-tool/) recipe
+  to branch `dial` targets by business logic.
+- Read the host-function surface in the
+  [Plugin System architecture](https://github.com/friday-mindhalla/smiths-net/blob/main/docs/architecture/02-plugin-system.md).

@@ -1,0 +1,9 @@
+name        = "call-control"
+version     = "0.1.0"
+type        = "wasm"
+entry       = "./call_control.wasm"
+provides    = ["routing.dial"]
+# `send_sip` unlocks smiths::originate / smiths::hangup.
+permissions = ["send_sip"]
+abi         = "1.0"
+description = "Place outbound SIP calls via smiths::originate; react to inbound calls via on_dialog_created."

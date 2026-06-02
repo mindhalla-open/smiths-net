@@ -212,6 +212,29 @@ python3 examples/python-client/speaker.py \
 Both processes use `sip:hello@127.0.0.1` as the Request-URI; the engine
 pairs them and forwards RTP A ↔ B. Afterwards open `tmp/rx.wav`.
 
+## Live mic/speaker and group calls
+
+This Python client streams from WAV files. For **live two-way audio
+from your computer's mic and speakers**, use the native
+[`smiths-softphone`](../../crates/smiths-softphone) client instead:
+
+```bash
+cargo run -p smiths-softphone -- call --engine 127.0.0.1:5060 --room hello
+```
+
+For an **N-party conference** (more than two participants mixed into one
+call), start the engine with a conference-room prefix and dial a room
+under it:
+
+```bash
+SMITHS__SIP__CONFERENCE_PREFIX=conf cargo run --release -- --config examples/config.toml
+# then each participant:
+python3 examples/python-client/speaker.py --engine 127.0.0.1:5060 --room conf-standup ...
+```
+
+Rooms not matching the prefix keep the classic 2-peer bridge. See the
+top-level [examples README](../README.md).
+
 ## What this sample does not do (yet)
 
 - Authentication (digest / REGISTER). The engine doesn't require it in

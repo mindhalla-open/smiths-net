@@ -20,12 +20,13 @@
 //! loop guest traps cleanly.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use dashmap::DashMap;
 use serde_json::Value;
+use smiths_core::call::CallOriginator;
 use smiths_core::media::MediaFabric;
 use smiths_core::{CallLookup, EventBus};
 use wasmtime::{Config, Engine, Linker, Memory, Module, Store, Trap};
@@ -64,6 +65,12 @@ pub struct WasmEngine {
     /// Media fabric handle for `send_rtp` dispatch. Attached via
     /// [`Self::with_media`]; `None` disables `send_rtp`.
     media_fabric: Option<Arc<dyn MediaFabric>>,
+    /// Late-bound call originator for `originate` / `hangup`. The UAC
+    /// is built *after* plugins load, so the engine holds a write-once
+    /// slot every cloned `WasmEngine` shares; the CLI fills it via
+    /// [`Self::originator_slot`] once SIP is up. Empty until then —
+    /// guests calling `originate` trap descriptively.
+    originator: Arc<OnceLock<Arc<dyn CallOriginator>>>,
 }
 
 impl std::fmt::Debug for WasmEngine {
@@ -79,6 +86,7 @@ impl std::fmt::Debug for WasmEngine {
             .field("bus", &self.bus.is_some())
             .field("call_lookup", &self.call_lookup.is_some())
             .field("media_fabric", &self.media_fabric.is_some())
+            .field("originator", &self.originator.get().is_some())
             .finish_non_exhaustive()
     }
 }
@@ -102,6 +110,7 @@ impl WasmEngine {
             bus: None,
             call_lookup: None,
             media_fabric: None,
+            originator: Arc::new(OnceLock::new()),
         })
     }
 
@@ -128,6 +137,16 @@ impl WasmEngine {
         self.call_lookup = Some(call_lookup);
         self.media_fabric = Some(media_fabric);
         self
+    }
+
+    /// Hand back a clone of the late-bound originator slot so a caller
+    /// (the CLI) can fill it in once the UAC exists. Every cloned
+    /// `WasmEngine` — including the ones inside loaded `WasmProvider`s
+    /// — shares this slot, so a single `set(...)` lights up
+    /// `originate` / `hangup` for all WASM plugins at once.
+    #[must_use]
+    pub fn originator_slot(&self) -> Arc<OnceLock<Arc<dyn CallOriginator>>> {
+        Arc::clone(&self.originator)
     }
 
     /// Fetch (or lazily create) the persistent KV store for `plugin`.
@@ -197,7 +216,8 @@ impl WasmEngine {
             &self.engine,
             HostState::for_plugin_with_state(plugin, state, permissions)
                 .with_bus(self.bus.clone())
-                .with_media(self.call_lookup.clone(), self.media_fabric.clone()),
+                .with_media(self.call_lookup.clone(), self.media_fabric.clone())
+                .with_originator(self.originator.get().cloned()),
         );
         store.set_fuel(DEFAULT_FUEL).map_err(WasmError::Fuel)?;
         store.set_epoch_deadline(u64::MAX);
@@ -272,7 +292,8 @@ impl WasmEngine {
             &self.engine,
             HostState::for_plugin_with_state(plugin, state, permissions)
                 .with_bus(self.bus.clone())
-                .with_media(self.call_lookup.clone(), self.media_fabric.clone()),
+                .with_media(self.call_lookup.clone(), self.media_fabric.clone())
+                .with_originator(self.originator.get().cloned()),
         );
         store.set_fuel(DEFAULT_FUEL).map_err(WasmError::Fuel)?;
         store.set_epoch_deadline(u64::MAX);
@@ -353,7 +374,8 @@ impl WasmEngine {
             &self.engine,
             HostState::for_plugin_with_state(plugin, state, permissions)
                 .with_bus(self.bus.clone())
-                .with_media(self.call_lookup.clone(), self.media_fabric.clone()),
+                .with_media(self.call_lookup.clone(), self.media_fabric.clone())
+                .with_originator(self.originator.get().cloned()),
         );
         store.set_fuel(fuel).map_err(WasmError::Fuel)?;
         // Configure the store's epoch deadline. When a deadline is

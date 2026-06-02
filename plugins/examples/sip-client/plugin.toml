@@ -1,0 +1,11 @@
+name        = "sip-client"
+version     = "0.1.0"
+type        = "wasm"
+entry       = "./sip_client.wasm"
+provides    = ["routing.dial"]
+# `send_sip` unlocks the smiths::originate / smiths::hangup host fns.
+# Without it the engine traps the guest's first originate call with a
+# PermissionDenied carrying this exact string.
+permissions = ["send_sip"]
+abi         = "1.0"
+description = "Call-control brain: places outbound SIP calls on the engine's behalf via smiths::originate. The audio itself is carried by a native client (smiths-softphone) — WASM cannot open sockets or audio devices."

@@ -164,6 +164,24 @@ pub trait ConferenceOrchestrator: Send + Sync {
         conference_id: u64,
         leg: BridgeLeg,
     ) -> Result<Option<Arc<dyn smiths_core::media::MediaSession>>, smiths_core::MediaError>;
+
+    /// Join `leg` into the conference named `room`, creating the
+    /// conference on first use. This is the entry point the UAS uses
+    /// for conference *rooms*: it doesn't know conference ids, only
+    /// the Request-URI user-part. Each INVITE to the same room adds
+    /// one participant to the same mixer — no pairing, no parking.
+    /// `None` = the orchestrator declined (caller falls back to the
+    /// 2-peer rendezvous). Default declines so non-mixer
+    /// implementations needn't implement room semantics.
+    async fn orchestrate_room(
+        &self,
+        dialog: DialogKey,
+        room: &str,
+        leg: BridgeLeg,
+    ) -> Result<Option<Arc<dyn smiths_core::media::MediaSession>>, smiths_core::MediaError> {
+        let _ = (dialog, room, leg);
+        Ok(None)
+    }
 }
 
 /// Parsed request summary.
@@ -274,6 +292,13 @@ pub struct UasServer<T: Transport> {
     /// updates the registry but doesn't yet bridge RTP. CLI
     /// wires a real orchestrator from `[media.mixer]` config.
     conference_orchestrator: Option<Arc<dyn ConferenceOrchestrator>>,
+    /// Request-URI user-part prefix that marks a *conference room*
+    /// (slice 5.6e-runtime). When set and a conference orchestrator is
+    /// wired, an INVITE whose room matches this prefix joins an N-party
+    /// mixer (one participant per INVITE) instead of the 2-peer
+    /// rendezvous. `None` = no conference routing — every room uses the
+    /// classic bridge, so default behaviour is unchanged.
+    conference_room_prefix: Option<String>,
     /// Registrar: digest-auths `REGISTER` against a [`CredentialStore`].
     /// `None` = auth disabled, registrar accepts any REGISTER blindly
     /// (dev convenience; never do that in prod).
@@ -369,6 +394,7 @@ impl<T: Transport> UasServer<T> {
             transcode_orchestrator: None,
             fax_orchestrator: None,
             conference_orchestrator: None,
+            conference_room_prefix: None,
             registrar: None,
             registration_store: None,
             cdr_store: None,
@@ -506,6 +532,17 @@ impl<T: Transport> UasServer<T> {
         orchestrator: Arc<dyn ConferenceOrchestrator>,
     ) -> Self {
         self.conference_orchestrator = Some(orchestrator);
+        self
+    }
+
+    /// Mark a Request-URI user-part prefix as conference rooms (slice
+    /// 5.6e-runtime). With a [`ConferenceOrchestrator`] also wired,
+    /// INVITEs to `sip:<prefix>…@engine` join an N-party mixer instead
+    /// of the 2-peer rendezvous. Without this, all rooms bridge as
+    /// before.
+    #[must_use]
+    pub fn with_conference_rooms(mut self, prefix: impl Into<String>) -> Self {
+        self.conference_room_prefix = Some(prefix.into());
         self
     }
 
@@ -1075,9 +1112,52 @@ impl<T: Transport> UasServer<T> {
             }
         }
 
+        // Conference rooms (slice 5.6e-runtime): an INVITE whose room
+        // matches the configured prefix joins an N-party mixer right
+        // away — one participant per INVITE, no pairing or parking.
+        // The session is filed under `dialog_sessions` so BYE stops it
+        // alongside transcoded sessions. A decline / error falls
+        // through to the classic 2-peer rendezvous below.
+        let mut conference_joined = false;
+        if !webrtc_bridged
+            && let (Some(orch), Some(prefix), Some(key), Some(ep), Some(remote_rtp)) = (
+                self.conference_orchestrator.as_ref(),
+                self.conference_room_prefix.as_deref(),
+                rendezvous.as_ref(),
+                endpoint.as_ref(),
+                remote_media,
+            )
+            && key.starts_with(prefix)
+        {
+            let leg = BridgeLeg {
+                endpoint: ep.id(),
+                peer: remote_rtp,
+                srtp: srtp_keys.clone(),
+            };
+            match orch.orchestrate_room(dialog_key.clone(), key, leg).await {
+                Ok(Some(session)) => {
+                    use smiths_core::{LegId, MediaKindTag};
+                    self.dialog_sessions.install(
+                        dialog_key.clone(),
+                        (LegId(0), MediaKindTag::Audio),
+                        session,
+                    );
+                    info!(room = %key, "conference participant joined");
+                    conference_joined = true;
+                }
+                Ok(None) => {
+                    warn!(room = %key, "conference declined; falling back to rendezvous");
+                }
+                Err(e) => {
+                    warn!(room = %key, ?e, "conference join failed; falling back to rendezvous");
+                }
+            }
+        }
+
         // Rendezvous pairing: need a key, an endpoint, and the peer RTP
         // address from the offer.
         if !webrtc_bridged
+            && !conference_joined
             && let (Some(key), Some(ep), Some(remote_rtp)) =
                 (rendezvous.as_ref(), endpoint.as_ref(), remote_media)
         {

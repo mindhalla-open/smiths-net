@@ -89,6 +89,11 @@ pub struct UdpMediaFabric {
     /// `true` → spawned bridges also run the Goertzel inband
     /// detector on plaintext PCMU. Off by default (slice 2.5).
     inband_dtmf: bool,
+    /// Optional `(min, max)` UDP port window for RTP/RTCP allocation.
+    /// `None` (default) = ephemeral OS-assigned ports. Set via
+    /// [`Self::with_rtp_port_range`] so operators can firewall a fixed
+    /// range.
+    rtp_ports: Option<(u16, u16)>,
 }
 
 impl UdpMediaFabric {
@@ -102,6 +107,16 @@ impl UdpMediaFabric {
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Pin RTP/RTCP allocation to the inclusive `[min, max]` UDP port
+    /// window so the media plane fits one firewall rule. `None` reverts
+    /// to ephemeral ports. Builder-style for the same reason as
+    /// [`Self::with_metrics`].
+    #[must_use]
+    pub fn with_rtp_port_range(mut self, range: Option<(u16, u16)>) -> Self {
+        self.rtp_ports = range;
         self
     }
 
@@ -240,7 +255,7 @@ fn dtls_err_to_media(e: &DtlsHandshakeError) -> MediaError {
 impl MediaFabric for UdpMediaFabric {
     #[instrument(skip(self), fields(%bind_ip))]
     async fn allocate(&self, bind_ip: IpAddr) -> Result<Arc<dyn MediaEndpoint>, MediaError> {
-        let pair = allocate_rtp_rtcp_pair(bind_ip, DEFAULT_MAX_ATTEMPTS).await?;
+        let pair = allocate_rtp_rtcp_pair(bind_ip, self.rtp_ports, DEFAULT_MAX_ATTEMPTS).await?;
         let id = self.fresh_endpoint_id();
         let rtp_addr = pair.rtp_addr;
         let rtcp_addr = pair.rtcp_addr;

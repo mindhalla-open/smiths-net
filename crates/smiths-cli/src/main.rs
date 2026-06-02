@@ -282,9 +282,43 @@ async fn main() -> anyhow::Result<()> {
     let (control_state, control_task) = ControlState::spawn(&bus, shutdown.token());
 
     // Build the shared media fabric before the WASM engine so guest
-    // `send_rtp` can push packets through it.
-    let media_fabric: Arc<dyn MediaFabric> =
-        Arc::new(UdpMediaFabric::new().with_metrics(Arc::clone(&metrics)));
+    // `send_rtp` can push packets through it. Keep the concrete
+    // `UdpMediaFabric` handle too — the conference orchestrator needs
+    // it to resolve per-endpoint UDP sockets.
+    // Optional fixed RTP port window (`[media.rtp_ports]`) so operators
+    // can open one firewall rule instead of the whole ephemeral range.
+    let rtp_port_range = config.media.rtp_ports.and_then(|r| {
+        if r.min < r.max {
+            Some((r.min, r.max))
+        } else {
+            warn!(
+                min = r.min,
+                max = r.max,
+                "media.rtp_ports: min must be < max; ignoring and using ephemeral ports"
+            );
+            None
+        }
+    });
+    let udp_media_fabric = Arc::new(
+        UdpMediaFabric::new()
+            .with_metrics(Arc::clone(&metrics))
+            .with_rtp_port_range(rtp_port_range),
+    );
+    let media_fabric: Arc<dyn MediaFabric> = Arc::clone(&udp_media_fabric) as Arc<dyn MediaFabric>;
+
+    // Conference: one registry + mixer orchestrator per engine, shared
+    // by the MCP create/join/leave tools and the UAS conference-room
+    // routing. The orchestrator resolves endpoint sockets via the
+    // concrete `UdpMediaFabric`. `sip.conference_prefix` (default
+    // `None`) gates room routing — without it, every room bridges 2-peer.
+    let conference_registry: Arc<dyn smiths_mixer::ConferenceRegistry> =
+        Arc::new(smiths_mixer::InMemoryConferenceRegistry::new());
+    let conference_orchestrator: Arc<dyn smiths_sip::ConferenceOrchestrator> =
+        Arc::new(smiths_mixer::MixerConferenceOrchestrator::new(
+            Arc::clone(&udp_media_fabric),
+            Arc::clone(&conference_registry),
+        ));
+    let conference_prefix = config.sip.conference_prefix.clone();
 
     // Load plugins from the configured directory. Failures are per-
     // plugin and logged; they don't block startup.
@@ -304,6 +338,14 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    // Grab the engine's write-once originator slot before the engine
+    // moves into the loader. The UAC that fills it is built further
+    // down (after SIP transports spawn), and every `WasmProvider`
+    // shares this slot, so filling it later lights up
+    // `smiths::originate` / `hangup` for all WASM call-control plugins.
+    let wasm_originator_slot = wasm_engine
+        .as_ref()
+        .map(smiths_plugin::wasm::WasmEngine::originator_slot);
     let loader_opts = smiths_plugin::LoaderOpts {
         bus: Some(bus.clone()),
         wasm_engine,
@@ -332,6 +374,17 @@ async fn main() -> anyhow::Result<()> {
     let resources = Arc::new(smiths_mcp::builtin_resources());
     let rate_limiter = Arc::new(smiths_mcp::RateLimiter::new(&config.mcp.rate_limit));
     let ai_registry_dyn: Arc<dyn AiRegistry> = Arc::new(ai_registry.clone());
+
+    // Auto-invoke call-control plugins on dialog lifecycle events. Only
+    // spawns a consumer when `[plugins] call_event_hooks` lists at
+    // least one plugin; otherwise it's a no-op task that exits at once.
+    let _call_event_hook_task = smiths_plugin::spawn_call_event_hooks(
+        &bus,
+        Arc::clone(&ai_registry_dyn),
+        config.plugins.call_event_hooks.clone(),
+        shutdown.token(),
+    );
+
     let config_snapshot = Arc::new(config.clone());
 
     // Shared response correlator. The UAS forwards responses to it;
@@ -492,6 +545,8 @@ async fn main() -> anyhow::Result<()> {
             std::mem::take(&mut initial_dialogs),
             Arc::clone(&replicator),
             dialogs_shared.as_ref().map(Arc::clone),
+            Some(Arc::clone(&conference_orchestrator)),
+            conference_prefix.clone(),
         )
         .await
         {
@@ -521,6 +576,16 @@ async fn main() -> anyhow::Result<()> {
     .with_metrics(Arc::clone(&metrics));
     if let Some(o) = originator.clone() {
         tool_ctx = tool_ctx.with_originator(o);
+    }
+    // Share the conference registry (built earlier, also driving the
+    // UAS conference-room routing) with the MCP tool context so
+    // `create_conference` / `join_conference` / `leave_conference`
+    // operate on the same live mixer.
+    tool_ctx = tool_ctx.with_conferences(Arc::clone(&conference_registry));
+    // Hand the same originator to WASM call-control plugins. Write-once;
+    // a redundant set (e.g. multi-bind) is harmless.
+    if let (Some(slot), Some(o)) = (&wasm_originator_slot, &originator) {
+        let _ = slot.set(Arc::clone(o));
     }
 
     // Slice 3.4 storage wiring. Today the CLI supports `memory` for
@@ -851,6 +916,8 @@ async fn main() -> anyhow::Result<()> {
                 std::mem::take(&mut initial_dialogs),
                 Arc::clone(&replicator),
                 dialogs_shared.as_ref().map(Arc::clone),
+                Some(Arc::clone(&conference_orchestrator)),
+                conference_prefix.clone(),
             )
             .await
             {
@@ -1432,6 +1499,8 @@ async fn spawn_sip_udp(
     dialogs_shared: Option<
         Arc<dashmap::DashMap<smiths_core::DialogKey, smiths_core::DialogRecord>>,
     >,
+    conference_orchestrator: Option<Arc<dyn smiths_sip::ConferenceOrchestrator>>,
+    conference_prefix: Option<String>,
 ) -> anyhow::Result<SpawnedSipUdp> {
     let transport = UdpTransport::bind(bind)
         .await
@@ -1458,6 +1527,12 @@ async fn spawn_sip_udp(
     .with_drain(drain.clone())
     .with_rate_limit(rate_limit.clone())
     .with_replicator(replicator);
+    if let Some(orch) = conference_orchestrator {
+        server = server.with_conference_orchestrator(orch);
+        if let Some(prefix) = conference_prefix {
+            server = server.with_conference_rooms(prefix);
+        }
+    }
     if let Some(d) = dialogs_shared {
         server = server.with_dialogs(d);
     }

@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
+use smiths_core::call::CallOriginator;
 use smiths_core::media::MediaFabric;
 use smiths_core::{CallLookup, Event, EventBus, PluginEvent};
 use tracing::{info, warn};
@@ -56,6 +57,11 @@ pub const PERM_TIMERS: &str = "timers";
 /// Permission string required by `send_rtp`.
 pub const PERM_SEND_RTP: &str = "send_rtp";
 
+/// Permission string required by `originate` / `hangup` — the SIP
+/// call-control surface a "brain" plugin uses to place and tear down
+/// calls on the engine's behalf.
+pub const PERM_SEND_SIP: &str = "send_sip";
+
 /// Per-instance mutable state handed to each host-fn call. Rebuilt on
 /// every `Store::new`; the persistent part (the per-plugin KV map)
 /// and the permission set are injected on construction.
@@ -77,6 +83,10 @@ pub struct HostState {
     pub call_lookup: Option<Arc<dyn CallLookup>>,
     /// Media fabric handle for `send_rtp` to push packets through.
     pub media_fabric: Option<Arc<dyn MediaFabric>>,
+    /// Call originator for `originate` / `hangup`. `None` (e.g. on a
+    /// bare-test engine or before the UAC is up) makes those host fns
+    /// trap with a descriptive message.
+    pub originator: Option<Arc<dyn CallOriginator>>,
 }
 
 impl HostState {
@@ -92,6 +102,7 @@ impl HostState {
             bus: None,
             call_lookup: None,
             media_fabric: None,
+            originator: None,
         }
     }
 
@@ -111,6 +122,7 @@ impl HostState {
             bus: None,
             call_lookup: None,
             media_fabric: None,
+            originator: None,
         }
     }
 
@@ -131,6 +143,14 @@ impl HostState {
     ) -> Self {
         self.call_lookup = call_lookup;
         self.media_fabric = media_fabric;
+        self
+    }
+
+    /// Attach a call originator for `originate` / `hangup`. Builder-
+    /// style; resolved per-call from the engine's late-bound slot.
+    #[must_use]
+    pub fn with_originator(mut self, originator: Option<Arc<dyn CallOriginator>>) -> Self {
+        self.originator = originator;
         self
     }
 
@@ -167,6 +187,12 @@ pub fn register(linker: &mut Linker<HostState>) -> Result<(), WasmError> {
         .map_err(WasmError::Link)?;
     linker
         .func_wrap("smiths", "send_rtp", host_send_rtp)
+        .map_err(WasmError::Link)?;
+    linker
+        .func_wrap("smiths", "originate", host_originate)
+        .map_err(WasmError::Link)?;
+    linker
+        .func_wrap("smiths", "hangup", host_hangup)
         .map_err(WasmError::Link)?;
     Ok(())
 }
@@ -387,6 +413,89 @@ fn host_send_rtp(
     handle.spawn(async move {
         if let Err(e) = fabric.send_packet(endpoint, remote, &payload).await {
             warn!(%plugin, ?e, "send_rtp dispatch failed");
+        }
+    });
+    Ok(0)
+}
+
+/// `smiths::originate(target_ptr, target_len) -> i32` — place an
+/// outbound call to the SIP URI in guest memory. Returns `0` once the
+/// call attempt is dispatched, traps on permission / ABI errors.
+/// Requires the `send_sip` permission.
+///
+/// Like `send_rtp`, the underlying `CallOriginator::place_call` is
+/// async while wasmtime host fns are sync, so the attempt runs as a
+/// fire-and-forget tokio task. The guest learns the outcome (and the
+/// allocated Call-ID) by subscribing to engine call events, not from
+/// this return value — call setup takes a SIP round-trip the guest
+/// can't block on.
+#[allow(clippy::needless_pass_by_value)]
+fn host_originate(
+    mut caller: Caller<'_, HostState>,
+    target_ptr: i32,
+    target_len: i32,
+) -> wasmtime::Result<i32> {
+    caller.data().require(PERM_SEND_SIP, "originate")?;
+    let originator =
+        caller.data().originator.clone().ok_or_else(|| {
+            wasmtime::Error::msg("originate: no CallOriginator bound to HostState")
+        })?;
+    let memory = caller
+        .get_export("memory")
+        .and_then(wasmtime::Extern::into_memory)
+        .ok_or_else(|| wasmtime::Error::msg("guest must export `memory`"))?;
+    let target = {
+        let mem = memory.data(&caller);
+        let bytes = read_slice(mem, target_ptr, target_len, "originate target")?;
+        std::str::from_utf8(bytes)
+            .map_err(|e| wasmtime::Error::msg(format!("originate target not UTF-8: {e}")))?
+            .to_owned()
+    };
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| wasmtime::Error::msg("originate: no tokio runtime on this thread"))?;
+    let plugin = caller.data().plugin.clone();
+    handle.spawn(async move {
+        match originator.place_call(&target).await {
+            Ok(call_id) => info!(%plugin, %call_id, %target, "wasm plugin originated call"),
+            Err(e) => warn!(%plugin, %target, ?e, "wasm originate failed"),
+        }
+    });
+    Ok(0)
+}
+
+/// `smiths::hangup(call_id_ptr, call_id_len) -> i32` — tear down an
+/// outbound call by Call-ID. Returns `0` on dispatch, traps on
+/// permission / ABI errors. Requires the `send_sip` permission.
+/// Fire-and-forget for the same reason as [`host_originate`].
+#[allow(clippy::needless_pass_by_value)]
+fn host_hangup(
+    mut caller: Caller<'_, HostState>,
+    call_id_ptr: i32,
+    call_id_len: i32,
+) -> wasmtime::Result<i32> {
+    caller.data().require(PERM_SEND_SIP, "hangup")?;
+    let originator = caller
+        .data()
+        .originator
+        .clone()
+        .ok_or_else(|| wasmtime::Error::msg("hangup: no CallOriginator bound to HostState"))?;
+    let memory = caller
+        .get_export("memory")
+        .and_then(wasmtime::Extern::into_memory)
+        .ok_or_else(|| wasmtime::Error::msg("guest must export `memory`"))?;
+    let call_id = {
+        let mem = memory.data(&caller);
+        let bytes = read_slice(mem, call_id_ptr, call_id_len, "hangup call_id")?;
+        std::str::from_utf8(bytes)
+            .map_err(|e| wasmtime::Error::msg(format!("hangup call_id not UTF-8: {e}")))?
+            .to_owned()
+    };
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| wasmtime::Error::msg("hangup: no tokio runtime on this thread"))?;
+    let plugin = caller.data().plugin.clone();
+    handle.spawn(async move {
+        if let Err(e) = originator.hangup(&call_id).await {
+            warn!(%plugin, %call_id, ?e, "wasm hangup failed");
         }
     });
     Ok(0)

@@ -67,6 +67,9 @@ impl WebRtcHarness {
     /// Placeholder until the browser-driver dep lands — always
     /// returns `Err(HarnessError::NotImplemented)` so the `#[ignore]`
     /// gate on any test that calls it stays honest.
+    // Signature is frozen `async` ahead of the real browser-driving
+    // implementation; the stub body has nothing to await yet.
+    #[allow(clippy::unused_async)]
     pub async fn run_audio_roundtrip(&self) -> Result<AudioStats, HarnessError> {
         Err(HarnessError::NotImplemented)
     }
@@ -107,6 +110,7 @@ mod tests {
         let h = WebRtcHarness::new(HarnessConfig::default());
         match h.run_audio_roundtrip().await {
             Err(HarnessError::NotImplemented) => {}
+            Ok(stats) => panic!("placeholder harness unexpectedly succeeded: {stats:?}"),
         }
     }
 }

@@ -41,6 +41,10 @@ async-trait        = { workspace = true }
 smiths-sdp         = { workspace = true }
 smiths-media       = { workspace = true }
 smiths-mcp         = { workspace = true }
+# Conference registry: the CLI owns one `InMemoryConferenceRegistry`
+# and hands it to the MCP tool context so the create/join/leave/list
+# conference tools go live.
+smiths-mixer       = { workspace = true }
 smiths-plugin      = { workspace = true }
 smiths-transcode   = { workspace = true }
 # Slice 5.10-dtls: thread `DtlsLegConfig` + `DtlsRole` into the

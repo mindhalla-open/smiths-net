@@ -68,6 +68,17 @@ pub trait ConferenceRegistry: Send + Sync {
 
     /// Snapshot of currently-live conference ids.
     async fn list(&self) -> Vec<ConferenceId>;
+
+    /// Fetch the live [`Conference`] handle for `conf`, if any. The
+    /// conference orchestrator needs the concrete handle to spawn a
+    /// participant session (`push_frame` / `leave`). Default returns
+    /// `None` so mock registries don't have to implement it — only
+    /// registries that own real `Arc<Conference>`s (the in-memory
+    /// impl) populate the orchestrator's session-spawn path.
+    fn get_conference(&self, conf: ConferenceId) -> Option<Arc<Conference>> {
+        let _ = conf;
+        None
+    }
 }
 
 /// In-memory registry. Suitable for single-node deployments; a
@@ -152,6 +163,10 @@ impl ConferenceRegistry for InMemoryConferenceRegistry {
         let mut ids: Vec<ConferenceId> = self.conferences.iter().map(|e| *e.key()).collect();
         ids.sort();
         ids
+    }
+
+    fn get_conference(&self, conf: ConferenceId) -> Option<Arc<Conference>> {
+        self.conferences.get(&conf).map(|c| Arc::clone(c.value()))
     }
 }
 
