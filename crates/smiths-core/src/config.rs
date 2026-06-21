@@ -161,6 +161,10 @@ pub struct MediaConfig {
     /// ```
     #[restart_required(group = "media rtp port range")]
     pub rtp_ports: Option<RtpPortRange>,
+    /// Public IPv4/IPv6 published in SDP `c=` / `o=` for peers that
+    /// cannot reach a private LAN address (home NAT / DMZ setups).
+    /// Unset = auto-detect via routing table (often wrong behind NAT).
+    pub advertise_ip: Option<String>,
 }
 
 /// `[media.rtp_ports]` — inclusive UDP port window for RTP/RTCP.

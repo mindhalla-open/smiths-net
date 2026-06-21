@@ -1,0 +1,7 @@
+name        = "ai-llm-llamacpp"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["ai.llm.chat"]
+abi         = "1.0"
+description = "llama.cpp server (OpenAI-compatible /v1/chat/completions) sidecar for local Gemma/Llama models. Set LLAMACPP_HOST + LLAMACPP_MODEL."

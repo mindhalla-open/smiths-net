@@ -1,0 +1,7 @@
+name        = "ai-tts-silero"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["ai.tts"]
+abi         = "1.0"
+description = "Silero TTS v5 offline sidecar — best open-source Russian quality (aidar/baya/kseniya/xenia/eugene). Native 8 kHz for telephony. Requires: pip install torch silero"

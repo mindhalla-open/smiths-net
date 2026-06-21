@@ -1,0 +1,61 @@
+# Megafon Multifon — конфигурация smiths-net для ASR-бота.
+#
+# Провайдер:
+#   Domain/Realm     multifon.ru
+#   Registrar/Proxy  sbc.megafon.ru
+#   SIP              UDP/TCP :5060 (также :8080 у провайдера)
+#   RTP              10000–27999
+#   Register Expires 180 s
+#   Codecs           PCMA (приоритет), PCMU, G.722, G.729, …
+#
+# Credentials — в examples/multifon.env (не коммитить):
+#   source examples/multifon.env
+#
+# Запуск (после source examples/multifon.env):
+#   PYTHONUNBUFFERED=1 python3 examples/python-client/asr_bot.py \
+#       --mode trunk --config examples/multifon.toml
+#
+# Регистрация отдельно (для проверки):
+#   python3 examples/python-client/sip_register.py --once
+
+[core]
+worker_threads = 0
+
+[observability]
+log_level = "info"
+log_format = "pretty"
+health_bind = "127.0.0.1:8080"
+
+[sip]
+# На проде замените на публичный IP / 0.0.0.0 если провайдер шлёт INVITE снаружи.
+bind = ["0.0.0.0:5060"]
+transports = ["udp", "tcp"]
+drain_timeout_secs = 10
+
+# Outbound TCP proxy (SOCKS5 / HTTP-CONNECT) — не SIP-registrar.
+# Для SIP trunk REGISTER нужен отдельный модуль (в разработке).
+[sip.proxy]
+mode = "none"
+
+[auth]
+backend = "none"
+realm   = "multifon.ru"
+
+[media]
+# Публичный IP в SDP (c=) — иначе Megafon шлёт RTP на 192.168.x.x → no audio.
+# Должен совпадать с SIP_PUBLIC_ADDRESS (curl ifconfig.me).
+advertise_ip = "176.115.151.161"
+
+# Megafon допускает 10000–27999, но smiths-net использует только порты из SDP.
+# С DMZ на роутере отдельный проброс RTP не нужен.
+[media.rtp_ports]
+min = 10000
+# 500 RTP/RTCP pairs — scanner INVITEs без ACK и «parked» legs быстро
+# съедают узкий диапазон (10000..10039 = всего 20 пар → PortExhausted).
+max = 10999
+
+[storage]
+backend = "none"
+
+[plugins]
+dir = "plugins/examples"

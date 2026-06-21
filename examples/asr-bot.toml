@@ -1,0 +1,26 @@
+# ASR bot — smiths-net SIP/RTP + MCP-плагины (STT/LLM/TTS).
+# Прод-конфиг Megafon: examples/multifon.toml + examples/multifon.env
+# Локальная отладка:  examples/asr-bot.toml + examples/asr-bot.env
+
+[core]
+worker_threads = 0
+
+[observability]
+log_level = "info"
+log_format = "pretty"
+health_bind = "127.0.0.1:8080"
+
+[sip]
+bind = ["127.0.0.1:5060"]
+transports = ["udp"]
+drain_timeout_secs = 10
+
+[auth]
+backend = "none"
+realm   = "smiths.local"
+
+[storage]
+backend = "none"
+
+[plugins]
+dir = "plugins/examples"

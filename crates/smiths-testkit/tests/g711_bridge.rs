@@ -115,7 +115,7 @@ async fn g711_bridge_preserves_payload_and_rewrites_ssrc() {
         sleep(Duration::from_millis(20)).await;
     }
 
-    let (packets, mut ua_b) = collector.await.expect("collector joined");
+    let (packets, ua_b) = collector.await.expect("collector joined");
     assert!(
         packets.len() >= FRAMES - 2,
         "UA-B received only {} of {FRAMES} RTP frames",
@@ -153,8 +153,11 @@ async fn g711_bridge_preserves_payload_and_rewrites_ssrc() {
     let tx_tail = &wire_bytes[wire_bytes.len() - tail_len..];
     assert_eq!(rx_tail, tx_tail, "μ-law payload tail differs after bridge");
 
+    // A BYE from either leg drops the whole bridge (B2BUA semantics): the
+    // engine propagates a BYE to the peer leg, so UA-B's dialog is already
+    // torn down and no second, per-leg BYE is needed.
     ua_a.bye(RENDEZVOUS).await.expect("UA-A BYE");
-    ua_b.bye(RENDEZVOUS).await.expect("UA-B BYE");
+    let _ = ua_b;
     cancel.cancel();
     let _ = timeout(Duration::from_secs(2), engine_task).await;
 }
