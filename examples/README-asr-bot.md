@@ -87,10 +87,10 @@ gender = "female"   # female | male | neutral
 greeting = "Здравствуйте! Чем могу помочь?"
 
 [prompt]
-base = """общие правила диалога (без рода)…"""
+base = """<general dialogue rules, gender-agnostic>…"""
 
 [gender.female]
-instruction = """…только женский род о себе…"""
+instruction = """<feminine self-reference only>…"""
 ```
 
 `gender` selects the `[gender.*]` block **and** toggles deterministic

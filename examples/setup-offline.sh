@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Турнкей-установка офлайн голосового ассистента:
+# Turnkey install of the offline voice assistant:
 #   venv + faster-whisper (STT) + Silero (TTS) + llama.cpp + Gemma-2-9B (LLM).
 #
 #   bash examples/setup-offline.sh
 #
-# После установки:
-#   bash examples/start-offline-stack.sh   # llama-server + бот
-#   bash examples/test-offline.sh          # smoke-тест всех компонентов
+# After install:
+#   bash examples/start-offline-stack.sh   # llama-server + bot
+#   bash examples/test-offline.sh          # smoke-test of all components
 #
-# GPU: скрипт ставит CUDA-сборку torch и cu12-библиотеки для CTranslate2.
-# Без GPU faster-whisper/Silero сработают на CPU (медленнее) — задайте
-# FW_DEVICE=cpu / SILERO_DEVICE=cpu в examples/offline.env.
+# GPU: the script installs the CUDA build of torch and cu12 libraries for CTranslate2.
+# Without a GPU, faster-whisper/Silero run on CPU (slower) — set
+# FW_DEVICE=cpu / SILERO_DEVICE=cpu in examples/offline.env.
 
 set -euo pipefail
 
@@ -24,24 +24,24 @@ VENV="$ROOT/.venv"
 PYTHON="$VENV/bin/python"
 PIP="$VENV/bin/pip"
 
-# Gemma-2-9B-it Q4_K_M (~5.6 ГБ) — заметно лучше по-русски, чем 2B, и
-# помещается на 12 ГБ GPU рядом с whisper large-v3 (int8_float16) + Silero.
+# Gemma-2-9B-it Q4_K_M (~5.6 GB) — noticeably better in Russian than 2B, and
+# fits on a 12 GB GPU alongside whisper large-v3 (int8_float16) + Silero.
 GEMMA_GGUF="$MODELS_DIR/gemma-2-9b-it-Q4_K_M.gguf"
 GEMMA_URL="https://huggingface.co/bartowski/gemma-2-9b-it-GGUF/resolve/main/gemma-2-9b-it-Q4_K_M.gguf"
 
-# llama.cpp prebuilt. ubuntu-x64 — CPU/Vulkan; для NVIDIA замените на
-# CUDA-сборку (см. https://github.com/ggml-org/llama.cpp/releases).
+# llama.cpp prebuilt. ubuntu-x64 — CPU/Vulkan; for NVIDIA replace with a
+# CUDA build (see https://github.com/ggml-org/llama.cpp/releases).
 LLAMA_RELEASE="${LLAMA_RELEASE:-b9718}"
 LLAMA_TAR="llama-${LLAMA_RELEASE}-bin-ubuntu-x64.tar.gz"
 LLAMA_URL="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_RELEASE}/${LLAMA_TAR}"
 LLAMACPP_PORT="${LLAMACPP_PORT:-8081}"
 
-# Silero v5 русская модель (~150 МБ).
+# Silero v5 Russian model (~150 MB).
 SILERO_MODEL_URL="https://models.silero.ai/models/tts/ru/v5_5_ru.pt"
 
 log() { echo "[setup-offline] $*"; }
 
-# ── 1. Python venv + зависимости ─────────────────────────────────
+# ── 1. Python venv + dependencies ────────────────────────────────
 if [[ ! -x "$PYTHON" ]]; then
   log "creating venv at $VENV"
   python3 -m venv "$VENV"
@@ -52,8 +52,8 @@ log "installing torch (CUDA) + faster-whisper + silero…"
 "$PIP" install torch -q
 "$PIP" install faster-whisper -q
 "$PIP" install silero -q
-# CTranslate2 (внутри faster-whisper) линкует cuBLAS/cuDNN из CUDA-12;
-# torch может ставить cu13 — добавляем совместимые cu12-колёса.
+# CTranslate2 (inside faster-whisper) links cuBLAS/cuDNN from CUDA-12;
+# torch may install cu13 — add compatible cu12 wheels.
 log "installing CUDA-12 cuBLAS/cuDNN wheels for CTranslate2…"
 "$PIP" install nvidia-cublas-cu12 nvidia-cudnn-cu12 -q || \
   log "WARN: cu12 wheels failed — faster-whisper may need FW_DEVICE=cpu"
@@ -80,8 +80,8 @@ patch_shebang plugins/examples/ai-asr-faster-whisper/main.py
 patch_shebang plugins/examples/ai-tts-silero/main.py
 patch_shebang plugins/examples/ai-llm-llamacpp/main.py
 
-# faster-whisper large-v3 (~3 ГБ) скачается автоматически при первом
-# запросе в FW_DOWNLOAD_ROOT; явная предзагрузка не требуется.
+# faster-whisper large-v3 (~3 GB) downloads automatically on the first
+# request into FW_DOWNLOAD_ROOT; no explicit pre-download is needed.
 
 # ── 3. llama.cpp prebuilt + Gemma-2-9B ───────────────────────────
 mkdir -p "$MODELS_DIR"

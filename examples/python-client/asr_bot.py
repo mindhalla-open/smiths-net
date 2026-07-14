@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """ASR voice bot — smiths-net + MCP plugins (fully offline stack).
 
-Движок smiths-net запускается в режиме `--mcp stdio` и обслуживает
-SIP/RTP. Вся AI-обработка идёт локально, на GPU, через MCP-инструменты:
+The smiths-net engine runs in `--mcp stdio` mode and handles SIP/RTP.
+All AI processing runs locally, on the GPU, via MCP tools:
 
     transcribe → ai-asr-faster-whisper  (Whisper large-v3, CTranslate2)
     llm_chat   → ai-llm-llamacpp        (llama.cpp + Gemma-2-9B-it)
     synthesize → ai-tts-silero          (Silero v5 Russian)
 
-Плагины переопределяются через ASR_PLUGIN / LLM_PLUGIN / TTS_PLUGIN.
+Plugins are overridden via ASR_PLUGIN / LLM_PLUGIN / TTS_PLUGIN.
 
-Режимы:
+Modes:
 
-  **local** (по умолчанию для asr-bot.toml)
-    Бот паркуется на rendezvous `voicebot`. Звонок из второго терминала:
+  **local** (default for asr-bot.toml)
+    The bot parks on the `voicebot` rendezvous. Call it from a second terminal:
       python3 examples/python-client/voice_caller.py --out tmp/asr-bot-reply.wav
 
   **trunk** (Megafon Multifon — multifon.toml + multifon.env)
-    Исходящий REGISTER на sbc.megafon.ru, входящие INVITE на DID.
-    Бот ждёт MCP `notifications/call/created`, подключается второй
-    ногой к rendezvous-ключу (= SIP_NUMBER) и ведёт диалог.
+    Outbound REGISTER to sbc.megafon.ru, inbound INVITE on the DID.
+    The bot waits for the MCP `notifications/call/created`, joins with a
+    second leg on the rendezvous key (= SIP_NUMBER) and runs the dialogue.
 
     source examples/multifon.env
     PYTHONUNBUFFERED=1 python3 examples/python-client/asr_bot.py \\
@@ -210,7 +210,7 @@ def payload_type_for_codec(codec: str) -> int:
 
 
 class Mcp:
-    """MCP stdio-клиент с фоновым чтением notifications."""
+    """MCP stdio client with background notification reading."""
 
     def __init__(self, cmd: list[str], on_notification=None) -> None:
         self.proc = subprocess.Popen(
@@ -353,7 +353,7 @@ _filler_idx = 0
 
 def _fillers_enabled() -> bool:
     # Off by default: with a local GPU LLM the answer arrives in ~0.1-0.4 s,
-    # so a "Секундочку…" filler only adds an awkward, often-irrelevant delay.
+    # so a "Секундочку…" ("one moment") filler only adds an awkward, often-irrelevant delay.
     return os.environ.get("BOT_FILLERS_ENABLE", "0").lower() in ("1", "true", "yes", "on")
 
 
@@ -971,7 +971,7 @@ def converse(
     # not an arbitrary counter; still bounded to avoid a runaway loop.
     if max_turns is None:
         max_turns = int(os.environ.get("BOT_MAX_TURNS", "200"))
-    # How many consecutive silent turns before giving up ("вас не слышно").
+    # How many consecutive silent turns before giving up (the "can't hear you" message).
     # 2 was too trigger-happy on a shaky start; allow one more grace turn.
     if idle_turns_max is None:
         idle_turns_max = int(os.environ.get("BOT_IDLE_TURNS_MAX", "3"))
@@ -986,7 +986,7 @@ def converse(
         greeting = greeting_text()
         # Lead-in silence: on symmetric-RTP trunks the relay/carrier pinhole may
         # still be latching when the greeting starts, clipping the first word
-        # ("иногда не слышно начала"). A short silence pad absorbs that clip so
+        # (the first word is sometimes inaudible). A short silence pad absorbs that clip so
         # the greeting itself is always heard intact. Tunable; 0 to disable.
         lead = _silence_wire(
             uac.payload_type, float(os.environ.get("GREETING_LEAD_SILENCE_SECS", "0.3"))
@@ -1274,8 +1274,8 @@ def preflight_network(engine_port: int = 5060) -> None:
         print(f"[bot] local SIP probe 127.0.0.1:{engine_port} → {status}")
     elif last_err:
         print(
-            f"[bot] WARNING: smiths-net не отвечает на :{engine_port} ({last_err}) "
-            "— входящие INVITE не дойдут; проверьте: ss -ulnp | grep 5060"
+            f"[bot] WARNING: smiths-net not responding on :{engine_port} ({last_err}) "
+            "— inbound INVITEs won't arrive; check: ss -ulnp | grep 5060"
         )
 
     if pub:

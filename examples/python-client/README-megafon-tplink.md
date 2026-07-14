@@ -1,13 +1,13 @@
 # Megafon + TP-Link TL-WR844N
 
-Роутер **TL-WR844N** в разделе **Advanced → NAT Forwarding → Port Forwarding**
-принимает только **один порт** в External/Internal Port. Формат `10000-27999` не работает.
+The **TL-WR844N** router, under **Advanced → NAT Forwarding → Port Forwarding**,
+accepts only **a single port** in External/Internal Port. The `10000-27999` range format does not work.
 
-## Вариант A — Port Forwarding (8 правил)
+## Option A — Port Forwarding (8 rules)
 
-Зарезервируйте IP ПК: **192.168.0.109**
+Reserve the PC's IP: **192.168.0.109**
 
-**Advanced → NAT Forwarding → Port Forwarding → Add** — для каждой строки:
+**Advanced → NAT Forwarding → Port Forwarding → Add** — for each row:
 
 | External Port | Internal Port | Device IP     | Protocol |
 |---------------|---------------|---------------|----------|
@@ -18,19 +18,19 @@
 | …             | …             | …             | UDP      |
 | 10013         | 10013         | 192.168.0.109 | UDP      |
 
-Порты RTP **10000–10013** заданы в `examples/multifon.toml` (14 портов = 7 RTP-сессий).
+RTP ports **10000–10013** are set in `examples/multifon.toml` (14 ports = 7 RTP sessions).
 
-Лимит роутера — **~16 правил**; не тратьте слоты на лишнее.
+The router's limit is **~16 rules**; don't waste slots on anything extra.
 
-## Вариант B — DMZ (проще, менее безопасно)
+## Option B — DMZ (simpler, less secure)
 
 **Advanced → NAT Forwarding → DMZ → Enable**
 
 DMZ Host IP: **192.168.0.109**
 
-Все входящие порты пойдут на ПК. Удобно для проверки; после теста лучше вернуться к варианту A.
+All inbound ports go to the PC. Handy for testing; after the test it's better to return to Option A.
 
-## Проверка
+## Verification
 
 ```bash
 source examples/multifon.env
@@ -38,4 +38,4 @@ python3 examples/python-client/sip_register.py --once
 PYTHONUNBUFFERED=1 python3 examples/python-client/asr_bot.py --mode trunk
 ```
 
-Звонок на номер из `SIP_NUMBER`.
+Call the number in `SIP_NUMBER`.

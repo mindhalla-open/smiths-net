@@ -1526,7 +1526,7 @@ impl<T: Transport> UasServer<T> {
     /// This makes the bridge behave like a B2BUA: a hang-up on either
     /// side terminates both. We reconstruct an in-dialog BYE from the
     /// stored tags — the engine never originated a request in this
-    /// dialog, so CSeq starts at 1; the remote matches on
+    /// dialog, so `CSeq` starts at 1; the remote matches on
     /// Call-ID + tags regardless of the Request-URI.
     async fn bye_peer_leg(&self, key: &DialogKey) {
         let Some((_, record)) = self.dialogs.remove(key) else {
@@ -1537,10 +1537,7 @@ impl<T: Transport> UasServer<T> {
             .replicate(smiths_core::DialogDelta::Delete(key.clone()));
         self.cancel_invite_2xx_retransmit(key);
 
-        let via = self
-            .transport
-            .local_addr()
-            .unwrap_or(record.peer_signal);
+        let via = self.transport.local_addr().unwrap_or(record.peer_signal);
         let branch = format!("z9hG4bK{}", next_tag());
         let peer_uri = format!("sip:{}", record.peer_signal);
         let bye = build_peer_bye(&PeerByeFields {
@@ -2229,7 +2226,7 @@ struct PeerByeFields<'a> {
 }
 
 /// Build a minimal RFC 3261 in-dialog BYE the engine sends to drop a
-/// bridged peer leg. CSeq is fixed at 1: the engine never originates a
+/// bridged peer leg. `CSeq` is fixed at 1: the engine never originates a
 /// request in these (inbound, UAS-accepted) dialogs, so 1 is always
 /// fresh in its own sequence space.
 fn build_peer_bye(f: &PeerByeFields<'_>) -> Vec<u8> {

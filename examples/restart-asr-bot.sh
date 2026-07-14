@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Перезапуск ASR-бота (Megafon trunk mode) — foreground, лог в терминале.
+# Restart the ASR bot (Megafon trunk mode) — foreground, logs to the terminal.
 #
 #   bash examples/restart-asr-bot.sh
 #
-# Останавливает running-экземпляр (если есть) и запускает новый.
-# Вывод дублируется в /tmp/asr-bot.log (или ASR_BOT_LOG=...).
-# Ctrl+C — остановить бота.
+# Stops the running instance (if any) and starts a new one.
+# Output is also duplicated to /tmp/asr-bot.log (or ASR_BOT_LOG=...).
+# Ctrl+C — stop the bot.
 
 set -euo pipefail
 

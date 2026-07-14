@@ -1,20 +1,20 @@
-# Конфигурация голосового ассистента: промпт, род, приветствие.
-# Путь: BOT_CONFIG=examples/bot.toml или --bot-config examples/bot.toml
+# Voice assistant configuration: prompt, gender, greeting.
+# Path: BOT_CONFIG=examples/bot.toml or --bot-config examples/bot.toml
 #
-# Переменные окружения (приоритет выше файла):
-#   BOT_SYSTEM_PROMPT — полный системный промпт (игнорирует [prompt])
-#   BOT_GREETING      — приветствие
-#   BOT_FEMINIZE      — постобработка рода (0/1); иначе следует [bot].gender
+# Environment variables (take priority over the file):
+#   BOT_SYSTEM_PROMPT — full system prompt (ignores [prompt])
+#   BOT_GREETING      — greeting
+#   BOT_FEMINIZE      — gender post-processing (0/1); otherwise follows [bot].gender
 
 [bot]
-# Род ассистента: female | male | neutral
+# Assistant gender: female | male | neutral
 gender = "female"
 
-# Озвучивается один раз в начале звонка (до первого ответа LLM).
+# Spoken once at the start of the call (before the first LLM reply).
 greeting = "Здравствуйте! Чем могу помочь?"
 
 [prompt]
-# Общие правила диалога (без указания рода — он задаётся в [gender.*]).
+# Common dialogue rules (gender-agnostic — gender is set in [gender.*]).
 base = """
 Ты — голосовой ассистент. Говоришь с человеком по телефону на русском языке.
 Веди живой, естественный диалог: отвечай по существу вопроса, помогай и при

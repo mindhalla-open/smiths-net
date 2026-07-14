@@ -111,7 +111,7 @@ def main() -> int:
                 "[caller] warning: reply very short — "
                 "is the bot running? try `--listen-secs 45` for OpenAI latency"
             )
-        # 48 kHz — desktop-плееры Ubuntu часто не воспроизводят 8 kHz WAV.
+        # 48 kHz — Ubuntu desktop players often won't play 8 kHz WAV.
         playback_hz = 48_000
         pcm_playback = upsample_pcm16(pcm, 8000, playback_hz)
         write_wav_mono_pcm16(args.out, pcm_playback, sample_rate=playback_hz)

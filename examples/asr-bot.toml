@@ -1,6 +1,6 @@
-# ASR bot — smiths-net SIP/RTP + MCP-плагины (STT/LLM/TTS).
-# Прод-конфиг Megafon: examples/multifon.toml + examples/multifon.env
-# Локальная отладка:  examples/asr-bot.toml + examples/asr-bot.env
+# ASR bot — smiths-net SIP/RTP + MCP plugins (STT/LLM/TTS).
+# Production config (Megafon): examples/multifon.toml + examples/multifon.env
+# Local debugging:             examples/asr-bot.toml + examples/asr-bot.env
 
 [core]
 worker_threads = 0
