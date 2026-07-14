@@ -452,7 +452,7 @@ priority = ["ai-tts-piper", "ai-tts-openai"]
 [ai.asr]
 priority = ["ai-asr-whisper", "ai-asr-deepgram"]
 [ai.llm.chat]
-priority = ["ai-llm-ollama", "ai-llm-anthropic", "ai-llm-openai"]
+priority = ["ai-llm-llamacpp", "ai-llm-ollama", "ai-llm-anthropic", "ai-llm-openai"]
 ```
 
 Selection: first provider that is (a) healthy (recent success rate

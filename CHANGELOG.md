@@ -5,6 +5,45 @@ All notable changes to **smiths-net** are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Adaptive playout jitter buffer** in `smiths-softphone`
+  (`src/jitter.rs`). Received RTP now passes through a de-jitter stage
+  before the speaker instead of being played in arrival order. It
+  reorders packets by RTP sequence number, drops duplicates and late
+  arrivals, conceals lost packets (the last good frame faded toward
+  silence over a loss burst), resyncs the play head over large
+  discontinuities, and adapts its playout depth — widening the cushion
+  and re-buffering under sustained starvation, then narrowing again
+  after a clean run to give the latency back. The buffer is I/O-free
+  (no sockets, codec, or clock) and unit-tested across 9 cases, so it
+  can later move into `smiths-media` for reuse by other playout /
+  transcode endpoints. Previously the receive path decoded each RTP
+  packet's sequence number and discarded it, so reorders played out of
+  order, duplicates played twice, and loss compressed the timeline —
+  all audible on a real network.
+
+### Changed
+
+- `smiths-softphone` now separates RTP receive from playout: `recv_loop`
+  only decodes PCMU and enqueues by sequence, and a new 20 ms
+  `playout_loop` releases frames from the jitter buffer to the speaker
+  queue. A one-line jitter summary (inserted / played / concealed / dup
+  / late / overflow / resync / rebuffer) prints on hang-up.
+- **README**: corrected the project status from "design phase" to the
+  actual pre-1.0, actively-developed state, and named the outstanding
+  media-plane work.
+- **llama.cpp** is now surfaced as a first-class local LLM provider
+  alongside Ollama: added to the README capability list and the
+  `smiths-net --version` AI capability banner, added to the `[ai.llm.chat]`
+  priority example in `docs/architecture/05-ai-plugin-protocol.md`, and
+  the `ai-llm-llamacpp` `plugin.toml` description expanded to match the
+  `ai-llm-ollama` style (env overrides, priority/failover ordering). The
+  `ai-llm-llamacpp` sidecar itself already shipped with the offline voice
+  assistant.
+
 ## [0.73.0] - 2026-04-24
 
 **`smiths-net init` config wizard — first-run onboarding.**

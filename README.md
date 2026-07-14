@@ -2,7 +2,11 @@
 
 A lightweight, AI-first SIP engine with dynamic plugins in any language.
 
-**Status**: design phase.
+**Status**: pre-1.0, under active development. The core is implemented and
+exercised end-to-end — RFC 3261 signaling (UDP/TCP/TLS), an RTP/SRTP/DTLS media
+bridge, WASM + sidecar plugins, the MCP control plane, and an HA Raft cluster all
+ship today (see [CHANGELOG.md](CHANGELOG.md)). Some media-plane polish — notably
+an adaptive jitter buffer for playout endpoints — is still outstanding.
 
 ## What it is
 
@@ -20,9 +24,9 @@ more. Everything else — routing, auth, AI features, storage — lives in
     plugins; any language at all (Python, Node, Go, Java).
 - **AI-first control plane** — embedded [MCP][mcp] server: LLM agents
   drive the engine through typed tools and resources.
-- **Capability-based plugins** — local AI (Whisper, Piper, Ollama) and
-  cloud AI (OpenAI, Anthropic, Gemini) are both just plugins declaring
-  `ai.*` capabilities. Local-first by default.
+- **Capability-based plugins** — local AI (Whisper, Piper, Ollama,
+  llama.cpp) and cloud AI (OpenAI, Anthropic, Gemini) are both just
+  plugins declaring `ai.*` capabilities. Local-first by default.
 - **Pluggable storage** — SQL, KV, document, vector, time-series all
   behind the same trait set.
 

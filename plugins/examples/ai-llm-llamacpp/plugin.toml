@@ -4,4 +4,4 @@ type        = "sidecar"
 entry       = "./main.py"
 provides    = ["ai.llm.chat"]
 abi         = "1.0"
-description = "llama.cpp server (OpenAI-compatible /v1/chat/completions) sidecar for local Gemma/Llama models. Set LLAMACPP_HOST + LLAMACPP_MODEL."
+description = "llama.cpp `llama-server` (OpenAI-compatible /v1/chat/completions) sidecar for local Gemma/Llama GGUF models — fully offline once the model is loaded. Set LLAMACPP_HOST + LLAMACPP_MODEL (optional LLAMACPP_API_KEY) to override. Advertises priority 18 so the dispatcher prefers it over ai-llm-ollama (20) and the mock (50)."

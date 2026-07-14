@@ -27,6 +27,7 @@
 mod audio;
 mod codec;
 mod effect;
+mod jitter;
 mod rtp;
 mod sip;
 mod stun;
@@ -48,6 +49,7 @@ use tracing::warn;
 use audio::{AudioIo, pop_frame, push_samples};
 use codec::{FRAME_MS, FRAME_SAMPLES, pcm16_to_pcmu, pcmu_to_pcm16};
 use effect::{Voice, VoiceChanger};
+use jitter::JitterBuffer;
 use rtp::{PT_PCMU, RtpPacket};
 use sip::{SipUac, detect_local_ip};
 
@@ -267,17 +269,37 @@ async fn run_call(
         audio.capture(),
         Arc::clone(&changer),
     ));
-    let recv = tokio::spawn(recv_loop(Arc::clone(&rtp_sock), audio.playback()));
+    // Received RTP flows through an adaptive jitter buffer (reorder,
+    // de-dup, loss concealment) before reaching the speaker queue.
+    let jitter = Arc::new(Mutex::new(JitterBuffer::new(FRAME_SAMPLES)));
+    let recv = tokio::spawn(recv_loop(Arc::clone(&rtp_sock), Arc::clone(&jitter)));
+    let playout = tokio::spawn(playout_loop(Arc::clone(&jitter), audio.playback()));
     let switch = tokio::spawn(voice_switch_loop(Arc::clone(&changer)));
 
     tokio::signal::ctrl_c().await.context("wait for Ctrl-C")?;
     println!("Hanging up …");
     send.abort();
     recv.abort();
+    playout.abort();
     switch.abort();
     if let Err(e) = uac.bye().await {
         warn!(?e, "BYE failed");
     }
+    let s = jitter.lock().expect("jitter mutex").stats();
+    println!(
+        "Jitter buffer: {} inserted, {} played, {} concealed (loss {}, \
+         starve {}), {} dup, {} late, {} overflow, {} resync, {} rebuffer.",
+        s.inserted,
+        s.played,
+        s.concealed_loss + s.concealed_starve,
+        s.concealed_loss,
+        s.concealed_starve,
+        s.duplicates,
+        s.late,
+        s.overflow,
+        s.resyncs,
+        s.rebuffers,
+    );
     println!("Done.");
     Ok(())
 }
@@ -437,9 +459,11 @@ async fn send_loop(
     }
 }
 
-/// Receive RTP, μ-law-decode PCMU payloads, and queue them for the
-/// speaker. Non-PCMU / malformed packets are dropped.
-async fn recv_loop(sock: Arc<UdpSocket>, playback: audio::Samples) {
+/// Receive RTP, μ-law-decode PCMU payloads, and hand each frame to the
+/// jitter buffer keyed by its RTP sequence number. Non-PCMU / malformed
+/// packets are dropped. Playout (reordering, de-dup, loss concealment,
+/// and the actual hand-off to the speaker) happens in `playout_loop`.
+async fn recv_loop(sock: Arc<UdpSocket>, jitter: Arc<Mutex<JitterBuffer>>) {
     let mut buf = vec![0u8; 2048];
     loop {
         let n = match sock.recv_from(&mut buf).await {
@@ -456,6 +480,27 @@ async fn recv_loop(sock: Arc<UdpSocket>, playback: audio::Samples) {
             continue;
         }
         let pcm = pcmu_to_pcm16(&pkt.payload);
-        push_samples(&playback, &pcm);
+        jitter
+            .lock()
+            .expect("jitter mutex")
+            .insert(pkt.sequence, pcm);
+    }
+}
+
+/// Release one frame from the jitter buffer every 20 ms and queue it for
+/// the speaker. The buffer emits `None` while priming its initial
+/// cushion, so the speaker plays silence until enough audio is buffered
+/// to ride out network jitter.
+async fn playout_loop(jitter: Arc<Mutex<JitterBuffer>>, playback: audio::Samples) {
+    let mut tick = interval(Duration::from_millis(FRAME_MS));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        // Hold the lock only for the synchronous pop — never across the
+        // await above.
+        let frame = jitter.lock().expect("jitter mutex").tick();
+        if let Some(pcm) = frame {
+            push_samples(&playback, &pcm);
+        }
     }
 }

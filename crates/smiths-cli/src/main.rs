@@ -84,7 +84,7 @@ const LONG_VERSION: &str = const_format::concatcp!(
     "\n",
     "storage: cdr+kv (sqlite), vector (memory), recording (fs), auth (sqlite+http)",
     "\n",
-    "ai: dispatcher, ollama/openai/anthropic refs, whisper.cpp ref, piper ref",
+    "ai: dispatcher, ollama/llamacpp/openai/anthropic refs, whisper.cpp ref, piper ref",
     "\n",
     "plugin tiers: sidecar, wasm, script (rhai)"
 );
