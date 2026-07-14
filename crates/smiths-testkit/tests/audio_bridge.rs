@@ -122,7 +122,7 @@ async fn two_uas_call_preserves_audio_byte_for_byte() {
     }
 
     // Stop collector (it returns UA-B so we can BYE it later).
-    let (packets, mut ua_b) = collector.await.expect("collector joined");
+    let (packets, ua_b) = collector.await.expect("collector joined");
 
     // rtp_target_b is used implicitly — UA-B listens on its own RTP socket,
     // but the engine sends to UA-B via its own leg-B socket (which points
@@ -156,9 +156,12 @@ async fn two_uas_call_preserves_audio_byte_for_byte() {
     let pcm_received = pcmu_to_pcm16(&received);
     write_mono_pcm16(Path::new(OUT_WAV), 8_000, &pcm_received).expect("wav write");
 
-    // Tear down dialogs; engine stops the bridge.
+    // Tear down the call. A BYE from *either* leg now drops the whole
+    // bridge (B2BUA semantics): the engine releases the media bridge and
+    // propagates a BYE to the peer leg, so UA-B's dialog is already gone
+    // and no second, per-leg BYE is required.
     ua_a.bye(RENDEZVOUS).await.expect("UA-A BYE");
-    ua_b.bye(RENDEZVOUS).await.expect("UA-B BYE");
+    let _ = ua_b;
 
     cancel.cancel();
     let _ = timeout(Duration::from_secs(2), engine_task).await;

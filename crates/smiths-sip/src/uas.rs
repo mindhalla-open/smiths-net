@@ -264,6 +264,9 @@ pub struct UasServer<T: Transport> {
     /// IP to bind RTP sockets on. Mirrors the signaling transport's
     /// local IP.
     media_bind_ip: IpAddr,
+    /// When set, published in SDP answers instead of [`media_bind_ip`]
+    /// or the routing-table guess — required for NAT/DMZ trunk setups.
+    sdp_advertise_ip: Option<IpAddr>,
     /// First-come leg of a rendezvous bridge, keyed by Request-URI
     /// user-part. The second `INVITE` with the same key pairs with it.
     pending_bridges: Arc<DashMap<String, PendingLeg>>,
@@ -388,6 +391,7 @@ impl<T: Transport> UasServer<T> {
             media_fabric,
             negotiator,
             media_bind_ip: local.ip(),
+            sdp_advertise_ip: None,
             pending_bridges: Arc::new(DashMap::new()),
             bridges_by_dialog: Arc::new(DashMap::new()),
             dialog_sessions: DialogSessions::new(),
@@ -475,6 +479,13 @@ impl<T: Transport> UasServer<T> {
     #[must_use]
     pub fn with_response_router(mut self, router: Arc<crate::ResponseRouter>) -> Self {
         self.response_router = Some(router);
+        self
+    }
+
+    /// Override the IP address embedded in SDP answers (NAT / DMZ).
+    #[must_use]
+    pub fn with_sdp_advertise_ip(mut self, ip: IpAddr) -> Self {
+        self.sdp_advertise_ip = Some(ip);
         self
     }
 
@@ -681,6 +692,12 @@ impl<T: Transport> UasServer<T> {
     }
 
     async fn handle_request(&self, req: RequestSummary, peer: SocketAddr) {
+        info!(
+            %peer,
+            method = %req.method,
+            call_id = req.call_id.as_deref().unwrap_or("-"),
+            "SIP request received"
+        );
         self.metrics
             .sip_requests
             .get_or_create(&SipMethodLabel {
@@ -969,7 +986,9 @@ impl<T: Transport> UasServer<T> {
                 // kernel which local address it would use to reach `peer`
                 // and publish *that* in SDP — otherwise the remote UA
                 // tries to sendto(0.0.0.0) and fails.
-                let effective_local_ip = resolve_local_ip_for(self.media_bind_ip, peer).await;
+                let effective_local_ip = self
+                    .sdp_advertise_ip
+                    .unwrap_or(resolve_local_ip_for(self.media_bind_ip, peer).await);
                 // Slice 5.1 / P11: call the multi-stream path with
                 // `video_port = None`. The negotiator preserves m-line
                 // ordering when the offer carries `m=video` by emitting
@@ -1445,9 +1464,22 @@ impl<T: Transport> UasServer<T> {
                 // second BYE finds no entry and the fabric release is
                 // idempotent.
                 if let Some((_, bid)) = self.bridges_by_dialog.remove(&key) {
+                    // Find the *other* leg sharing this bridge before we
+                    // drop its entry — releasing only the media bridge
+                    // leaves the peer's SIP dialog up (it hears silence
+                    // but the call never drops). Propagate the hang-up so
+                    // a BYE from either leg ends the whole call.
+                    let peer_key = self
+                        .bridges_by_dialog
+                        .iter()
+                        .find(|e| *e.value() == bid)
+                        .map(|e| e.key().clone());
                     self.bridges_by_dialog.retain(|_, other| *other != bid);
                     self.media_fabric.release_bridge(bid).await;
                     debug!(call_id = %record.call_id, "rendezvous bridge stopped");
+                    if let Some(pk) = peer_key {
+                        self.bye_peer_leg(&pk).await;
+                    }
                 }
                 // Slice 5.6c: drain any non-passthrough sessions
                 // (transcoded, and later FAX / conference) that
@@ -1483,6 +1515,70 @@ impl<T: Transport> UasServer<T> {
                 .await;
             }
         }
+    }
+
+    /// End the *other* leg of a torn-down bridge by originating a BYE
+    /// toward its peer, then release its dialog + media.
+    ///
+    /// When one bridged leg sends BYE the engine only releases the
+    /// media bridge; the surviving leg's SIP dialog stays Confirmed and
+    /// the call never actually drops (the remote just hears silence).
+    /// This makes the bridge behave like a B2BUA: a hang-up on either
+    /// side terminates both. We reconstruct an in-dialog BYE from the
+    /// stored tags — the engine never originated a request in this
+    /// dialog, so `CSeq` starts at 1; the remote matches on
+    /// Call-ID + tags regardless of the Request-URI.
+    async fn bye_peer_leg(&self, key: &DialogKey) {
+        let Some((_, record)) = self.dialogs.remove(key) else {
+            return;
+        };
+        self.metrics.dialogs_active.dec();
+        self.replicator
+            .replicate(smiths_core::DialogDelta::Delete(key.clone()));
+        self.cancel_invite_2xx_retransmit(key);
+
+        let via = self.transport.local_addr().unwrap_or(record.peer_signal);
+        let branch = format!("z9hG4bK{}", next_tag());
+        let peer_uri = format!("sip:{}", record.peer_signal);
+        let bye = build_peer_bye(&PeerByeFields {
+            request_uri: &peer_uri,
+            via_sent_by: via,
+            branch: &branch,
+            from_uri: &format!("<sip:smiths@{via}>"),
+            from_tag: &record.local_tag,
+            to_uri: &format!("<{peer_uri}>"),
+            to_tag: &record.remote_tag,
+            call_id: &record.call_id,
+        });
+        // Fire-and-forget the BYE with a couple of UDP retransmits: the
+        // dialog is already removed locally, so we don't process the
+        // peer's 200, but a single lost datagram would otherwise leave
+        // the far end ringing. Duplicate BYEs are harmless (200 then 481).
+        let bye = Bytes::from(bye);
+        let transport = Arc::clone(&self.transport);
+        let dest = record.peer_signal;
+        let call_id = record.call_id.clone();
+        tokio::spawn(async move {
+            for attempt in 0..3u8 {
+                if let Err(e) = transport.send(bye.clone(), dest).await {
+                    warn!(peer = %dest, ?e, "failed to BYE bridged peer leg");
+                    break;
+                }
+                debug!(%call_id, peer = %dest, attempt, "BYE → bridged peer leg");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+
+        for session in self.dialog_sessions.remove_dialog(key) {
+            session.stop().await;
+        }
+        if let Some(ep) = record.media {
+            self.media_fabric.release_endpoint(ep).await;
+        }
+        self.emit_cdr_for(key, "answered");
+        let _ = self.bus.publish(Event::Sip(SipEvent::DialogTerminated {
+            call_id: record.call_id,
+        }));
     }
 
     /// Pop the CDR-in-progress entry for `key`, compose a full
@@ -2115,6 +2211,44 @@ async fn resolve_local_ip_for(bind_ip: IpAddr, peer: SocketAddr) -> IpAddr {
         SocketAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         SocketAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
     }
+}
+
+/// Fields for an engine-originated in-dialog BYE on a bridged peer leg.
+struct PeerByeFields<'a> {
+    request_uri: &'a str,
+    via_sent_by: SocketAddr,
+    branch: &'a str,
+    from_uri: &'a str,
+    from_tag: &'a str,
+    to_uri: &'a str,
+    to_tag: &'a str,
+    call_id: &'a str,
+}
+
+/// Build a minimal RFC 3261 in-dialog BYE the engine sends to drop a
+/// bridged peer leg. `CSeq` is fixed at 1: the engine never originates a
+/// request in these (inbound, UAS-accepted) dialogs, so 1 is always
+/// fresh in its own sequence space.
+fn build_peer_bye(f: &PeerByeFields<'_>) -> Vec<u8> {
+    format!(
+        "BYE {ruri} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {via};branch={branch};rport\r\n\
+         Max-Forwards: 70\r\n\
+         From: {from};tag={ftag}\r\n\
+         To: {to};tag={ttag}\r\n\
+         Call-ID: {cid}\r\n\
+         CSeq: 1 BYE\r\n\
+         Content-Length: 0\r\n\r\n",
+        ruri = f.request_uri,
+        via = f.via_sent_by,
+        branch = f.branch,
+        from = f.from_uri,
+        ftag = f.from_tag,
+        to = f.to_uri,
+        ttag = f.to_tag,
+        cid = f.call_id,
+    )
+    .into_bytes()
 }
 
 /// Monotonic, process-unique tag for `From` / `To`.

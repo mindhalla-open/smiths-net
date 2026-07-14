@@ -3,5 +3,10 @@
 /.claude
 /target
 /tmp
+.venv
+examples/multifon.env
+examples/asr-bot.env
+examples/salute.env
+examples/offline.env
 
 .DS_Store

@@ -477,6 +477,16 @@ async fn main() -> anyhow::Result<()> {
         (None, None)
     };
 
+    let sdp_advertise_ip = config
+        .media
+        .advertise_ip
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok());
+    if let Some(ip) = sdp_advertise_ip {
+        info!(%ip, "SDP answers will advertise public media IP");
+    }
+
     // ---- HA Replication (slice 6.2) ----
     let mut replicator: Arc<dyn smiths_core::Replicator> = Arc::new(smiths_core::NoopReplicator);
     let mut dialogs_shared: Option<
@@ -547,6 +557,7 @@ async fn main() -> anyhow::Result<()> {
             dialogs_shared.as_ref().map(Arc::clone),
             Some(Arc::clone(&conference_orchestrator)),
             conference_prefix.clone(),
+            sdp_advertise_ip,
         )
         .await
         {
@@ -918,6 +929,7 @@ async fn main() -> anyhow::Result<()> {
                 dialogs_shared.as_ref().map(Arc::clone),
                 Some(Arc::clone(&conference_orchestrator)),
                 conference_prefix.clone(),
+                sdp_advertise_ip,
             )
             .await
             {
@@ -946,6 +958,7 @@ async fn main() -> anyhow::Result<()> {
                 &config_snapshot.sip.proxy,
                 Arc::clone(&replicator),
                 dialogs_shared.as_ref().map(Arc::clone),
+                sdp_advertise_ip,
             )
             .await
             {
@@ -970,6 +983,7 @@ async fn main() -> anyhow::Result<()> {
                 registrar.clone(),
                 Arc::clone(&replicator),
                 dialogs_shared.as_ref().map(Arc::clone),
+                sdp_advertise_ip,
             )
             .await
             {
@@ -1501,6 +1515,7 @@ async fn spawn_sip_udp(
     >,
     conference_orchestrator: Option<Arc<dyn smiths_sip::ConferenceOrchestrator>>,
     conference_prefix: Option<String>,
+    sdp_advertise_ip: Option<std::net::IpAddr>,
 ) -> anyhow::Result<SpawnedSipUdp> {
     let transport = UdpTransport::bind(bind)
         .await
@@ -1527,6 +1542,9 @@ async fn spawn_sip_udp(
     .with_drain(drain.clone())
     .with_rate_limit(rate_limit.clone())
     .with_replicator(replicator);
+    if let Some(ip) = sdp_advertise_ip {
+        server = server.with_sdp_advertise_ip(ip);
+    }
     if let Some(orch) = conference_orchestrator {
         server = server.with_conference_orchestrator(orch);
         if let Some(prefix) = conference_prefix {
@@ -1596,6 +1614,7 @@ async fn spawn_sip_tls(
     dialogs_shared: Option<
         Arc<dashmap::DashMap<smiths_core::DialogKey, smiths_core::DialogRecord>>,
     >,
+    sdp_advertise_ip: Option<std::net::IpAddr>,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let transport = TlsTransport::bind(bind, cert, key)
         .await
@@ -1613,6 +1632,9 @@ async fn spawn_sip_tls(
         .with_drain(drain)
         .with_rate_limit(rate_limit)
         .with_replicator(replicator);
+    if let Some(ip) = sdp_advertise_ip {
+        server = server.with_sdp_advertise_ip(ip);
+    }
     if let Some(d) = dialogs_shared {
         server = server.with_dialogs(d);
     }
@@ -1639,6 +1661,7 @@ async fn spawn_sip_tcp(
     dialogs_shared: Option<
         Arc<dashmap::DashMap<smiths_core::DialogKey, smiths_core::DialogRecord>>,
     >,
+    sdp_advertise_ip: Option<std::net::IpAddr>,
 ) -> anyhow::Result<Vec<JoinHandle<()>>> {
     let mut transport = TcpTransport::bind(bind)
         .await
@@ -1666,6 +1689,9 @@ async fn spawn_sip_tcp(
         .with_drain(drain)
         .with_rate_limit(rate_limit)
         .with_replicator(replicator);
+    if let Some(ip) = sdp_advertise_ip {
+        server = server.with_sdp_advertise_ip(ip);
+    }
     if let Some(d) = dialogs_shared {
         server = server.with_dialogs(d);
     }

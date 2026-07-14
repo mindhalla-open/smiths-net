@@ -1,0 +1,7 @@
+name        = "ai-asr-faster-whisper"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./main.py"
+provides    = ["ai.asr"]
+abi         = "1.0"
+description = "faster-whisper (CTranslate2) neural ASR on GPU. High accuracy on noisy 8 kHz telephony, fully offline once the model is cached. Set FW_MODEL/FW_DEVICE; priority 22 so it beats Vosk (18) and whisper.cpp (20)."

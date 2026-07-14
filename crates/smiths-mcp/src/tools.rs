@@ -1522,6 +1522,7 @@ impl Tool for TranscribeTool {
                 "audio_base64": { "type": "string", "description": "Base64 of PCM16 LE bytes." },
                 "sample_rate":  { "type": "integer", "description": "Audio sample rate in Hz (default 8000)." },
                 "language":     { "type": "string",  "description": "BCP-47 tag or `auto`." },
+                "codec":        { "type": "string",  "description": "Audio codec of audio_base64 (e.g. pcm_s16le, pcma, pcmu). Default pcm_s16le." },
                 "controls":     { "type": "object",  "description": "Provider-specific controls." }
             },
             "required": ["plugin", "audio_base64"],
@@ -1544,6 +1545,7 @@ impl Tool for TranscribeTool {
             "audio_base64": audio,
             "sample_rate": args.get("sample_rate"),
             "language": args.get("language"),
+            "codec": args.get("codec"),
             "controls": args.get("controls"),
         });
         entry

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 
 from smiths_client import (
@@ -24,6 +25,8 @@ from smiths_client import (
     pcm16_to_pcmu,
     pcmu_to_pcm16,
     read_wav_mono_pcm16_8k,
+    upsample_pcm16,
+    write_wav_mono_pcm16,
     write_wav_mono_pcm16_8k,
 )
 
@@ -50,8 +53,14 @@ def main() -> int:
     ap.add_argument(
         "--listen-secs",
         type=float,
-        default=8.0,
-        help="Max time to wait for the agent's reply.",
+        default=45.0,
+        help="Max time to wait for the agent's reply (default: 45).",
+    )
+    ap.add_argument(
+        "--quiet-secs",
+        type=float,
+        default=0.6,
+        help="Stop recording after this much silence once audio arrives (default: 0.6).",
     )
     args = ap.parse_args()
 
@@ -70,27 +79,56 @@ def main() -> int:
     # Small delay so the agent's parked leg is definitely bridged.
     time.sleep(0.3)
 
+    # Record in a background thread while we stream the greeting. The bot
+    # needs several seconds for STT → LLM → TTS; if we only start
+    # recording after we finish speaking, we'd miss the reply window.
+    received: list[bytes] = []
+
+    def _record() -> None:
+        received.append(
+            uac.record_pcmu(args.listen_secs, quiet_secs=args.quiet_secs)
+        )
+
+    rec = threading.Thread(target=_record, daemon=True)
+    rec.start()
+    time.sleep(0.05)
+
     print(f"[caller] streaming {len(greeting) // 2} samples as PCMU RTP…")
     uac.stream_pcmu(pcm16_to_pcmu(greeting))
 
-    print(f"[caller] listening for agent reply for up to {args.listen_secs:.1f} s…")
-    reply_wire = uac.record_pcmu(max_seconds=args.listen_secs)
+    print(f"[caller] waiting for agent reply (up to {args.listen_secs:.1f} s)…")
+    rec.join(timeout=args.listen_secs + 2.0)
+    reply_wire = received[0] if received else b""
     print(
         f"[caller] captured {len(reply_wire)} μ-law bytes "
         f"({len(reply_wire) / 8000:.2f} s)"
     )
 
-    try:
-        uac.bye(RENDEZVOUS)
-    finally:
-        uac.close()
-
     if reply_wire:
         pcm = pcmu_to_pcm16(reply_wire)
-        write_wav_mono_pcm16_8k(args.out, pcm)
-        print(f"[caller] reply written to {args.out}")
+        if len(pcm) < 3200:
+            print(
+                "[caller] warning: reply very short — "
+                "is the bot running? try `--listen-secs 45` for OpenAI latency"
+            )
+        # 48 kHz — Ubuntu desktop players often won't play 8 kHz WAV.
+        playback_hz = 48_000
+        pcm_playback = upsample_pcm16(pcm, 8000, playback_hz)
+        write_wav_mono_pcm16(args.out, pcm_playback, sample_rate=playback_hz)
+        print(
+            f"[caller] reply written to {args.out} "
+            f"({len(pcm_playback) / (playback_hz * 2):.2f} s @ {playback_hz} Hz)"
+        )
+        print(f"[caller] play: aplay {args.out}")
     else:
         print("[caller] no audio received from the agent")
+
+    try:
+        uac.bye(RENDEZVOUS)
+    except Exception as e:
+        print(f"[caller] BYE failed (non-fatal): {e}")
+    finally:
+        uac.close()
 
     return 0
 
