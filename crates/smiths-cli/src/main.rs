@@ -1544,6 +1544,10 @@ async fn spawn_sip_udp(
     .with_replicator(replicator);
     if let Some(ip) = sdp_advertise_ip {
         server = server.with_sdp_advertise_ip(ip);
+        // The same public address has to appear in `Contact:`. Advertising it
+        // only in SDP fixes media but leaves signalling pointing at the bind
+        // address, so the peer's ACK is undeliverable and the dialog dies.
+        server = server.with_contact_advertise_ip(ip);
     }
     if let Some(orch) = conference_orchestrator {
         server = server.with_conference_orchestrator(orch);

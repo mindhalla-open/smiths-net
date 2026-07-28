@@ -489,6 +489,23 @@ impl<T: Transport> UasServer<T> {
         self
     }
 
+    /// Override the host in the `Contact:` header (NAT / DMZ).
+    ///
+    /// [`Self::new`] composes `Contact` from the transport's local
+    /// address, which for a `0.0.0.0` bind is not routable. A carrier
+    /// that targets the dialog by `Contact` — Megafon Multifon does —
+    /// then sends its ACK for our 200 OK to `0.0.0.0`, it never
+    /// arrives, and the call is torn down once the 2xx retransmit
+    /// budget is exhausted. Setting the public address here keeps the
+    /// ACK on a routable path. The port is left as bound.
+    #[must_use]
+    pub fn with_contact_advertise_ip(mut self, ip: IpAddr) -> Self {
+        if let Ok(local) = self.transport.local_addr() {
+            self.contact = format!("<sip:smiths@{}>", SocketAddr::new(ip, local.port()));
+        }
+        self
+    }
+
     /// Attach a shared [`smiths_core::Drain`] so the UAS can refuse
     /// new INVITEs during graceful shutdown. Without it, drain-aware
     /// shutdown is a no-op (new dialogs keep being admitted until the
