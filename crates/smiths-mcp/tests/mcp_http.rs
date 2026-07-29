@@ -174,6 +174,7 @@ async fn sse_stream_receives_dialog_created_notification() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     bus.publish(Event::Sip(SipEvent::DialogCreated {
         call_id: "sse-test@example".into(),
+        from_uri: None,
         media_endpoint: None,
         remote_rtp: None,
     }))

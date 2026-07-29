@@ -489,6 +489,23 @@ impl<T: Transport> UasServer<T> {
         self
     }
 
+    /// Override the host in the `Contact:` header (NAT / DMZ).
+    ///
+    /// [`Self::new`] composes `Contact` from the transport's local
+    /// address, which for a `0.0.0.0` bind is not routable. A carrier
+    /// that targets the dialog by `Contact` — Megafon Multifon does —
+    /// then sends its ACK for our 200 OK to `0.0.0.0`, it never
+    /// arrives, and the call is torn down once the 2xx retransmit
+    /// budget is exhausted. Setting the public address here keeps the
+    /// ACK on a routable path. The port is left as bound.
+    #[must_use]
+    pub fn with_contact_advertise_ip(mut self, ip: IpAddr) -> Self {
+        if let Ok(local) = self.transport.local_addr() {
+            self.contact = format!("<sip:smiths@{}>", SocketAddr::new(ip, local.port()));
+        }
+        self
+    }
+
     /// Attach a shared [`smiths_core::Drain`] so the UAS can refuse
     /// new INVITEs during graceful shutdown. Without it, drain-aware
     /// shutdown is a no-op (new dialogs keep being admitted until the
@@ -1310,6 +1327,7 @@ impl<T: Transport> UasServer<T> {
 
         let _ = self.bus.publish(Event::Sip(SipEvent::DialogCreated {
             call_id,
+            from_uri: req.from_uri.clone(),
             media_endpoint: endpoint.as_ref().map(|ep| ep.id()),
             remote_rtp: remote_media,
         }));
@@ -1722,6 +1740,12 @@ impl<T: Transport> UasServer<T> {
         let transport = Arc::clone(&self.transport);
         let metrics = Arc::clone(&self.metrics);
         let retransmits = Arc::clone(&self.invite_2xx_retransmits);
+        // Needed to hand the dialog's resources back when it is abandoned.
+        let dialogs = Arc::clone(&self.dialogs);
+        let pending = Arc::clone(&self.pending_bridges);
+        let media_fabric = Arc::clone(&self.media_fabric);
+        let dialog_sessions = self.dialog_sessions.clone();
+        let bus = self.bus.clone();
         let task_key = key.clone();
         let task_cancel = cancel.clone();
         tokio::spawn(async move {
@@ -1740,13 +1764,33 @@ impl<T: Transport> UasServer<T> {
                 }
                 elapsed = elapsed.saturating_add(interval);
                 if elapsed > INVITE_2XX_BUDGET {
-                    // §13.3.1.4: after 64·T1 without ACK the TU gives
-                    // up. Dialog-level cleanup (sending BYE) is a
-                    // follow-on; today we just exit the loop.
+                    // §13.3.1.4: after 64·T1 without ACK the TU gives up.
+                    // Whatever the dialog holds goes back now — leaving it
+                    // parked costs an RTP/RTCP pair per unacknowledged
+                    // INVITE, and a pool drained that way refuses every
+                    // later call with PortExhausted until the process is
+                    // restarted. No BYE is sent: the peer never confirmed
+                    // the dialog, and answering a flood would only echo it.
                     warn!(
                         ?task_key,
-                        "INVITE 2xx retransmit budget exhausted without ACK"
+                        "INVITE 2xx retransmit budget exhausted: releasing the dialog"
                     );
+                    // A leg parked on a rendezvous key holds the endpoint
+                    // itself, so dropping the dialog alone leaves the sockets
+                    // referenced and open.
+                    pending.retain(|_, leg| leg.dialog_key != task_key);
+                    if let Some((_, record)) = dialogs.remove(&task_key) {
+                        metrics.dialogs_active.dec();
+                        for session in dialog_sessions.remove_dialog(&task_key) {
+                            session.stop().await;
+                        }
+                        if let Some(ep) = record.media {
+                            media_fabric.release_endpoint(ep).await;
+                        }
+                        let _ = bus.publish(Event::Sip(SipEvent::DialogTerminated {
+                            call_id: record.call_id,
+                        }));
+                    }
                     break;
                 }
                 if let Err(e) = transport.send(bytes.clone(), peer).await {

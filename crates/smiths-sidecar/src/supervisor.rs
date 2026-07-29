@@ -34,6 +34,25 @@ use crate::rpc::{RpcRequest, RpcResponse};
 /// Default RPC timeout — conservative because AI models can be slow.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-call RPC budget, overridable via `SMITHS_PLUGIN_RPC_TIMEOUT_SECS`.
+///
+/// 30 s covers a warm model, but not a cold one: faster-whisper's
+/// large-v3 has to load (and on a fresh cache, convert) weights before
+/// its first `transcribe` returns, which can take minutes. A call that
+/// lands in that window used to fail outright — the caller heard the
+/// greeting and then nothing. Operators running large local models set
+/// this higher so a cold first turn is merely slow, not broken.
+fn rpc_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        std::env::var("SMITHS_PLUGIN_RPC_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map_or(DEFAULT_RPC_TIMEOUT, Duration::from_secs)
+    })
+}
+
 /// Depth of the notification broadcast. Small on purpose —
 /// subscribers that fall behind lose intermediate partials, which is
 /// the right behaviour for streaming ASR / TTS (agent reconnects +
@@ -257,8 +276,7 @@ impl Sidecar {
 
     /// Send a JSON-RPC request and await the correlated response.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, Error> {
-        self.call_with_timeout(method, params, DEFAULT_RPC_TIMEOUT)
-            .await
+        self.call_with_timeout(method, params, rpc_timeout()).await
     }
 
     /// Same as [`Self::call`] with an explicit timeout override.

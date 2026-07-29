@@ -82,6 +82,7 @@ impl ControlState {
                                 call_id,
                                 media_endpoint,
                                 remote_rtp,
+                                ..
                             })) => {
                                 state.calls.insert(
                                     call_id.clone(),
@@ -190,6 +191,7 @@ mod tests {
 
         bus.publish(Event::Sip(SipEvent::DialogCreated {
             call_id: "call-1".into(),
+            from_uri: None,
             media_endpoint: None,
             remote_rtp: None,
         }))

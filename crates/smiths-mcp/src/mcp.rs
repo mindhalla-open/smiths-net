@@ -128,10 +128,12 @@ async fn write_frame(stdout: &mut tokio::io::Stdout, frame: &Value) -> std::io::
 /// events we don't expose (keeps the wire quiet and forward-compatible).
 pub(crate) fn event_to_notification(event: &Event) -> Option<Value> {
     match event {
-        Event::Sip(SipEvent::DialogCreated { call_id, .. }) => Some(json!({
+        Event::Sip(SipEvent::DialogCreated {
+            call_id, from_uri, ..
+        }) => Some(json!({
             "jsonrpc": "2.0",
             "method": "notifications/call/created",
-            "params": { "call_id": call_id },
+            "params": { "call_id": call_id, "from_uri": from_uri },
         })),
         Event::Sip(SipEvent::DialogTerminated { call_id }) => Some(json!({
             "jsonrpc": "2.0",

@@ -116,6 +116,10 @@ pub enum SipEvent {
     DialogCreated {
         /// `Call-ID` header value.
         call_id: String,
+        /// Caller's `From` URI, when the request carried one. Carries the
+        /// calling number on a PSTN trunk, which an assistant needs to reach
+        /// the caller back without asking them to read it out.
+        from_uri: Option<String>,
         /// Engine-allocated media endpoint, if the dialog carries media.
         media_endpoint: Option<EndpointId>,
         /// Peer's RTP endpoint learned from the SDP offer, if any.

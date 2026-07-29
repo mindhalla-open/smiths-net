@@ -165,6 +165,7 @@ async fn uac_places_call_and_hangs_up_against_fake_uas() {
             call_id: cid,
             media_endpoint,
             remote_rtp,
+            ..
         }) => {
             assert_eq!(cid, call_id);
             assert!(media_endpoint.is_some(), "UAC should have allocated media");

@@ -12,6 +12,7 @@ Quick start (Gemma 3 4B):
                -c 4096 -ngl 99
 
 Environment:
+  LLAMACPP_REASONING — `0` disables the model's thinking pass (default on)
   LLAMACPP_HOST         — base URL (default `http://127.0.0.1:8080`)
   LLAMACPP_MODEL        — model name sent in API body (default `gemma`)
   LLAMACPP_API_KEY      — optional Bearer token (llama-server --api-key)
@@ -32,6 +33,16 @@ LLAMACPP_HOST = os.environ.get("LLAMACPP_HOST", "http://127.0.0.1:8080").rstrip(
 LLAMACPP_MODEL = os.environ.get("LLAMACPP_MODEL", "gemma")
 LLAMACPP_API_KEY = os.environ.get("LLAMACPP_API_KEY", "")
 REQUEST_TIMEOUT = float(os.environ.get("LLAMACPP_TIMEOUT_SECS", "120"))
+# Thinking models (Gemma 4, Qwen 3, DeepSeek-R1 …) reason before answering.
+# Set LLAMACPP_REASONING=0 to ask for the answer only: on a latency-bound
+# channel the deliberation is paid for twice, in time and in tokens, and a
+# budget spent thinking can leave no budget to reply with.
+LLAMACPP_REASONING = os.environ.get("LLAMACPP_REASONING", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 
 DESCRIPTOR = {
     "capability": "ai.llm.chat",
@@ -89,6 +100,12 @@ def llamacpp_chat(messages: list, controls: dict | None) -> dict:
         "messages": messages,
         "stream": False,
     }
+    if not LLAMACPP_REASONING:
+        # Two spellings: the chat template's own switch, and the server-side
+        # budget. Builds honour one or the other, and both are ignored by
+        # models that never think, so sending both is safe.
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+        body["reasoning_budget"] = 0
     if controls:
         if "temperature" in controls:
             body["temperature"] = controls["temperature"]
