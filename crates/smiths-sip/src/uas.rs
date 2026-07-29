@@ -1740,6 +1740,12 @@ impl<T: Transport> UasServer<T> {
         let transport = Arc::clone(&self.transport);
         let metrics = Arc::clone(&self.metrics);
         let retransmits = Arc::clone(&self.invite_2xx_retransmits);
+        // Needed to hand the dialog's resources back when it is abandoned.
+        let dialogs = Arc::clone(&self.dialogs);
+        let pending = Arc::clone(&self.pending_bridges);
+        let media_fabric = Arc::clone(&self.media_fabric);
+        let dialog_sessions = self.dialog_sessions.clone();
+        let bus = self.bus.clone();
         let task_key = key.clone();
         let task_cancel = cancel.clone();
         tokio::spawn(async move {
@@ -1758,13 +1764,33 @@ impl<T: Transport> UasServer<T> {
                 }
                 elapsed = elapsed.saturating_add(interval);
                 if elapsed > INVITE_2XX_BUDGET {
-                    // §13.3.1.4: after 64·T1 without ACK the TU gives
-                    // up. Dialog-level cleanup (sending BYE) is a
-                    // follow-on; today we just exit the loop.
+                    // §13.3.1.4: after 64·T1 without ACK the TU gives up.
+                    // Whatever the dialog holds goes back now — leaving it
+                    // parked costs an RTP/RTCP pair per unacknowledged
+                    // INVITE, and a pool drained that way refuses every
+                    // later call with PortExhausted until the process is
+                    // restarted. No BYE is sent: the peer never confirmed
+                    // the dialog, and answering a flood would only echo it.
                     warn!(
                         ?task_key,
-                        "INVITE 2xx retransmit budget exhausted without ACK"
+                        "INVITE 2xx retransmit budget exhausted: releasing the dialog"
                     );
+                    // A leg parked on a rendezvous key holds the endpoint
+                    // itself, so dropping the dialog alone leaves the sockets
+                    // referenced and open.
+                    pending.retain(|_, leg| leg.dialog_key != task_key);
+                    if let Some((_, record)) = dialogs.remove(&task_key) {
+                        metrics.dialogs_active.dec();
+                        for session in dialog_sessions.remove_dialog(&task_key) {
+                            session.stop().await;
+                        }
+                        if let Some(ep) = record.media {
+                            media_fabric.release_endpoint(ep).await;
+                        }
+                        let _ = bus.publish(Event::Sip(SipEvent::DialogTerminated {
+                            call_id: record.call_id,
+                        }));
+                    }
                     break;
                 }
                 if let Err(e) = transport.send(bytes.clone(), peer).await {
