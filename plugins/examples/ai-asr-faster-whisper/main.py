@@ -90,7 +90,7 @@ import re as _re  # noqa: E402
 # punctuation-stripped) form. Extend via FW_HALLUCINATION_EXTRA (|-separated).
 _HALLUCINATION_PATTERNS = [
     r"dima\s*torzok",
-    r"субтитр\w*\s+(созда|сдела|редакт|коррект|подготов)",
+    r"субтитр\w*\s+(созда|сдела|редакт|коррект|подготов|подогна|перевод)",
     r"редактор\s+субтитр",
     r"коррект\w+\s+а\.?\s*егоров",
     r"продолжение\s+следует",
