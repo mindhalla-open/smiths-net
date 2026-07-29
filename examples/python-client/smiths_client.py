@@ -294,6 +294,8 @@ class SipUAC:
         self.rtp.bind((local_ip, 0))
         self.rtp.settimeout(2.0)
 
+        # Set once the far end BYEs us; suppresses our own teardown BYE.
+        self.peer_gone = False
         self.call_id = f"pyclient-{_unique()}@{local_ip}"
         self.from_tag = f"py-{_unique()}"
         self.to_tag: Optional[str] = None
@@ -360,11 +362,61 @@ class SipUAC:
         self._send(self._frame("ACK", room, cseq, body=""))
 
     def bye(self, room: str) -> None:
+        # The far end already tore the dialog down; a BYE of our own would
+        # just draw a 481 and stall waiting for a response that never comes.
+        if self.peer_gone:
+            return
         self._cseq += 1
         self._send(self._frame("BYE", room, self._cseq, body=""))
         msg = self._recv_sip()
         if _status(msg) != 200:
             raise RuntimeError(f"BYE not acked: {msg.splitlines()[0]}")
+
+    def peer_hangup_pending(self) -> bool:
+        """True once the engine has sent a ``BYE`` for this dialog.
+
+        The caller hanging up reaches us as a BYE on the SIP socket, which
+        nothing else drains between turns. Left unread, the bot goes on
+        talking to a dead line until its idle-turn budget runs out, and every
+        call arriving in that window is answered by the engine with no bot
+        behind it. Any BYE found is answered so the engine's transaction
+        completes instead of retransmitting.
+        """
+        previous = self.sip.gettimeout()
+        self.sip.settimeout(0.0)
+        try:
+            while True:
+                try:
+                    data, addr = self.sip.recvfrom(8192)
+                except (BlockingIOError, socket.timeout, OSError):
+                    break
+                msg = data.decode("utf-8", errors="replace")
+                if msg.split(" ", 1)[0].upper() == "BYE":
+                    self.peer_gone = True
+                    self._answer_bye(msg, addr)
+        finally:
+            self.sip.settimeout(previous)
+        return self.peer_gone
+
+    def _answer_bye(self, request: str, addr) -> None:
+        """Answer an inbound BYE with `200 OK`, echoing its dialog headers."""
+        echoed = []
+        for line in request.split("\r\n"):
+            if not line:
+                break
+            if line.split(":", 1)[0].strip().lower() in (
+                "via",
+                "from",
+                "to",
+                "call-id",
+                "cseq",
+            ):
+                echoed.append(line)
+        response = "SIP/2.0 200 OK\r\n" + "\r\n".join(echoed) + "\r\nContent-Length: 0\r\n\r\n"
+        try:
+            self.sip.sendto(response.encode(), addr)
+        except OSError:
+            pass
 
     def prime_rtp(self, seconds: float = 0.25, frame_samples: int = 160) -> None:
         """Send a short burst of codec silence to latch the RTP relay.
