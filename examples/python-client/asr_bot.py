@@ -954,6 +954,24 @@ def _play_prerendered_wire(uac: SipUAC, wire: bytes) -> float:
     return secs
 
 
+# Calling number of the call being handled, taken from the INVITE's From URI
+# when the trunk supplies one. Set before converse() runs and cleared after, so
+# a conversation policy can reach the caller back without asking for a number
+# the network already knows -- and without mis-hearing it over 8 kHz audio.
+CURRENT_CALLER: str | None = None
+# call_id -> From URI, filled by the notification handler before the
+# call is dequeued for handling.
+CALLERS_BY_CALL: dict[str, str] = {}
+
+
+def caller_number() -> str | None:
+    """Digits of the current caller's number, or None if the trunk withheld it."""
+    uri = CURRENT_CALLER or ""
+    user = uri.split("sip:", 1)[-1].split("@", 1)[0] if "sip:" in uri else ""
+    digits = "".join(ch for ch in user if ch.isdigit())
+    return digits or None
+
+
 def converse(
     uac: SipUAC,
     mcp: Mcp,
@@ -1208,6 +1226,10 @@ def handle_trunk_call(
         print(f"[bot] RTP primed {prime_secs:.2f}s (relay latched)")
     except Exception as e:  # noqa: BLE001
         print(f"[bot] RTP prime failed ({e})")
+    global CURRENT_CALLER
+    CURRENT_CALLER = CALLERS_BY_CALL.pop(call_id, None)
+    if CURRENT_CALLER:
+        print(f"[bot] caller {caller_number() or CURRENT_CALLER}")
     try:
         converse(
             uac,
@@ -1380,6 +1402,8 @@ def run_trunk_mode(
             if not cid or cid.startswith("pyclient-") or handling.is_set():
                 return
             print(f"[mcp ] {method}  {params}")
+            if params.get("from_uri"):
+                CALLERS_BY_CALL[cid] = str(params["from_uri"])
             # Megafon inbound call-ids always start with SD — queue immediately.
             if _MEGAFON_CALL_RE.match(cid):
                 call_q.put(cid)

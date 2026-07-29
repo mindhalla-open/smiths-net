@@ -1327,6 +1327,7 @@ impl<T: Transport> UasServer<T> {
 
         let _ = self.bus.publish(Event::Sip(SipEvent::DialogCreated {
             call_id,
+            from_uri: req.from_uri.clone(),
             media_endpoint: endpoint.as_ref().map(|ep| ep.id()),
             remote_rtp: remote_media,
         }));

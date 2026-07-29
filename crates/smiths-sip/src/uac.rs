@@ -278,6 +278,7 @@ impl<T: Transport> UacClient<T> {
 
         let _ = self.bus.publish(Event::Sip(SipEvent::DialogCreated {
             call_id: call_id.clone(),
+            from_uri: None,
             media_endpoint: Some(endpoint.id()),
             remote_rtp,
         }));
