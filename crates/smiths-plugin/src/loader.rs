@@ -77,11 +77,18 @@ pub async fn load_plugins(
 
     let mut entries = tokio::fs::read_dir(root).await?;
     while let Some(entry) = entries.next_entry().await? {
-        let meta = entry.metadata().await?;
+        let path = entry.path();
+        // `DirEntry::metadata` reports on the link itself, so a symlinked
+        // plugin directory looks like a plain file and gets skipped. Deploy
+        // ments that keep the engine and its plugins in separate trees link
+        // them in, so resolve the target instead.
+        let Ok(meta) = tokio::fs::metadata(&path).await else {
+            warn!(dir = %path.display(), "plugin entry unreadable; skipping");
+            continue;
+        };
         if !meta.is_dir() {
             continue;
         }
-        let path = entry.path();
         match load_one(&path, registry, opts.clone()).await {
             Ok(name) => {
                 info!(plugin = %name, dir = %path.display(), "plugin loaded");
