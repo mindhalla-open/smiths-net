@@ -4,6 +4,7 @@
 mod engine;
 mod ha;
 mod http;
+mod ice_driver;
 mod init;
 mod logging;
 mod reload_driver;

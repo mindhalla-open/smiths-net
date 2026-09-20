@@ -86,6 +86,11 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+/// How long connectivity checks may run before the offer is
+/// rejected. Browsers give up around 30 s; failing sooner frees the
+/// media endpoint while the caller is still waiting.
+const DEFAULT_ICE_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Default deadline for an unpaired WebRTC leg (slice
 /// 5.10-bridge). An operator-facing TOML knob lands with
 /// `[webrtc] rendezvous_deadline_s` when a real use case asks
@@ -152,6 +157,19 @@ pub(crate) struct CliWebRtcHandler {
     /// live-updates the inner `Mutex<WebRtcPrivacyConfig>` when
     /// the operator rotates the `redaction_key` or flips `mode`.
     privacy: Arc<std::sync::Mutex<WebRtcPrivacyConfig>>,
+    /// Session-id → live ICE agent, so a trickled candidate that
+    /// arrives mid-check reaches the agent still running it.
+    ice_agents: Arc<DashMap<WebTransportSessionId, crate::ice_driver::SharedAgent>>,
+    /// Session-id → cancel handle for that leg's keepalive task, so
+    /// `bye` stops it instead of leaving it pinging a dead peer.
+    ice_keepalives: Arc<DashMap<WebTransportSessionId, tokio_util::sync::CancellationToken>>,
+    /// How long a leg may spend on connectivity checks before the
+    /// offer is rejected and its endpoint released.
+    ice_deadline: Duration,
+    /// Whether `[webrtc.ice] enabled` selected the agent. When off,
+    /// media goes to the address in the offer's `c=` / `m=` lines,
+    /// which is the pre-ICE behaviour.
+    ice_enabled: bool,
 }
 
 impl CliWebRtcHandler {
@@ -176,14 +194,35 @@ impl CliWebRtcHandler {
             metrics: None,
             rendezvous_deadline: DEFAULT_RENDEZVOUS_DEADLINE,
             privacy: Arc::new(std::sync::Mutex::new(WebRtcPrivacyConfig::default())),
+            ice_agents: Arc::new(DashMap::new()),
+            ice_keepalives: Arc::new(DashMap::new()),
+            ice_deadline: DEFAULT_ICE_DEADLINE,
+            ice_enabled: false,
         }
     }
 
     /// STUN servers to query for server-reflexive candidates
-    /// (`[webrtc.ice] stun_servers`).
+    /// (`[webrtc.ice] stun_servers`). Setting them also turns the ICE
+    /// agent on, since `[webrtc.ice] enabled` is what populates them.
     #[must_use]
     pub(crate) fn with_stun_servers(mut self, servers: Vec<SocketAddr>) -> Self {
         self.stun_servers = servers;
+        self
+    }
+
+    /// Run connectivity checks before DTLS (`[webrtc.ice] enabled`).
+    #[must_use]
+    pub(crate) fn with_ice_enabled(mut self, enabled: bool) -> Self {
+        self.ice_enabled = enabled;
+        self
+    }
+
+    /// Override the connectivity-check deadline. Tests use a tight
+    /// one so a peer that never answers does not hold the suite up.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_ice_deadline(mut self, deadline: Duration) -> Self {
+        self.ice_deadline = deadline;
         self
     }
 
@@ -280,6 +319,79 @@ impl CliWebRtcHandler {
     pub(crate) fn with_rendezvous_deadline(mut self, d: Duration) -> Self {
         self.rendezvous_deadline = d;
         self
+    }
+
+    /// Run ICE for one leg, if the negotiation asked for it.
+    ///
+    /// Returns the validated remote address, or `None` when ICE is
+    /// off or the offer carried no ICE parameters — in which case the
+    /// caller keeps the address from the offer's `c=` / `m=` lines.
+    /// The agent is registered under `session` first so a trickled
+    /// candidate arriving mid-check reaches it.
+    async fn run_ice(
+        &self,
+        session: WebTransportSessionId,
+        endpoint: EndpointId,
+        ice: Option<&smiths_core::sdp::IceParams>,
+        sdp_offer: &str,
+    ) -> Result<Option<SocketAddr>, crate::ice_driver::IceError> {
+        let (Some(params), true) = (ice, self.ice_enabled) else {
+            return Ok(None);
+        };
+        let Some(socket) = self.fabric.endpoint_socket(endpoint) else {
+            // The endpoint was allocated a few lines ago, so this can
+            // only mean it was released underneath us.
+            return Ok(None);
+        };
+        let base = socket.local_addr()?;
+
+        // Local candidates: the media socket itself, plus any
+        // server-reflexive address the answer already advertised, so
+        // the agent checks exactly what the peer was told about.
+        let mut local = smiths_ice::candidate::gather_host_candidates(&[base], 1);
+        if !self.stun_servers.is_empty() {
+            let observed = smiths_ice::stun::gather_srflx_candidates(
+                &socket,
+                &self.stun_servers,
+                Duration::from_secs(1),
+            )
+            .await;
+            for (idx, addr) in observed.into_iter().enumerate() {
+                local.push(srflx_candidate(addr, base, idx));
+            }
+        }
+
+        let remote: Vec<IceCandidate> = sdp_offer
+            .lines()
+            .filter_map(|l| l.strip_prefix("a=candidate:"))
+            .filter_map(|rest| {
+                smiths_sdp::parse::parse_candidate_line(&format!("candidate:{rest}")).ok()
+            })
+            .collect();
+        debug!(
+            ?session,
+            local = local.len(),
+            remote = remote.len(),
+            "starting ICE connectivity checks"
+        );
+        let agent = crate::ice_driver::build_agent(
+            params.clone(),
+            &local,
+            &remote,
+            &socket,
+            self.metrics.clone(),
+        )?;
+        self.ice_agents.insert(session, Arc::clone(&agent));
+
+        let selected =
+            crate::ice_driver::run_to_completion(&agent, &socket, self.ice_deadline).await?;
+        // Consent freshness for the nominated pair. Send-only, so it
+        // never competes with DTLS or the bridge for inbound packets.
+        let keepalive_cancel = tokio_util::sync::CancellationToken::new();
+        self.ice_keepalives
+            .insert(session, keepalive_cancel.clone());
+        crate::ice_driver::spawn_keepalives(agent, keepalive_cancel);
+        Ok(Some(selected))
     }
 
     /// Gather server-reflexive candidates for the leg's socket and
@@ -607,6 +719,7 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
                 remote_media,
                 srtp: sdes_keys,
                 dtls,
+                ice,
                 ..
             } => {
                 let Some(peer) = remote_media else {
@@ -614,6 +727,24 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
                     return Err(WebRtcHandlerError::OfferRejected(
                         "offer had no usable audio endpoint (port 0 / no c= line)".into(),
                     ));
+                };
+                // Connectivity checks run before DTLS and decide where
+                // media actually goes. Without ICE the peer stays
+                // whatever the offer's `c=` / `m=` lines claimed.
+                let peer = match self
+                    .run_ice(session, endpoint_id, ice.as_ref(), sdp_offer)
+                    .await
+                {
+                    Ok(Some(selected)) => selected,
+                    Ok(None) => peer,
+                    Err(e) => {
+                        warn!(?session, %e, "ICE connectivity checks failed");
+                        self.ice_agents.remove(&session);
+                        self.fabric.release_endpoint(endpoint_id).await;
+                        return Err(WebRtcHandlerError::OfferRejected(format!(
+                            "ICE connectivity checks failed: {e}"
+                        )));
+                    }
                 };
                 // If the offer used DTLS-SRTP, run the
                 // handshake right now against the allocated
@@ -737,6 +868,12 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
             .map(|e| format!(" bridge={:?}", *e.value()))
             .unwrap_or_default();
         debug!(?session, note = %peer_note, "webrtc: session bye");
+        // Stop consent keepalives and forget the agent: nothing
+        // should keep pinging a peer that has hung up.
+        if let Some((_, cancel)) = self.ice_keepalives.remove(&session) {
+            cancel.cancel();
+        }
+        self.ice_agents.remove(&session);
         // Release a live bridge if one is installed for this
         // session. The fabric's `release_bridge` is idempotent
         // — a concurrent bye from the partner side races harmlessly.
@@ -768,11 +905,6 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
         candidate: &str,
         sdp_m_line_index: u16,
     ) -> Result<(), WebRtcHandlerError> {
-        // : accept trickle-ICE candidates.
-        // Real ICE pair checks happen against whatever address
-        // the DTLS handshake actually received from — the
-        // candidate line is diagnostic + future pair-check
-        // input. We parse to validate syntax, log, move on.
         use smiths_sdp::parse::parse_candidate_line;
         match parse_candidate_line(candidate) {
             Ok(c) => {
@@ -784,6 +916,18 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
                     port = c.port,
                     "webrtc: trickle ICE candidate"
                 );
+                // Hand it to the agent still running checks for this
+                // leg. A candidate that arrives after ICE finished
+                // has no agent to reach, which is expected rather
+                // than an error.
+                if let Some(agent) = self.ice_agents.get(&session).map(|e| Arc::clone(e.value())) {
+                    crate::ice_driver::add_remote_candidate(&agent, &c).await;
+                } else {
+                    debug!(
+                        ?session,
+                        "no live ICE agent for this session; candidate noted only"
+                    );
+                }
             }
             Err(e) => {
                 warn!(?session, error = %e, raw = %candidate, "webrtc: malformed ICE candidate");
@@ -843,6 +987,7 @@ pub(crate) fn build_handler(
     let mut handler = CliWebRtcHandler::new(negotiator, fabric, bind.ip())
         .with_metrics(Arc::clone(metrics))
         .with_privacy(config.webrtc.privacy.clone());
+    handler = handler.with_ice_enabled(config.webrtc.ice.enabled);
     if config.webrtc.ice.enabled {
         handler = handler.with_stun_servers(config.webrtc.ice.stun_servers.clone());
     }
@@ -1036,6 +1181,102 @@ mod tests {
             Ipv4Addr::LOCALHOST,
         )));
         CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST))
+    }
+
+    /// A handler whose negotiator also emits ICE parameters, which is
+    /// what `build_handler` does when `[webrtc.ice] enabled` is set.
+    fn ice_handler() -> CliWebRtcHandler {
+        // ICE rides on DTLS-SRTP offers, which is the only shape a
+        // browser sends, so the negotiator needs a cert too.
+        let cert = Arc::new(SelfSignedCert::generate("test-webrtc").expect("cert"));
+        let neg: Arc<dyn SdpNegotiator> = Arc::new(
+            Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST))
+                .with_ice_enabled(true)
+                .with_dtls_cert(Arc::clone(&cert)),
+        );
+        CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_ice_enabled(true)
+            .with_dtls_cert(cert)
+    }
+
+    /// An SDP offer that asks for ICE against `peer`, with a plain
+    /// RTP profile so the test exercises ICE without needing DTLS.
+    fn ice_offer(peer: SocketAddr, ufrag: &str, pwd: &str) -> String {
+        format!(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 {ip}\r\n\
+             s=-\r\n\
+             c=IN IP4 {ip}\r\n\
+             t=0 0\r\n\
+             m=audio {port} UDP/TLS/RTP/SAVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=setup:actpass\r\n\
+             a=fingerprint:sha-256 AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99\r\n\
+             a=ice-ufrag:{ufrag}\r\n\
+             a=ice-pwd:{pwd}\r\n\
+             a=candidate:1 1 UDP 2130706431 {ip} {port} typ host\r\n",
+            ip = peer.ip(),
+            port = peer.port(),
+        )
+    }
+
+    /// With ICE enabled but a peer that never answers a connectivity
+    /// check, the offer is rejected rather than bridged to an address
+    /// nobody validated — and the media endpoint is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_enabled_rejects_a_peer_that_never_answers_checks() {
+        let dead = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let peer = dead.local_addr().expect("addr");
+        // Bound but never read: checks go out, nothing comes back.
+        let h = ice_handler().with_ice_deadline(Duration::from_millis(400));
+        let err = h
+            .handle_offer_tagged(
+                WebTransportSessionId(7),
+                None,
+                &ice_offer(peer, "remoteUfrag", "remotePasswordxxxx"),
+            )
+            .await
+            .expect_err("an unvalidated peer must not be accepted");
+        let msg = err.to_string();
+        assert!(msg.contains("ICE"), "{msg}");
+        assert!(
+            h.ice_agents.is_empty(),
+            "a failed leg must not leave its agent registered"
+        );
+    }
+
+    /// The same offer with ICE off keeps the pre-ICE behaviour: the
+    /// address from the offer is used and the leg is accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ice_disabled_uses_the_offer_address_unchanged() {
+        let dead = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let peer = dead.local_addr().expect("addr");
+        // Same ICE attributes, plain profile: with the agent off the
+        // engine answers immediately instead of checking anything.
+        let offer = format!(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 {ip}\r\n\
+             s=-\r\n\
+             c=IN IP4 {ip}\r\n\
+             t=0 0\r\n\
+             m=audio {port} RTP/AVP 0\r\n\
+             a=rtpmap:0 PCMU/8000\r\n\
+             a=ice-ufrag:remoteUfrag\r\n\
+             a=ice-pwd:remotePasswordxxxx\r\n",
+            ip = peer.ip(),
+            port = peer.port(),
+        );
+        let h = handler();
+        let answer = h
+            .handle_offer_tagged(WebTransportSessionId(8), None, &offer)
+            .await
+            .expect("ICE off must not gate the offer");
+        assert!(answer.contains("m=audio"), "{answer}");
+        assert!(h.ice_agents.is_empty(), "no agent when ICE is disabled");
     }
 
     #[tokio::test]
