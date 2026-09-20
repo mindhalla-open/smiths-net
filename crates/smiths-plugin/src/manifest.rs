@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+pub use smiths_sidecar::framing::WireFormat;
 
 use crate::error::Error;
 
@@ -86,6 +87,13 @@ pub struct Manifest {
     /// plugins. `0` means "use the engine default" (500 ms).
     #[serde(default)]
     pub script_wall_clock_ms: u64,
+    /// Stdio encoding for a `type = "sidecar"` plugin. `"json"` (the
+    /// default) is newline-delimited JSON-RPC, which needs nothing
+    /// but a standard library. `"binary"` opts into length-prefixed
+    /// frames for plugins that move enough traffic to care. Ignored
+    /// for every other plugin type.
+    #[serde(default)]
+    pub wire_format: WireFormat,
 }
 
 /// Which DSL engine a `type = "script"` manifest selects.
@@ -179,6 +187,42 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("plugin.toml"), toml).unwrap();
         Manifest::from_dir(dir.path())
+    }
+
+    #[test]
+    fn wire_format_defaults_to_json_and_accepts_binary() {
+        let base = r#"
+            name = "p"
+            version = "0.1.0"
+            type = "sidecar"
+            entry = "./p.py"
+        "#;
+        let m = parse(base).expect("a manifest needs no wire_format key");
+        assert_eq!(m.wire_format, WireFormat::Json, "the default stays JSON");
+
+        let m = parse(&format!("{base}\nwire_format = \"binary\"\n"))
+            .expect("binary is an accepted value");
+        assert_eq!(m.wire_format, WireFormat::Binary);
+    }
+
+    #[test]
+    fn unknown_wire_format_is_refused_with_the_accepted_values() {
+        let err = parse(
+            r#"
+            name = "p"
+            version = "0.1.0"
+            type = "sidecar"
+            entry = "./p.py"
+            wire_format = "msgpack"
+        "#,
+        )
+        .expect_err("an unknown encoding must not load");
+        let msg = err.to_string();
+        // serde lists the variants it knows, which is exactly the set
+        // a plugin author may choose from.
+        for accepted in WireFormat::accepted() {
+            assert!(msg.contains(accepted), "`{accepted}` missing from: {msg}");
+        }
     }
 
     #[test]

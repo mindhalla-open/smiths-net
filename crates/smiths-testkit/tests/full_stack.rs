@@ -140,17 +140,22 @@ async fn full_stack_call_metrics_and_drain() {
         Some(1.0),
         "{text}"
     );
-    let forwarded = sample(
+    // Which leg the bridge calls "a" follows the order the two
+    // INVITEs happened to arrive in, so sum both directions rather
+    // than guessing: exactly one of them carries this test's frames.
+    let a_to_b = sample(
         &text,
         "smiths_rtp_packets_forwarded_total{direction=\"a_to_b\"}",
-    )
-    .or_else(|| {
-        sample(
-            &text,
-            "smiths_rtp_packets_forwarded_total{direction=\"b_to_a\"}",
-        )
-    })
-    .expect("forwarded counter present");
+    );
+    let b_to_a = sample(
+        &text,
+        "smiths_rtp_packets_forwarded_total{direction=\"b_to_a\"}",
+    );
+    assert!(
+        a_to_b.is_some() || b_to_a.is_some(),
+        "forwarded counter present\n{text}"
+    );
+    let forwarded = a_to_b.unwrap_or(0.0) + b_to_a.unwrap_or(0.0);
     assert!(
         forwarded >= f64::from(u32::try_from(FRAMES - 2).expect("frame count fits u32")),
         "forwarded={forwarded}\n{text}"

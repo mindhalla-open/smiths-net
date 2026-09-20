@@ -7,6 +7,38 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- **Raft is a real cluster mode.** `cluster.mode = "raft"` replicates
+  the dialog table as a consensus state machine, so the cluster
+  survives losing any node instead of mirroring one way. The crate
+  existed but nothing linked it and no config could select it.
+  `cluster://status` now reports leader / follower / no-quorum from
+  openraft's own metrics.
+- **ICE gates WebRTC media.** Connectivity checks run before DTLS and
+  decide where media goes; a leg that cannot validate a pair is
+  rejected instead of bridged to an address nobody verified. Trickled
+  candidates reach the live agent, and consent keepalives run
+  send-only after nomination. `[webrtc.ice] enabled = false` keeps the
+  previous behaviour.
+- **Sidecars can opt into binary framing.** `wire_format = "binary"`
+  in a `plugin.toml` selects length-prefixed `smiths_proto::Envelope`
+  frames; the declared length is checked against the frame cap before
+  anything is allocated. JSON-RPC stays the default so a plugin
+  remains one stdlib-only file, and every existing example is
+  untouched. A worked Python sample and the layout live in
+  `plugins/cookbook/sidecar/python/binary-frames/`.
+
+### Fixed
+
+- **Dialog deletions never replicated.** `DialogDelta` was internally
+  tagged and serde cannot fold a tuple into a tagged object, so
+  `Delete(DialogKey)` failed to serialize at runtime — on the existing
+  primary/secondary path too, where a later resync snapshot happened
+  to hide it. Now adjacently tagged.
+- A failed DTLS handshake left the leg in `Handshaking` despite
+  documenting a transition to `Closed`.
+
 ### Security
 
 - **Digest nonces are now CSPRNG-generated and single-use per

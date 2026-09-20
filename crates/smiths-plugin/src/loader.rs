@@ -210,6 +210,9 @@ pub(crate) async fn load_one(
             sandbox: opts.sandbox.clone(),
             rpc_timeout: opts.sidecar_rpc_timeout,
             max_frame_bytes: opts.sidecar_max_frame_bytes,
+            // Per-plugin, from its manifest: the default stays JSON
+            // so an existing plugin needs no key at all.
+            wire_format: manifest.wire_format,
             env: registry.env_snapshot(),
         },
     )

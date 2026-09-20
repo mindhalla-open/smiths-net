@@ -1,0 +1,15 @@
+# plugin.toml — a sidecar that speaks the length-prefixed binary
+# framing instead of newline-delimited JSON-RPC.
+#
+# `wire_format` is the only difference from a JSON sidecar. Leave it
+# out (or set "json") and you get the default, which is what every
+# other example here uses and what you want unless you have measured
+# a reason not to.
+name        = "binary-frames-py"
+version     = "0.1.0"
+type        = "sidecar"
+entry       = "./binary_frames.py"
+provides    = ["ai.echo"]
+abi         = "1.0"
+wire_format = "binary"
+description = "Stdlib-only Python sidecar speaking the binary wire format."

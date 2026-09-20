@@ -46,6 +46,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
 use crate::error::Error;
+use crate::framing::WireFormat;
 use crate::rpc::{RpcRequest, RpcResponse};
 
 /// Default RPC timeout — conservative because AI models can be slow.
@@ -147,6 +148,9 @@ pub struct SpawnOptions {
     pub rpc_timeout: Duration,
     /// Largest stdout frame the reader accepts; see the module docs.
     pub max_frame_bytes: usize,
+    /// Stdio encoding this plugin speaks. Defaults to
+    /// [`WireFormat::Json`]; a manifest opts into the binary framing.
+    pub wire_format: WireFormat,
     /// Extra environment variables for the child, layered over the
     /// engine's own environment. Applied on every spawn, so a
     /// restart picks up whatever the caller passed at spawn time.
@@ -160,6 +164,7 @@ impl Default for SpawnOptions {
             sandbox: SandboxConfig::default(),
             rpc_timeout: DEFAULT_RPC_TIMEOUT,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            wire_format: WireFormat::Json,
             env: BTreeMap::new(),
         }
     }
@@ -200,6 +205,7 @@ struct Inner {
     sandbox: sandbox::Plan,
     rpc_timeout: Duration,
     max_frame_bytes: usize,
+    wire_format: WireFormat,
     env: BTreeMap<String, String>,
     /// Flipped by `shutdown` so the supervisor stops respawning.
     shutdown: CancellationToken,
@@ -220,6 +226,7 @@ impl std::fmt::Debug for Inner {
             .field("policy", &self.policy)
             .field("rpc_timeout", &self.rpc_timeout)
             .field("max_frame_bytes", &self.max_frame_bytes)
+            .field("wire_format", &self.wire_format)
             .finish_non_exhaustive()
     }
 }
@@ -323,6 +330,7 @@ impl Sidecar {
             sandbox: sandbox_plan,
             rpc_timeout: options.rpc_timeout,
             max_frame_bytes: options.max_frame_bytes,
+            wire_format: options.wire_format,
             env: options.env,
             shutdown: CancellationToken::new(),
             supervisor: Mutex::new(None),
@@ -394,8 +402,12 @@ impl Sidecar {
             method,
             params,
         };
-        let mut buf = serde_json::to_vec(&frame)?;
-        buf.push(b'\n');
+        let buf = crate::framing::encode_request(
+            self.inner.wire_format,
+            frame.id,
+            frame.method,
+            &frame.params,
+        );
 
         // Write under the process lock so the child doesn't get mid-
         // frame bytes if it dies during the write.
@@ -550,6 +562,7 @@ async fn run_child(inner: &Inner, mut live: Live) -> ChildExit {
         inner.notifications.clone(),
         inner.name.clone(),
         inner.max_frame_bytes,
+        inner.wire_format,
     );
     let stderr_task = spawn_stderr_forwarder(live.stderr, inner.name.clone());
 
@@ -675,8 +688,13 @@ fn spawn_stdout_reader(
     notifications: broadcast::Sender<PluginNotification>,
     name: String,
     max_frame_bytes: usize,
+    wire_format: WireFormat,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        if wire_format == WireFormat::Binary {
+            read_binary_frames(stdout, pending, notifications, name, max_frame_bytes).await;
+            return;
+        }
         let mut reader = BufReader::new(stdout);
         let mut buf: Vec<u8> = Vec::new();
         // One frame may consume at most the cap plus its newline.
@@ -721,6 +739,59 @@ fn spawn_stdout_reader(
     })
 }
 
+/// Read length-prefixed binary frames until the child closes or
+/// breaks the protocol.
+///
+/// The declared length is validated against the cap before the body
+/// buffer is sized, so a bogus prefix cannot make the engine reserve
+/// an arbitrary allocation. Any framing error ends the task, which
+/// the supervisor treats as the child dying — the same outcome an
+/// over-long JSON line produces.
+async fn read_binary_frames(
+    stdout: ChildStdout,
+    pending: Pending,
+    notifications: broadcast::Sender<PluginNotification>,
+    name: String,
+    max_frame_bytes: usize,
+) {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut reader = BufReader::new(stdout);
+    let mut prefix = [0u8; crate::framing::LENGTH_PREFIX];
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        match reader.read_exact(&mut prefix).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                debug!(plugin = %name, "sidecar stdout closed");
+                break;
+            }
+            Err(e) => {
+                warn!(plugin = %name, ?e, "stdout read error");
+                break;
+            }
+        }
+        let declared = u32::from_be_bytes(prefix) as usize;
+        if let Err(e) = crate::framing::check_declared_len(declared, max_frame_bytes) {
+            warn!(plugin = %name, %e, "binary frame exceeds the frame cap; dropping the child");
+            break;
+        }
+        body.clear();
+        body.resize(declared, 0);
+        if let Err(e) = reader.read_exact(&mut body).await {
+            warn!(plugin = %name, ?e, "sidecar stdout closed mid-frame");
+            break;
+        }
+        match crate::framing::decode_binary_body(&body) {
+            Ok(resp) => deliver(resp, &pending, &notifications, &name).await,
+            Err(e) => {
+                warn!(plugin = %name, %e, "bad binary frame");
+                break;
+            }
+        }
+    }
+}
+
 /// Parse one wire frame and forward it to the correlating request.
 async fn dispatch_frame(
     frame: &str,
@@ -729,30 +800,40 @@ async fn dispatch_frame(
     name: &str,
 ) {
     match serde_json::from_str::<RpcResponse>(frame) {
-        Ok(resp) => {
-            if let Some(id) = resp.id {
-                let tx = pending.lock().await.remove(&id);
-                if let Some(tx) = tx {
-                    let _ = tx.send(resp);
-                } else {
-                    debug!(plugin = %name, id, "response to unknown id");
-                }
-            } else if let Some(method) = resp.method {
-                // Plugin-initiated notification — fan out to
-                // `subscribe_notifications` consumers. Send error
-                // just means "no subscribers right now", which is
-                // normal when no streaming tool is active.
-                let _ = notifications.send(PluginNotification {
-                    method,
-                    params: resp.params,
-                });
-            } else {
-                debug!(plugin = %name, "frame without id or method; dropped");
-            }
-        }
+        Ok(resp) => deliver(resp, pending, notifications, name).await,
         Err(e) => {
             warn!(plugin = %name, ?e, raw = %frame, "bad frame");
         }
+    }
+}
+
+/// Route one decoded frame: a response wakes its caller, an id-less
+/// frame with a method fans out as a notification. Shared by both
+/// encodings so they behave identically above the wire.
+async fn deliver(
+    resp: RpcResponse,
+    pending: &Pending,
+    notifications: &broadcast::Sender<PluginNotification>,
+    name: &str,
+) {
+    if let Some(id) = resp.id {
+        let tx = pending.lock().await.remove(&id);
+        if let Some(tx) = tx {
+            let _ = tx.send(resp);
+        } else {
+            debug!(plugin = %name, id, "response to unknown id");
+        }
+    } else if let Some(method) = resp.method {
+        // Plugin-initiated notification — fan out to
+        // `subscribe_notifications` consumers. Send error just means
+        // "no subscribers right now", which is normal when no
+        // streaming tool is active.
+        let _ = notifications.send(PluginNotification {
+            method,
+            params: resp.params,
+        });
+    } else {
+        debug!(plugin = %name, "frame without id or method; dropped");
     }
 }
 
@@ -782,6 +863,56 @@ while IFS= read -r line; do
 done
 "#;
 
+    /// A stdlib-only Python child speaking the length-prefixed
+    /// binary framing. Written from the layout in
+    /// `docs/architecture/10-plugin-wire-format.md` alone, which is
+    /// the point: a plugin author in any language can do the same.
+    const BINARY_ECHO: &str = r#"#!/usr/bin/env python3
+import json, struct, sys
+
+ENV_MAGIC = b"SMEV"
+HEADER = 36
+
+def read_exact(n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sys.stdin.buffer.read(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+def encode(kind, ident, method, params, result, err_msg, err_code):
+    m, p, r, e = (s.encode() for s in (method, params, result, err_msg))
+    head = ENV_MAGIC + struct.pack("<HBBqi", 1, kind, 0, ident, err_code)
+    head += struct.pack("<IIII", len(m), len(p), len(r), len(e))
+    return head + m + p + r + e
+
+def send(body):
+    sys.stdout.buffer.write(struct.pack(">I", len(body)) + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    prefix = read_exact(4)
+    if prefix is None:
+        break
+    (n,) = struct.unpack(">I", prefix)
+    body = read_exact(n)
+    if body is None:
+        break
+    kind = body[6]
+    ident = struct.unpack_from("<q", body, 8)[0]
+    m_len, p_len, _r_len, _e_len = struct.unpack_from("<IIII", body, 20)
+    method = body[HEADER:HEADER + m_len].decode()
+    params = body[HEADER + m_len:HEADER + m_len + p_len].decode()
+    if method == "boom":
+        send(encode(2, ident, "", "", "", "exploded on purpose", -32000))
+        continue
+    # One notification before the reply, to prove the id-less path.
+    send(encode(3, 0, "progress", json.dumps({"method": method}), "", "", 0))
+    send(encode(2, ident, "", "", json.dumps({"ok": True, "method": method, "echo": params}), "", 0))
+"#;
+
     fn make_script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, body).unwrap();
@@ -789,6 +920,95 @@ done
         p.set_mode(0o755);
         fs::set_permissions(&path, p).unwrap();
         path
+    }
+
+    /// A real child on the binary path: request/response correlation,
+    /// an id-less notification, and a plugin-reported error all work
+    /// exactly as they do over JSON.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn binary_framing_round_trips_through_a_real_child() {
+        let dir = tempdir().unwrap();
+        make_script(dir.path(), "echo.py", BINARY_ECHO);
+
+        let sidecar = Sidecar::spawn_with_options(
+            "binary-test",
+            dir.path(),
+            Path::new("./echo.py"),
+            SpawnOptions {
+                policy: RestartPolicy::no_restart(),
+                wire_format: WireFormat::Binary,
+                ..SpawnOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut notes = sidecar.subscribe_notifications();
+        let out = sidecar
+            .call("describe_capabilities", serde_json::json!({"x": 1}))
+            .await
+            .expect("binary round trip");
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["method"], "describe_capabilities");
+        assert_eq!(
+            out["echo"], r#"{"x":1}"#,
+            "params must reach the child intact"
+        );
+
+        let note = tokio::time::timeout(Duration::from_secs(5), notes.recv())
+            .await
+            .expect("notification arrives")
+            .expect("notification channel");
+        assert_eq!(note.method, "progress");
+
+        // An error reply surfaces as a plugin error, not a timeout.
+        let err = sidecar
+            .call("boom", Value::Null)
+            .await
+            .expect_err("the child reported an error");
+        assert!(err.to_string().contains("exploded on purpose"), "{err}");
+    }
+
+    /// A length prefix larger than the cap must drop the child rather
+    /// than make the engine reserve the buffer it asked for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_binary_frame_drops_the_child() {
+        const HUGE_PREFIX: &str = r#"#!/usr/bin/env python3
+import struct, sys
+# Claim a gigabyte, then send nothing.
+sys.stdout.buffer.write(struct.pack(">I", 1 << 30))
+sys.stdout.buffer.flush()
+import time
+time.sleep(30)
+"#;
+        let dir = tempdir().unwrap();
+        make_script(dir.path(), "huge.py", HUGE_PREFIX);
+
+        let sidecar = Sidecar::spawn_with_options(
+            "huge-test",
+            dir.path(),
+            Path::new("./huge.py"),
+            SpawnOptions {
+                policy: RestartPolicy::no_restart(),
+                wire_format: WireFormat::Binary,
+                max_frame_bytes: 4096,
+                rpc_timeout: Duration::from_secs(2),
+                ..SpawnOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // The reader rejects the prefix and ends; the call cannot be
+        // answered, so it fails rather than hanging forever.
+        let err = sidecar
+            .call("anything", Value::Null)
+            .await
+            .expect_err("an oversized frame must not be honoured");
+        assert!(
+            !err.to_string().is_empty(),
+            "the failure must be reported, not swallowed"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

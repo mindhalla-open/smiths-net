@@ -7,7 +7,9 @@ license      = { workspace = true }
 description  = "Sidecar plugin host: subprocess supervisor and JSON-RPC IPC over stdio."
 
 [dependencies]
-smiths-core = { workspace = true }
+smiths-core  = { workspace = true }
+# Shared envelope types for the opt-in binary framing.
+smiths-proto = { workspace = true }
 tokio       = { workspace = true }
 tokio-util  = { workspace = true }
 serde       = { workspace = true }

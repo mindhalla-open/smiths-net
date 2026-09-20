@@ -16,6 +16,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod error;
+pub mod framing;
 pub mod rpc;
 pub mod sandbox;
 pub mod supervisor;

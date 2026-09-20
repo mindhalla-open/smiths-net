@@ -20,13 +20,12 @@ Runs fully offline.
 > **Status:** pre-1.0, under active development. What ships and is
 > exercised end-to-end: signaling over UDP/TCP/TLS with the RFC 3261
 > transaction and dialog state machines, digest auth, an RTP/SRTP/DTLS
-> media bridge, G.711 transcoding, N-party mixing, WASM + sidecar
-> plugins, and the MCP control plane. **Experimental, not wired into
-> the engine:** the Raft crate (`smiths-raft`), the ICE agent
-> (`smiths-ice::agent`), and T.38 fax. HA today is one-way
-> primary→secondary dialog mirroring, not consensus. APIs still move.
-> See [CHANGELOG](CHANGELOG.md), and read the code before relying on a
-> capability.
+> media bridge gated by real ICE connectivity checks, G.711
+> transcoding, N-party mixing, WASM + sidecar plugins, the MCP control
+> plane, and HA either as one-way primary→secondary mirroring or as a
+> Raft-replicated dialog table. **Still experimental:** T.38 fax.
+> APIs still move. See [CHANGELOG](CHANGELOG.md), and read the code
+> before relying on a capability.
 
 ## Why smiths-net
 
@@ -44,7 +43,8 @@ Runs fully offline.
     language (Rust, TinyGo, C, Zig).
   - **Sidecar (subprocess + newline-delimited JSON-RPC over stdio)** —
     control-plane and AI plugins; any language at all (Python, Node,
-    Go, Java). A plugin is one file with no dependencies.
+    Go, Java). A plugin is one file with no dependencies, and can opt
+    into a length-prefixed binary framing when throughput warrants it.
 - **Rust core, `unsafe`-free by policy.** `unsafe_code = "deny"`
   workspace-wide; the media/crypto hot path is pure Rust (SRTP, DTLS).
 

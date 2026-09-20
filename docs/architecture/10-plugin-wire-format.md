@@ -1,12 +1,12 @@
 # Plugin wire format
 
-What actually crosses the engine↔plugin boundary, per tier. There is
-no per-plugin wire-format switch: each tier has one encoding, and a
-manifest cannot change it.
+What actually crosses the engine↔plugin boundary, per tier. The WASM
+and script tiers each have exactly one encoding. A sidecar defaults to
+JSON-RPC and may opt into a binary framing with one manifest key.
 
 | Tier | Encoding | Defined in |
 |------|----------|------------|
-| Sidecar | Newline-delimited JSON-RPC 2.0 over the child's stdin / stdout | `crates/smiths-sidecar/src/rpc.rs` |
+| Sidecar | Newline-delimited JSON-RPC 2.0 over the child's stdin / stdout (default), or length-prefixed binary frames per `wire_format` | `crates/smiths-sidecar/src/framing.rs` |
 | WASM | Typed envelopes passed as bytes through guest linear memory | `crates/smiths-proto/src/lib.rs` |
 | Script (Rhai) | Rhai values converted in-process; no serialization | `crates/smiths-script/src/lib.rs` |
 
@@ -29,9 +29,31 @@ capped (`LoaderOpts::sidecar_max_frame_bytes`, 16 MiB by default) and
 each RPC has a timeout (`sidecar_rpc_timeout`, 30 s by default); a
 child that overruns either is restarted under the restart policy.
 
-Swapping this encoding later is an implementation change inside
-`smiths-sidecar`, not a change to the plugin protocol: the method
-names, parameter shapes and capability descriptors stay the same.
+### Opting into binary frames
+
+A sidecar that moves enough traffic for per-frame JSON parsing to
+matter can set one key in its `plugin.toml`:
+
+```toml
+wire_format = "binary"   # default: "json"
+```
+
+Each frame is then a 4-byte big-endian length followed by an
+`Envelope` in the fixed-offset layout below. The declared length is
+checked against `sidecar_max_frame_bytes` *before* any buffer is
+sized, so a bogus prefix cannot make the engine reserve an arbitrary
+allocation. An unknown value is refused at load time, naming the
+accepted ones.
+
+Nothing above the wire changes: the same methods, the same parameter
+shapes, the same notification channel, timeout, frame cap and restart
+policy. Only the bytes differ, which is why JSON stays the default —
+it costs a plugin author nothing, and the binary path only pays off
+where it has been measured to.
+
+`plugins/cookbook/sidecar/python/binary-frames/` is a stdlib-only
+worked example with a README describing the layout well enough to
+implement a reader in another language.
 
 ## WASM: typed envelopes
 
@@ -97,7 +119,8 @@ byte branches a decoder in constant time.
 
 ## See also
 
-- `crates/smiths-sidecar/src/rpc.rs` — the JSON-RPC framing.
+- `crates/smiths-sidecar/src/framing.rs` — both sidecar encodings.
+- `crates/smiths-sidecar/src/rpc.rs` — the JSON-RPC message shapes.
 - `crates/smiths-proto/src/lib.rs` — the logical types.
 - `crates/smiths-proto/src/fixed_frame.rs` — the fixed-offset layout.
 - `crates/smiths-plugin/src/manifest.rs` — what a `plugin.toml` may
