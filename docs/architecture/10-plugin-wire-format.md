@@ -1,60 +1,60 @@
 # Plugin wire format
 
-Slice 5.2 / P18. smiths-net ships two wire formats for the
-engine↔plugin channel. Plugin authors opt in per-plugin via a
-single manifest field; the engine picks the right encoder at
-load time.
+What actually crosses the engine↔plugin boundary, per tier. There is
+no per-plugin wire-format switch: each tier has one encoding, and a
+manifest cannot change it.
 
-| Format         | Manifest value     | When to use                                                              |
-|----------------|--------------------|--------------------------------------------------------------------------|
-| Protobuf       | `"proto"` (default)| Control-plane RPC, ai.* capabilities, anything off the per-packet hot path. |
-| FlatBuffers-style | `"flatbuffers"` | `media.streaming_rtp` plugins — zero-copy on `RtpFrame`, ≥2× decode throughput. |
+| Tier | Encoding | Defined in |
+|------|----------|------------|
+| Sidecar | Newline-delimited JSON-RPC 2.0 over the child's stdin / stdout | `crates/smiths-sidecar/src/rpc.rs` |
+| WASM | Typed envelopes passed as bytes through guest linear memory | `crates/smiths-proto/src/lib.rs` |
+| Script (Rhai) | Rhai values converted in-process; no serialization | `crates/smiths-script/src/lib.rs` |
 
-Both formats speak the same logical types (`Envelope`,
-`Request`, `Response`, `Notification`, `RtpFrame`); they differ
-only in on-wire bytes. A plugin that flips from `proto` to
-`flatbuffers` changes exactly two things: the manifest field and
-the encoder/decoder import on the plugin side.
+## Sidecar: JSON-RPC over stdio
 
-## Picking
+One JSON object per line. Requests carry an `id`; the plugin replies
+with the same `id`. Lines without an `id` are notifications, which the
+engine republishes on its event bus. Anything on stderr is logged
+against the plugin's name.
 
-**Rule of thumb**: if you process RTP frames per packet, pick
-`flatbuffers`. Everything else, stay on `proto`.
-
-The benchmark in
-`crates/smiths-proto/tests/wire_format_throughput.rs` (run it
-with `cargo test -p smiths-proto --test wire_format_throughput
--- --ignored --nocapture`) measures **3.27× speedup** on a
-160-byte PCMU-shaped `RtpFrame` in debug mode. In release the
-gap widens further because prost's varint decode doesn't
-inline as aggressively as the flat layout's fixed-offset loads.
-
-For `ai.*` methods (tts, asr, llm, embed) the gain is in the
-noise: those methods invoke once per agent turn, and the
-Envelope's `params` / `result` fields are opaque JSON that
-dominates the encode cost either way. Stay on `proto` unless you
-have a measurement saying otherwise.
-
-## Manifest
-
-Add one line:
-
-```toml
-# plugin.toml
-name        = "rtp-tap"
-type        = "sidecar"
-entry       = "./rtp_tap.py"
-provides    = ["media.streaming_rtp"]
-wire_format = "flatbuffers"      # default: "proto"
+```json
+{"jsonrpc":"2.0","id":1,"method":"describe_capabilities","params":{}}
+{"jsonrpc":"2.0","id":1,"result":[{"capability":"ai.tts","plugin":"ai-tts-piper","model_id":"...","abi":"1.0"}]}
 ```
 
-The engine validates the token at load time — unknown values
-(`"msgpack"`, `"cbor"`, typos) fail the manifest parse rather
-than silently fall back. That failure is loud: the plugin
-doesn't load, the CLI's startup summary reports it, operators
-notice immediately.
+JSON was chosen over protobuf so a plugin author needs no `protoc`,
+no schema compiler and no dependencies. Every example sidecar under
+`plugins/examples/` is a single stdlib-only Python file. Frames are
+capped (`LoaderOpts::sidecar_max_frame_bytes`, 16 MiB by default) and
+each RPC has a timeout (`sidecar_rpc_timeout`, 30 s by default); a
+child that overruns either is restarted under the restart policy.
 
-## `RtpFrame` layout (flatbuffers variant)
+Swapping this encoding later is an implementation change inside
+`smiths-sidecar`, not a change to the plugin protocol: the method
+names, parameter shapes and capability descriptors stay the same.
+
+## WASM: typed envelopes
+
+`smiths-proto` owns the logical types (`Envelope`, `Request`,
+`Response`, `Notification`, `RtpFrame`) shared by the host and guest.
+The host writes the encoded bytes into guest memory and passes a
+pointer and length; the guest writes its reply back the same way.
+Every read is bounds-checked against the guest's memory size.
+
+`FixedFrameWireFormat` (`crates/smiths-proto/src/fixed_frame.rs`) is a
+hand-rolled fixed-offset binary layout for these types: a magic, a
+version, fixed-width scalars, then a variable-length region. It has no
+tags and no varints, so a reader can jump straight to a field, and a
+payload slice can be read without copying.
+
+Despite the name it once carried, this is **not** FlatBuffers. The
+`flatbuffers` crate's table API is `unsafe`, and the workspace sets
+`unsafe_code = "deny"`; the schema needed here is a handful of scalars
+plus one byte slice, so a ~250-line in-tree layout was cheaper than a
+scoped `unsafe` allow plus 100 KiB of crate code. If a future format
+needs schema evolution or unions, that trade is worth revisiting.
+
+### `RtpFrame` layout
 
 ```
 offset  size  field
@@ -74,25 +74,7 @@ offset  size  field
 32+N+M  P     payload            (raw bytes)
 ```
 
-Plugins that read only `payload` (the common case) skip the
-entire variable-length region by jumping straight to the offset
-at `32 + direction_len + call_id_len`. No per-field tags, no
-varints, no heap allocation. The `RtpFrameView` type exposes
-this as typed accessors on the engine side:
-
-```rust
-use smiths_proto::FlatbuffersWireFormat;
-use smiths_proto::flatbuffers_io::RtpFrameView;
-
-let bytes = FlatbuffersWireFormat.encode_rtp_frame(&frame);
-let view = RtpFrameView::new(&bytes)?;
-let payload: &[u8] = view.payload();  // zero-copy
-```
-
-Guest-side readers in other languages are small — the spec above
-compiles to ~20 lines of Python or ~10 lines of Go.
-
-## `Envelope` layout (flatbuffers variant)
+### `Envelope` layout
 
 ```
 offset  size  field
@@ -110,57 +92,13 @@ offset  size  field
 36      N+M+R+E  method ++ params ++ result ++ err_msg (UTF-8)
 ```
 
-Fields not populated by a given kind are zero-length. Kind byte
-branches decoders in O(1).
-
-## Migration checklist for existing plugins
-
-1. Measure. Run your plugin through its real workload for a few
-   minutes with the default `proto` format. Record the
-   per-invoke CPU cost.
-2. If `media.streaming_rtp` is in `provides` and the per-call
-   CPU cost is non-trivial, flip `wire_format = "flatbuffers"`.
-   Update your plugin's decoder to read `SMRF` framed bytes.
-3. If neither is true, stay on `proto`. The format is still
-   maintained and benefits from prost's mature ecosystem
-   (gRPC-interop, reflection, every other Rust/Go/Python codec).
-4. Re-measure. If you don't see ≥2× improvement on encode
-   throughput alone, the bottleneck isn't the wire format —
-   look upstream.
-
-## Why we didn't pull the official flatbuffers runtime
-
-The `flatbuffers` crate's low-level table API is marked
-`unsafe`, and the smiths-net workspace sets `unsafe_code =
-"deny"` at the root. Two ways forward were available:
-
-1. Add a scoped `#[allow(unsafe_code)]` with a justification,
-   matching the pattern `smiths-sidecar::sandbox` uses for
-   `pre_exec`.
-2. Hand-roll a flat binary layout that matches the FlatBuffers
-   philosophy (fixed offsets, no tags, zero-copy reads) without
-   pulling the library.
-
-Option 2 won because the schema we need is tiny — five scalar
-fields plus one bytes slice for `RtpFrame`, seven scalar/string
-fields for `Envelope`. The library's strength (schema
-evolution, hundreds of field tables, unions) isn't exercised by
-our schema; its cost (100+ KiB of crate code, `unsafe`) is. The
-in-tree hand-rolled layout is ~250 LOC total and keeps the
-unsafe-free posture.
-
-If a future slice needs a richer schema (say, a streaming
-camera-frame format with optional metadata tables), we can
-revisit — a scoped `unsafe_code` allow with a justification
-comment is a one-file change.
+Fields a given kind does not populate are zero-length, so the kind
+byte branches a decoder in constant time.
 
 ## See also
 
-- `crates/smiths-proto/src/lib.rs` — `WireFormat` trait +
-  `ProtoWireFormat`.
-- `crates/smiths-proto/src/flatbuffers_io.rs` — hand-rolled
-  flat layouts + `RtpFrameView`.
-- `crates/smiths-proto/tests/wire_format_throughput.rs` — the
-  ≥2× acceptance test.
-- `crates/smiths-plugin/src/manifest.rs` — `WireFormat` enum +
-  manifest field.
+- `crates/smiths-sidecar/src/rpc.rs` — the JSON-RPC framing.
+- `crates/smiths-proto/src/lib.rs` — the logical types.
+- `crates/smiths-proto/src/fixed_frame.rs` — the fixed-offset layout.
+- `crates/smiths-plugin/src/manifest.rs` — what a `plugin.toml` may
+  contain.

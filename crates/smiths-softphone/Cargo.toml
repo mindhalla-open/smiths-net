@@ -14,6 +14,9 @@ path = "src/main.rs"
 # G.711 μ-law codec — reuse the engine's bit-exact implementation
 # rather than re-derive it, so client and engine agree byte-for-byte.
 smiths-core = { workspace = true }
+# Adaptive playout jitter buffer — the same one the engine's
+# transcoded and conference paths use.
+smiths-media = { workspace = true }
 cpal        = { workspace = true }
 tokio       = { workspace = true }
 clap        = { workspace = true }

@@ -1,20 +1,41 @@
-//! RTCP packet builder (RFC 3550 §6.4).
+//! RTCP packet builder and parser (RFC 3550 §6).
 //!
-//! Covers the Sender Report (SR, PT=200) since our engine is always a
-//! sender in the passthrough bridge. The Receiver Report (RR, PT=201)
-//! lands when we split the emission path per direction. Packet parse
-//! has a matching `parse_sr` for tests and for future RTCP passthrough.
+//! The bridge terminates RTCP: it emits its own compound packets
+//! (Sender Report + SDES CNAME) on every leg and consumes whatever the
+//! peer sends back. This module has the wire formats for both sides:
 //!
-//! We deliberately don't implement SDES, BYE, or APP here — the MVP
-//! bridge just needs receivers to know we're alive and to get
-//! sender-side stats. Those can land in follow-on slices when we
-//! integrate with external monitoring.
+//! - builders for SR (with or without a report block), RR and SDES,
+//!   plus [`build_compound`] to concatenate them;
+//! - [`parse_compound`], which walks a compound datagram packet by
+//!   packet using the length field and returns typed [`RtcpPacket`]s
+//!   for SR, RR, SDES and BYE (anything else is reported by type);
+//! - [`is_rtcp`], the RFC 5761 demux test the RTP forwarder uses to
+//!   spot RTCP multiplexed onto the RTP port;
+//! - [`round_trip_time`], the `LSR` / `DLSR` arithmetic behind the
+//!   RTT the bridge derives from a peer's report block.
+//!
+//! APP packets are parsed by type only; the engine has no use for
+//! their payload.
+
+use std::time::Duration;
 
 /// RTCP Packet Type for Sender Report.
 pub const PT_SENDER_REPORT: u8 = 200;
 
 /// RTCP Packet Type for Receiver Report.
 pub const PT_RECEIVER_REPORT: u8 = 201;
+
+/// RTCP Packet Type for Source Description.
+pub const PT_SDES: u8 = 202;
+
+/// RTCP Packet Type for Goodbye.
+pub const PT_BYE: u8 = 203;
+
+/// RTCP Packet Type for Application-defined packets.
+pub const PT_APP: u8 = 204;
+
+/// SDES item type for the canonical name.
+pub const SDES_CNAME: u8 = 1;
 
 /// Length on the wire of one Report Block (RFC 3550 §6.4.1): 24 bytes.
 pub const REPORT_BLOCK_LEN: usize = 24;
@@ -129,6 +150,63 @@ pub fn build_rr(sender_ssrc: u32, rb: &ReportBlock) -> [u8; 32] {
     out
 }
 
+/// Build an SDES packet with a single chunk carrying one CNAME item
+/// (RFC 3550 §6.5). The chunk is padded with zero octets to a 32-bit
+/// boundary as the wire format requires; `cname` is truncated at 255
+/// bytes (the item length field is one octet).
+#[must_use]
+pub fn build_sdes_cname(ssrc: u32, cname: &str) -> Vec<u8> {
+    let name = &cname.as_bytes()[..cname.len().min(255)];
+    // chunk = ssrc(4) + item type(1) + len(1) + name + terminator(1),
+    // then pad to a multiple of 4.
+    let chunk_len = 4 + 2 + name.len() + 1;
+    let padded = chunk_len.div_ceil(4) * 4;
+    let mut out = Vec::with_capacity(4 + padded);
+    out.push(0x81); // V=2, P=0, SC=1
+    out.push(PT_SDES);
+    // length = words - 1, and the header word counts too.
+    let words = u16::try_from(padded / 4).unwrap_or(u16::MAX);
+    out.extend_from_slice(&words.to_be_bytes());
+    out.extend_from_slice(&ssrc.to_be_bytes());
+    out.push(SDES_CNAME);
+    #[allow(clippy::cast_possible_truncation)] // clamped to 255 above
+    out.push(name.len() as u8);
+    out.extend_from_slice(name);
+    out.resize(4 + padded, 0);
+    out
+}
+
+/// Build a BYE packet for one SSRC with an optional reason string
+/// (RFC 3550 §6.6).
+#[must_use]
+pub fn build_bye(ssrc: u32, reason: Option<&str>) -> Vec<u8> {
+    let mut out = vec![0x81, PT_BYE, 0, 0];
+    out.extend_from_slice(&ssrc.to_be_bytes());
+    if let Some(reason) = reason {
+        let text = &reason.as_bytes()[..reason.len().min(255)];
+        #[allow(clippy::cast_possible_truncation)] // clamped to 255 above
+        out.push(text.len() as u8);
+        out.extend_from_slice(text);
+        let padded = out.len().div_ceil(4) * 4;
+        out.resize(padded, 0);
+    }
+    let words = u16::try_from(out.len() / 4 - 1).unwrap_or(u16::MAX);
+    out[2..4].copy_from_slice(&words.to_be_bytes());
+    out
+}
+
+/// Concatenate already-built RTCP packets into one compound datagram
+/// (RFC 3550 §6.1: SR/RR first, SDES second).
+#[must_use]
+pub fn build_compound(packets: &[&[u8]]) -> Vec<u8> {
+    let total: usize = packets.iter().map(|p| p.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for p in packets {
+        out.extend_from_slice(p);
+    }
+    out
+}
+
 fn write_report_block(buf: &mut [u8], rb: &ReportBlock) {
     debug_assert_eq!(buf.len(), REPORT_BLOCK_LEN);
     buf[0..4].copy_from_slice(&rb.ssrc.to_be_bytes());
@@ -144,6 +222,15 @@ fn write_report_block(buf: &mut [u8], rb: &ReportBlock) {
     buf[12..16].copy_from_slice(&rb.jitter.to_be_bytes());
     buf[16..20].copy_from_slice(&rb.last_sr.to_be_bytes());
     buf[20..24].copy_from_slice(&rb.delay_since_last_sr.to_be_bytes());
+}
+
+/// RFC 5761 §4 demux test: an RTP-or-RTCP datagram whose second
+/// octet (RTP: `M` + `PT`; RTCP: `PT`) falls in 192..=223 is RTCP.
+/// RTP payload types 64–95 are unassignable precisely so this check
+/// is unambiguous.
+#[must_use]
+pub fn is_rtcp(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && (bytes[0] >> 6) == 2 && (192..=223).contains(&bytes[1])
 }
 
 /// Parse a Receiver Report packet (PT=201). Returns `(sender_ssrc,
@@ -164,16 +251,17 @@ pub fn parse_rr(bytes: &[u8]) -> Option<(u32, Vec<ReportBlock>)> {
     }
     let rc = (bytes[0] & 0x1F) as usize;
     let sender_ssrc = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    let mut blocks = Vec::with_capacity(rc);
-    for i in 0..rc {
-        let start = 8 + i * REPORT_BLOCK_LEN;
-        let end = start + REPORT_BLOCK_LEN;
-        if end > bytes.len() {
-            break;
-        }
-        blocks.push(read_report_block(&bytes[start..end]));
+    Some((sender_ssrc, read_report_blocks(&bytes[8..], rc)))
+}
+
+/// Read up to `rc` report blocks from `bytes`, stopping early if the
+/// buffer runs out.
+fn read_report_blocks(bytes: &[u8], rc: usize) -> Vec<ReportBlock> {
+    let mut blocks = Vec::with_capacity(rc.min(bytes.len() / REPORT_BLOCK_LEN));
+    for chunk in bytes.chunks_exact(REPORT_BLOCK_LEN).take(rc) {
+        blocks.push(read_report_block(chunk));
     }
-    Some((sender_ssrc, blocks))
+    blocks
 }
 
 fn read_report_block(buf: &[u8]) -> ReportBlock {
@@ -208,15 +296,21 @@ fn read_report_block(buf: &[u8]) -> ReportBlock {
 /// without error for valid input; `None` on any header mismatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParsedSr {
+    /// SSRC of the sender the report describes.
     pub sender_ssrc: u32,
+    /// 64-bit NTP timestamp of the report.
     pub ntp_ts: u64,
+    /// RTP timestamp corresponding to `ntp_ts`.
     pub rtp_ts: u32,
+    /// Sender's packet count.
     pub packet_count: u32,
+    /// Sender's payload octet count.
     pub octet_count: u32,
 }
 
-/// Parse an SR packet. Returns `None` if the bytes are malformed or
-/// not a sender report.
+/// Parse an SR packet's sender-info block. Returns `None` if the bytes
+/// are malformed or not a sender report. Report blocks after the
+/// sender info are ignored; use [`parse_sr_with_blocks`] to get them.
 #[must_use]
 pub fn parse_sr(bytes: &[u8]) -> Option<ParsedSr> {
     if bytes.len() < SR_WIRE_LEN {
@@ -240,6 +334,172 @@ pub fn parse_sr(bytes: &[u8]) -> Option<ParsedSr> {
     })
 }
 
+/// Parse an SR packet including its report blocks (as many as the RC
+/// field claims and the buffer actually holds).
+#[must_use]
+pub fn parse_sr_with_blocks(bytes: &[u8]) -> Option<(ParsedSr, Vec<ReportBlock>)> {
+    let sr = parse_sr(bytes)?;
+    let rc = (bytes[0] & 0x1F) as usize;
+    Some((sr, read_report_blocks(&bytes[SR_WIRE_LEN..], rc)))
+}
+
+/// One SDES chunk: the source it describes plus its CNAME, if any.
+/// Other item types are skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdesChunk {
+    /// Source the items describe.
+    pub ssrc: u32,
+    /// Canonical name, when the chunk carried one.
+    pub cname: Option<String>,
+}
+
+/// One RTCP packet out of a compound datagram.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RtcpPacket {
+    /// Sender Report with its report blocks.
+    SenderReport {
+        /// Sender info.
+        sr: ParsedSr,
+        /// Reception reports the sender is making about streams it
+        /// receives.
+        blocks: Vec<ReportBlock>,
+    },
+    /// Receiver Report.
+    ReceiverReport {
+        /// SSRC of the reporting receiver.
+        sender_ssrc: u32,
+        /// Reception reports.
+        blocks: Vec<ReportBlock>,
+    },
+    /// Source Description.
+    SourceDescription(Vec<SdesChunk>),
+    /// Goodbye.
+    Bye {
+        /// Sources leaving.
+        ssrcs: Vec<u32>,
+        /// Optional reason for leaving.
+        reason: Option<String>,
+    },
+    /// Any other packet type (APP, feedback, …), reported by type.
+    Other {
+        /// RTCP packet type.
+        payload_type: u8,
+    },
+}
+
+/// Walk a compound RTCP datagram (RFC 3550 §6.1) and parse every
+/// packet in it. Parsing stops at the first packet whose length field
+/// runs past the datagram; packets already parsed are still returned.
+/// A non-RTCP datagram yields an empty vector.
+#[must_use]
+pub fn parse_compound(bytes: &[u8]) -> Vec<RtcpPacket> {
+    let mut out = Vec::new();
+    let mut rest = bytes;
+    while rest.len() >= 4 {
+        if rest[0] >> 6 != 2 {
+            break;
+        }
+        let words = usize::from(u16::from_be_bytes([rest[2], rest[3]]));
+        let len = (words + 1) * 4;
+        if len > rest.len() {
+            break;
+        }
+        let (pkt, tail) = rest.split_at(len);
+        // Padding (P bit) only applies to the last packet; the length
+        // field already includes it, so no adjustment is needed for
+        // the walk itself.
+        if let Some(parsed) = parse_one(pkt) {
+            out.push(parsed);
+        }
+        rest = tail;
+    }
+    out
+}
+
+fn parse_one(pkt: &[u8]) -> Option<RtcpPacket> {
+    let count = usize::from(pkt[0] & 0x1F);
+    match pkt[1] {
+        PT_SENDER_REPORT => {
+            let (sr, blocks) = parse_sr_with_blocks(pkt)?;
+            Some(RtcpPacket::SenderReport { sr, blocks })
+        }
+        PT_RECEIVER_REPORT => {
+            let (sender_ssrc, blocks) = parse_rr(pkt)?;
+            Some(RtcpPacket::ReceiverReport {
+                sender_ssrc,
+                blocks,
+            })
+        }
+        PT_SDES => Some(RtcpPacket::SourceDescription(parse_sdes_chunks(
+            &pkt[4..],
+            count,
+        ))),
+        PT_BYE => {
+            let mut ssrcs = Vec::with_capacity(count);
+            let mut pos = 4;
+            for _ in 0..count {
+                if pos + 4 > pkt.len() {
+                    break;
+                }
+                ssrcs.push(u32::from_be_bytes([
+                    pkt[pos],
+                    pkt[pos + 1],
+                    pkt[pos + 2],
+                    pkt[pos + 3],
+                ]));
+                pos += 4;
+            }
+            let reason = (pos < pkt.len()).then(|| {
+                let n = usize::from(pkt[pos]).min(pkt.len() - pos - 1);
+                String::from_utf8_lossy(&pkt[pos + 1..pos + 1 + n]).into_owned()
+            });
+            Some(RtcpPacket::Bye { ssrcs, reason })
+        }
+        other => Some(RtcpPacket::Other {
+            payload_type: other,
+        }),
+    }
+}
+
+/// Parse `count` SDES chunks. Each chunk is `SSRC` followed by items
+/// (`type`, `len`, `text`) terminated by a zero type octet and padded
+/// to a 32-bit boundary.
+fn parse_sdes_chunks(mut bytes: &[u8], count: usize) -> Vec<SdesChunk> {
+    let mut chunks = Vec::with_capacity(count);
+    for _ in 0..count {
+        if bytes.len() < 4 {
+            break;
+        }
+        let ssrc = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let mut pos = 4;
+        let mut cname = None;
+        while let Some(&item_type) = bytes.get(pos) {
+            if item_type == 0 {
+                pos += 1;
+                break;
+            }
+            let Some(&len) = bytes.get(pos + 1) else {
+                break;
+            };
+            let start = pos + 2;
+            let end = start + usize::from(len);
+            if end > bytes.len() {
+                break;
+            }
+            if item_type == SDES_CNAME && cname.is_none() {
+                cname = Some(String::from_utf8_lossy(&bytes[start..end]).into_owned());
+            }
+            pos = end;
+        }
+        chunks.push(SdesChunk { ssrc, cname });
+        // Items end on a 32-bit boundary (the terminator is followed by
+        // zero padding up to it).
+        let padded = pos.div_ceil(4) * 4;
+        bytes = bytes.get(padded..).unwrap_or(&[]);
+    }
+    chunks
+}
+
 /// Encode the current wall-clock as a 64-bit NTP timestamp: the upper
 /// 32 bits are seconds since 1900-01-01 (NTP epoch), the lower 32 bits
 /// are a fractional second scaled to 2^32.
@@ -256,6 +516,40 @@ pub fn ntp_now() -> u64 {
     // Scale nanoseconds into a 32-bit fractional second.
     let frac = ((u64::from(d.subsec_nanos())) << 32) / 1_000_000_000;
     (secs << 32) | frac
+}
+
+/// Middle 32 bits of a 64-bit NTP timestamp — the compact form the
+/// `LSR` field and RTT arithmetic use (units of 1/65536 s).
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // middle 32 bits by construction
+pub fn ntp_middle(ntp: u64) -> u32 {
+    (ntp >> 16) as u32
+}
+
+/// Express a delay as `DLSR` units (1/65536 s), saturating at `u32::MAX`.
+#[must_use]
+pub fn to_dlsr(delay: Duration) -> u32 {
+    u32::try_from(delay.as_micros() * 65_536 / 1_000_000).unwrap_or(u32::MAX)
+}
+
+/// RFC 3550 §6.4.1 round-trip time: `A − LSR − DLSR`, where `A` is
+/// the arrival time of the report block in NTP-middle units. Returns
+/// `None` when the block never saw one of our SRs (`LSR == 0`) or the
+/// arithmetic is nonsensical (a stale echo older than 18 hours).
+#[must_use]
+pub fn round_trip_time(arrival_ntp_mid: u32, rb: &ReportBlock) -> Option<Duration> {
+    if rb.last_sr == 0 {
+        return None;
+    }
+    let ticks = arrival_ntp_mid
+        .wrapping_sub(rb.last_sr)
+        .wrapping_sub(rb.delay_since_last_sr);
+    // A genuine RTT is a fraction of a second; anything that wraps
+    // into the top bit is a clock or echo error, not a measurement.
+    if ticks & 0x8000_0000 != 0 {
+        return None;
+    }
+    Some(Duration::from_micros(u64::from(ticks) * 1_000_000 / 65_536))
 }
 
 #[cfg(test)]
@@ -321,11 +615,10 @@ mod tests {
         let len_field = u16::from_be_bytes([bytes[2], bytes[3]]);
         assert_eq!(len_field, 12, "length field (words - 1) must be 12");
 
-        // The underlying SR fields decode with `parse_sr`, which
-        // intentionally ignores report blocks past the 28-byte header.
-        let parsed = parse_sr(&bytes[..SR_WIRE_LEN]).expect("parse SR prefix");
+        let (parsed, blocks) = parse_sr_with_blocks(&bytes).expect("parse SR");
         assert_eq!(parsed.sender_ssrc, 0x1111_1111);
         assert_eq!(parsed.packet_count, 100);
+        assert_eq!(blocks, vec![rb]);
     }
 
     #[test]
@@ -368,6 +661,135 @@ mod tests {
             1,
             "parser caps at what the wire actually carries"
         );
+    }
+
+    #[test]
+    fn sdes_cname_round_trips_with_padding() {
+        for cname in ["a", "ab", "abc", "abcd", "smiths-net@0xdeadbeef"] {
+            let bytes = build_sdes_cname(0xDEAD_BEEF, cname);
+            assert_eq!(bytes.len() % 4, 0, "SDES must be 32-bit aligned");
+            let words = usize::from(u16::from_be_bytes([bytes[2], bytes[3]]));
+            assert_eq!((words + 1) * 4, bytes.len(), "length field matches");
+            let parsed = parse_compound(&bytes);
+            assert_eq!(
+                parsed,
+                vec![RtcpPacket::SourceDescription(vec![SdesChunk {
+                    ssrc: 0xDEAD_BEEF,
+                    cname: Some(cname.to_owned()),
+                }])]
+            );
+        }
+    }
+
+    #[test]
+    fn bye_round_trips_with_and_without_reason() {
+        let plain = build_bye(7, None);
+        assert_eq!(plain.len(), 8);
+        assert_eq!(
+            parse_compound(&plain),
+            vec![RtcpPacket::Bye {
+                ssrcs: vec![7],
+                reason: None
+            }]
+        );
+        let with_reason = build_bye(7, Some("teardown"));
+        assert_eq!(with_reason.len() % 4, 0);
+        assert_eq!(
+            parse_compound(&with_reason),
+            vec![RtcpPacket::Bye {
+                ssrcs: vec![7],
+                reason: Some("teardown".into())
+            }]
+        );
+    }
+
+    #[test]
+    fn compound_walk_yields_every_packet_in_order() {
+        let rb = sample_rb();
+        let sr = build_sr_with_rb(1, 2, 3, 4, 5, &rb);
+        let sdes = build_sdes_cname(1, "one");
+        let rr = build_rr(9, &rb);
+        let bye = build_bye(1, Some("bye"));
+        let app = [0x80, PT_APP, 0, 2, 0, 0, 0, 1, b'n', b'a', b'm', b'e'];
+        let compound = build_compound(&[&sr, &sdes, &rr, &bye, &app]);
+        let parsed = parse_compound(&compound);
+        assert_eq!(parsed.len(), 5);
+        assert!(matches!(
+            &parsed[0],
+            RtcpPacket::SenderReport { sr, blocks } if sr.sender_ssrc == 1 && blocks.len() == 1
+        ));
+        assert!(matches!(&parsed[1], RtcpPacket::SourceDescription(c) if c.len() == 1));
+        assert!(matches!(
+            &parsed[2],
+            RtcpPacket::ReceiverReport { sender_ssrc: 9, blocks } if blocks[0] == rb
+        ));
+        assert!(matches!(&parsed[3], RtcpPacket::Bye { ssrcs, .. } if ssrcs == &[1]));
+        assert_eq!(
+            parsed[4],
+            RtcpPacket::Other {
+                payload_type: PT_APP
+            }
+        );
+    }
+
+    #[test]
+    fn compound_walk_stops_at_truncation_and_ignores_garbage() {
+        let sr = build_sr(1, 2, 3, 4, 5);
+        let sdes = build_sdes_cname(1, "one");
+        let mut compound = build_compound(&[&sr, &sdes]);
+        compound.truncate(sr.len() + 6); // second packet cut short
+        let parsed = parse_compound(&compound);
+        assert_eq!(parsed.len(), 1, "only the intact SR is returned");
+        assert!(parse_compound(b"not rtcp at all").is_empty());
+        assert!(parse_compound(&[]).is_empty());
+    }
+
+    #[test]
+    fn is_rtcp_separates_rtcp_from_rtp() {
+        assert!(is_rtcp(&build_sr(1, 2, 3, 4, 5)));
+        assert!(is_rtcp(&build_rr(1, &sample_rb())));
+        assert!(is_rtcp(&build_bye(1, None)));
+        // RTP with PT 0 and marker set: byte1 = 0x80, not RTCP.
+        let rtp = [0x80, 0x80, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert!(!is_rtcp(&rtp));
+        // RTP with PT 101 (telephone-event): byte1 = 101.
+        let rtp_dtmf = [0x80, 101, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert!(!is_rtcp(&rtp_dtmf));
+        assert!(!is_rtcp(&[0x80, 200]), "too short to be either");
+    }
+
+    #[test]
+    fn round_trip_time_from_lsr_dlsr() {
+        // Our SR left at NTP-middle 1_000_000; the peer echoed it after
+        // holding it for 0.25 s (16_384 units); the RR arrived at
+        // 1_000_000 + 65_536 (1 s later) → RTT = 0.75 s.
+        let rb = ReportBlock {
+            last_sr: 1_000_000,
+            delay_since_last_sr: 16_384,
+            ..sample_rb()
+        };
+        let rtt = round_trip_time(1_000_000 + 65_536, &rb).expect("rtt");
+        assert_eq!(rtt, Duration::from_millis(750));
+        // No SR echoed → no RTT.
+        let none = ReportBlock {
+            last_sr: 0,
+            ..sample_rb()
+        };
+        assert!(round_trip_time(5, &none).is_none());
+        // Echo from the "future" (clock skew) → rejected.
+        let skew = ReportBlock {
+            last_sr: 2_000_000,
+            delay_since_last_sr: 0,
+            ..sample_rb()
+        };
+        assert!(round_trip_time(1_000_000, &skew).is_none());
+    }
+
+    #[test]
+    fn dlsr_and_ntp_middle_units() {
+        assert_eq!(to_dlsr(Duration::from_secs(1)), 65_536);
+        assert_eq!(to_dlsr(Duration::from_millis(500)), 32_768);
+        assert_eq!(ntp_middle(0x1234_5678_9ABC_DEF0), 0x5678_9ABC);
     }
 
     #[test]

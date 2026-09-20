@@ -12,6 +12,12 @@
 //!    wire (`is_breaker_open()` == `true`).
 //! 4. Bearer auth — the webhook asserts the `Authorization: Bearer
 //!    <token>` header is present.
+//! 5. Algorithm passthrough — `lookup_for(.., Sha256)` asks the
+//!    webhook for a SHA-256 HA1.
+//! 6. Runtime bridging — `Registrar::authenticate_async` works on a
+//!    `current_thread` runtime (no `block_in_place`), the sync trait
+//!    path degrades to `None` there instead of panicking, and works
+//!    outside any runtime.
 
 #![cfg(feature = "auth-http")]
 
@@ -27,10 +33,13 @@ use axum::{
     routing::post,
 };
 use serde::{Deserialize, Serialize};
-use smiths_sip::auth::digest::Algorithm;
+use smiths_sip::auth::digest::{Algorithm, AuthError, Registrar, ha2, response_qop_auth};
 use smiths_sip::auth::http_store::{HttpAuthConfig, HttpAuthStore};
 use smiths_sip::auth::{CredentialStore, Credentials};
 use tokio::net::TcpListener;
+
+/// HA1 the mock webhook returns by default (RFC 2617's Mufasa vector).
+const MOCK_HA1: &str = "939e7578ed9e3c518a452acee763bce9";
 
 #[derive(Clone, Default)]
 struct MockState {
@@ -327,4 +336,122 @@ async fn http_store_authenticate_api_returns_error_on_breaker_open() {
     let synthetic = Credentials::from_ha1("u", "r", "DEADBEEF");
     assert!(synthetic.password.is_empty());
     assert_eq!(synthetic.ha1.as_deref(), Some("DEADBEEF"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_store_lookup_for_requests_the_asked_algorithm() {
+    let state = MockState::default();
+    let addr = spawn_mock_webhook(state.clone()).await;
+    let cfg = HttpAuthConfig {
+        endpoint: format!("http://{addr}/authenticate"),
+        ..HttpAuthConfig::default()
+    };
+    let store = HttpAuthStore::new(cfg).unwrap();
+
+    assert!(
+        store
+            .lookup_for("smiths.test", "alice", Algorithm::Sha256)
+            .is_some()
+    );
+    let captured = state.last_request.lock().unwrap().clone().unwrap();
+    assert_eq!(captured.algorithm, "sha-256");
+
+    assert!(store.lookup("smiths.test", "alice").is_some());
+    let captured = state.last_request.lock().unwrap().clone().unwrap();
+    assert_eq!(captured.algorithm, "md5", "plain lookup asks for MD5");
+}
+
+/// Digest header for `nonce` using the mock's fixed HA1.
+fn authorization_for(nonce: &str, nc: &str) -> String {
+    let uri = "sip:smiths.test";
+    let h2 = ha2(Algorithm::Md5, "REGISTER", uri);
+    let resp = response_qop_auth(Algorithm::Md5, MOCK_HA1, nonce, nc, "cn", &h2);
+    format!(
+        "Digest username=\"alice\", realm=\"smiths.test\", nonce=\"{nonce}\", \
+         uri=\"{uri}\", response=\"{resp}\", algorithm=MD5, qop=auth, nc={nc}, cnonce=\"cn\""
+    )
+}
+
+fn nonce_of(challenge: &str) -> String {
+    challenge
+        .split("nonce=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn registrar_authenticate_async_with_http_store_on_current_thread_runtime() {
+    // A current_thread runtime cannot `block_in_place`; the async
+    // path must go through the store's native async lookup.
+    let state = MockState::default();
+    let addr = spawn_mock_webhook(state.clone()).await;
+    let cfg = HttpAuthConfig {
+        endpoint: format!("http://{addr}/authenticate"),
+        ..HttpAuthConfig::default()
+    };
+    let store = Arc::new(HttpAuthStore::new(cfg).unwrap());
+    let reg = Registrar::new("smiths.test", store);
+
+    let nonce = nonce_of(&reg.challenge(Algorithm::Md5, false));
+    let hdr = authorization_for(&nonce, "00000001");
+    assert_eq!(
+        reg.authenticate_async("REGISTER", "sip:smiths.test", &hdr)
+            .await,
+        Ok("alice".to_owned())
+    );
+    assert_eq!(state.hits.load(Ordering::Relaxed), 1);
+    // Replay of the same header is refused without another webhook hit.
+    assert_eq!(
+        reg.authenticate_async("REGISTER", "sip:smiths.test", &hdr)
+            .await,
+        Err(AuthError::NonceReplayed)
+    );
+    assert_eq!(state.hits.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn http_store_sync_lookup_on_current_thread_runtime_degrades_to_none() {
+    let state = MockState::default();
+    let addr = spawn_mock_webhook(state.clone()).await;
+    let cfg = HttpAuthConfig {
+        endpoint: format!("http://{addr}/authenticate"),
+        ..HttpAuthConfig::default()
+    };
+    let store = HttpAuthStore::new(cfg).unwrap();
+    // Blocking the only worker would deadlock the reactor; the sync
+    // path must refuse (logged) rather than panic.
+    assert!(store.lookup("smiths.test", "alice").is_none());
+    assert_eq!(state.hits.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn http_store_sync_lookup_outside_any_runtime_works() {
+    // Run the mock webhook on its own runtime thread; the test thread
+    // itself has no tokio context.
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+    let state = MockState::default();
+    let server_state = state.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let addr = spawn_mock_webhook(server_state).await;
+            addr_tx.send(addr).unwrap();
+            std::future::pending::<()>().await;
+        });
+    });
+    let addr = addr_rx.recv().unwrap();
+    let cfg = HttpAuthConfig {
+        endpoint: format!("http://{addr}/authenticate"),
+        ..HttpAuthConfig::default()
+    };
+    let store = HttpAuthStore::new(cfg).unwrap();
+    let creds = store
+        .lookup_for("smiths.test", "alice", Algorithm::Md5)
+        .expect("throwaway runtime must drive the lookup");
+    assert_eq!(creds.ha1.as_deref(), Some(MOCK_HA1));
 }

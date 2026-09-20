@@ -1,4 +1,4 @@
-//! WebRTC-native signaling runtime (slice 5.10-followup).
+//! WebRTC-native signaling runtime.
 //!
 //! Hosts the axum WebSocket route + the concrete
 //! [`WebRtcSessionHandler`] impl that routes offers through the
@@ -35,25 +35,28 @@
 //! `smiths_webrtc_sessions_paired_total{partner="none"}` so
 //! dashboards alert on a rising slope of orphaned legs.
 //!
-//! ## Honest deferrals
+//! ## Boundaries
 //!
-//! - **ICE / NAT traversal.** The DTLS handshake trusts the
-//!   peer address in the offer's `c=` / `m=` block. Fine for
-//!   loopback and same-subnet deployments; real NATs need ICE.
-//!   Slice 5.10-ice / 5.11-turn fill that gap.
-//! - **SIP → WebRTC dial path.** Wiring a SIP INVITE into the
-//!   same rendezvous map (so an incoming SIP call can pair with
-//!   a pre-parked WebRTC leg) lands in a dedicated follow-on.
-//!   Today, two WebRTC legs sharing a tag can pair; a SIP leg
-//!   plus a WebRTC leg requires the MCP control plane.
-//! - **TLS termination.** `serve_webrtc` binds plain HTTP/
-//!   WebSocket today; production deployments front the engine
-//!   with nginx/Caddy for `wss://`. See
-//!   `docs/deployment/webrtc.md`.
+//! - **ICE.** Answers carry host candidates from the negotiator
+//!   and, when `[webrtc.ice] stun_servers` is set, server-reflexive
+//!   candidates gathered with one STUN Binding per server against
+//!   the leg's own media socket. Connectivity checks are ICE-lite:
+//!   the DTLS handshake and RTP go to the peer address the offer
+//!   advertised.
+//! - **SIP ↔ WebRTC.** A SIP INVITE carrying
+//!   `X-Smiths-Webrtc-Tag` pairs with a parked WebRTC leg through
+//!   [`smiths_core::WebRtcRendezvous`]; two WebRTC legs sharing a
+//!   tag pair with each other.
+//! - **TLS termination.** `serve_webrtc` binds plain HTTP /
+//!   WebSocket; production deployments front the engine with a
+//!   TLS terminator for `wss://` (`docs/deployment/webrtc.md`).
+//!   `Config::validate` refuses `[webrtc] tls_cert` / `tls_key`.
+//! - **Media ports.** The adapter's fabric honors
+//!   `[media.rtp_ports]` like the SIP fabric does, so one firewall
+//!   window covers both.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -64,20 +67,22 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use dashmap::DashMap;
-use smiths_core::metrics::{PrivacyRejectReasonLabel, WebRtcPartnerLabel};
+use smiths_core::metrics::{IceCandidateTypeLabel, PrivacyRejectReasonLabel, WebRtcPartnerLabel};
 use smiths_core::{
-    BridgeId, BridgeLeg, EndpointId, MediaFabric, Metrics, NegotiationOutcome, SdpNegotiator,
-    SelfSignedCert, SrtpKeys, WebRtcPrivacyConfig, WebRtcPrivacyMode,
+    BridgeId, BridgeLeg, Config, EndpointId, MediaFabric, Metrics, NegotiationOutcome,
+    SdpNegotiator, SelfSignedCert, Shutdown, SrtpKeys, WebRtcPrivacyConfig, WebRtcPrivacyMode,
 };
 use smiths_dtls::{DtlsLegConfig, DtlsRole as DtlsLegRole};
 use smiths_media::UdpMediaFabric;
 use smiths_sdp::SessionDescription;
 use smiths_sdp::privacy::{OfferPrivacyVerdict, redact_ip, reject_direct_candidates};
+use smiths_sdp::types::IceCandidate;
 use smiths_sip::webrtc::{
     WebRtcHandlerError, WebRtcSession, WebRtcSessionHandler, WebSocketSignalingListener,
 };
 use smiths_sip::webtransport::WebTransportSessionId;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -119,12 +124,9 @@ struct PendingLeg {
 pub(crate) struct CliWebRtcHandler {
     negotiator: Arc<dyn SdpNegotiator>,
     local_ip: IpAddr,
-    /// Next media port — legacy hint; `fabric.allocate` picks
-    /// the actual port so `next_port` survives only as an
-    /// observability counter.
-    next_port: AtomicU16,
-    port_base: u16,
-    port_range: u16,
+    /// STUN servers queried for server-reflexive candidates on
+    /// every accepted offer. Empty = host candidates only.
+    stun_servers: Vec<SocketAddr>,
     /// Handle on the DTLS-SRTP identity — None = DTLS offers
     /// land on `UnsupportedTransport`; Some = every
     /// `UDP/TLS/RTP/SAVP[F]` offer gets a real answer.
@@ -145,7 +147,7 @@ pub(crate) struct CliWebRtcHandler {
     /// `with_rendezvous_deadline` for tests that need tighter
     /// eviction.
     rendezvous_deadline: Duration,
-    /// Privacy posture (slice 5.11-privacy). Reads of
+    /// Privacy posture. Reads of
     /// `[webrtc.privacy]`; the 5.8-b read-through adapter
     /// live-updates the inner `Mutex<WebRtcPrivacyConfig>` when
     /// the operator rotates the `redaction_key` or flips `mode`.
@@ -153,28 +155,20 @@ pub(crate) struct CliWebRtcHandler {
 }
 
 impl CliWebRtcHandler {
-    /// Build a handler bound to the given negotiator + fabric
-    /// + local IP (what the engine publishes in the answer's
-    ///   `c=` line).
-    ///
-    /// `port_base` / `port_range` are legacy hints kept for
-    /// dashboards; the actual port is picked by
-    /// `MediaFabric::allocate`. When `port_range == 0` the
-    /// handler still wires the counter without wrapping.
+    /// Build a handler bound to the given negotiator, media fabric
+    /// and local IP (the address the engine publishes in the answer's
+    /// `c=` line). Media ports come from the fabric's allocator,
+    /// which honors `[media.rtp_ports]`.
     #[must_use]
     pub(crate) fn new(
         negotiator: Arc<dyn SdpNegotiator>,
         fabric: Arc<UdpMediaFabric>,
         local_ip: IpAddr,
-        port_base: u16,
-        port_range: u16,
     ) -> Self {
         Self {
             negotiator,
             local_ip,
-            next_port: AtomicU16::new(port_base),
-            port_base,
-            port_range,
+            stun_servers: Vec::new(),
             dtls_cert: None,
             fabric,
             pending: Arc::new(DashMap::new()),
@@ -183,6 +177,14 @@ impl CliWebRtcHandler {
             rendezvous_deadline: DEFAULT_RENDEZVOUS_DEADLINE,
             privacy: Arc::new(std::sync::Mutex::new(WebRtcPrivacyConfig::default())),
         }
+    }
+
+    /// STUN servers to query for server-reflexive candidates
+    /// (`[webrtc.ice] stun_servers`).
+    #[must_use]
+    pub(crate) fn with_stun_servers(mut self, servers: Vec<SocketAddr>) -> Self {
+        self.stun_servers = servers;
+        self
     }
 
     /// Attach the `[webrtc.privacy]` config. Holds an
@@ -280,12 +282,43 @@ impl CliWebRtcHandler {
         self
     }
 
-    fn alloc_port_hint(&self) -> u16 {
-        if self.port_range == 0 {
-            return self.port_base;
+    /// Gather server-reflexive candidates for the leg's socket and
+    /// append them to the answer's first media section. STUN
+    /// failures leave the answer as it was — host-only.
+    async fn add_srflx_candidates(&self, endpoint: EndpointId, answer: &str) -> String {
+        let Some(socket) = self.fabric.endpoint_socket(endpoint) else {
+            return answer.to_owned();
+        };
+        let Ok(local) = socket.local_addr() else {
+            return answer.to_owned();
+        };
+        let observed = smiths_ice::stun::gather_srflx_candidates(
+            &socket,
+            &self.stun_servers,
+            Duration::from_secs(1),
+        )
+        .await;
+        if observed.is_empty() {
+            debug!(?endpoint, "no srflx candidate gathered");
+            return answer.to_owned();
         }
-        let p = self.next_port.fetch_add(2, Ordering::Relaxed);
-        self.port_base + ((p - self.port_base) % self.port_range)
+        let Ok(mut sdp) = SessionDescription::parse(answer) else {
+            return answer.to_owned();
+        };
+        let Some(m) = sdp.media.first_mut() else {
+            return answer.to_owned();
+        };
+        for (idx, addr) in observed.into_iter().enumerate() {
+            m.candidates.push(srflx_candidate(addr, local, idx));
+            if let Some(metrics) = &self.metrics {
+                metrics
+                    .ice_candidates_gathered
+                    .get_or_create(&IceCandidateTypeLabel { ty: "srflx".into() })
+                    .inc();
+            }
+            debug!(?endpoint, %addr, "srflx candidate added to answer");
+        }
+        sdp.to_string()
     }
 
     fn bump_pair(&self, partner: &'static str) {
@@ -307,7 +340,7 @@ impl CliWebRtcHandler {
     ///   `MediaFabric::bridge` + retain the `BridgeId` under
     ///   the session so `bye` can release it.
     ///
-    /// Returns `Ok(())` whether this leg paired or parked —
+    /// Returns `Ok()` whether this leg paired or parked —
     /// the caller sends the answer either way. The only
     /// `Err` path is a fabric bridge install failure, which
     /// surfaces as `WebRtcHandlerError::Resource` so the
@@ -409,7 +442,6 @@ impl CliWebRtcHandler {
     }
 }
 
-#[async_trait]
 #[async_trait]
 impl smiths_core::WebRtcRendezvous for CliWebRtcHandler {
     async fn pair_sip_leg(
@@ -520,10 +552,9 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
         tag: Option<&str>,
         sdp_offer: &str,
     ) -> Result<String, WebRtcHandlerError> {
-        let _hint = self.alloc_port_hint();
         debug!(?session, ?tag, "webrtc: negotiating offer");
 
-        // Slice 5.11-privacy: pre-negotiation candidate filter.
+        // : pre-negotiation candidate filter.
         // In `relay_only` / `strict` mode, reject offers that
         // advertise `host` / `srflx` candidates — the engine
         // is contractually "relay only" and accepting such a
@@ -620,7 +651,7 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
                         Err(e) => {
                             // Log the offer's `o=` line so the
                             // operator can correlate with the
-                            // peer's SDP in logs (slice 5.10-dtls
+                            // peer's SDP in logs (
                             // Small 2 requirement).
                             let origin = sdp_offer
                                 .lines()
@@ -647,7 +678,7 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
                     self.rendezvous(session, tag, endpoint_id, peer, srtp_keys)
                         .await?;
                 }
-                // Slice 5.11-privacy: strip `host` candidates
+                // : strip `host` candidates
                 // from the answer in `relay_only` / `strict`.
                 // Today the negotiator doesn't emit candidates
                 // in answers (ICE emission lands with
@@ -663,6 +694,15 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
                 } else {
                     answer_body
                 };
+                // Server-reflexive candidates only make sense in
+                // `open` mode: relay-only deployments would strip
+                // them again on the client side.
+                let final_answer =
+                    if self.stun_servers.is_empty() || privacy.mode != WebRtcPrivacyMode::Open {
+                        final_answer
+                    } else {
+                        self.add_srflx_candidates(endpoint_id, &final_answer).await
+                    };
                 let peer_rendered = self.render_peer(peer);
                 debug!(
                     ?session,
@@ -728,7 +768,7 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
         candidate: &str,
         sdp_m_line_index: u16,
     ) -> Result<(), WebRtcHandlerError> {
-        // Slice 5.10-ice: accept trickle-ICE candidates.
+        // : accept trickle-ICE candidates.
         // Real ICE pair checks happen against whatever address
         // the DTLS handshake actually received from — the
         // candidate line is diagnostic + future pair-check
@@ -751,6 +791,123 @@ impl WebRtcSessionHandler for CliWebRtcHandler {
         }
         Ok(())
     }
+}
+
+/// RFC 8445 §5.1.2 priority for a server-reflexive candidate
+/// (type preference 100) on component 1.
+fn srflx_candidate(observed: SocketAddr, base: SocketAddr, idx: usize) -> IceCandidate {
+    let local_pref: u32 = if observed.is_ipv6() { 65_535 } else { 65_534 };
+    IceCandidate {
+        foundation: format!("srflx{idx}"),
+        component: 1,
+        transport: "UDP".into(),
+        priority: (100u32 << 24) + (local_pref << 8) + 255,
+        address: observed.ip(),
+        port: observed.port(),
+        candidate_type: "srflx".into(),
+        related_address: Some(base.ip()),
+        related_port: Some(base.port()),
+        raw_params: Vec::new(),
+    }
+}
+
+/// Build the signaling handler from `[webrtc]` without starting
+/// its servers. The handler doubles as the SIP UAS's
+/// [`smiths_core::WebRtcRendezvous`] so SIP INVITEs carrying
+/// `X-Smiths-Webrtc-Tag:` can bridge against a parked WebRTC
+/// partner. It shares the engine's media fabric, so WebRTC and SIP
+/// endpoints draw from one `[media.rtp_ports]` allocator and a
+/// bridge can span both.
+pub(crate) fn build_handler(
+    config: &Config,
+    metrics: &Arc<Metrics>,
+    fabric: Arc<UdpMediaFabric>,
+) -> Arc<CliWebRtcHandler> {
+    let bind = config.webrtc.ws_bind;
+    let dtls_cert = match SelfSignedCert::generate("smiths-net-webrtc") {
+        Ok(c) => Some(Arc::new(c)),
+        Err(e) => {
+            warn!(
+                ?e,
+                "minting WebRTC DTLS cert failed; DTLS-SRTP offers will be rejected"
+            );
+            None
+        }
+    };
+    let mut negotiator_builder = smiths_sdp::Negotiator::with_default_codecs(bind.ip());
+    if let Some(cert) = dtls_cert.as_ref() {
+        negotiator_builder = negotiator_builder.with_dtls_cert(Arc::clone(cert));
+    }
+    negotiator_builder = negotiator_builder.with_ice_enabled(config.webrtc.ice.enabled);
+    let negotiator: Arc<dyn SdpNegotiator> = Arc::new(negotiator_builder);
+    let mut handler = CliWebRtcHandler::new(negotiator, fabric, bind.ip())
+        .with_metrics(Arc::clone(metrics))
+        .with_privacy(config.webrtc.privacy.clone());
+    if config.webrtc.ice.enabled {
+        handler = handler.with_stun_servers(config.webrtc.ice.stun_servers.clone());
+    }
+    if let Some(cert) = dtls_cert {
+        handler = handler.with_dtls_cert(cert);
+    }
+    Arc::new(handler)
+}
+
+/// Start the WebSocket signaling server and, when `[webrtc.turn]`
+/// enables it without an `external_url`, the embedded TURN server.
+pub(crate) fn spawn_servers(
+    config: &Config,
+    metrics: &Arc<Metrics>,
+    handler: Arc<CliWebRtcHandler>,
+    shutdown: &Shutdown,
+) -> Vec<JoinHandle<()>> {
+    let mut tasks = Vec::new();
+    let bind = config.webrtc.ws_bind;
+    let cancel = shutdown.token();
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = serve_webrtc(bind, handler, cancel).await {
+            warn!(%bind, ?e, "WebRTC WebSocket server error");
+        }
+    }));
+
+    let turn = &config.webrtc.turn;
+    if turn.enabled && !turn.external_url.is_empty() {
+        info!(url = %turn.external_url, "webrtc.turn.external_url set; embedded TURN server skipped");
+        return tasks;
+    }
+    if !turn.enabled {
+        return tasks;
+    }
+    let realm = if turn.realm.is_empty() {
+        "smiths-turn"
+    } else {
+        turn.realm.as_str()
+    };
+    let turn_cfg = smiths_ice::TurnServerConfig {
+        bind: turn.bind,
+        realm: realm.to_owned(),
+        relay_ip: turn.relay_ip.unwrap_or_else(|| turn.bind.ip()),
+        allocation_lifetime: Duration::from_secs(u64::from(turn.allocation_lifetime_s)),
+        credentials: turn
+            .credentials
+            .iter()
+            .map(|c| smiths_ice::LongTermCredential::new(&c.username, realm, &c.password))
+            .collect(),
+    };
+    if turn_cfg.credentials.is_empty() {
+        warn!(
+            bind = %turn_cfg.bind,
+            "webrtc.turn.enabled but credentials list is empty; every Allocate will 401. \
+             Add `[[webrtc.turn.credentials]]` entries or disable the server."
+        );
+    }
+    let server = Arc::new(smiths_ice::TurnServer::new(turn_cfg).with_metrics(Arc::clone(metrics)));
+    let cancel = shutdown.token();
+    tasks.push(tokio::spawn(async move {
+        if let Err(e) = server.run(cancel).await {
+            warn!(?e, "TURN server exited with error");
+        }
+    }));
+    tasks
 }
 
 /// Axum app state: the WebSocket route handler needs the
@@ -846,7 +1003,7 @@ async fn handle_socket(mut socket: WebSocket, state: WsState) {
             // Non-terminal silent ack (ice-candidate / ice-end) — keep
             // reading. Terminal `bye` also returns None, but the client
             // is expected to close its side; if it doesn't, we'll see
-            // either more frames or EOF on the next recv().
+            // either more frames or EOF on the next recv.
             continue;
         };
         let encoded = match frame.encode() {
@@ -878,7 +1035,7 @@ mod tests {
         let neg: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(IpAddr::V4(
             Ipv4Addr::LOCALHOST,
         )));
-        CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000, 100)
+        CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST))
     }
 
     #[tokio::test]
@@ -945,25 +1102,81 @@ mod tests {
         assert!(matches!(err, WebRtcHandlerError::OfferRejected(_)));
     }
 
-    #[tokio::test]
-    async fn port_hint_wraps_within_configured_range() {
-        // 3 alloc_port_hint calls with range=4 should hand out
-        // the first two slots then wrap. `alloc_port_hint`
-        // doesn't bind a socket — it's a legacy observability
-        // counter only.
-        let neg: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(IpAddr::V4(
-            Ipv4Addr::LOCALHOST,
-        )));
-        let h = CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000, 4);
-        let ports: Vec<u16> = (0..3).map(|_| h.alloc_port_hint()).collect();
-        assert_eq!(ports[0], 40_000);
-        assert_eq!(ports[1], 40_002);
-        assert_eq!(ports[2], 40_000, "third alloc should wrap");
+    /// Minimal STUN server: answers every Binding request with the
+    /// sender's own address in `XOR-MAPPED-ADDRESS`.
+    async fn spawn_stun_responder() -> SocketAddr {
+        use smiths_ice::StunMessage;
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 1500];
+            while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                if let Ok(req) = StunMessage::decode(&buf[..n])
+                    && let Ok(bytes) = StunMessage::new_binding_response(&req, from).encode()
+                {
+                    let _ = sock.send_to(&bytes, from).await;
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stun_servers_add_srflx_candidates_to_the_answer() {
+        let stun = spawn_stun_responder().await;
+        let neg: Arc<dyn SdpNegotiator> = Arc::new(
+            Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST)).with_ice_enabled(true),
+        );
+        let h = CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_stun_servers(vec![stun]);
+        let offer = "v=0\r\n\
+                     o=- 1 1 IN IP4 127.0.0.1\r\n\
+                     s=-\r\n\
+                     c=IN IP4 127.0.0.1\r\n\
+                     t=0 0\r\n\
+                     m=audio 49170 RTP/AVP 0\r\n\
+                     a=rtpmap:0 PCMU/8000\r\n\
+                     a=ice-ufrag:abcd\r\n\
+                     a=ice-pwd:0123456789abcdef0123456789\r\n";
+        let answer = h
+            .handle_offer(WebTransportSessionId(7), offer)
+            .await
+            .expect("offer must negotiate");
+        let srflx: Vec<&str> = answer
+            .lines()
+            .filter(|l| l.starts_with("a=candidate:") && l.contains(" typ srflx"))
+            .collect();
+        assert_eq!(srflx.len(), 1, "answer:\n{answer}");
+        assert!(srflx[0].contains("raddr 127.0.0.1"), "{}", srflx[0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unreachable_stun_server_keeps_host_only_answer() {
+        // Nothing listens here; the 1 s gather times out and the
+        // answer is returned unchanged.
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let neg: Arc<dyn SdpNegotiator> = Arc::new(
+            Negotiator::with_default_codecs(IpAddr::V4(Ipv4Addr::LOCALHOST)).with_ice_enabled(true),
+        );
+        let h = CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_stun_servers(vec![dead]);
+        let offer = "v=0\r\n\
+                     o=- 1 1 IN IP4 127.0.0.1\r\n\
+                     s=-\r\n\
+                     c=IN IP4 127.0.0.1\r\n\
+                     t=0 0\r\n\
+                     m=audio 49170 RTP/AVP 0\r\n\
+                     a=rtpmap:0 PCMU/8000\r\n";
+        let answer = h
+            .handle_offer(WebTransportSessionId(8), offer)
+            .await
+            .expect("offer must negotiate");
+        assert!(!answer.contains("typ srflx"), "{answer}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn two_webrtc_legs_with_same_tag_pair_and_bridge() {
-        // Slice 5.10-bridge Small 1 — two WebRTC legs dialling
+        //  Small 1 — two WebRTC legs dialling
         // tag "X" end up sharing a bridge. `RTP/AVP` path so
         // the test doesn't need a DTLS handshake between two
         // in-process fabrics; the pairing logic under test is
@@ -973,7 +1186,7 @@ mod tests {
         let neg: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(IpAddr::V4(
             Ipv4Addr::LOCALHOST,
         )));
-        let h = CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000, 100)
+        let h = CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST))
             .with_metrics(Arc::clone(&metrics));
 
         let offer_a = "v=0\r\n\
@@ -1035,7 +1248,7 @@ mod tests {
         let neg: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(IpAddr::V4(
             Ipv4Addr::LOCALHOST,
         )));
-        let h = CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000, 100)
+        let h = CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST))
             .with_metrics(Arc::clone(&metrics))
             .with_rendezvous_deadline(Duration::from_millis(80));
 
@@ -1065,7 +1278,7 @@ mod tests {
 
     #[tokio::test]
     async fn relay_only_rejects_offer_with_host_candidate() {
-        // Slice 5.11-privacy — in `relay_only`, an offer
+        //  — in `relay_only`, an offer
         // advertising a `host` candidate is rejected before
         // the negotiator even runs; the reject-reason counter
         // bumps against the `host` bucket.
@@ -1074,7 +1287,7 @@ mod tests {
         let neg: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(IpAddr::V4(
             Ipv4Addr::LOCALHOST,
         )));
-        let h = CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000, 100)
+        let h = CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST))
             .with_metrics(Arc::clone(&metrics))
             .with_privacy(WebRtcPrivacyConfig {
                 mode: WebRtcPrivacyMode::RelayOnly,
@@ -1123,7 +1336,7 @@ mod tests {
         let neg: Arc<dyn SdpNegotiator> = Arc::new(Negotiator::with_default_codecs(IpAddr::V4(
             Ipv4Addr::LOCALHOST,
         )));
-        let h = CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST), 40_000, 100)
+        let h = CliWebRtcHandler::new(neg, fabric(), IpAddr::V4(Ipv4Addr::LOCALHOST))
             .with_metrics(Arc::clone(&metrics))
             .with_privacy(WebRtcPrivacyConfig {
                 mode: WebRtcPrivacyMode::Strict,
@@ -1155,8 +1368,6 @@ mod tests {
             ))),
             fabric(),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
-            40_000,
-            100,
         )
         .with_metrics(Arc::clone(&metrics));
 
@@ -1187,7 +1398,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn sip_leg_pairs_with_parked_webrtc_leg() {
-        // Slice 5.10-sipjoin — a WebRTC leg parks under tag
+        //  — a WebRTC leg parks under tag
         // "room-1"; a SIP leg arrives via `pair_sip_leg(...)`
         // with the same tag and the bridge is installed
         // through the WebRTC handler's rendezvous map.
@@ -1201,8 +1412,6 @@ mod tests {
             ))),
             fabric(),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
-            40_000,
-            100,
         )
         .with_metrics(Arc::clone(&metrics));
 
@@ -1285,7 +1494,7 @@ mod tests {
 
     #[tokio::test]
     async fn hot_reload_flips_mode_live() {
-        // Slice 5.11-privacy Small 1 — mutating the handler's
+        //  Small 1 — mutating the handler's
         // privacy handle flips the enforcement without
         // rebuilding. First offer (open) accepts; reload to
         // relay_only; second offer rejects.
@@ -1297,8 +1506,6 @@ mod tests {
             ))),
             fabric(),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
-            40_000,
-            100,
         )
         .with_metrics(Arc::clone(&metrics));
 

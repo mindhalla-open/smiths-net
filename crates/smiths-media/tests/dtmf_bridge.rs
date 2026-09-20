@@ -1,10 +1,6 @@
 //! Integration: an RFC 4733 telephone-event stream driven at leg A
 //! of a live bridge produces exactly one `DtmfKeypress` via the
 //! configured `DtmfSink`.
-//!
-//! Slice 2.4 (v0.36.0) acceptance — closes the "engine sees DTMF"
-//! half of P7. Plugin-side emission is a thin follow-on that wires
-//! the same sink into the WASM tier.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -56,18 +52,8 @@ async fn dtmf_stream_on_leg_a_emits_one_keypress() {
     let sink = Collect::default();
     let bridge = Bridge::spawn_with(
         BridgeId(42),
-        &Leg {
-            socket: Arc::clone(&engine_a_rtp),
-            peer: leg_a_addr,
-            rtcp: None,
-            srtp: None,
-        },
-        &Leg {
-            socket: Arc::clone(&engine_side_b),
-            peer: leg_beta_addr,
-            rtcp: None,
-            srtp: None,
-        },
+        &Leg::new(Arc::clone(&engine_a_rtp), leg_a_addr),
+        &Leg::new(Arc::clone(&engine_side_b), leg_beta_addr),
         &BridgeConfig {
             rtcp_interval: None,
             metrics: None,

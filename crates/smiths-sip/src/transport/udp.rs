@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument, warn};
 
-use super::{Datagram, Transport};
+use super::{Datagram, Transport, TransportKind};
 
 /// SIP UDP transport.
 ///
@@ -22,7 +22,7 @@ pub struct UdpTransport {
 }
 
 impl UdpTransport {
-    /// Bind a UDP socket. `bind.port() == 0` lets the OS assign one.
+    /// Bind a UDP socket. `bind.port == 0` lets the OS assign one.
     pub async fn bind(bind: SocketAddr) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(bind).await?;
         Ok(Self {
@@ -86,5 +86,9 @@ impl Transport for UdpTransport {
 
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    fn kind(&self) -> TransportKind {
+        TransportKind::Udp
     }
 }

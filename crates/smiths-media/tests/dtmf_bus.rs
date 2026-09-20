@@ -38,16 +38,8 @@ async fn dtmf_through_fabric_lands_on_bus() {
 
     let bridge_id = fabric
         .bridge(
-            BridgeLeg {
-                endpoint: ep_a.id(),
-                peer: leg_a_addr,
-                srtp: None,
-            },
-            BridgeLeg {
-                endpoint: ep_b.id(),
-                peer: leg_beta_addr,
-                srtp: None,
-            },
+            BridgeLeg::plain(ep_a.id(), leg_a_addr),
+            BridgeLeg::plain(ep_b.id(), leg_beta_addr),
         )
         .await
         .unwrap();

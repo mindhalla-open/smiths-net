@@ -1,8 +1,8 @@
-//! WebRTC-native signaling (slice 5.10-runtime).
+//! WebRTC-native signaling.
 //!
 //! Browsers open a WebSocket to the engine's `[webrtc]
 //! ws_bind`, exchange JSON frames matching the [`WtSignal`]
-//! shape from slice 5.7, and negotiate a WebRTC audio call
+//! shape from , and negotiate a WebRTC audio call
 //! without implementing any SIP. Media lands on the engine's
 //! existing DTLS-SRTP path (same as any SIP call); only the
 //! signaling is WebRTC-native.
@@ -67,7 +67,7 @@ pub trait WebRtcSessionHandler: Send + Sync {
         sdp_offer: &str,
     ) -> Result<String, WebRtcHandlerError>;
 
-    /// Slice 5.10-bridge: handle an inbound `offer` frame with
+    /// : handle an inbound `offer` frame with
     /// the `tag` string captured from the session's
     /// `SessionInit` (if any). The default impl discards the
     /// tag and falls through to [`Self::handle_offer`] so older
@@ -212,7 +212,7 @@ impl WebSocketSignalingListener {
                         "offer frame's session_id doesn't match session-init".into(),
                     ));
                 }
-                // Slice 5.10-bridge: forward the session's tag
+                // : forward the session's tag
                 // (if any) so the handler can drive the
                 // rendezvous map keyed by it.
                 let tag = session.as_ref().and_then(|s| s.tag.as_deref());

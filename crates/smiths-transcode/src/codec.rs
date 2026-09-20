@@ -12,7 +12,7 @@
 
 use thiserror::Error;
 
-use smiths_core::codec::{pcm16_to_pcmu, pcmu_to_pcm16};
+use smiths_core::codec::{linear_to_ulaw, ulaw_to_linear};
 
 /// Wire-level codec identifier, used by the bridge to route a
 /// transcode job and by the admission layer to look up a CPU cost
@@ -32,6 +32,9 @@ pub enum CodecKind {
 }
 
 impl CodecKind {
+    /// Every kind, in a fixed order (index = [`Self::index`]).
+    pub const ALL: [Self; 4] = [Self::Pcmu, Self::Pcma, Self::Opus, Self::Pcm16];
+
     /// Short human label used in metrics and tracing spans.
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -40,6 +43,40 @@ impl CodecKind {
             Self::Pcma => "pcma",
             Self::Opus => "opus",
             Self::Pcm16 => "pcm16",
+        }
+    }
+
+    /// Position in [`Self::ALL`]; lets per-kind tables be plain arrays.
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::Pcmu => 0,
+            Self::Pcma => 1,
+            Self::Opus => 2,
+            Self::Pcm16 => 3,
+        }
+    }
+
+    /// RTP clock rate the codec's timestamps tick at (RFC 3551 for
+    /// G.711, RFC 7587 §4.1 for Opus, which is always 48 kHz on the
+    /// wire regardless of the internal sample rate). PCM16 never goes
+    /// on the wire; it reports the G.711 rate the mixer runs at.
+    #[must_use]
+    pub fn rtp_clock_rate(self) -> u32 {
+        match self {
+            Self::Pcmu | Self::Pcma | Self::Pcm16 => 8_000,
+            Self::Opus => 48_000,
+        }
+    }
+
+    /// Static RTP payload type (RFC 3551 Table 4), or `None` for
+    /// codecs that are negotiated with a dynamic payload type.
+    #[must_use]
+    pub fn static_payload_type(self) -> Option<u8> {
+        match self {
+            Self::Pcmu => Some(0),
+            Self::Pcma => Some(8),
+            Self::Opus | Self::Pcm16 => None,
         }
     }
 }
@@ -97,34 +134,54 @@ pub enum TranscodeError {
 /// (G.711) run inline on the existing per-bridge task.
 ///
 /// Bound is `Send` only, not `Send + Sync`: every method takes
-/// `&mut self`, and codecs are owned exclusively by a single
-/// [`CallTranscoder`](crate::CallTranscoder) which is itself reached
-/// through an `Arc<Mutex<_>>`. That makes the shared handle `Sync`
-/// (a `Mutex<T>` is `Sync` whenever `T: Send`) without ever sharing a
-/// codec by shared reference. Requiring `Sync` here would needlessly
-/// exclude libopus, whose encoder/decoder hold non-`Sync` raw
-/// pointers.
+/// `&mut self`, and each codec instance is owned by exactly one task
+/// (a transcoded session gives each leg its own decoder and encoder,
+/// so the two directions never share state). Requiring `Sync` here
+/// would needlessly exclude libopus, whose encoder/decoder hold
+/// non-`Sync` raw pointers.
+///
+/// The `*_into` variants are the hot-path API: they reuse the
+/// caller's buffer instead of allocating per frame. The owned
+/// variants are conveniences built on top of them.
 pub trait Codec: Send {
     /// Codec this instance speaks on the wire.
     fn kind(&self) -> CodecKind;
-    /// Encode one RTP payload worth of 16-bit PCM samples. The caller
-    /// picks the frame size (160 samples @ 8 kHz = 20 ms for G.711;
-    /// 960 samples @ 48 kHz = 20 ms for Opus); this method just
-    /// converts whatever it's handed.
+    /// Encode one RTP payload worth of 16-bit PCM samples into `out`
+    /// (cleared first). The caller picks the frame size (160 samples
+    /// @ 8 kHz = 20 ms for G.711; 960 samples @ 48 kHz = 20 ms for
+    /// Opus); this method just converts whatever it's handed.
     ///
     /// # Errors
     /// - [`TranscodeError::InvalidFrame`] if the sample slice has the
     ///   wrong shape for the codec (Opus rejects non-standard frame
     ///   sizes).
     /// - [`TranscodeError::Opus`] when libopus rejects the input.
-    fn encode(&mut self, samples: &[i16]) -> Result<Vec<u8>, TranscodeError>;
-    /// Decode one RTP payload back to 16-bit PCM samples. See
-    /// [`encode`](Self::encode) for framing constraints.
+    fn encode_into(&mut self, samples: &[i16], out: &mut Vec<u8>) -> Result<(), TranscodeError>;
+    /// Decode one RTP payload into `out` (cleared first). See
+    /// [`encode_into`](Self::encode_into) for framing constraints.
     ///
     /// # Errors
     /// - [`TranscodeError::InvalidFrame`] if the payload is malformed.
     /// - [`TranscodeError::Opus`] when libopus rejects the input.
-    fn decode(&mut self, payload: &[u8]) -> Result<Vec<i16>, TranscodeError>;
+    fn decode_into(&mut self, payload: &[u8], out: &mut Vec<i16>) -> Result<(), TranscodeError>;
+    /// Allocating form of [`encode_into`](Self::encode_into).
+    ///
+    /// # Errors
+    /// As per [`encode_into`](Self::encode_into).
+    fn encode(&mut self, samples: &[i16]) -> Result<Vec<u8>, TranscodeError> {
+        let mut out = Vec::with_capacity(samples.len());
+        self.encode_into(samples, &mut out)?;
+        Ok(out)
+    }
+    /// Allocating form of [`decode_into`](Self::decode_into).
+    ///
+    /// # Errors
+    /// As per [`decode_into`](Self::decode_into).
+    fn decode(&mut self, payload: &[u8]) -> Result<Vec<i16>, TranscodeError> {
+        let mut out = Vec::with_capacity(payload.len());
+        self.decode_into(payload, &mut out)?;
+        Ok(out)
+    }
 }
 
 /// G.711 codec — μ-law or A-law, 8 kHz, 8-bit/sample.
@@ -165,25 +222,41 @@ impl Codec for G711Codec {
         self.variant.kind()
     }
 
-    fn encode(&mut self, samples: &[i16]) -> Result<Vec<u8>, TranscodeError> {
-        Ok(match self.variant {
-            G711Variant::Pcmu => pcm16_to_pcmu(samples),
-            G711Variant::Pcma => samples.iter().copied().map(linear_to_alaw).collect(),
-        })
+    fn encode_into(&mut self, samples: &[i16], out: &mut Vec<u8>) -> Result<(), TranscodeError> {
+        out.clear();
+        match self.variant {
+            G711Variant::Pcmu => out.extend(samples.iter().copied().map(linear_to_ulaw)),
+            G711Variant::Pcma => out.extend(samples.iter().copied().map(linear_to_alaw)),
+        }
+        Ok(())
     }
 
-    fn decode(&mut self, payload: &[u8]) -> Result<Vec<i16>, TranscodeError> {
-        Ok(match self.variant {
-            G711Variant::Pcmu => pcmu_to_pcm16(payload),
-            G711Variant::Pcma => payload.iter().copied().map(alaw_to_linear).collect(),
-        })
+    fn decode_into(&mut self, payload: &[u8], out: &mut Vec<i16>) -> Result<(), TranscodeError> {
+        out.clear();
+        match self.variant {
+            G711Variant::Pcmu => out.extend(payload.iter().copied().map(ulaw_to_linear)),
+            G711Variant::Pcma => out.extend(payload.iter().copied().map(alaw_to_linear)),
+        }
+        Ok(())
     }
+}
+
+/// Encode 16-bit PCM to A-law, one byte per sample.
+#[must_use]
+pub fn pcm16_to_pcma(samples: &[i16]) -> Vec<u8> {
+    samples.iter().copied().map(linear_to_alaw).collect()
+}
+
+/// Decode A-law to 16-bit PCM.
+#[must_use]
+pub fn pcma_to_pcm16(bytes: &[u8]) -> Vec<i16> {
+    bytes.iter().copied().map(alaw_to_linear).collect()
 }
 
 // --- A-law lookup ------------------------------------------------
 //
 // μ-law implementation lives in `smiths-core::codec`; A-law doesn't
-// because no other crate had a use for it before slice 5.3. The
+// because no other crate had a use for it before . The
 // tables here are the ITU-T G.711 reference. Round-trip of any A-law
 // byte through decode → encode is identity (A-law doesn't have μ-law's
 // dual-zero quirk).
@@ -299,29 +372,31 @@ impl Codec for OpusCodec {
         CodecKind::Opus
     }
 
-    fn encode(&mut self, samples: &[i16]) -> Result<Vec<u8>, TranscodeError> {
+    fn encode_into(&mut self, samples: &[i16], out: &mut Vec<u8>) -> Result<(), TranscodeError> {
         // Upper bound per RFC 6716 §3.2: 4000 bytes for a 120 ms frame.
         // We only ever feed 20 ms frames, so this is a generous ceiling.
-        let mut buf = vec![0_u8; 4000];
+        out.clear();
+        out.resize(4000, 0);
         let n = self
             .encoder
-            .encode(samples, &mut buf)
+            .encode(samples, out)
             .map_err(|e| TranscodeError::Opus(e.to_string()))?;
-        buf.truncate(n);
-        Ok(buf)
+        out.truncate(n);
+        Ok(())
     }
 
-    fn decode(&mut self, payload: &[u8]) -> Result<Vec<i16>, TranscodeError> {
+    fn decode_into(&mut self, payload: &[u8], out: &mut Vec<i16>) -> Result<(), TranscodeError> {
         // Max frame size libopus can return is 120 ms * 48 kHz = 5760
         // samples per channel.
         let max_samples = 5760 * self.channels as usize;
-        let mut out = vec![0_i16; max_samples];
+        out.clear();
+        out.resize(max_samples, 0);
         let n = self
             .decoder
-            .decode(payload, &mut out, false)
+            .decode(payload, out, false)
             .map_err(|e| TranscodeError::Opus(e.to_string()))?;
         out.truncate(n * self.channels as usize);
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -355,6 +430,33 @@ mod tests {
         let re = c.encode(&back).unwrap();
         let back2 = c.decode(&re).unwrap();
         assert_eq!(back, back2, "A-law round-trip not idempotent on PCM");
+    }
+
+    #[test]
+    fn into_variants_reuse_the_callers_buffer() {
+        let mut c = G711Codec::pcmu();
+        let samples: Vec<i16> = (0_i16..160).map(|i| i * 100).collect();
+        let mut bytes = Vec::with_capacity(160);
+        let mut back = Vec::with_capacity(160);
+        for _ in 0..3 {
+            c.encode_into(&samples, &mut bytes).unwrap();
+            assert_eq!(bytes.len(), 160);
+            assert_eq!(bytes.capacity(), 160, "no reallocation across frames");
+            c.decode_into(&bytes, &mut back).unwrap();
+            assert_eq!(back, c.decode(&bytes).unwrap());
+        }
+    }
+
+    #[test]
+    fn kind_metadata_matches_rfc_3551() {
+        assert_eq!(CodecKind::Pcmu.static_payload_type(), Some(0));
+        assert_eq!(CodecKind::Pcma.static_payload_type(), Some(8));
+        assert_eq!(CodecKind::Opus.static_payload_type(), None);
+        assert_eq!(CodecKind::Opus.rtp_clock_rate(), 48_000);
+        assert_eq!(CodecKind::Pcma.rtp_clock_rate(), 8_000);
+        for (i, k) in CodecKind::ALL.iter().enumerate() {
+            assert_eq!(k.index(), i);
+        }
     }
 
     #[test]

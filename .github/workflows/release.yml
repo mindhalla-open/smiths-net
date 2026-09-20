@@ -1,9 +1,13 @@
 name: release
 
-# Fires on version tags (`v*`). Builds and pushes a multi-arch Docker
-# image under `ghcr.io/<owner>/smiths-net:<tag>` plus a `:latest` tag
-# when the release is from the main branch. Adjust `REGISTRY` if the
-# destination is not GitHub Container Registry.
+# Fires on version tags (`v*`). One multi-arch Docker build yields both
+# deliverables:
+#   - the image, pushed as `ghcr.io/<owner>/smiths-net:<version>`,
+#     `:<major>.<minor>` and, for a non-prerelease tag, `:latest`;
+#   - the static musl binaries for x86_64 and aarch64, exported from
+#     the same build (Dockerfile `export` stage) and attached to the
+#     GitHub release as tarballs plus a SHA256SUMS file.
+# Adjust `REGISTRY` if the destination is not GitHub Container Registry.
 
 on:
   push:
@@ -16,14 +20,18 @@ env:
 
 jobs:
   docker:
-    name: multi-arch docker image
+    name: multi-arch image + release binaries
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      packages: write
+      contents: write # release assets
+      packages: write # ghcr.io push
     steps:
       - uses: actions/checkout@v4
 
+      # The builder stage cross-compiles on the runner's own
+      # architecture and the runtime stage only copies files, so no
+      # stage executes arm64 code; emulation is a safety net for a
+      # future RUN in the runtime stage, nothing more.
       - name: Set up QEMU (cross-arch emulation)
         uses: docker/setup-qemu-action@v3
 
@@ -42,63 +50,57 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # `latest` comes from the semver flavor default
+          # (`latest=auto`): added for stable tags such as v1.2.3,
+          # skipped for pre-releases such as v1.2.3-rc1.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
+      - name: Build and push image
+        uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Cache across release runs — musl builds are slow; first
-          # run warms, subsequent runs hit the registry cache.
+          # Cache across release runs — musl builds are slow; the first
+          # run warms, subsequent runs hit the cache.
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  binaries:
-    name: release binaries
-    runs-on: ubuntu-latest
-    needs: docker
-    strategy:
-      matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      # Same Dockerfile, same builder instance, `export` stage: the
+      # builder layers are already in this job's buildx cache, so this
+      # only copies the two binaries out as dist/linux_<arch>/smiths-net.
+      - name: Export static binaries
+        uses: docker/build-push-action@v6
         with:
-          targets: ${{ matrix.target }}
+          context: .
+          platforms: linux/amd64,linux/arm64
+          target: export
+          outputs: type=local,dest=dist
+          cache-from: type=gha
 
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cross-compile toolchain
-        if: matrix.target == 'aarch64-unknown-linux-musl'
+      - name: Package release assets
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          for pair in amd64:x86_64-unknown-linux-musl arm64:aarch64-unknown-linux-musl; do
+            arch="${pair%%:*}"
+            triple="${pair#*:}"
+            name="smiths-net-${version}-${triple}"
+            mkdir "$name"
+            install -m 0755 "dist/linux_${arch}/smiths-net" "$name/smiths-net"
+            cp examples/config.toml "$name/config.toml.example"
+            cp README.md LICENSE "$name/"
+            tar -czf "${name}.tar.gz" "$name"
+          done
+          sha256sum smiths-net-*.tar.gz | tee SHA256SUMS
 
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --bin smiths-net
-
-      - name: Package
-        run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
-          NAME="smiths-net-${VERSION}-${{ matrix.target }}"
-          mkdir "$NAME"
-          cp "target/${{ matrix.target }}/release/smiths-net" "$NAME/"
-          cp examples/config.toml "$NAME/config.toml.example"
-          cp README.md LICENSE* "$NAME/" 2>/dev/null || true
-          tar -czf "${NAME}.tar.gz" "$NAME"
-
-      - name: Upload release asset
+      - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: smiths-net-*.tar.gz
+          files: |
+            smiths-net-*.tar.gz
+            SHA256SUMS

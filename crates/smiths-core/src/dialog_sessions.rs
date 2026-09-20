@@ -1,4 +1,4 @@
-//! Runtime map of live media sessions per dialog (slice 5.6).
+//! Runtime map of live media sessions per dialog.
 //!
 //! `DialogRecord` is the *serializable* view of a dialog (carries
 //! IDs, codecs, state — everything the HA snapshot layer needs).
@@ -24,7 +24,7 @@
 //! caller can install the new session first, stop the old one on
 //! its own schedule (typically one tick after the peer's 200 OK so
 //! any in-flight RTP drains). This is why 5.4 T.38 and 5.5
-//! conferencing wirings (slice 5.6b follow-on) aren't bespoke
+//! conferencing wirings ( follow-on) aren't bespoke
 //! code paths — the swap semantics fit both patterns through the
 //! same API.
 
@@ -76,8 +76,8 @@ impl DialogSessions {
 
     /// Atomically swap the session at `(dialog, key)` for `new`. The
     /// **previous** handle (if any) is returned so the caller can
-    /// `stop()` it on its own schedule. This is the primitive behind
-    /// slice 5.4's audio→T.38 re-INVITE and slice 5.5's conference
+    /// `stop` it on its own schedule. This is the primitive behind
+    /// the audio→T.38 re-INVITE and the conference
     /// join/leave.
     ///
     /// On a key that had no prior entry, behaves like
@@ -94,7 +94,7 @@ impl DialogSessions {
     }
 
     /// Remove one session by `(dialog, key)`. Returns the removed
-    /// handle so the caller can `stop()` it without holding any
+    /// handle so the caller can `stop` it without holding any
     /// lock across the `.await`.
     #[must_use = "the returned session handle must be stopped by the caller"]
     pub fn remove(&self, dialog: &DialogKey, key: &SessionKey) -> Option<Arc<dyn MediaSession>> {
@@ -105,7 +105,7 @@ impl DialogSessions {
 
     /// Remove every session belonging to `dialog`. Used on BYE to
     /// drain the call's entire session set in one shot. Returns the
-    /// removed handles; the caller is expected to `stop()` each.
+    /// removed handles; the caller is expected to `stop` each.
     #[must_use = "every drained session handle must be stopped by the caller"]
     pub fn remove_dialog(&self, dialog: &DialogKey) -> Vec<Arc<dyn MediaSession>> {
         let mut drained = Vec::new();

@@ -32,7 +32,7 @@ pub struct SdesCrypto {
     /// Cipher suite (today only [`SrtpSuite::AesCm128HmacSha1_80`]).
     pub suite: SrtpSuite,
     /// Raw `key + salt` bytes (decoded from the `inline:` base64
-    /// value). Length equals `suite.key_material_len()`.
+    /// value). Length equals `suite.key_material_len`.
     pub key_material: Vec<u8>,
 }
 

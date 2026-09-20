@@ -8,9 +8,9 @@
 //! - [`KvStore`] — opaque key/value. Used by session-level caches,
 //!   hot-reload snapshots, and anything else that wants persistence
 //!   without a schema.
-//! - [`VectorStore`] (slice 3.4) — embedding-indexed semantic
+//! - [`VectorStore`] — embedding-indexed semantic
 //!   search. Backs `search_calls_semantic` and RAG flows.
-//! - [`RecordingStore`] (slice 3.4) — per-call audio retention.
+//! - [`RecordingStore`] — per-call audio retention.
 //!   Filesystem default ships in-tree; object-store implementations
 //!   slot in behind the same trait.
 //! - The SIP subscriber-credential trait is already pluggable — see
@@ -20,7 +20,7 @@
 //!   generic companion surfaces.
 //!
 //! Implementations must be `Send + Sync + 'static`. Async is not yet
-//! on the trait — the backends in slice 2.3 are all synchronous
+//! on the trait — the backends in  are all synchronous
 //! (`SQLite`). When an async-only backend (cloud object store,
 //! remote Postgres via tokio-postgres) lands, we grow an
 //! `AsyncCdrStore` variant rather than retrofit.
@@ -39,7 +39,7 @@ use thiserror::Error;
 /// Errors a storage backend can raise.
 ///
 /// Deliberately small — every backend funnels its own error type
-/// through `Backend` via `to_string()`. Callers who need backend-
+/// through `Backend` via `to_string`. Callers who need backend-
 /// specific detail get it by downcasting the underlying error.
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -220,7 +220,7 @@ pub trait CdrStore: Send + Sync + 'static {
 }
 
 // ---------------------------------------------------------------------
-// VectorStore — slice 3.4 semantic-search surface
+// VectorStore —  semantic-search surface
 // ---------------------------------------------------------------------
 
 /// One record in a [`VectorStore`]. The `id` is the caller's choice
@@ -283,7 +283,7 @@ pub trait VectorStore: Send + Sync + 'static {
     /// endpoint.
     fn len(&self) -> Result<usize, StorageError>;
 
-    /// `true` iff `len()? == 0`. Convenience so callers don't have to
+    /// `true` iff `len? == 0`. Convenience so callers don't have to
     /// compare against 0 themselves.
     fn is_empty(&self) -> Result<bool, StorageError> {
         Ok(self.len()? == 0)
@@ -394,7 +394,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 // ---------------------------------------------------------------------
-// RecordingStore — slice 3.4 per-call audio retention
+// RecordingStore —  per-call audio retention
 // ---------------------------------------------------------------------
 
 /// Audio retention surface. One blob per `call_id`; the engine writes
@@ -438,10 +438,10 @@ pub trait RecordingStore: Send + Sync + 'static {
 /// a filename-safe mangling of `call_id` so any printable ASCII
 /// call-id round-trips through the filesystem.
 ///
-/// The mangling is reversible for the `list()` path: we store a
+/// The mangling is reversible for the `list` path: we store a
 /// `.cid` sidecar text file per blob containing the original
 /// `call_id`. That avoids the "filesystem characters escape the
-/// call id" landmine and keeps `list()` honest.
+/// call id" landmine and keeps `list` honest.
 #[derive(Debug)]
 pub struct FsRecordingStore {
     root: PathBuf,
@@ -465,15 +465,48 @@ impl FsRecordingStore {
     }
 }
 
+/// Write `bytes` to `path` atomically: stream into a sibling temp
+/// file, fsync, then rename over the destination. A crash mid-write
+/// leaves either the old file or a stray `*.tmp` (which `list` and
+/// `prune_older_than` ignore), never a truncated blob.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), StorageError> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Err(StorageError::Invalid(format!(
+            "recording path has no file name: {}",
+            path.display()
+        )));
+    };
+    let tmp = path.with_file_name(format!(
+        "{file_name}.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|e| StorageError::Backend(e.to_string()))
+}
+
 impl RecordingStore for FsRecordingStore {
     fn put(&self, call_id: &str, audio: &[u8]) -> Result<(), StorageError> {
         if call_id.is_empty() {
             return Err(StorageError::Invalid("call_id must not be empty".into()));
         }
-        std::fs::write(self.blob_path(call_id), audio)
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
-        std::fs::write(self.meta_path(call_id), call_id.as_bytes())
-            .map_err(|e| StorageError::Backend(e.to_string()))?;
+        // Blob first, then the `.cid` sidecar that `list` scans: an
+        // interrupted put leaves at worst an unlisted blob that the
+        // retention sweep removes, never a listed id without audio.
+        write_atomic(&self.blob_path(call_id), audio)?;
+        write_atomic(&self.meta_path(call_id), call_id.as_bytes())?;
         Ok(())
     }
 
@@ -598,7 +631,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Slice 3.4 — VectorStore + RecordingStore
+    //  — VectorStore + RecordingStore
     // -----------------------------------------------------------------
 
     fn vec_rec(id: &str, v: &[f32]) -> VectorRecord {
@@ -699,6 +732,39 @@ mod tests {
         store.put("a", b"x").unwrap();
         assert!(store.delete("a").unwrap());
         assert!(!store.delete("a").unwrap());
+    }
+
+    #[test]
+    fn fs_recording_store_put_leaves_no_temp_files_and_replaces_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsRecordingStore::new(tmp.path()).unwrap();
+        store.put("call-1", b"first").unwrap();
+        store.put("call-1", b"second-longer").unwrap();
+        assert_eq!(store.get("call-1").unwrap(), b"second-longer");
+        assert_eq!(store.list().unwrap(), vec!["call-1".to_string()]);
+        let names: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| std::path::Path::new(n)
+                .extension()
+                .is_none_or(|e| e != "tmp")),
+            "temp files left behind: {names:?}"
+        );
+        assert_eq!(names.len(), 2, "exactly one .wav + one .cid: {names:?}");
+    }
+
+    #[test]
+    fn fs_recording_store_put_into_missing_root_is_backend_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsRecordingStore::new(tmp.path()).unwrap();
+        std::fs::remove_dir_all(tmp.path()).unwrap();
+        assert!(matches!(
+            store.put("call-1", b"x"),
+            Err(StorageError::Backend(_))
+        ));
     }
 
     #[test]

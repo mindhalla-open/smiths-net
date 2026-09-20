@@ -1,4 +1,4 @@
-//! `config://history` MCP resource (slice 7.3).
+//! `config://history` MCP resource.
 //!
 //! In-memory ring buffer of the last N `put_config` calls.
 //! Each entry captures timestamp, path, before/after values,

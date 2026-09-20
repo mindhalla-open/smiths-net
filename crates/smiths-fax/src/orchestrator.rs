@@ -1,5 +1,5 @@
 //! Concrete [`FaxOrchestrator`] that builds a [`UdptlSession`]
-//! when two legs re-INVITE into T.38 (slice 5.6d-runtime).
+//! when two legs re-INVITE into T.38.
 //!
 //! Pairs with the trait seam defined in `smiths-sip::uas`. The
 //! UAS's future re-INVITE handler calls `try_orchestrate_fax`

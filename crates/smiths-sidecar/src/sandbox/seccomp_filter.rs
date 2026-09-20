@@ -35,30 +35,27 @@ use std::collections::BTreeMap;
 use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
 use thiserror::Error;
 
-/// Errors from compiling or installing the seccomp filter.
+/// Errors from compiling the seccomp filter.
 #[derive(Debug, Error)]
 pub(super) enum SeccompError {
     /// `seccompiler` rejected the rule set (unknown syscall, etc).
     #[error("compile: {0}")]
     Compile(String),
-    /// The kernel refused to install the compiled BPF program. Most
-    /// commonly because `PR_SET_NO_NEW_PRIVS` hasn't been set and
-    /// the calling thread isn't `CAP_SYS_ADMIN`.
-    #[error("install: {0}")]
-    Install(String),
     /// Unknown syscall name in the user-supplied `extra_allow` list.
     #[error("unknown syscall in extra-allow list: {0}")]
     UnknownSyscall(String),
 }
 
-/// Compile + install the allowlist for the current thread.
+/// Compile the allowlist into a BPF program. Runs in the parent
+/// before `fork`; installation happens separately in the child via
+/// `seccompiler::apply_filter`.
 ///
 /// `extra_allow` adds entries on top of the baseline; entries whose
 /// names don't resolve to a valid syscall on the target arch fail
 /// fast with [`SeccompError::UnknownSyscall`] rather than silently
 /// dropping — an operator that typos a syscall name deserves loud
 /// feedback, not a mysterious `EPERM` at runtime.
-pub(super) fn install_allowlist(extra_allow: &[String]) -> Result<(), SeccompError> {
+pub(super) fn compile_allowlist(extra_allow: &[String]) -> Result<BpfProgram, SeccompError> {
     // x86_64 is the only arch we target for containers today. The
     // ARM64 slice (1.8 — multi-arch Docker) will add a `target_arch`
     // branch; until then, refuse to install on anything else rather
@@ -89,9 +86,10 @@ pub(super) fn install_allowlist(extra_allow: &[String]) -> Result<(), SeccompErr
     let program: BpfProgram = filter
         .try_into()
         .map_err(|e: seccompiler::BackendError| SeccompError::Compile(e.to_string()))?;
-
-    seccompiler::apply_filter(&program).map_err(|e| SeccompError::Install(e.to_string()))?;
-    Ok(())
+    if program.is_empty() {
+        return Err(SeccompError::Compile("empty BPF program".into()));
+    }
+    Ok(program)
 }
 
 fn insert_allow(
@@ -454,13 +452,15 @@ mod tests {
 
     #[test]
     fn unknown_syscall_is_rejected() {
-        match install_allowlist(&["not_a_real_syscall".into()]) {
+        match compile_allowlist(&["not_a_real_syscall".into()]) {
             Err(SeccompError::UnknownSyscall(name)) => assert_eq!(name, "not_a_real_syscall"),
-            // On hosts where install succeeds despite the typo, the
-            // test has a bigger problem — but since we short-circuit
-            // on UnknownSyscall before installing, this shouldn't
-            // happen.
             other => panic!("expected UnknownSyscall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn baseline_compiles_to_a_non_empty_program() {
+        let program = compile_allowlist(&[]).expect("baseline must compile");
+        assert!(!program.is_empty());
     }
 }

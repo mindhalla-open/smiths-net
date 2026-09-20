@@ -4057,12 +4057,14 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bytes",
  "clap",
  "const_format",
  "dashmap",
  "dialoguer",
  "prometheus-client",
  "rustix",
+ "serde",
  "serde_json",
  "smiths-core",
  "smiths-dtls",
@@ -4073,6 +4075,7 @@ dependencies = [
  "smiths-plugin",
  "smiths-sdp",
  "smiths-sip",
+ "smiths-testkit",
  "smiths-transcode",
  "tempfile",
  "tokio",
@@ -4150,7 +4153,6 @@ name = "smiths-ice"
 version = "0.73.0"
 dependencies = [
  "bytes",
- "futures",
  "hmac",
  "md5",
  "prometheus-client",
@@ -4177,6 +4179,7 @@ dependencies = [
  "futures",
  "hex",
  "prometheus-client",
+ "rand 0.10.1",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -4224,6 +4227,7 @@ dependencies = [
  "async-trait",
  "dashmap",
  "prometheus-client",
+ "rand 0.10.1",
  "smiths-core",
  "smiths-media",
  "smiths-sip",
@@ -4329,6 +4333,7 @@ dependencies = [
 name = "smiths-sip"
 version = "0.73.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "axum",
  "base64",
@@ -4336,6 +4341,7 @@ dependencies = [
  "dashmap",
  "hex",
  "md-5 0.11.0",
+ "rand 0.10.1",
  "rcgen 0.14.7",
  "reqwest 0.13.2",
  "rsip",
@@ -4366,6 +4372,7 @@ dependencies = [
  "cpal",
  "rand 0.10.1",
  "smiths-core",
+ "smiths-media",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4375,10 +4382,13 @@ dependencies = [
 name = "smiths-testkit"
 version = "0.73.0"
 dependencies = [
+ "prometheus-client",
  "smiths-core",
+ "smiths-dtls",
  "smiths-media",
  "smiths-sdp",
  "smiths-sip",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

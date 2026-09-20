@@ -7,13 +7,12 @@ license      = { workspace = true }
 description  = "Wire schema shared by core, WASM plugins, and sidecar plugins."
 
 [features]
-# Slice 5.2 / P18. On by default; surfaces
-# [`FlatbuffersWireFormat`] + lets a manifest declare
-# `wire_format = "flatbuffers"`. The implementation is a
-# hand-rolled flat binary layout — zero-copy reads via field
-# offsets + no unsafe, no `flatc` toolchain dep, no build.rs.
-default     = ["flatbuffers"]
-flatbuffers = []
+# On by default; surfaces the `fixed_frame` module and
+# `FixedFrameWireFormat` — a hand-rolled fixed-offset binary layout
+# (zero-copy reads, no unsafe, no build.rs). Needs `std`; turn it
+# off for `no_std` consumers.
+default     = ["fixed-frame"]
+fixed-frame = []
 
 [dependencies]
 prost = { workspace = true }

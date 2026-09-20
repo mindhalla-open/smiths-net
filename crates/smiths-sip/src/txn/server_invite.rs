@@ -46,6 +46,12 @@
 //! - **I** (absorb ACK retransmits): `T4 = 5 s`. Armed on entering
 //!   Confirmed; fires → Terminated.
 //!
+//! ## Reliable transports
+//!
+//! With [`Transaction::set_reliable`] (TCP / TLS) timer G is never
+//! armed (H still guards the ACK) and timer I is zero: the ACK for a
+//! non-2xx final terminates the transaction directly (§17.2.1).
+//!
 //! ## 2xx bypass
 //!
 //! Per §17.2.1, 2xx finals bypass the Completed / Confirmed dance:
@@ -71,6 +77,8 @@ pub struct ServerInviteTxn {
     last_response: Option<Bytes>,
     /// Attempt counter for timer G's doubling-up-to-T2 schedule.
     g_attempt: u32,
+    /// Reliable-transport profile: no timer G, zero timer I.
+    reliable: bool,
 }
 
 impl ServerInviteTxn {
@@ -91,7 +99,15 @@ impl ServerInviteTxn {
             state: TransactionState::Proceeding,
             last_response: None,
             g_attempt: 0,
+            reliable: false,
         }
+    }
+
+    /// Builder form of [`Transaction::set_reliable`].
+    #[must_use]
+    pub const fn with_reliable(mut self, reliable: bool) -> Self {
+        self.reliable = reliable;
+        self
     }
 }
 
@@ -102,6 +118,10 @@ impl Transaction for ServerInviteTxn {
 
     fn state(&self) -> TransactionState {
         self.state
+    }
+
+    fn set_reliable(&mut self, reliable: bool) {
+        self.reliable = reliable;
     }
 
     fn on_event(&mut self, event: TransactionEvent) -> Vec<TransactionAction> {
@@ -138,17 +158,18 @@ impl Transaction for ServerInviteTxn {
             {
                 self.state = S::Completed;
                 self.last_response = Some(bytes.clone());
-                vec![
-                    TransactionAction::SendToPeer(bytes),
-                    TransactionAction::ArmTimer {
+                let mut actions = vec![TransactionAction::SendToPeer(bytes)];
+                if !self.reliable {
+                    actions.push(TransactionAction::ArmTimer {
                         id: TimerId::G,
                         after: T1,
-                    },
-                    TransactionAction::ArmTimer {
-                        id: TimerId::H,
-                        after: TIMEOUT_64T1,
-                    },
-                ]
+                    });
+                }
+                actions.push(TransactionAction::ArmTimer {
+                    id: TimerId::H,
+                    after: TIMEOUT_64T1,
+                });
+                actions
             }
 
             // --- INVITE retransmit in Proceeding — replay last 1xx ------
@@ -191,15 +212,22 @@ impl Transaction for ServerInviteTxn {
 
             // --- ACK for the non-2xx final — enter Confirmed ------------
             (S::Completed, Ev::RequestReceived { ref method, .. }) if method == "ACK" => {
-                self.state = S::Confirmed;
-                vec![
+                let mut actions = vec![
                     TransactionAction::CancelTimer(TimerId::G),
                     TransactionAction::CancelTimer(TimerId::H),
-                    TransactionAction::ArmTimer {
+                ];
+                if self.reliable {
+                    // Timer I is zero: nothing to absorb on a stream.
+                    self.state = S::Terminated;
+                    actions.push(TransactionAction::Terminated);
+                } else {
+                    self.state = S::Confirmed;
+                    actions.push(TransactionAction::ArmTimer {
                         id: TimerId::I,
                         after: T4,
-                    },
-                ]
+                    });
+                }
+                actions
             }
 
             // --- ACK retransmits in Confirmed — swallow silently --------
@@ -459,6 +487,27 @@ mod tests {
         let a = t.on_event(TransactionEvent::TimerFired(TimerId::I));
         assert_eq!(t.state(), TransactionState::Terminated);
         assert!(has_terminated(&a));
+    }
+
+    #[test]
+    fn reliable_non_2xx_skips_g_and_ack_terminates() {
+        let mut t = new_txn().with_reliable(true);
+        let a = t.on_event(TransactionEvent::SendResponseFromTu {
+            status: 486,
+            bytes: Bytes::from_static(b"SIP/2.0 486 Busy Here\r\n\r\n"),
+        });
+        assert!(has_send(&a));
+        assert!(!has_timer(&a, TimerId::G), "no retransmit timer on TCP");
+        assert!(has_timer(&a, TimerId::H), "H still guards the ACK");
+        assert_eq!(t.state(), TransactionState::Completed);
+        let ack = t.on_event(TransactionEvent::RequestReceived {
+            method: "ACK".into(),
+            bytes: Bytes::new(),
+        });
+        assert!(has_cancel(&ack, TimerId::H));
+        assert!(!has_timer(&ack, TimerId::I), "timer I is zero on TCP");
+        assert!(has_terminated(&ack));
+        assert_eq!(t.state(), TransactionState::Terminated);
     }
 
     #[test]

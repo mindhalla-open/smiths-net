@@ -1,17 +1,28 @@
 name: fuzz-nightly
 
-# Runs the existing `fuzz/` corpus for ~24 hours every night. v0.14.0
-# proved out the fuzz harness with 5.2M runs and 0 crashes; this job
-# keeps that bar by re-running on fresh nightly toolchains and
-# publishing coverage + any crash inputs as workflow artifacts.
+# Runs every `cargo-fuzz` target under `fuzz/` on a fresh nightly
+# toolchain each night. GitHub-hosted runners cap a job at six hours,
+# so each target gets about five hours of fuzzing (`FUZZ_SECS`) with
+# slack for the coverage and upload steps; self-hosted runners can
+# raise `timeout-minutes` and `FUZZ_SECS` together for longer
+# campaigns. The corpus is carried between runs through the Actions
+# cache so coverage accumulates instead of restarting from the seeds
+# every night. libFuzzer exits non-zero on a crash, timeout or OOM
+# input, which fails the job; the input is uploaded for triage (see
+# fuzz/README.md).
 
 on:
   schedule:
-    # 02:00 UTC every day — pick a window that doesn't collide with
-    # the main CI's usual push burst.
+    # 02:00 UTC every day — a window that doesn't collide with the
+    # main CI's usual push burst.
     - cron: "0 2 * * *"
   # Manual trigger for ad-hoc runs.
   workflow_dispatch:
+
+env:
+  # Seconds of fuzzing per target. Keep this comfortably below
+  # `timeout-minutes` so the coverage + upload steps still run.
+  FUZZ_SECS: 17700
 
 jobs:
   fuzz:
@@ -26,15 +37,13 @@ jobs:
           - sip_parser
           - via_branch
           - sdes_crypto
-    # 24-hour budget split across `cargo-fuzz` + coverage artifact
-    # upload. `runs-on: ubuntu-latest` caps at 6 hours per job by
-    # default — operators wiring their own runners can remove this.
+    # The GitHub-hosted maximum.
     timeout-minutes: 360
 
     steps:
       - uses: actions/checkout@v4
 
-      # cargo-fuzz requires nightly for -Zinstrument-coverage.
+      # cargo-fuzz needs nightly for the sanitizer + coverage flags.
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
@@ -46,38 +55,52 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
-      - name: Fuzz ${{ matrix.target }} for 5h
-        # Split into a ~5 hour timeout so the 6-hour job budget has
-        # slack for coverage extraction + artifact uploads.
+      # Restore the newest corpus for this target; the save step below
+      # runs even when the fuzz step fails so a crash still leaves the
+      # enlarged corpus behind.
+      - name: Restore corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz ${{ matrix.target }}
         working-directory: fuzz
         run: |
-          timeout 18000 cargo fuzz run ${{ matrix.target }} \
-            -- -max_total_time=17700 -timeout=60 \
-            || true  # a timeout exits non-zero; treat as success
+          cargo fuzz run ${{ matrix.target }} \
+            -- -max_total_time=${FUZZ_SECS} -timeout=60
 
-      - name: Collect coverage
-        working-directory: fuzz
-        continue-on-error: true
-        run: |
-          cargo fuzz coverage ${{ matrix.target }} || true
-          ls -la target/*/coverage/*/coverage.profdata 2>/dev/null || true
+      - name: Save corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
 
-      - name: Upload crash corpus
+      - name: Upload crash inputs
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: crashes-${{ matrix.target }}
-          path: |
-            fuzz/artifacts/${{ matrix.target }}/
-            fuzz/corpus/${{ matrix.target }}/
+          path: fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
           retention-days: 30
+
+      # Replays the corpus through an instrumented build; the report
+      # lands under fuzz/coverage/<target>/. Best effort — a coverage
+      # hiccup must not hide the fuzz result.
+      - name: Collect coverage
+        if: always()
+        working-directory: fuzz
+        continue-on-error: true
+        run: cargo fuzz coverage ${{ matrix.target }}
 
       - name: Upload coverage
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: coverage-${{ matrix.target }}
-          path: fuzz/target/*/coverage/
+          path: fuzz/coverage/${{ matrix.target }}/
           if-no-files-found: ignore
           retention-days: 14

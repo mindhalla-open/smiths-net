@@ -1,13 +1,21 @@
 //! RFC 3261 SIP signaling: transport, parser, transactions, dialogs,
 //! digest auth.
 //!
-//! Phase 1 scope: UDP / TCP / TLS transports, an OPTIONS-answering
-//! UAS, a UAC for engine-initiated calls, and the `Transport` +
-//! `CredentialStore` trait seams (MVP guardrails for later phases).
-//! Full RFC 3261 transaction FSMs with timers A–K land in follow-up
-//! passes.
+//! - [`transport`]: UDP / TCP / TLS transports behind the [`Transport`]
+//!   seam.
+//! - [`txn`]: the four RFC 3261 §17 transaction FSMs (timers A–K)
+//!   plus the async [`TransactionDriver`] that runs them, and the
+//!   §12 [`txn::DialogFsm`].
+//! - [`uas`]: the User-Agent Server — INVITE / re-INVITE / UPDATE /
+//!   CANCEL / BYE / OPTIONS / REGISTER, rendezvous bridging, RFC 4028
+//!   session timers — with every request routed through the server
+//!   FSMs.
+//! - [`uac`]: the User-Agent Client for engine-initiated calls,
+//!   routed through the client FSMs.
+//! - [`auth`]: digest authentication behind the `CredentialStore` /
+//!   `RegistrationStore` seams.
 
-// Slice 1.7: lint-level `warn` on unwraps. The existing call sites
+// : lint-level `warn` on unwraps. The existing call sites
 // live under a forward-work bucket — new code fires a warning that
 // reviewers can chase before merge, even while legacy usage is
 // still being retired.
@@ -38,7 +46,9 @@ pub use txn::{
     TransactionState, TuEvent,
 };
 pub use uac::{UacClient, UacError};
-pub use uas::{ConferenceOrchestrator, FaxOrchestrator, TranscodeOrchestrator, UasServer};
+pub use uas::{
+    ConferenceOrchestrator, FaxOrchestrator, SessionTimerConfig, TranscodeOrchestrator, UasServer,
+};
 #[cfg(feature = "webtransport")]
 pub use webrtc::{
     WebRtcHandlerError, WebRtcListenError, WebRtcSession, WebRtcSessionHandler,

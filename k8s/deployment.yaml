@@ -10,9 +10,9 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: smiths-net
-  # Rolling update with one-at-a-time — SIP dialogs don't tolerate
-  # sudden pod loss, and graceful drain (SIGTERM → 503) needs a few
-  # seconds to complete.
+  # Rolling update one at a time — SIP dialogs don't tolerate sudden
+  # pod loss, and the graceful drain (SIGTERM → 503 on new INVITEs)
+  # needs a few seconds to complete.
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -27,8 +27,10 @@ spec:
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
     spec:
-      # Give drain enough time — default grace is 30 s, smiths-net
-      # drains for 10 s then exits; cushion the difference.
+      # On SIGTERM the engine answers new INVITEs with 503 +
+      # Retry-After: 0 for SMITHS_DRAIN_SECS (set below; the binary's
+      # default is 5 s), then cancels its tasks and exits. The grace
+      # period must exceed the drain window with room for shutdown.
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -39,8 +41,13 @@ spec:
           type: RuntimeDefault
       containers:
         - name: smiths-net
-          image: ghcr.io/mindhalla/smiths-net:latest
+          image: ghcr.io/mindhalla-open/smiths-net:latest
           imagePullPolicy: IfNotPresent
+          env:
+            # Seconds of 503-drain before the process exits; the only
+            # drain knob the engine reads.
+            - name: SMITHS_DRAIN_SECS
+              value: "10"
           ports:
             - name: sip-udp
               containerPort: 5060
@@ -48,6 +55,8 @@ spec:
             - name: sip-tcp
               containerPort: 5060
               protocol: TCP
+            # Only listens once the ConfigMap enables TLS with a bind
+            # entry on this port (see k8s/configmap.yaml).
             - name: sip-tls
               containerPort: 5061
               protocol: TCP
@@ -82,9 +91,12 @@ spec:
               port: health
             initialDelaySeconds: 2
             periodSeconds: 5
-            # Readiness flips to false the moment SIGTERM lands (the
-            # drain flag gates /health's `ready` subfield). Load
-            # balancers stop sending new traffic; live calls finish.
+            # /health answers 200 for the whole process lifetime —
+            # during the drain window the JSON body carries
+            # "draining": true, which an httpGet probe cannot see. New
+            # traffic stops anyway: Kubernetes drops a terminating pod
+            # from the Service endpoints, and the engine itself
+            # refuses new INVITEs with 503 while draining.
             failureThreshold: 2
           volumeMounts:
             - name: config

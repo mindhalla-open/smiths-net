@@ -109,7 +109,7 @@ async fn invite_with_sdp_offer_gets_sdp_answer() {
     assert_eq!(m.kind, MediaKind::Audio);
     assert_ne!(m.port, 0, "engine must allocate a real media port");
     // First offered codec was PCMU; we expect PCMU in the answer.
-    assert_eq!(m.formats, vec![0]);
+    assert_eq!(m.formats, vec!["0"]);
     assert_eq!(m.rtpmap.len(), 1);
     assert_eq!(m.rtpmap[0].codec.to_ascii_uppercase(), "PCMU");
     assert_eq!(m.rtpmap[0].clock_rate, 8_000);

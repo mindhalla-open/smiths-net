@@ -10,7 +10,7 @@ smiths-net/
 ├── Cargo.toml                 # [workspace] only
 ├── crates/
 │   ├── smiths-core/           # runtime, event bus, config, shutdown, Call FSM
-│   ├── smiths-proto/          # protobuf types shared by core/WASM/sidecars
+│   ├── smiths-proto/          # wire types shared by core and the WASM host
 │   ├── smiths-sip/            # SIP parser, transport, transactions, dialogs, auth
 │   ├── smiths-sdp/            # SDP parse/generate, offer/answer negotiation
 │   ├── smiths-media/          # RTP/RTCP session, jitter buffer, media router
@@ -19,15 +19,20 @@ smiths-net/
 │   ├── smiths-script/         # embedded DSL runtime (Rhai/Lua/Starlark), host-fn bridge
 │   ├── smiths-sidecar/        # subprocess supervisor, IPC framing
 │   ├── smiths-mcp/            # MCP server (stdio + HTTP/SSE)
+│   ├── smiths-dtls/           # DTLS-SRTP handshake + key export
+│   ├── smiths-ice/            # STUN, TURN server/client, ICE agent
+│   ├── smiths-transcode/      # codecs + the engine-wide CPU budget
+│   ├── smiths-mixer/          # N-party conference mixing
+│   ├── smiths-fax/            # T.38 / UDPTL (experimental)
+│   ├── smiths-raft/           # Raft consensus (experimental, unlinked)
+│   ├── smiths-softphone/      # `smiths-softphone` binary: mic/speaker client
+│   ├── smiths-config-macros/  # `Reloadable` derive for the config tree
 │   ├── smiths-cli/            # main binary: CLI, config loading, wiring
 │   └── smiths-testkit/        # integration helpers: fake UAC/UAS, pcap cmp
 ├── plugins/
-│   ├── examples/
-│   │   ├── rust-logger/       # WASM plugin in Rust
-│   │   ├── tinygo-hdr/        # WASM plugin in TinyGo
-│   │   └── py-ai/             # sidecar plugin in Python
+│   ├── cookbook/              # minimal per-tier examples (wasm/script/sidecar)
+│   ├── examples/              # ai.*, routing, storage, integration plugins
 │   └── README.md
-├── proto/                     # .proto sources; compiled by smiths-proto build.rs
 └── docs/
     ├── openswitch.md          # original spec
     ├── architecture/
@@ -36,23 +41,38 @@ smiths-net/
 
 ## Dependency graph (no cycles)
 
+Normal (non-dev) dependencies, as the manifests actually declare them:
+
 ```
-cli ─┬─ core
-     ├─ sip ──── core
-     ├─ sdp ──── core               (impls core::sdp::SdpNegotiator)
-     ├─ media ── core               (impls core::media::MediaFabric)
-     ├─ plugin ─┬─ core             (impls core::ai::{AiProvider, AiRegistry})
-     │          ├─ wasm ──── core + proto
-     │          ├─ script ── core
-     │          └─ sidecar ─ core
-     └─ mcp ──── core               (consumes core::ai trait seam)
+config-macros ← core ← everything below
+
+sdp        ← core
+transcode  ← core
+script     ← core
+sidecar    ← core
+sip        ← core
+wasm       ← core, proto
+dtls       ← core, sdp
+ice        ← core, sdp
+media      ← core, sdp, dtls, transcode
+mixer      ← core, media, sip
+fax        ← core, sdp, sip, media          (experimental)
+raft       ← core, sip                      (experimental, nothing links it)
+plugin     ← core, wasm, script, sidecar
+mcp        ← core, media, mixer
+softphone  ← core, media
+testkit    ← core, sdp, dtls, media
+cli        ← core, sip, sdp, media, mixer, plugin, mcp, dtls, ice, transcode
 ```
 
-**Layering invariant.** Every non-root crate depends on `smiths-core`
-(and `smiths-proto` where wire types are needed), with **one documented
-exception**: `smiths-plugin` owns its host tiers and directly depends
-on `smiths-wasm`, `smiths-script`, and `smiths-sidecar`. No other
-crate reaches sideways into a sibling.
+**Layering invariant.** The graph is a DAG rooted at `smiths-core`, and
+no crate depends on `smiths-cli`. It is *not* a hub-and-spoke: a crate
+that composes a lower layer depends on it directly (`media` on `dtls`
+and `transcode`, `mixer` on `media` and `sip`, `mcp` on `media` and
+`mixer`), and `plugin` owns its three host tiers. What stays banned is
+a cycle, and reaching *up*: `sip` never links `sdp` or `media`, taking
+`Arc<dyn MediaFabric>` and `Arc<dyn SdpNegotiator>` instead, so
+signaling can be tested without a media plane.
 
 The dependency-inversion seam makes this work: shared concerns that
 touch multiple subsystems (event bus, config, media fabric, SDP
@@ -72,14 +92,14 @@ Concretely:
 - `smiths-media` depends on `smiths-core` to impl `MediaFabric` and
   return `EndpointId` / `BridgeId` tokens; it knows nothing about SIP
   or SDP.
-- `smiths-mcp` depends on `smiths-core` only — it consumes
-  `Arc<dyn AiRegistry>` and calls plugins through `AiProvider::invoke`,
-  so it never links `smiths-plugin` and stays a pure tool/adapter layer.
+- `smiths-mcp` consumes `Arc<dyn AiRegistry>` and calls plugins through
+  `AiProvider::invoke`, so it never links `smiths-plugin`. It does link
+  `smiths-media` and `smiths-mixer`, because tools like `bridge_calls`
+  and `join_conference` act on those directly.
 - `smiths-plugin` is the umbrella for the three host tiers. It
-  implements `core::ai::{AiProvider, AiRegistry}` over its sidecar
-  (today) / WASM (Phase 3) / script (Phase 3) backends and re-exports
-  each host crate as a sub-namespace (`plugin::sidecar`, `plugin::wasm`,
-  `plugin::script`).
+  implements `core::ai::{AiProvider, AiRegistry}` over its sidecar,
+  WASM and script backends and re-exports each host crate as a
+  sub-namespace (`plugin::sidecar`, `plugin::wasm`, `plugin::script`).
 - Integration tests and the CLI are **allowed** to reach across
   siblings (they wire concrete implementations) — that is the one
   place the layering "flattens" on purpose.
@@ -89,7 +109,7 @@ Concretely:
 | Crate            | Responsibility                                                            | Key external deps                        |
 |------------------|---------------------------------------------------------------------------|------------------------------------------|
 | `smiths-core`    | tokio runtime, typed event bus, config loader (+ `BindSpec`), graceful shutdown, Call FSM state (`DialogRecord`, `Serialize`), media/sdp **trait seams** (`MediaFabric`, `SdpNegotiator`, `EndpointId`, `BridgeId`, `NegotiationOutcome`), AI-plugin **trait seams** (`CapabilityDescriptor`, `validate_controls`, `AiProvider`, `AiRegistry`), timer wheel | `tokio`, `async-trait`, `serde`, `serde_json`, `tracing`, `toml`, `figment` |
-| `smiths-proto`   | `.proto` → Rust types; build-time codegen; schema versioning              | `prost`, `prost-build`                   |
+| `smiths-proto`   | Wire types shared by the WASM host and its guests (prost derives, no `build.rs`) plus the fixed-offset `FixedFrameWireFormat` | `prost` |
 | `smiths-sip`     | RFC 3261 parser/serializer, UDP/TCP/TLS transport, transaction + dialog FSMs, digest auth. Consumes `MediaFabric` + `SdpNegotiator` trait objects; **no** direct deps on `smiths-sdp` / `smiths-media` | `rsip` or custom `nom`, `rustls`, `tokio-rustls` |
 | `smiths-sdp`     | SDP parse/generate, codec negotiation (PCMU, PCMA, Opus). Provides `Negotiator: SdpNegotiator` impl consumed through `smiths-core` | `webrtc-sdp` or custom                   |
 | `smiths-media`   | RTP/RTCP sockets, SSRC mgmt, passthrough router, optional jitter buffer. Provides `UdpMediaFabric: MediaFabric` impl; owns all media sockets behind opaque tokens | `webrtc-rtp`, `webrtc-rtcp`, `dashmap`   |
@@ -124,7 +144,7 @@ wasmtime     = "26"
 
 ## Public API boundaries
 
-- `smiths-core::bus` — only mechanism for cross-crate communication.
+- `smiths-core::bus` — typed events for notification; control flow uses the trait seams below.
 - `smiths-core::config` — all config types re-exported from here.
 - `smiths-core::ai` — single source of truth for the AI-plugin contract:
   `CapabilityDescriptor`, `validate_controls`, and the `AiProvider` /

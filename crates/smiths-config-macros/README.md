@@ -49,13 +49,9 @@ struct Section {
     #[nested]
     sub: SubSection,
 
-    // No attribute → the field is skipped silently. Use
-    // sparingly: this is the "opt-out of the diff" knob, and
-    // new unmarked fields will not show up in ApplyReport at
-    // all. The point of the derive is to keep tracked fields
-    // aligned with the struct; skip means "I've reviewed this
-    // and it's deliberately out of scope."
-    internal_state: Cache,
+    // There is no "skip" attribute: a field without one of the
+    // three markers is a compile error, so every knob is either
+    // hot-reloadable, restart-required, or recursed into.
 }
 ```
 
@@ -150,9 +146,6 @@ impl crate::reloader::Reloadable for Section {
   is therefore intended for `smiths-core` use. If a future
   caller needs it in another crate, flip the generated paths to
   `::smiths_core::reloader::…` in `lib.rs` — nothing else changes.
-- Compile-time enforcement of "every field must be classified"
-  is not shipped: unmarked fields are silently skipped. This is
-  deliberate — the existing config has many fields that aren't
-  part of the reload surface today. A future slice can add a
-  `#[derive(Reloadable)]` struct-level `strict` flag that errors
-  on unmarked fields for operators who want that safety.
+- Every field must be classified. The derive rejects an unmarked
+  field at compile time, so adding a config knob without deciding
+  whether it hot-reloads is impossible.

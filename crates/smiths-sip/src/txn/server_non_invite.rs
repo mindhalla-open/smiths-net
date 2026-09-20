@@ -6,10 +6,9 @@
 //! retransmissions for 64·T1 before retiring.
 //!
 //! Used by every inbound non-INVITE method the UAS handles: OPTIONS,
-//! BYE, REGISTER, MESSAGE, CANCEL, …. Today the UAS still uses its
-//! `dedupe` `DashMap` for replay protection; this FSM is the
-//! architectural replacement — callable from a future UAS migration
-//! slice.
+//! BYE, REGISTER, MESSAGE, CANCEL, …. The UAS registers one per
+//! request with the transaction driver, which replays the cached
+//! response on retransmits.
 //!
 //! ## State diagram (unreliable / UDP)
 //!
@@ -42,7 +41,9 @@
 //! ## Timers (RFC 3261 §17.2.2)
 //!
 //! - **J** (absorb retransmitted requests): `64 · T1 = 32 s` on
-//!   unreliable transport; `0` on reliable. Armed on entering
+//!   unreliable transport; `0` on reliable
+//!   ([`Transaction::set_reliable`]), where the final response
+//!   terminates the transaction directly. Armed on entering
 //!   Completed; fires → Terminated. While armed, any retransmit
 //!   of the original request causes the FSM to re-send the cached
 //!   final response.
@@ -61,6 +62,8 @@ pub struct ServerNonInviteTxn {
     /// Last response emitted. Replayed on request retransmits in
     /// Proceeding / Completed.
     last_response: Option<Bytes>,
+    /// Reliable-transport profile: zero timer J.
+    reliable: bool,
 }
 
 impl ServerNonInviteTxn {
@@ -78,6 +81,36 @@ impl ServerNonInviteTxn {
             },
             state: TransactionState::Trying,
             last_response: None,
+            reliable: false,
+        }
+    }
+
+    /// Builder form of [`Transaction::set_reliable`].
+    #[must_use]
+    pub const fn with_reliable(mut self, reliable: bool) -> Self {
+        self.reliable = reliable;
+        self
+    }
+
+    /// Emit the TU's final response. Completed + timer J on UDP;
+    /// straight to Terminated on a reliable transport (J = 0).
+    fn emit_final(&mut self, bytes: Bytes) -> Vec<TransactionAction> {
+        self.last_response = Some(bytes.clone());
+        if self.reliable {
+            self.state = TransactionState::Terminated;
+            vec![
+                TransactionAction::SendToPeer(bytes),
+                TransactionAction::Terminated,
+            ]
+        } else {
+            self.state = TransactionState::Completed;
+            vec![
+                TransactionAction::SendToPeer(bytes),
+                TransactionAction::ArmTimer {
+                    id: TimerId::J,
+                    after: TIMEOUT_64T1,
+                },
+            ]
         }
     }
 }
@@ -89,6 +122,10 @@ impl Transaction for ServerNonInviteTxn {
 
     fn state(&self) -> TransactionState {
         self.state
+    }
+
+    fn set_reliable(&mut self, reliable: bool) {
+        self.reliable = reliable;
     }
 
     fn on_event(&mut self, event: TransactionEvent) -> Vec<TransactionAction> {
@@ -105,19 +142,11 @@ impl Transaction for ServerNonInviteTxn {
                 vec![TransactionAction::SendToPeer(bytes)]
             }
 
-            // --- TU final from Trying → Completed ------------------------
-            (S::Trying, Ev::SendResponseFromTu { status, bytes })
+            // --- TU final from Trying or Proceeding → Completed ----------
+            (S::Trying | S::Proceeding, Ev::SendResponseFromTu { status, bytes })
                 if (200..700).contains(&status) =>
             {
-                self.state = S::Completed;
-                self.last_response = Some(bytes.clone());
-                vec![
-                    TransactionAction::SendToPeer(bytes),
-                    TransactionAction::ArmTimer {
-                        id: TimerId::J,
-                        after: TIMEOUT_64T1,
-                    },
-                ]
+                self.emit_final(bytes)
             }
 
             // --- TU 1xx in Proceeding — emit, stay -----------------------
@@ -126,21 +155,6 @@ impl Transaction for ServerNonInviteTxn {
             {
                 self.last_response = Some(bytes.clone());
                 vec![TransactionAction::SendToPeer(bytes)]
-            }
-
-            // --- TU final from Proceeding → Completed --------------------
-            (S::Proceeding, Ev::SendResponseFromTu { status, bytes })
-                if (200..700).contains(&status) =>
-            {
-                self.state = S::Completed;
-                self.last_response = Some(bytes.clone());
-                vec![
-                    TransactionAction::SendToPeer(bytes),
-                    TransactionAction::ArmTimer {
-                        id: TimerId::J,
-                        after: TIMEOUT_64T1,
-                    },
-                ]
             }
 
             // --- Request retransmit in Proceeding or Completed -----------
@@ -312,6 +326,21 @@ mod tests {
             bytes: Bytes::new(),
         });
         assert!(a.is_empty());
+    }
+
+    #[test]
+    fn reliable_final_terminates_without_timer_j() {
+        let mut t = new_txn().with_reliable(true);
+        let a = t.on_event(TransactionEvent::SendResponseFromTu {
+            status: 200,
+            bytes: Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"),
+        });
+        assert_eq!(count_sends(&a), 1);
+        assert!(!has_timer(&a, TimerId::J), "timer J is zero on TCP");
+        assert!(has_terminated(&a));
+        assert_eq!(t.state(), TransactionState::Terminated);
+        // Send must precede the Terminated marker so the bytes go out.
+        assert!(matches!(a[0], TransactionAction::SendToPeer(_)));
     }
 
     #[test]

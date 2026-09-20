@@ -1,4 +1,4 @@
-//! Config hot-reload substrate (slice 5.8-mvp + 5.9-mvp).
+//! Config hot-reload substrate.
 //!
 //! Wraps the engine's live [`Config`] in an `ArcSwap<Config>` so
 //! subscribers can observe changes without restarting and the
@@ -9,43 +9,34 @@
 //!
 //! - The engine owns one [`ConfigReloader`] at boot; it's the
 //!   source of truth for "what config is live right now".
-//! - [`Self::current`] returns a cheap `Arc<Config>` snapshot any
-//!   subsystem can read — zero lock contention on the hot path.
-//! - [`Self::apply`] atomically swaps in a new `Arc<Config>`,
-//!   mints a [`ChangeReceipt`], and retains the prior snapshot.
-//!   The receipt carries a `deadline_at_unix` (Unix seconds at
-//!   which auto-rollback fires); the caller runs a timer that
-//!   tests the deadline and calls [`Self::rollback`] if the
-//!   operator hasn't [`Self::confirm`]ed.
-//! - [`Self::confirm`] drops the prior snapshot — the apply is
-//!   permanent.
-//! - [`Self::rollback`] atomically swaps back to the prior
-//!   snapshot and records the rollback reason.
+//! - [`ConfigReloader::current`] returns a cheap `Arc<Config>`
+//!   snapshot any subsystem can read — zero lock contention on
+//!   the hot path.
+//! - [`ConfigReloader::apply`] validates the candidate, diffs it
+//!   against the live snapshot through the `#[derive(Reloadable)]`
+//!   walk ([`Config::apply_report`]), refuses when a
+//!   restart-required field changed, and otherwise atomically
+//!   swaps in the new `Arc<Config>`, mints a [`ChangeReceipt`] and
+//!   retains the prior snapshot.
+//! - [`ConfigReloader::spawn_auto_rollback`] arms the canary
+//!   deadline on a receipt; [`crate::probe::ErrorRateProbe`]
+//!   watches the plugin-error and SIP-parse-error rates over the
+//!   same window and rolls back early when a ceiling trips.
+//! - [`ConfigReloader::spawn_read_through`] gives each subsystem
+//!   (tracing filter, SIP rate limiter, prompt library, transcode
+//!   budget, AI credentials, WebRTC privacy, HA heartbeat) a task
+//!   that applies a reloadable value the moment it changes.
+//! - [`ConfigReloader::confirm`] drops the prior snapshot — the
+//!   apply is permanent. [`ConfigReloader::rollback`] swaps the
+//!   prior snapshot back and broadcasts it so every read-through
+//!   reverses its side effect.
+//! - The CLI's SIGHUP driver and the MCP `put_config` tool are
+//!   the two callers of `apply`; both go through the same
+//!   validate → diff → swap path.
 //!
-//! ## What's NOT in this mvp
-//!
-//! - **Auto-rollback timer task.** The deadline lives on the
-//!   receipt; a caller decides how to watch it. The CLI's
-//!   canary layer adds the timer in a follow-on slice.
-//! - **`#[derive(Reloadable)]` macro.** The MVP hardcodes the
-//!   reloadable-vs-restart-required field list in
-//!   [`Config::apply_report`] (on the `Config` type itself).
-//!   Follow-on slice lands the derive macro to keep the list
-//!   from drifting.
-//! - **Subsystem read-throughs.** Only the `config://current`
-//!   MCP resource + future `get_config`/`put_config` tools
-//!   consult the live reloader. Every other subsystem still
-//!   reads its boot snapshot — documented as "restart required"
-//!   for those fields. Follow-on slice threads `Arc<ConfigReloader>`
-//!   into tracing-filter / rate-limiter / prompt library /
-//!   proxy connector for live updates.
-//! - **SIGHUP handler.** The CLI layer adds POSIX SIGHUP +
-//!   Windows named-event wiring that calls `apply`; the
-//!   reloader itself stays async-runtime-agnostic.
-//! - **Error-rate probe.** The 5.9-spec watcher that triggers
-//!   early rollback on `plugin_invocations{outcome="error"}` +
-//!   `sip_parse_errors` rate ceilings is a focused follow-on;
-//!   today's canary is deadline-only.
+//! Every task the reloader spawns selects on the cancellation
+//! token handed to [`ConfigReloader::new_with_cancel`], so engine
+//! shutdown never waits on a canary deadline.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,8 +45,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
+use tokio_util::sync::CancellationToken;
 
 use crate::Config;
+use crate::config::ConfigValidationError;
 
 /// Opaque identifier for one `apply` call. Sequential per
 /// process; wraps at `u64::MAX` but that's 580 years of apply
@@ -159,10 +152,14 @@ pub enum ApplyError {
         /// Fields that would need a restart.
         fields: Vec<String>,
     },
-    /// Candidate config failed `Config::validate()`. Reason
-    /// carried verbatim.
+    /// Candidate config failed [`Config::validate`].
     #[error("candidate config failed validation: {0}")]
-    Invalid(String),
+    Invalid(#[from] ConfigValidationError),
+    /// A previous apply is still inside its canary window. Confirm
+    /// or roll it back first — the canary model tracks one pending
+    /// change at a time.
+    #[error("previous apply still pending — confirm or rollback first")]
+    Pending,
 }
 
 /// Reason surfaced to [`ConfigReloader::rollback`] for metrics
@@ -205,17 +202,21 @@ pub enum CanaryError {
 /// Process-wide config reloader.
 ///
 /// Cheap to clone (two `Arc`s inside). Subsystems hold a clone
-/// and call `current()` on every hot-path access.
+/// and call `current` on every hot-path access.
 pub struct ConfigReloader {
     current: ArcSwap<Config>,
     state: Mutex<ReloaderState>,
     next_change_id: AtomicU64,
     /// Broadcast channel subsystems subscribe to for
-    /// change notifications (slice 5.8-b). Every `apply` and
+    /// change notifications. Every `apply` and
     /// `rollback` sends the new live `Arc<Config>` through
     /// here. Subsystems hold a `watch::Receiver` and
-    /// `select!`-await `changed()` — no polling.
+    /// `select!`-await `changed` — no polling.
     watch_tx: watch::Sender<Arc<Config>>,
+    /// Cancelled on engine shutdown; every task the reloader
+    /// spawns (canary timers, read-through adapters) exits when
+    /// it fires.
+    cancel: CancellationToken,
 }
 
 struct ReloaderState {
@@ -235,9 +236,19 @@ struct PendingChange {
 }
 
 impl ConfigReloader {
-    /// Build a reloader seeded with the engine's boot config.
+    /// Build a reloader seeded with the engine's boot config. Tasks
+    /// it spawns stop when [`Self::shutdown`] is called.
     #[must_use]
     pub fn new(boot_config: Config) -> Arc<Self> {
+        Self::new_with_cancel(boot_config, CancellationToken::new())
+    }
+
+    /// Build a reloader whose spawned tasks (canary timers,
+    /// read-through adapters) exit as soon as `cancel` fires — the
+    /// engine hands in its shutdown token so a pending canary
+    /// deadline can never hold up process exit.
+    #[must_use]
+    pub fn new_with_cancel(boot_config: Config, cancel: CancellationToken) -> Arc<Self> {
         let arc = Arc::new(boot_config);
         let (watch_tx, _rx) = watch::channel(Arc::clone(&arc));
         Arc::new(Self {
@@ -245,10 +256,17 @@ impl ConfigReloader {
             state: Mutex::new(ReloaderState { pending: None }),
             next_change_id: AtomicU64::new(0),
             watch_tx,
+            cancel,
         })
     }
 
-    /// Subscribe to config-change notifications (slice 5.8-b).
+    /// Stop every task this reloader spawned. Equivalent to
+    /// cancelling the token passed to [`Self::new_with_cancel`].
+    pub fn shutdown(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Subscribe to config-change notifications.
     /// The returned `Receiver` yields the new live `Arc<Config>`
     /// on every `apply` or `rollback`. Cheap to clone; subsystems
     /// call this once at boot and hold the receiver for the
@@ -278,9 +296,14 @@ impl ConfigReloader {
     ///   with `deadline_at_unix = now + canary_window_s`, and
     ///   stores the prior snapshot so `rollback` can restore it.
     ///   Subsequent `apply` calls while a pending change is in
-    ///   flight error with [`ApplyError::Invalid`] (the prior
+    ///   flight error with [`ApplyError::Pending`] (the prior
     ///   apply must confirm or roll back first — keeps the
     ///   canary model simple).
+    ///
+    /// Every config field is classified as reloadable or
+    /// restart-required (the derive rejects unmarked fields), so a
+    /// candidate that differs from the live config always either
+    /// swaps or is refused — nothing is silently ignored.
     ///
     /// # Errors
     /// [`ApplyError`] — see variant docs.
@@ -289,15 +312,11 @@ impl ConfigReloader {
         candidate: Config,
         canary_window_s: u64,
     ) -> Result<ChangeReceipt, ApplyError> {
-        if let Err(e) = candidate.validate() {
-            return Err(ApplyError::Invalid(e));
-        }
+        candidate.validate()?;
 
         let mut state = self.state.lock().await;
         if state.pending.is_some() {
-            return Err(ApplyError::Invalid(
-                "previous apply still pending — confirm or rollback first".into(),
-            ));
+            return Err(ApplyError::Pending);
         }
 
         let prior = self.current.load_full();
@@ -330,10 +349,10 @@ impl ConfigReloader {
                 prior_snapshot: prior,
                 receipt: receipt.clone(),
             });
-            // Broadcast the new config to every subscriber
-            // (slice 5.8-b). `watch::send` never errors when
-            // at least the reloader itself holds a sender; the
-            // receivers drain asynchronously.
+            // Broadcast the new config to every subscriber.
+            // `watch::send` never errors when at least the
+            // reloader itself holds a sender; the receivers
+            // drain asynchronously.
             let _ = self.watch_tx.send(new_arc);
         }
 
@@ -369,9 +388,8 @@ impl ConfigReloader {
             Some(p) if p.id == id => {
                 let restored = Arc::clone(&p.prior_snapshot);
                 self.current.store(p.prior_snapshot);
-                // Broadcast the restored config (slice 5.8-b)
-                // so subsystems reverse any live-applied
-                // side effects.
+                // Broadcast the restored config so subsystems
+                // reverse any live-applied side effects.
                 let _ = self.watch_tx.send(restored);
                 Ok(())
             }
@@ -396,12 +414,14 @@ impl ConfigReloader {
             .map(|p| p.receipt.clone())
     }
 
-    /// Spawn an auto-rollback timer task (slice 5.8-followup-c).
-    /// Sleeps until `receipt.deadline_at_unix`; if the change is
-    /// still pending, calls `rollback(id, Timeout)` and updates
-    /// the canary metrics. Idempotent with operator `confirm` /
-    /// manual `rollback` — the timer's rollback call returns
-    /// `UnknownChange` when the change already resolved.
+    /// Spawn an auto-rollback timer task. Sleeps until
+    /// `receipt.deadline_at_unix`; if the change is still pending,
+    /// calls `rollback(id, Timeout)` and updates the canary
+    /// metrics. Idempotent with operator `confirm` / manual
+    /// `rollback` — the timer's rollback call returns
+    /// `UnknownChange` when the change already resolved. The task
+    /// exits without rolling back when the reloader's cancellation
+    /// token fires first (engine shutdown).
     pub fn spawn_auto_rollback(
         self: &Arc<Self>,
         receipt: &ChangeReceipt,
@@ -413,12 +433,20 @@ impl ConfigReloader {
         if let Some(m) = &metrics {
             m.config_canary_active.set(1);
         }
+        let cancel = self.cancel.clone();
         tokio::spawn(async move {
             let now = current_unix_seconds();
             let wait = deadline.saturating_sub(now).max(0);
             #[allow(clippy::cast_sign_loss)] // clamped ≥ 0
             let wait = wait as u64;
-            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    tracing::debug!(%id, "canary timer cancelled by shutdown");
+                    return;
+                }
+                () = tokio::time::sleep(std::time::Duration::from_secs(wait)) => {}
+            }
             match me.rollback(id, RollbackReason::Timeout).await {
                 Ok(()) => {
                     tracing::warn!(%id, "config canary deadline fired; rolled back");
@@ -441,7 +469,7 @@ impl ConfigReloader {
         })
     }
 
-    /// Spawn a subsystem read-through adapter (slice 5.8-b).
+    /// Spawn a subsystem read-through adapter.
     ///
     /// `extract` pulls one reloadable value out of the live
     /// `Config`; `apply` takes the extracted value and does
@@ -456,9 +484,9 @@ impl ConfigReloader {
     /// [`crate::metrics::Metrics::config_reloaded_fields`] so
     /// operators see which adapter fired.
     ///
-    /// The returned `JoinHandle` completes when every
-    /// `watch::Sender` drops (which happens only on
-    /// `ConfigReloader` teardown) or the caller aborts.
+    /// The returned `JoinHandle` completes when the reloader's
+    /// cancellation token fires, when every `watch::Sender` drops
+    /// (`ConfigReloader` teardown), or when the caller aborts it.
     pub fn spawn_read_through<T, F, A>(
         self: &Arc<Self>,
         field_name: &'static str,
@@ -476,9 +504,19 @@ impl ConfigReloader {
         // the initial state — the subsystem already initialised
         // itself from the boot config. We only react to CHANGES.
         let initial = extract(&rx.borrow());
+        let cancel = self.cancel.clone();
         tokio::spawn(async move {
             let mut last = initial;
-            while rx.changed().await.is_ok() {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return,
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
                 let next = extract(&rx.borrow());
                 if next == last {
                     continue;
@@ -548,39 +586,6 @@ impl Config {
         let mut report = ApplyReport::default();
         self.diff_into(new, &mut report, "");
         report
-    }
-
-    /// Validate the config — catches semantic errors that
-    /// pass TOML parsing but would fail at apply time.
-    ///
-    /// Cheap today: checks (a) rate-limit thresholds are
-    /// self-consistent, (b) TLS paths exist when TLS is in
-    /// `sip.transports`, (c) bind addresses parse (they
-    /// already did during deserialization — included for
-    /// future structural checks). A future slice adds cert+key
-    /// cryptographic match verification via rustls.
-    ///
-    /// # Errors
-    /// Returns a single human-readable reason on the first
-    /// failure — for a multi-error accumulator, build a
-    /// `Vec<String>` wrapper.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.sip.rate_limit.per_sec > 0 && self.sip.rate_limit.burst == 0 {
-            return Err(
-                "sip.rate_limit: per_sec > 0 but burst = 0 — bucket never admits traffic".into(),
-            );
-        }
-        if self
-            .sip
-            .transports
-            .contains(&crate::config::SipTransport::Tls)
-            && (self.sip.tls_cert_path.is_none() || self.sip.tls_key_path.is_none())
-        {
-            return Err(
-                "sip.transports includes `tls` but tls_cert_path / tls_key_path are unset".into(),
-            );
-        }
-        Ok(())
     }
 }
 
@@ -707,15 +712,57 @@ mod tests {
         let mut b = base_config();
         b.observability.log_level = "trace".into();
         let err = reloader.apply(b, 60).await.unwrap_err();
-        assert!(matches!(err, ApplyError::Invalid(_)));
+        assert!(matches!(err, ApplyError::Pending));
     }
 
-    #[test]
-    fn validate_catches_inconsistent_rate_limit() {
-        let mut cfg = base_config();
-        cfg.sip.rate_limit.per_sec = 10;
-        cfg.sip.rate_limit.burst = 0;
-        assert!(cfg.validate().is_err());
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_invalid_candidate_is_typed_error() {
+        let reloader = ConfigReloader::new(base_config());
+        let mut bad = base_config();
+        bad.sip.rate_limit.per_sec = 10;
+        bad.sip.rate_limit.burst = 0;
+        let err = reloader.apply(bad, 60).await.unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::Invalid(crate::config::ConfigValidationError::RateLimitBurstZero { .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_token_stops_auto_rollback_without_rolling_back() {
+        let cancel = CancellationToken::new();
+        let reloader = ConfigReloader::new_with_cancel(base_config(), cancel.clone());
+        let mut next = base_config();
+        next.observability.log_level = "debug".into();
+        // Deadline of 0 s would fire immediately; use a long one
+        // and prove cancellation wins.
+        let receipt = reloader.apply(next, 3_600).await.unwrap();
+        let handle = reloader.spawn_auto_rollback(&receipt, None);
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("timer task must exit on cancel")
+            .unwrap();
+        // Still pending — cancellation is not a rollback.
+        assert!(reloader.pending().await.is_some());
+        assert_eq!(reloader.current().observability.log_level, "debug");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_token_stops_read_through_adapter() {
+        let cancel = CancellationToken::new();
+        let reloader = ConfigReloader::new_with_cancel(base_config(), cancel.clone());
+        let handle = reloader.spawn_read_through(
+            "observability.log_level",
+            None,
+            |c: &Config| c.observability.log_level.clone(),
+            |_: &String| {},
+        );
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("adapter must exit on cancel")
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -732,7 +779,7 @@ mod tests {
         next.observability.log_level = "trace".into();
         let _receipt = reloader.apply(next, 60).await.unwrap();
 
-        // `changed()` resolves once the reloader sent the new value.
+        // `changed` resolves once the reloader sent the new value.
         rx.changed().await.unwrap();
         assert_eq!(rx.borrow().observability.log_level, "trace");
     }
@@ -869,6 +916,23 @@ mod tests {
                     }
                 }),
             ),
+            (
+                "webrtc.privacy",
+                Box::new(|c| c.webrtc.privacy.redaction_key = "rotated".into()),
+            ),
+            (
+                "sip.drain_timeout_secs",
+                Box::new(|c| c.sip.drain_timeout_secs += 1),
+            ),
+            (
+                "reload.enabled",
+                Box::new(|c| c.reload.enabled = !c.reload.enabled),
+            ),
+            ("canary.deadline_s", Box::new(|c| c.canary.deadline_s += 1)),
+            (
+                "cluster.heartbeat_interval_secs",
+                Box::new(|c| c.cluster.heartbeat_interval_secs += 1),
+            ),
         ];
         for (expected, mutator) in cases {
             let report = diff_case(mutator);
@@ -920,6 +984,28 @@ mod tests {
             (
                 "storage backend",
                 Box::new(|c| c.storage.backend = StorageBackend::Sqlite),
+            ),
+            (
+                "core.worker_threads",
+                Box::new(|c| c.core.worker_threads = 3),
+            ),
+            (
+                "webtransport listener",
+                Box::new(|c| c.webtransport.enabled = true),
+            ),
+            ("webrtc bind / tls", Box::new(|c| c.webrtc.enabled = true)),
+            ("webrtc.ice", Box::new(|c| c.webrtc.ice.enabled = true)),
+            (
+                "sip session timer",
+                Box::new(|c| c.sip.session_expires_secs += 1),
+            ),
+            (
+                "mcp binds",
+                Box::new(|c| c.mcp.http.bearer_token = Some("t".into())),
+            ),
+            (
+                "plugins.wasm",
+                Box::new(|c| c.plugins.wasm.memory_limit_mb = 1),
             ),
         ];
         for (expected, mutator) in cases {

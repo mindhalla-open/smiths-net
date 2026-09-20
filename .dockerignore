@@ -1,0 +1,9 @@
+# Allow-list: the Dockerfile copies only the workspace manifests, the
+# crates and the default config. Everything else (target/ dirs, .git,
+# docs, site, plugins, fuzz) stays out of the build context.
+*
+!Cargo.toml
+!Cargo.lock
+!crates
+!examples/config.toml
+**/target

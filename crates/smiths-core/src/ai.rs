@@ -50,7 +50,7 @@ pub struct CapabilityDescriptor {
     /// Concurrency limits the plugin advertises.
     #[serde(default)]
     pub concurrency: Option<ConcurrencyHint>,
-    /// Dispatch priority (slice 3.1). **Lower wins** — 0 is the
+    /// Dispatch priority. **Lower wins** — 0 is the
     /// strongest preference, 100 the weakest. Providers that omit
     /// the field default to [`DEFAULT_PRIORITY`]. The dispatcher
     /// sorts candidates by this value; ties broken by advertised
@@ -98,27 +98,61 @@ const fn default_priority() -> u8 {
 }
 
 /// Parse the JSON body a plugin returned from `describe_capabilities`
-/// (sidecar handshake) or the `describe()` export (WASM tier). Accepts
+/// (sidecar handshake) or the `describe` export (WASM tier). Accepts
 /// either a single descriptor object or an array of them. Rejects an
 /// empty list and runs [`CapabilityDescriptor::validate`] on each entry.
 ///
 /// Lives here (not in `smiths-plugin`) so every tier can share the same
 /// parse/validate pipeline without pulling in a plugin-host dependency.
-pub fn parse_descriptors(raw: Value) -> Result<Vec<CapabilityDescriptor>, String> {
+pub fn parse_descriptors(raw: Value) -> Result<Vec<CapabilityDescriptor>, DescriptorError> {
     let list: Vec<CapabilityDescriptor> = if raw.is_array() {
-        serde_json::from_value(raw).map_err(|e| format!("descriptor array parse: {e}"))?
+        serde_json::from_value(raw).map_err(|e| DescriptorError::Parse(e.to_string()))?
     } else {
         let single: CapabilityDescriptor =
-            serde_json::from_value(raw).map_err(|e| format!("descriptor parse: {e}"))?;
+            serde_json::from_value(raw).map_err(|e| DescriptorError::Parse(e.to_string()))?;
         vec![single]
     };
     if list.is_empty() {
-        return Err("plugin returned no capabilities".into());
+        return Err(DescriptorError::Empty);
     }
     for d in &list {
         d.validate()?;
     }
     Ok(list)
+}
+
+/// Why a plugin's `describe_capabilities` payload was rejected.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum DescriptorError {
+    /// The JSON didn't deserialize into one descriptor or an array
+    /// of them.
+    #[error("descriptor parse: {0}")]
+    Parse(String),
+    /// The plugin returned an empty capability list.
+    #[error("plugin returned no capabilities")]
+    Empty,
+    /// `capability` was the empty string.
+    #[error("capability is empty")]
+    EmptyCapability,
+    /// `capability` is outside the namespaces the engine dispatches.
+    #[error(
+        "capability `{0}` is outside the `ai.*` / `media.*` / `storage.*` / `routing.*` / \
+         `bridge.*` namespaces"
+    )]
+    UnknownNamespace(String),
+    /// `plugin` was the empty string.
+    #[error("plugin name is empty")]
+    EmptyPluginName,
+    /// `abi` is not a `1.x` version.
+    #[error("descriptor abi `{0}` is not 1.x")]
+    UnsupportedAbi(String),
+}
+
+impl From<DescriptorError> for ProviderError {
+    fn from(e: DescriptorError) -> Self {
+        Self(e.to_string())
+    }
 }
 
 impl CapabilityDescriptor {
@@ -129,12 +163,12 @@ impl CapabilityDescriptor {
     ///
     /// - `ai.*` — AI providers (LLM, TTS, ASR, embed). The original
     ///   plugin tier.
-    /// - `media.*` — streaming-RTP consumers. Added in slice 2.5
+    /// - `media.*` — streaming-RTP consumers. Added in
     ///   so a sidecar plugin can declare itself as something that
     ///   receives per-packet RTP from the engine (e.g. the deferred
     ///   `dtmf-inband` Python sidecar). See [`MEDIA_STREAMING_RTP`].
     /// - `storage.*` — pluggable backends for the storage traits
-    ///   (slice 3.4). `storage.vector` backs
+    ///   . `storage.vector` backs
     ///   `search_calls_semantic`; `storage.recording` backs audio
     ///   retention. See [`STORAGE_VECTOR`] and
     ///   [`STORAGE_RECORDING`].
@@ -142,13 +176,13 @@ impl CapabilityDescriptor {
     ///   4.1 + 4.2). Scripts (Rhai) typically advertise
     ///   `routing.dialplan` and export a `route(req) -> target`
     ///   method the UAS calls on INVITE.
-    /// - `bridge.*` — `IoT` / integration plugins (slice 4.5).
+    /// - `bridge.*` — `IoT` / integration plugins.
     ///   `bridge.ha` (Home Assistant), `bridge.mqtt` (MQTT
     ///   broker), and future add-ons like `Slack` / `Teams` / `PagerDuty`
     ///   live here. See [`BRIDGE_HA`] and [`BRIDGE_MQTT`].
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), DescriptorError> {
         if self.capability.is_empty() {
-            return Err("capability is empty".into());
+            return Err(DescriptorError::EmptyCapability);
         }
         if !self.capability.starts_with("ai.")
             && !self.capability.starts_with("media.")
@@ -156,23 +190,20 @@ impl CapabilityDescriptor {
             && !self.capability.starts_with("routing.")
             && !self.capability.starts_with("bridge.")
         {
-            return Err(format!(
-                "capability `{}` is outside the `ai.*` / `media.*` / `storage.*` / `routing.*` / `bridge.*` namespaces",
-                self.capability
-            ));
+            return Err(DescriptorError::UnknownNamespace(self.capability.clone()));
         }
         if self.plugin.is_empty() {
-            return Err("plugin name is empty".into());
+            return Err(DescriptorError::EmptyPluginName);
         }
         if !self.abi.starts_with("1.") {
-            return Err(format!("descriptor abi `{}` is not 1.x", self.abi));
+            return Err(DescriptorError::UnsupportedAbi(self.abi.clone()));
         }
         Ok(())
     }
 }
 
 /// Capability token declaring a plugin that consumes streaming RTP
-/// from the engine's media fabric (slice 2.5). The engine wires the
+/// from the engine's media fabric. The engine wires the
 /// bridge's plaintext RTP feed to the plugin's `on_rtp_frame` host
 /// function; the plugin decides what to do with it (DTMF detect,
 /// recording, RAG ingestion).
@@ -189,25 +220,25 @@ impl CapabilityDescriptor {
 pub const MEDIA_STREAMING_RTP: &str = "media.streaming_rtp";
 
 /// Capability token declaring a plugin that serves an embedding-
-/// indexed vector store (slice 3.4). The MCP `search_calls_semantic`
+/// indexed vector store. The MCP `search_calls_semantic`
 /// tool routes through this seam to back its top-k queries. The
 /// reference sidecar is `store-qdrant` (Qdrant HTTP API wrapper).
 pub const STORAGE_VECTOR: &str = "storage.vector";
 
 /// Capability token declaring a plugin that serves per-call audio
-/// retention (slice 3.4). The filesystem default ships in-tree;
+/// retention. The filesystem default ships in-tree;
 /// operators pointing `[storage.recording] backend = "sidecar"` at
 /// an S3-compatible sidecar route through this seam. The reference
 /// sidecar is `store-s3-recording`.
 pub const STORAGE_RECORDING: &str = "storage.recording";
 
 /// Capability token declaring a Home Assistant integration
-/// sidecar (slice 4.5 / P21). Methods: `emit_event`, `get_state`,
+/// sidecar. Methods: `emit_event`, `get_state`,
 /// `call_service`. The reference sidecar is `ha-bridge`.
 pub const BRIDGE_HA: &str = "bridge.ha";
 
 /// Capability token declaring a generic MQTT broker integration
-/// (slice 4.5 / P21). Methods: `publish`, `subscribe`. The
+///. Methods: `publish`, `subscribe`. The
 /// reference sidecar is `mqtt-bridge`.
 pub const BRIDGE_MQTT: &str = "bridge.mqtt";
 
@@ -442,7 +473,7 @@ pub trait AiRegistry: Send + Sync {
         ))
     }
     /// Overwrite a script-tier plugin's entry source and trigger a
-    /// hot reload (slice 4.1). The implementation writes atomically
+    /// hot reload. The implementation writes atomically
     /// so an in-flight `describe_capabilities` never sees a partial
     /// file. Default impl responds "not supported" so registries
     /// that don't host scripts stay trait-compatible.
@@ -454,7 +485,7 @@ pub trait AiRegistry: Send + Sync {
 }
 
 // ---------------------------------------------------------------------
-// Dispatcher — slice 3.1
+// Dispatcher —
 // ---------------------------------------------------------------------
 
 /// Errors surfaced by [`AiDispatcher::invoke`].
@@ -505,9 +536,12 @@ impl Default for DispatchPolicy {
 /// Breaker state for one provider, tracked by the dispatcher so a
 /// flapping plugin doesn't keep getting picked first.
 ///
-/// Simple count-with-cooldown: after `OPEN_AFTER` consecutive
-/// failures the provider is marked Open for `OPEN_COOLDOWN`; during
-/// that window the dispatcher skips it. Any success closes it.
+/// Count-with-cooldown: after `OPEN_AFTER` consecutive failures the
+/// provider is marked Open for `OPEN_COOLDOWN_SECS`; during that
+/// window the dispatcher skips it. When the cooldown elapses the
+/// breaker closes with a fresh failure budget — the provider gets
+/// `OPEN_AFTER` new chances rather than re-tripping on its first
+/// post-cooldown failure. Any success also closes it.
 #[derive(Debug, Default)]
 struct ProviderHealth {
     consecutive_failures: std::sync::atomic::AtomicU32,
@@ -528,7 +562,21 @@ impl ProviderHealth {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        now.saturating_sub(tripped) < Self::OPEN_COOLDOWN_SECS
+        if now.saturating_sub(tripped) < Self::OPEN_COOLDOWN_SECS {
+            return true;
+        }
+        // Cooldown elapsed: close the breaker and reset the failure
+        // count so the next probe starts from a clean budget. The
+        // compare-exchange makes exactly one caller do the reset if
+        // several observe the expiry concurrently.
+        if self
+            .tripped_at_unix
+            .compare_exchange(tripped, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.consecutive_failures.store(0, Ordering::Release);
+        }
+        false
     }
 
     fn record_success(&self) {
@@ -557,7 +605,7 @@ impl ProviderHealth {
 ///
 /// ## Selection rule
 ///
-/// 1. Every provider whose `capabilities()` includes a descriptor
+/// 1. Every provider whose `capabilities` includes a descriptor
 ///    with matching `capability` string is a candidate.
 /// 2. Breaker-open providers are skipped unless every candidate is
 ///    Open (in which case the dispatcher still tries them — fail
@@ -807,7 +855,7 @@ mod tests {
 
     #[test]
     fn accepts_storage_vector_capability() {
-        // Slice 3.4: `storage.*` joins `ai.*` / `media.*` as a
+        // : `storage.*` joins `ai.*` / `media.*` as a
         // recognized plugin capability namespace so vector /
         // recording sidecars validate.
         let d = CapabilityDescriptor {
@@ -842,7 +890,7 @@ mod tests {
 
     #[test]
     fn accepts_bridge_ha_and_mqtt_capabilities() {
-        // Slice 4.5: `bridge.*` joins the whitelist for IoT / home-
+        // : `bridge.*` joins the whitelist for IoT / home-
         // automation / pager / messaging sidecars.
         for cap in [BRIDGE_HA, BRIDGE_MQTT] {
             let d = CapabilityDescriptor {
@@ -863,7 +911,7 @@ mod tests {
 
     #[test]
     fn accepts_media_streaming_rtp_capability() {
-        // Slice 2.5: `media.*` joins `ai.*` as a recognized plugin
+        // : `media.*` joins `ai.*` as a recognized plugin
         // capability namespace so streaming-RTP consumers (DTMF
         // sidecars, recording sidecars) validate without hacking
         // around the namespace check.
@@ -952,7 +1000,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Dispatcher tests (slice 3.1)
+    // Dispatcher tests
     // -----------------------------------------------------------------
 
     use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
@@ -1117,6 +1165,77 @@ mod tests {
         });
         let v = d.invoke("ai.llm.chat", "chat", json!({})).await.unwrap();
         assert_eq!(v["who"], "fast");
+    }
+
+    #[test]
+    fn breaker_closes_with_fresh_budget_after_cooldown() {
+        use std::sync::atomic::Ordering;
+        let h = ProviderHealth::default();
+        for _ in 0..ProviderHealth::OPEN_AFTER {
+            h.record_failure();
+        }
+        assert!(h.is_open(), "three failures must trip the breaker");
+
+        // Rewind the trip time past the cooldown window.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        h.tripped_at_unix.store(
+            now - ProviderHealth::OPEN_COOLDOWN_SECS - 1,
+            Ordering::Release,
+        );
+        assert!(!h.is_open(), "cooldown elapsed → closed");
+        assert_eq!(h.consecutive_failures.load(Ordering::Acquire), 0);
+
+        // One post-cooldown failure must NOT re-trip.
+        h.record_failure();
+        assert!(
+            !h.is_open(),
+            "single failure after cooldown re-tripped the breaker"
+        );
+        // A fresh run of failures does.
+        h.record_failure();
+        h.record_failure();
+        assert!(h.is_open());
+        // And success closes it outright.
+        h.record_success();
+        assert!(!h.is_open());
+    }
+
+    #[test]
+    fn descriptor_validation_errors_are_typed() {
+        let mut d = CapabilityDescriptor {
+            capability: "ai.tts".into(),
+            plugin: "p".into(),
+            model_id: String::new(),
+            abi: "1.0".into(),
+            description: String::new(),
+            latency_ms: None,
+            concurrency: None,
+            priority: DEFAULT_PRIORITY,
+            extra: BTreeMap::new(),
+        };
+        assert_eq!(d.validate(), Ok(()));
+        d.capability = "video.x".into();
+        assert!(
+            matches!(d.validate(), Err(DescriptorError::UnknownNamespace(c)) if c == "video.x")
+        );
+        d.capability = String::new();
+        assert_eq!(d.validate(), Err(DescriptorError::EmptyCapability));
+        d.capability = "ai.tts".into();
+        d.abi = "2.0".into();
+        assert_eq!(
+            d.validate(),
+            Err(DescriptorError::UnsupportedAbi("2.0".into()))
+        );
+        assert!(matches!(
+            parse_descriptors(json!([])),
+            Err(DescriptorError::Empty)
+        ));
+        assert!(matches!(
+            parse_descriptors(json!(42)),
+            Err(DescriptorError::Parse(_))
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]

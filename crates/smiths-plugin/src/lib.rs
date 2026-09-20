@@ -1,20 +1,26 @@
 //! Plugin discovery, manifest parsing, and capability registry.
 //!
-//! Today's scope — **sidecar plugins only** (`type = "sidecar"`). WASM
-//! and embedded-script tiers land later and live in the re-exported
-//! sub-namespaces [`wasm`] / [`script`] / [`sidecar`]. A plugin is:
+//! Three plugin tiers load through one loader and register in one
+//! [`AiRegistry`]:
 //!
-//! 1. A directory under `plugins.dir` containing `plugin.toml`.
-//! 2. An executable entry point (relative to that directory).
+//! - `type = "sidecar"` — a subprocess speaking JSON-RPC over stdio,
+//!   supervised by [`sidecar::Sidecar`];
+//! - `type = "wasm"` — a guest module run by the in-process
+//!   [`wasm::WasmEngine`];
+//! - `type = "script"` — an embedded Rhai script run by
+//!   [`script::ScriptRuntime`].
 //!
-//! At boot the loader spawns each plugin via [`sidecar::Sidecar`],
-//! calls `describe_capabilities`, validates the returned descriptors
-//! against `05-ai-plugin-protocol.md`, and registers them in the
-//! [`AiRegistry`]. Plugin metadata and the control-schema validator
-//! live in `smiths-core::ai`; this crate just implements the traits
-//! and owns the host-tier sub-crates.
+//! A plugin is a directory containing `plugin.toml` plus its entry
+//! (executable, `.wasm`, or script). The loader scans the configured
+//! root — descending through container directories such as
+//! `plugins/examples` and `plugins/cookbook/...` — runs each plugin's
+//! `describe_capabilities` handshake, validates the returned
+//! descriptors against the plugin protocol, registers the provider,
+//! and wires the lifecycle hooks its manifest declares into the
+//! registry's priority-ordered dispatcher. Plugin metadata and the
+//! control-schema validator live in `smiths-core::ai`; this crate
+//! implements the traits and owns the host-tier sub-crates.
 
-// Slice 1.7 lint tightening.
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -43,10 +49,12 @@ pub use smiths_core::ai::{
 
 pub use dispatcher::{Dispatcher, Hook, HookReport, MemoryDispatcher};
 pub use error::Error;
-pub use event_hook::spawn_call_event_hooks;
-pub use loader::{LoadReport, LoaderOpts, load_plugins};
-pub use manifest::{Manifest, PluginType, ScriptEngine, WireFormat};
-pub use registry::{AiRegistry, PluginEntry};
+pub use event_hook::{HOOK_DIALOG_CREATED, HOOK_DIALOG_TERMINATED, spawn_call_event_hooks};
+pub use loader::{LoadReport, LoaderOpts, MAX_SCAN_DEPTH, load_plugins};
+pub use manifest::{
+    DEFAULT_PRIORITY, MAX_PRIORITY, Manifest, PluginType, SUPPORTED_HOOKS, ScriptEngine,
+};
+pub use registry::{AiRegistry, DEFAULT_HOOK_BUDGET, PluginEntry, ProviderHook};
 pub use script_provider::{ROLLBACK_AFTER, ScriptProvider};
 pub use wasm_provider::WasmProvider;
 pub use watcher::{WatcherHandle, spawn as spawn_watcher};

@@ -14,8 +14,10 @@ the new generic webhook). This guide walks through:
 
 ## 1. Where tools live
 
-Every tool lives in `crates/smiths-mcp/src/tools.rs` (or — when a
-tool grows beyond ~100 LOC — its own module next to `tools.rs`).
+Every tool lives in a module under `crates/smiths-mcp/src/tools/`,
+grouped by what it acts on: `call.rs`, `media.rs`, `conference.rs`,
+`ai.rs`, `pipeline.rs`, `plugin.rs`, `config.rs`, `metrics.rs`.
+`tools/mod.rs` registers them.
 Register it in `builtin_registry()` so all four adapters pick it
 up automatically.
 
@@ -140,7 +142,7 @@ types are for adapter authors, not tool authors.
 
 ## See also
 
-* `crates/smiths-mcp/src/tools.rs` — every built-in tool, read
+* `crates/smiths-mcp/src/tools/` — every built-in tool, read
   `TranslateTool`, `SearchCallsSemanticTool`, and `SummarizeCallTool`
   for the canonical shapes.
 * `crates/smiths-mcp/src/control_protocol.rs` — the trait

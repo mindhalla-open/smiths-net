@@ -37,13 +37,36 @@ pub enum WasmError {
         /// Fuel budget that was set for this invocation.
         fuel: u64,
     },
-    /// Guest ran past the wall-clock deadline set by
-    /// [`crate::WasmEngine::run_with_deadline`] and tripped the
+    /// Guest ran past its wall-clock deadline (the engine's invoke
+    /// timeout or the explicit one passed to
+    /// [`crate::WasmEngine::run_with_deadline`]) and tripped the
     /// epoch interruption.
     #[error("wasm deadline exceeded after {millis} ms")]
     Timeout {
         /// Deadline configured for the invocation.
         millis: u64,
+    },
+    /// Guest tried to grow a linear memory past the engine's cap.
+    /// The instance is dead but the engine survives.
+    #[error("wasm plugin `{plugin}` exceeded its memory limit ({requested} > {limit} bytes)")]
+    MemoryLimit {
+        /// Plugin name from the host state.
+        plugin: String,
+        /// Configured cap in bytes.
+        limit: usize,
+        /// Size the guest asked for.
+        requested: usize,
+    },
+    /// Guest tried to write more persistent state than its byte
+    /// budget allows. The write is refused and the guest trapped.
+    #[error("wasm plugin `{plugin}` exceeded its state budget ({would_use} > {budget} bytes)")]
+    StateBudgetExceeded {
+        /// Plugin name from the host state.
+        plugin: String,
+        /// Configured budget in bytes.
+        budget: usize,
+        /// Bytes the store would hold after the refused write.
+        would_use: usize,
     },
     /// `Store::set_fuel` / fuel setup failed.
     #[error("wasm fuel configuration: {0}")]

@@ -27,14 +27,18 @@
 //! ```
 //!
 //! The FSM is **pure synchronous** — just a state enum plus
-//! `on_event(ev) -> Result`. Call-owning code (today's UAS / UAC)
-//! holds a [`DialogFsm`] per dialog and feeds it events as SIP
-//! messages flow. Illegal transitions (e.g. `AckReceived` when
-//! already Terminated) are explicit `Err(DialogTransitionError)`
-//! rather than silent no-ops — that's the distinction from
-//! transaction FSMs where stray events absorb. Dialogs are
-//! long-lived, so an illegal event usually means an application
-//! bug worth surfacing.
+//! `on_event(ev) -> Result`. The UAS rebuilds a [`DialogFsm`] from
+//! each [`smiths_core::DialogRecord`]'s serialized state
+//! ([`DialogFsm::from_core_state`]), feeds it the event a SIP
+//! message represents, and projects the result back with
+//! [`DialogFsm::to_core_state`] — `None` means the dialog is gone
+//! and the record is dropped. Illegal transitions (e.g.
+//! `AckReceived` when already Terminated) are explicit
+//! `Err(DialogTransitionError)` rather than silent no-ops — that's
+//! the distinction from transaction FSMs where stray events absorb.
+//! Dialogs are long-lived, so an illegal event usually means an
+//! application bug worth logging; the UAS logs and leaves the
+//! record untouched.
 //!
 //! ## Relationship to `smiths-core::DialogState`
 //!
@@ -109,6 +113,18 @@ impl DialogFsm {
         Self {
             state: DialogFsmState::Early,
         }
+    }
+
+    /// Rebuild an FSM from a serialized [`CoreDialogState`]. The
+    /// core type has no terminal variant — a terminated dialog has
+    /// no record — so this always yields a live FSM.
+    #[must_use]
+    pub const fn from_core_state(state: CoreDialogState) -> Self {
+        let state = match state {
+            CoreDialogState::Early => DialogFsmState::Early,
+            CoreDialogState::Confirmed => DialogFsmState::Confirmed,
+        };
+        Self { state }
     }
 
     /// Current state.
@@ -268,6 +284,16 @@ mod tests {
                 "{ev:?} must be refused in Terminated"
             );
         }
+    }
+
+    #[test]
+    fn from_core_state_round_trips() {
+        let early = DialogFsm::from_core_state(CoreDialogState::Early);
+        assert_eq!(early.state(), DialogFsmState::Early);
+        assert_eq!(early.to_core_state(), Some(CoreDialogState::Early));
+        let confirmed = DialogFsm::from_core_state(CoreDialogState::Confirmed);
+        assert_eq!(confirmed.state(), DialogFsmState::Confirmed);
+        assert_eq!(confirmed.to_core_state(), Some(CoreDialogState::Confirmed));
     }
 
     #[test]

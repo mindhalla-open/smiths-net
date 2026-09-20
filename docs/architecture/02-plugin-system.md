@@ -54,17 +54,28 @@ non-Rust operators (and by LLMs via MCP).
 need for unrestricted I/O.
 
 - Runtime: a child process supervised by `smiths-sidecar`.
-- Transport:
-  - **default**: length-prefixed Protobuf over stdio.
-  - **opt-in**: gRPC over Unix domain socket (feature `sidecar-grpc`).
-  - **future**: NATS subject pair for multi-node plugins.
-- Languages: anything with a protobuf library — Python, Node, Go, Java, C#,
-  Ruby, Rust, ...
+- Transport: newline-delimited JSON-RPC 2.0 over the child's stdin /
+  stdout. One JSON object per line, requests carry an `id`, and
+  anything the child writes to stderr is logged. JSON was chosen over
+  protobuf so a plugin author needs no `protoc` and no dependencies:
+  the example plugins are single stdlib-only Python files. Swapping the
+  wire format later is an implementation change, not a protocol one.
+- Languages: anything that can read and write lines of JSON — Python,
+  Node, Go, Java, C#, Ruby, Rust, a shell script.
 - Packaging: any executable + `plugin.toml` in `plugins/<name>/`.
 
-## Unified hook set
+## Hook set
 
-Identical semantics across tiers. Payload schema is the same protobuf type.
+The table below is the **designed** surface. What the engine dispatches
+today is narrower: the loader accepts only `on_dialog_created` and
+`on_dialog_terminated` in a manifest's `hooks` list (see
+`smiths_plugin::manifest::SUPPORTED_HOOKS`), and rejects any other name
+with an error listing the ones it knows. Plugins are otherwise driven
+through `AiProvider::invoke`, which every tier implements. Ordering
+among plugins registered for the same hook comes from the manifest's
+`priority` (`0..=100`, lower first, default 50).
+
+Payloads are JSON objects; the same shape reaches every tier.
 
 | Hook                    | Direction   | Supported tiers             | Sync/async characteristics |
 |-------------------------|-------------|-----------------------------|----------------------------|
@@ -157,28 +168,21 @@ drains then unloads. No dropped calls.
 
 ## Sidecar wire protocol (v1, stdio)
 
-Length-prefixed Protobuf frames:
+Newline-delimited JSON-RPC 2.0 — one object per line, in both
+directions. Requests carry an `id` and expect a reply with the same
+`id`; a line without one is a notification the engine republishes on
+its event bus. Anything the child writes to stderr is logged against
+the plugin's name.
 
-```
-  4 bytes  big-endian uint32 length
-  N bytes  Protobuf-encoded Frame
+```json
+{"jsonrpc":"2.0","id":7,"method":"invoke","params":{"capability":"ai.tts","text":"hello"}}
+{"jsonrpc":"2.0","id":7,"result":{"audio":"<base64>","sample_rate":8000}}
+{"jsonrpc":"2.0","method":"notify","params":{"event":"partial_transcript","text":"hel"}}
 ```
 
-```proto
-// smiths-proto/proto/plugin.proto
-message Frame {
-  uint64 seq = 1;
-  oneof kind {
-    HookCall   call    = 10;   // core → plugin, needs reply with matching seq
-    HookReturn ret     = 11;   // plugin → core
-    HostCall   host    = 12;   // plugin → core (syscall), needs reply
-    HostReturn host_r  = 13;   // core → plugin
-    LogLine    log     = 20;   // plugin → core, fire-and-forget
-    Ping       ping    = 30;   // bidirectional health
-    Pong       pong    = 31;
-  }
-}
-```
+Lines longer than `LoaderOpts::sidecar_max_frame_bytes` (16 MiB by
+default) are a protocol error and restart the child; each RPC is
+bounded by `sidecar_rpc_timeout` (30 s by default).
 
 Backpressure: stdio pipe naturally provides it. Core maintains a per-plugin
 outbox of bounded size; overflow drops oldest non-critical frames and

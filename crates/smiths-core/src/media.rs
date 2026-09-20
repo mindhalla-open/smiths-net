@@ -102,7 +102,7 @@ pub trait MediaSession: Send + Sync {
     /// Opaque ID this session was filed under.
     fn id(&self) -> BridgeId;
     /// Halt forwarding. Idempotent. Does not consume `self`, so
-    /// callers holding `Arc<dyn MediaSession>` can issue `stop()`
+    /// callers holding `Arc<dyn MediaSession>` can issue `stop`
     /// without dismantling other holders' references.
     async fn stop(&self);
 }
@@ -181,6 +181,11 @@ pub enum SrtpError {
     /// keys or tampering.
     #[error("SRTP authentication failed")]
     AuthFailed,
+    /// Packet index was already accepted, or is older than the replay
+    /// window (RFC 3711 §3.3.2). The bridge drops it without touching
+    /// stats so a replay attack can't inflate counters either.
+    #[error("SRTP packet replayed")]
+    Replayed,
     /// Any other transform-layer failure (encrypt/decrypt returned an
     /// error the backend didn't classify more specifically).
     #[error("SRTP transform error: {0}")]
@@ -213,16 +218,31 @@ pub trait SrtpTransform: Send + Sync {
     /// plaintext (same shape as the original pre-encryption packet).
     /// Auth-tag failures surface as [`SrtpError::AuthFailed`] — the
     /// bridge drops the packet on that path without touching further
-    /// state.
+    /// state. Replayed packets (already-seen index inside the replay
+    /// window, or older than the window) are rejected the same way.
     fn unprotect_rtp(&self, ciphertext: &[u8]) -> Result<Vec<u8>, SrtpError>;
+
+    /// Encrypt an outgoing RTCP packet (SRTCP, RFC 3711 §3.4). The
+    /// result carries the E-bit + SRTCP index trailer and the auth
+    /// tag, so it is longer than the input.
+    fn protect_rtcp(&self, plaintext: &[u8]) -> Result<Vec<u8>, SrtpError>;
+
+    /// Decrypt and authenticate an incoming SRTCP packet. Failure
+    /// modes mirror [`Self::unprotect_rtp`].
+    fn unprotect_rtcp(&self, ciphertext: &[u8]) -> Result<Vec<u8>, SrtpError>;
 }
+
+/// RTP clock rate a leg is assumed to run at when the negotiated
+/// codec doesn't say otherwise — G.711 and every other RFC 3551
+/// static audio payload type tick at 8 kHz.
+pub const DEFAULT_RTP_CLOCK_RATE: u32 = 8_000;
 
 /// One side of a bridge request.
 ///
-/// Split out from the previous 4-arg `bridge(a, peer_a, b, peer_b)`
-/// signature so the two newly optional pieces — per-leg SRTP keying
-/// material today, per-leg codec transcoding later — can be added
-/// without inflating the argument list.
+/// Carries everything the fabric needs to run one leg: the local
+/// endpoint, where the peer receives RTP, optional SRTP keying
+/// material, the codec clock rate (feeds the RTCP jitter estimator
+/// and the DTMF detectors), and where the peer receives RTCP.
 #[derive(Clone, Debug)]
 pub struct BridgeLeg {
     /// Local endpoint (previously allocated via [`MediaFabric::allocate`]).
@@ -232,27 +252,73 @@ pub struct BridgeLeg {
     pub peer: SocketAddr,
     /// SRTP keys to apply on this leg. `None` = plain RTP passthrough.
     pub srtp: Option<SrtpKeys>,
+    /// RTP clock rate of the negotiated codec, in Hz. Defaults to
+    /// [`DEFAULT_RTP_CLOCK_RATE`].
+    pub clock_rate: u32,
+    /// Where the peer receives RTCP. `None` = RFC 3550 §11 convention
+    /// (`peer` port + 1). `Some` = explicit address — what an SDP
+    /// `a=rtcp:` attribute supplies, or `peer` itself when the peer
+    /// negotiated `a=rtcp-mux` (RFC 5761).
+    pub rtcp_peer: Option<SocketAddr>,
 }
 
 impl BridgeLeg {
-    /// Construct a plain-RTP leg (no SRTP).
+    /// Construct a plain-RTP leg (no SRTP) with default clock rate and
+    /// the port + 1 RTCP convention.
     #[must_use]
     pub const fn plain(endpoint: EndpointId, peer: SocketAddr) -> Self {
         Self {
             endpoint,
             peer,
             srtp: None,
+            clock_rate: DEFAULT_RTP_CLOCK_RATE,
+            rtcp_peer: None,
         }
     }
 
-    /// Construct an SRTP-protected leg.
+    /// Construct an SRTP-protected leg with default clock rate and
+    /// the port + 1 RTCP convention.
     #[must_use]
     pub const fn with_srtp(endpoint: EndpointId, peer: SocketAddr, srtp: SrtpKeys) -> Self {
         Self {
             endpoint,
             peer,
             srtp: Some(srtp),
+            clock_rate: DEFAULT_RTP_CLOCK_RATE,
+            rtcp_peer: None,
         }
+    }
+
+    /// Set the RTP clock rate of the negotiated codec.
+    #[must_use]
+    pub const fn with_clock_rate(mut self, clock_rate: u32) -> Self {
+        self.clock_rate = clock_rate;
+        self
+    }
+
+    /// Set an explicit RTCP destination for the peer (from `a=rtcp:`,
+    /// or the RTP address itself for `a=rtcp-mux`).
+    #[must_use]
+    pub const fn with_rtcp_peer(mut self, rtcp_peer: SocketAddr) -> Self {
+        self.rtcp_peer = Some(rtcp_peer);
+        self
+    }
+
+    /// Effective RTCP destination: the explicit one when set, else
+    /// the RTP peer's port + 1.
+    #[must_use]
+    pub fn rtcp_destination(&self) -> SocketAddr {
+        self.rtcp_peer.unwrap_or_else(|| {
+            let mut addr = self.peer;
+            addr.set_port(self.peer.port().wrapping_add(1));
+            addr
+        })
+    }
+
+    /// `true` when RTCP shares the RTP 5-tuple (`a=rtcp-mux`).
+    #[must_use]
+    pub fn rtcp_muxed(&self) -> bool {
+        self.rtcp_peer == Some(self.peer)
     }
 }
 
@@ -279,7 +345,7 @@ pub enum MediaError {
 ///
 /// All methods are `async` because binding sockets and awaiting
 /// forwarder shutdown are naturally async. `release_*` methods are
-/// idempotent and return `()` — observers shouldn't care whether the
+/// idempotent and return `` — observers shouldn't care whether the
 /// handle was already gone, only that it is gone now.
 #[async_trait]
 pub trait MediaFabric: Send + Sync {
@@ -320,7 +386,7 @@ pub trait MediaFabric: Send + Sync {
 }
 
 /// Cross-subsystem handle the SIP UAS uses to participate in
-/// the WebRTC tag-based rendezvous (slice 5.10-sipjoin).
+/// the WebRTC tag-based rendezvous.
 ///
 /// A SIP INVITE carrying `X-Smiths-Webrtc-Tag: <tag>` asks the
 /// engine to bridge this dialog with a WebRTC leg sharing the

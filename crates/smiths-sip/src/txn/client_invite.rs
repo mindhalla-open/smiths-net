@@ -51,6 +51,12 @@
 //!   on entering Completed; fires → Terminated. During D any
 //!   duplicate non-2xx triggers a re-send of the ACK (not a
 //!   re-delivery to the TU).
+//!
+//! ## Reliable transports
+//!
+//! With [`Transaction::set_reliable`] (TCP / TLS) timer A is never
+//! armed and timer D is zero: a non-2xx final sends the ACK and
+//! terminates the transaction in the same step (§17.1.1.2).
 
 use bytes::Bytes;
 
@@ -77,6 +83,8 @@ pub struct ClientInviteTxn {
     ack_for_non_ok: Option<Bytes>,
     /// Timer A retransmit attempt counter (0 = first pending retry).
     attempt: u32,
+    /// Reliable-transport profile: no timer A, zero timer D.
+    reliable: bool,
 }
 
 impl ClientInviteTxn {
@@ -95,18 +103,31 @@ impl ClientInviteTxn {
             invite: request,
             ack_for_non_ok: None,
             attempt: 0,
+            reliable: false,
         }
+    }
+
+    /// Builder form of [`Transaction::set_reliable`].
+    #[must_use]
+    pub const fn with_reliable(mut self, reliable: bool) -> Self {
+        self.reliable = reliable;
+        self
     }
 
     /// Enter Completed on a non-2xx final. Build and send the ACK
     /// (stored so retransmits of the same final re-send it), arm D,
-    /// cancel A and B, deliver the final to the TU.
+    /// cancel A and B, deliver the final to the TU. On a reliable
+    /// transport D is zero, so the FSM terminates right away.
     fn enter_completed_non_ok(
         &mut self,
         status: u16,
         final_bytes: Bytes,
     ) -> Vec<TransactionAction> {
-        self.state = TransactionState::Completed;
+        self.state = if self.reliable {
+            TransactionState::Terminated
+        } else {
+            TransactionState::Completed
+        };
         // Build the ACK once and cache it for timer-D-bracketed
         // retransmits. If we can't parse the INVITE + response enough
         // to build an ACK, we still cancel timers and deliver the
@@ -125,10 +146,14 @@ impl ClientInviteTxn {
         if let Some(ack) = ack_bytes {
             actions.push(TransactionAction::SendToPeer(ack));
         }
-        actions.push(TransactionAction::ArmTimer {
-            id: TimerId::D,
-            after: TIMER_D,
-        });
+        if self.reliable {
+            actions.push(TransactionAction::Terminated);
+        } else {
+            actions.push(TransactionAction::ArmTimer {
+                id: TimerId::D,
+                after: TIMER_D,
+            });
+        }
         actions
     }
 
@@ -161,6 +186,10 @@ impl Transaction for ClientInviteTxn {
         self.state
     }
 
+    fn set_reliable(&mut self, reliable: bool) {
+        self.reliable = reliable;
+    }
+
     fn on_event(&mut self, event: TransactionEvent) -> Vec<TransactionAction> {
         use TransactionEvent as Ev;
         use TransactionState as S;
@@ -168,17 +197,18 @@ impl Transaction for ClientInviteTxn {
         match (self.state, event) {
             // --- Initial send --------------------------------------------
             (S::Calling, Ev::StartClient) => {
-                vec![
-                    TransactionAction::SendToPeer(self.invite.clone()),
-                    TransactionAction::ArmTimer {
+                let mut actions = vec![TransactionAction::SendToPeer(self.invite.clone())];
+                if !self.reliable {
+                    actions.push(TransactionAction::ArmTimer {
                         id: TimerId::A,
                         after: T1,
-                    },
-                    TransactionAction::ArmTimer {
-                        id: TimerId::B,
-                        after: TIMEOUT_64T1,
-                    },
-                ]
+                    });
+                }
+                actions.push(TransactionAction::ArmTimer {
+                    id: TimerId::B,
+                    after: TIMEOUT_64T1,
+                });
+                actions
             }
 
             // --- Timer A — retransmit INVITE, double the interval --------
@@ -534,6 +564,41 @@ mod tests {
             bytes: rsp(180, ""),
         });
         assert!(a1.is_empty() && a2.is_empty());
+    }
+
+    #[test]
+    fn reliable_start_arms_only_timer_b() {
+        let mut t = new_txn().with_reliable(true);
+        let a = t.on_event(TransactionEvent::StartClient);
+        assert!(has_send(&a));
+        assert!(!has_timer(&a, TimerId::A), "no retransmit timer on TCP");
+        assert!(has_timer(&a, TimerId::B));
+    }
+
+    #[test]
+    fn reliable_non_2xx_acks_and_terminates_immediately() {
+        let mut t = new_txn();
+        t.set_reliable(true);
+        t.on_event(TransactionEvent::StartClient);
+        let a = t.on_event(TransactionEvent::ResponseReceived {
+            status: 486,
+            bytes: rsp(486, "srv486"),
+        });
+        assert_eq!(delivered_status(&a), Some(486));
+        assert_eq!(count_sends_with_prefix(&a, b"ACK "), 1);
+        assert!(!has_timer(&a, TimerId::D), "timer D is zero on TCP");
+        assert!(has_terminated(&a));
+        assert_eq!(t.state(), TransactionState::Terminated);
+        // The ACK must be enqueued before the Terminated marker.
+        let ack_idx = a
+            .iter()
+            .position(|x| matches!(x, TransactionAction::SendToPeer(_)))
+            .unwrap();
+        let term_idx = a
+            .iter()
+            .position(|x| matches!(x, TransactionAction::Terminated))
+            .unwrap();
+        assert!(ack_idx < term_idx);
     }
 
     #[test]

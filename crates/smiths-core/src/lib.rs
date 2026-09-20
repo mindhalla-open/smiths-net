@@ -2,22 +2,23 @@
 //!
 //! This crate hosts everything every other module depends on:
 //! configuration, the typed event bus, graceful shutdown, and the shared
-//! error type. It pulls in no sibling workspace crates — it is the root
-//! of the dependency graph.
+//! error type. Its only sibling dependency is `smiths-config-macros`
+//! (the `#[derive(Reloadable)]` proc macro); every runtime crate
+//! depends on this one.
 
 // Per-package tightening: smiths-core has zero production-code
-// `.unwrap()` / `.expect()` (every use lives in `#[cfg(test)]` mods).
+// `.unwrap` / `.expect` (every use lives in `#[cfg(test)]` mods).
 // Promoting the lint here guards future drift at no current cost.
-// Unit tests inside `src/**/*.rs` are allowed to `.unwrap()` freely —
+// Unit tests inside `src/**/*.rs` are allowed to `.unwrap` freely —
 // that's the idiomatic test style and the only purpose of `cfg_attr`
 // below. The lint lives in `lib.rs` rather than `Cargo.toml` because
 // Cargo 1.74+ doesn't permit mixing `[lints] workspace = true` with
 // a `[lints.clippy]` override.
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-// Slice 1.7: missing_docs promoted to warn on smiths-core so every
+// : missing_docs promoted to warn on smiths-core so every
 // public item carries at least a one-line description. Zero-fire
-// today; a CI gate in slice 1.8 blocks regressions.
+// today; a CI gate in  blocks regressions.
 #![warn(missing_docs)]
 
 pub mod ai;
@@ -44,7 +45,7 @@ pub mod storage;
 
 pub use ai::{
     AiDispatcher, AiProvider, AiRegistry, BRIDGE_HA, BRIDGE_MQTT, CapabilityDescriptor,
-    ConcurrencyHint, DEFAULT_PRIORITY, DispatchError, DispatchPolicy, LatencyHint,
+    ConcurrencyHint, DEFAULT_PRIORITY, DescriptorError, DispatchError, DispatchPolicy, LatencyHint,
     MEDIA_STREAMING_RTP, ProviderError, STORAGE_RECORDING, STORAGE_VECTOR, ValidationError,
     validate_controls,
 };
@@ -55,15 +56,16 @@ pub use call::{
 };
 pub use codec::{linear_to_ulaw, pcm16_to_pcmu, pcmu_to_pcm16, ulaw_to_linear};
 pub use config::{
-    A2aConfig, AiConfig, AuthBackend, AuthConfig, BindSpec, BindSpecError, CanaryConfig,
-    ClusterConfig, ClusterMode, Config, CoreConfig, FsRecordingConfig, HttpAuthConfig,
-    HttpFailureMode, LogFormat, McpConfig, McpHttp3Config, MediaConfig, ObservabilityConfig,
-    PluginsConfig, PromptsConfig, ProxyMode, RateLimitConfig, RecordingBackend,
-    RecordingStoreConfig, ReloadConfig, RtpPortRange, SandboxConfig, SeccompPolicy, SipConfig,
-    SipProxyConfig, SipRateLimit, SipTransport, SipVpnConfig, SqliteAuthConfig,
-    SqliteStorageConfig, StorageBackend, StorageConfig, TranscodeConfig, VectorBackend,
-    VectorStoreConfig, VpnMode, WebRtcConfig, WebRtcIceConfig, WebRtcPrivacyConfig,
-    WebRtcPrivacyMode, WebRtcTurnConfig, WebRtcTurnCredential, WebTransportConfig,
+    A2aConfig, AiConfig, AuthBackend, AuthConfig, BindSpec, BindSpecError, BuildSupport,
+    CanaryConfig, ClusterConfig, ClusterMode, Config, ConfigValidationError, CoreConfig,
+    FsRecordingConfig, HttpAuthConfig, HttpFailureMode, LogFormat, McpConfig, McpHttp3Config,
+    McpHttpConfig, MediaConfig, ObservabilityConfig, PluginsConfig, PluginsWasmConfig,
+    PromptsConfig, ProxyMode, RateLimitConfig, RecordingBackend, RecordingStoreConfig,
+    ReloadConfig, RtpPortRange, SandboxConfig, SeccompPolicy, SipConfig, SipProxyConfig,
+    SipRateLimit, SipTransport, SipVpnConfig, SqliteAuthConfig, SqliteStorageConfig,
+    StorageBackend, StorageConfig, TranscodeConfig, VectorBackend, VectorStoreConfig, VpnMode,
+    WebRtcConfig, WebRtcIceConfig, WebRtcPrivacyConfig, WebRtcPrivacyMode, WebRtcTurnConfig,
+    WebRtcTurnCredential, WebTransportConfig,
 };
 pub use dialog_sessions::DialogSessions;
 pub use drain::Drain;

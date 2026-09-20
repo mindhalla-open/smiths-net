@@ -12,7 +12,6 @@
 //! Protobuf later is a `WireFormat` implementation swap, not a
 //! protocol change.
 
-// Slice 1.7 lint tightening.
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -23,4 +22,7 @@ pub mod supervisor;
 
 pub use error::Error;
 pub use rpc::{RpcRequest, RpcResponse};
-pub use supervisor::{PluginNotification, RestartPolicy, Sidecar};
+pub use supervisor::{
+    DEFAULT_MAX_FRAME_BYTES, DEFAULT_RPC_TIMEOUT, PluginNotification, RestartPolicy, Sidecar,
+    SpawnOptions,
+};

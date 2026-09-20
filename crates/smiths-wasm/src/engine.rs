@@ -1,25 +1,41 @@
-//! Wasmtime engine wrapper with per-call fuel + epoch interruption.
+//! Wasmtime engine wrapper with per-call fuel, memory caps, and
+//! epoch-based wall-clock deadlines.
 //!
 //! `WasmEngine` is cheap to clone (it holds an `Arc`-backed
 //! `wasmtime::Engine`). The usual flow is:
 //!
 //! ```ignore
-//! let engine  = WasmEngine::new()?;
+//! let engine = WasmEngine::new?
+//!.with_memory_limit(32 * 1024 * 1024)
+//!.with_invoke_timeout(std::time::Duration::from_secs(2));
 //! let module  = engine.load(wasm_bytes)?;
 //! engine.run_entry(&module, "on_call", 1_000_000, "rust-logger")?;
-//! // With a wall-clock deadline:
+//! // With a per-call wall-clock deadline override:
 //! engine.run_with_deadline(&module, "on_call", 1_000_000, "rust-logger",
 //!                          std::time::Duration::from_millis(50))?;
 //! ```
 //!
-//! `run_entry` instantiates a fresh [`wasmtime::Store`] per call
-//! (per-call isolation), wires the `smiths::*` host imports, and
-//! invokes the named exported function (arity `() -> ()` for now).
-//! `run_with_deadline` additionally arms a one-shot timer thread
-//! that calls [`Engine::increment_epoch`] on expiry so an infinite-
-//! loop guest traps cleanly.
+//! Every entry point instantiates a fresh [`wasmtime::Store`] per
+//! call (per-call isolation), wires the `smiths::*` host imports, and
+//! invokes the named export. Each store gets:
+//!
+//! - a fuel budget (deterministic instruction cap);
+//! - a linear-memory cap enforced through [`HostState`]'s
+//!   `ResourceLimiter` — growth past it traps with
+//!   [`WasmError::MemoryLimit`];
+//! - an epoch deadline relative to the engine's current epoch. One
+//!   background ticker thread per engine bumps the epoch every
+//!   [`EPOCH_TICK`]; a guest that runs past its own deadline traps
+//!   with [`WasmError::Timeout`]. Because each store's deadline is
+//!   relative to the shared counter, concurrent guests with
+//!   different deadlines never interrupt each other.
+//!
+//! Entry points are synchronous and block the calling thread for
+//! the duration of the guest call. Async callers (the plugin
+//! provider) run them on `tokio::task::spawn_blocking`.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -32,22 +48,37 @@ use smiths_core::{CallLookup, EventBus};
 use wasmtime::{Config, Engine, Linker, Memory, Module, Store, Trap};
 
 use crate::error::WasmError;
-use crate::host::{HostState, PluginPermissions, PluginState, register};
+use crate::host::{
+    DEFAULT_STATE_BUDGET_BYTES, HostState, PluginPermissions, PluginState, PluginStore,
+    RTP_QUEUE_CAPACITY, RtpQueue, register,
+};
 
 /// Default per-call fuel budget. Guest is a small event handler, not
 /// a compute workload — a million units is generous.
 pub const DEFAULT_FUEL: u64 = 1_000_000;
 
+/// Default cap on each guest linear memory (64 MiB).
+pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default wall-clock budget for one guest invocation.
+pub const DEFAULT_INVOKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Period of the engine's epoch ticker thread. Deadlines are rounded
+/// up to a whole number of ticks, so this is also their resolution.
+pub const EPOCH_TICK: Duration = Duration::from_millis(10);
+
 /// Wasmtime engine configured for smiths plugins.
 ///
-/// Cheap to clone — state is `Arc`-backed internally. Persistent
-/// plugin KV state and the per-plugin declared permission set both
-/// live on the engine so they survive the ephemeral [`Store`] we
-/// build per invocation.
+/// Cheap to clone — shared state is `Arc`-backed. Persistent plugin
+/// KV state and the per-plugin declared permission set both live on
+/// the engine so they survive the ephemeral [`Store`] built per
+/// invocation. The resource knobs (`memory_limit_bytes`,
+/// `invoke_timeout`, `fuel`, `state_budget_bytes`) are plain values
+/// copied by `clone`, so a clone can be tuned independently.
 #[derive(Clone)]
 pub struct WasmEngine {
     engine: Engine,
-    /// Per-plugin `Arc<DashMap>` state. Created on first access via
+    /// Per-plugin persistent KV stores. Created on first access via
     /// [`Self::plugin_state`].
     states: Arc<DashMap<String, PluginState>>,
     /// Per-plugin declared permissions. Populated via
@@ -62,15 +93,27 @@ pub struct WasmEngine {
     /// Call-id → (endpoint, remote) lookup for `send_rtp`. Attached
     /// via [`Self::with_media`]; `None` disables `send_rtp`.
     call_lookup: Option<Arc<dyn CallLookup>>,
-    /// Media fabric handle for `send_rtp` dispatch. Attached via
-    /// [`Self::with_media`]; `None` disables `send_rtp`.
-    media_fabric: Option<Arc<dyn MediaFabric>>,
+    /// Bounded outbound RTP queue draining into the media fabric.
+    /// Attached via [`Self::with_media`]; `None` disables `send_rtp`.
+    rtp_queue: Option<Arc<RtpQueue>>,
     /// Late-bound call originator for `originate` / `hangup`. The UAC
     /// is built *after* plugins load, so the engine holds a write-once
     /// slot every cloned `WasmEngine` shares; the CLI fills it via
     /// [`Self::originator_slot`] once SIP is up. Empty until then —
     /// guests calling `originate` trap descriptively.
     originator: Arc<OnceLock<Arc<dyn CallOriginator>>>,
+    /// Linear-memory cap applied to every store.
+    memory_limit_bytes: usize,
+    /// Wall-clock budget for `call_invoke` / `call_describe` /
+    /// `run_entry`.
+    invoke_timeout: Duration,
+    /// Fuel budget for `call_invoke` / `call_describe`.
+    fuel: u64,
+    /// Byte budget handed to each newly created plugin KV store.
+    state_budget_bytes: usize,
+    /// Keeps the epoch ticker thread alive; the thread exits when the
+    /// last engine clone drops. Only its `Drop` matters.
+    _ticker: Arc<EpochTicker>,
 }
 
 impl std::fmt::Debug for WasmEngine {
@@ -85,17 +128,22 @@ impl std::fmt::Debug for WasmEngine {
             .field("permissions", &self.permissions.len())
             .field("bus", &self.bus.is_some())
             .field("call_lookup", &self.call_lookup.is_some())
-            .field("media_fabric", &self.media_fabric.is_some())
+            .field("rtp_queue", &self.rtp_queue.is_some())
             .field("originator", &self.originator.get().is_some())
+            .field("memory_limit_bytes", &self.memory_limit_bytes)
+            .field("invoke_timeout", &self.invoke_timeout)
+            .field("fuel", &self.fuel)
+            .field("state_budget_bytes", &self.state_budget_bytes)
             .finish_non_exhaustive()
     }
 }
 
 impl WasmEngine {
-    /// Build a new engine with fuel metering + epoch interruption on.
-    /// Per-call deadlines are armed by [`Self::run_with_deadline`];
-    /// [`Self::run_entry`] stays deadline-free for computations the
-    /// caller doesn't need to bound.
+    /// Build a new engine with fuel metering + epoch interruption on
+    /// and the default resource caps ([`DEFAULT_MEMORY_LIMIT_BYTES`],
+    /// [`DEFAULT_INVOKE_TIMEOUT`], [`DEFAULT_FUEL`],
+    /// [`DEFAULT_STATE_BUDGET_BYTES`]). Starts the epoch ticker
+    /// thread that drives wall-clock deadlines.
     pub fn new() -> Result<Self, WasmError> {
         let mut config = Config::new();
         config
@@ -103,14 +151,20 @@ impl WasmEngine {
             .epoch_interruption(true)
             .wasm_multi_memory(false);
         let engine = Engine::new(&config).map_err(WasmError::Engine)?;
+        let ticker = EpochTicker::spawn(engine.clone())?;
         Ok(Self {
             engine,
             states: Arc::new(DashMap::new()),
             permissions: Arc::new(DashMap::new()),
             bus: None,
             call_lookup: None,
-            media_fabric: None,
+            rtp_queue: None,
             originator: Arc::new(OnceLock::new()),
+            memory_limit_bytes: DEFAULT_MEMORY_LIMIT_BYTES,
+            invoke_timeout: DEFAULT_INVOKE_TIMEOUT,
+            fuel: DEFAULT_FUEL,
+            state_budget_bytes: DEFAULT_STATE_BUDGET_BYTES,
+            _ticker: Arc::new(ticker),
         })
     }
 
@@ -127,7 +181,8 @@ impl WasmEngine {
 
     /// Attach the call-lookup + media-fabric pair needed by
     /// `smiths::send_rtp`. Without this, guests that call `send_rtp`
-    /// trap. Builder-style for the same reason as [`Self::with_bus`].
+    /// trap. Packets flow through a bounded [`RtpQueue`] of
+    /// [`RTP_QUEUE_CAPACITY`] packets; see [`Self::rtp_dropped`].
     #[must_use]
     pub fn with_media(
         mut self,
@@ -135,8 +190,72 @@ impl WasmEngine {
         media_fabric: Arc<dyn MediaFabric>,
     ) -> Self {
         self.call_lookup = Some(call_lookup);
-        self.media_fabric = Some(media_fabric);
+        self.rtp_queue = Some(RtpQueue::new(media_fabric, RTP_QUEUE_CAPACITY));
         self
+    }
+
+    /// Cap each guest linear memory at `bytes`. Growth past the cap
+    /// traps with [`WasmError::MemoryLimit`].
+    #[must_use]
+    pub fn with_memory_limit(mut self, bytes: usize) -> Self {
+        self.memory_limit_bytes = bytes;
+        self
+    }
+
+    /// Wall-clock budget for every invocation that doesn't pass its
+    /// own deadline ([`Self::call_invoke`], [`Self::call_describe`],
+    /// [`Self::run_entry`]).
+    #[must_use]
+    pub fn with_invoke_timeout(mut self, timeout: Duration) -> Self {
+        self.invoke_timeout = timeout;
+        self
+    }
+
+    /// Fuel budget for [`Self::call_invoke`] / [`Self::call_describe`].
+    #[must_use]
+    pub fn with_fuel(mut self, fuel: u64) -> Self {
+        self.fuel = fuel;
+        self
+    }
+
+    /// Byte budget for each plugin's persistent KV store. Applies to
+    /// stores created after this call; a plugin whose store already
+    /// exists keeps the budget it was created with.
+    #[must_use]
+    pub fn with_state_budget(mut self, bytes: usize) -> Self {
+        self.state_budget_bytes = bytes;
+        self
+    }
+
+    /// Linear-memory cap in bytes.
+    #[must_use]
+    pub fn memory_limit_bytes(&self) -> usize {
+        self.memory_limit_bytes
+    }
+
+    /// Default per-invocation wall-clock budget.
+    #[must_use]
+    pub fn invoke_timeout(&self) -> Duration {
+        self.invoke_timeout
+    }
+
+    /// Fuel budget used by `call_invoke` / `call_describe`.
+    #[must_use]
+    pub fn fuel(&self) -> u64 {
+        self.fuel
+    }
+
+    /// Byte budget handed to newly created plugin KV stores.
+    #[must_use]
+    pub fn state_budget_bytes(&self) -> usize {
+        self.state_budget_bytes
+    }
+
+    /// Outbound RTP packets dropped because the queue was full. `0`
+    /// when no media is attached.
+    #[must_use]
+    pub fn rtp_dropped(&self) -> u64 {
+        self.rtp_queue.as_ref().map_or(0, |q| q.dropped())
     }
 
     /// Hand back a clone of the late-bound originator slot so a caller
@@ -150,13 +269,13 @@ impl WasmEngine {
     }
 
     /// Fetch (or lazily create) the persistent KV store for `plugin`.
-    /// Called by `run_internal` but also exposed so tests can inspect
-    /// state between invocations.
+    /// Used by every entry point but also exposed so tests can
+    /// inspect state between invocations.
     #[must_use]
     pub fn plugin_state(&self, plugin: &str) -> PluginState {
         self.states
             .entry(plugin.to_owned())
-            .or_insert_with(|| Arc::new(DashMap::new()))
+            .or_insert_with(|| Arc::new(PluginStore::new(self.state_budget_bytes)))
             .clone()
     }
 
@@ -193,7 +312,38 @@ impl WasmEngine {
         Module::new(&self.engine, bytes).map_err(WasmError::Compile)
     }
 
-    /// Run `entry` with a fuel budget and no wall-clock deadline.
+    /// Build a store for one invocation of `plugin`: host state with
+    /// the plugin's persistent KV store and permissions, the memory
+    /// cap as the store's resource limiter, `fuel`, and an epoch
+    /// deadline `deadline` from now.
+    fn new_store(
+        &self,
+        plugin: &str,
+        fuel: u64,
+        deadline: Duration,
+    ) -> Result<Store<HostState>, WasmError> {
+        let host = HostState::for_plugin_with_state(
+            plugin,
+            self.plugin_state(plugin),
+            self.plugin_permissions(plugin),
+        )
+        .with_bus(self.bus.clone())
+        .with_media(self.call_lookup.clone(), self.rtp_queue.clone())
+        .with_originator(self.originator.get().cloned())
+        .with_memory_limit(self.memory_limit_bytes);
+        let mut store = Store::new(&self.engine, host);
+        store.limiter(|host| host);
+        store.set_fuel(fuel).map_err(WasmError::Fuel)?;
+        // Relative to the engine's current epoch, so every concurrent
+        // store carries its own absolute deadline against the one
+        // shared counter the ticker thread advances.
+        store.set_epoch_deadline(ticks_for(deadline));
+        store.epoch_deadline_trap();
+        Ok(store)
+    }
+
+    /// Run `entry` (arity ` -> `) with a fuel budget and the
+    /// engine's default wall-clock deadline.
     pub fn run_entry(
         &self,
         module: &Module,
@@ -201,27 +351,45 @@ impl WasmEngine {
         fuel: u64,
         plugin: &str,
     ) -> Result<(), WasmError> {
-        self.run_internal(module, entry, fuel, plugin, None)
+        self.run_with_deadline(module, entry, fuel, plugin, self.invoke_timeout)
     }
 
-    /// Invoke a guest `describe() -> i64` export and read the
+    /// Run `entry` with a fuel budget **and** an explicit wall-clock
+    /// deadline. When `deadline` elapses the guest's next epoch check
+    /// traps with [`WasmError::Timeout`]; other guests running on the
+    /// same engine are unaffected.
+    pub fn run_with_deadline(
+        &self,
+        module: &Module,
+        entry: &str,
+        fuel: u64,
+        plugin: &str,
+        deadline: Duration,
+    ) -> Result<(), WasmError> {
+        let mut store = self.new_store(plugin, fuel, deadline)?;
+        let mut linker = Linker::new(&self.engine);
+        register(&mut linker)?;
+        let instance = linker
+            .instantiate(&mut store, module)
+            .map_err(WasmError::Link)?;
+        let entry_fn = instance
+            .get_typed_func::<(), ()>(&mut store, entry)
+            .map_err(|_| WasmError::MissingExport(entry.to_owned()))?;
+        entry_fn
+            .call(&mut store, ())
+            .map_err(|err| classify_trap(err, fuel, deadline))
+    }
+
+    /// Invoke a guest `describe -> i64` export and read the
     /// returned capability bytes out of the guest's exported
     /// `memory`. The returned `i64` is packed as `(ptr << 32) | len`.
     /// Used by the WASM plugin tier to discover advertised
-    /// capabilities at load time.
+    /// capabilities at load time. Bounded by the engine's fuel and
+    /// wall-clock defaults.
     pub fn call_describe(&self, module: &Module, plugin: &str) -> Result<Vec<u8>, WasmError> {
-        let state = self.plugin_state(plugin);
-        let permissions = self.plugin_permissions(plugin);
-        let mut store = Store::new(
-            &self.engine,
-            HostState::for_plugin_with_state(plugin, state, permissions)
-                .with_bus(self.bus.clone())
-                .with_media(self.call_lookup.clone(), self.media_fabric.clone())
-                .with_originator(self.originator.get().cloned()),
-        );
-        store.set_fuel(DEFAULT_FUEL).map_err(WasmError::Fuel)?;
-        store.set_epoch_deadline(u64::MAX);
-
+        let fuel = self.fuel;
+        let deadline = self.invoke_timeout;
+        let mut store = self.new_store(plugin, fuel, deadline)?;
         let mut linker = Linker::new(&self.engine);
         register(&mut linker)?;
 
@@ -233,25 +401,11 @@ impl WasmEngine {
             .map_err(|_| WasmError::MissingExport("describe".into()))?;
         let packed = describe
             .call(&mut store, ())
-            .map_err(|e| classify_trap(e, DEFAULT_FUEL, None))?;
-        #[allow(clippy::cast_sign_loss)] // packed is a guest-provided u64 we control
-        let ptr = (packed >> 32) as u32 as usize;
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let len = (packed & 0xFFFF_FFFF) as u32 as usize;
+            .map_err(|e| classify_trap(e, fuel, deadline))?;
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or_else(|| WasmError::Trap(wasmtime::Error::msg("guest must export `memory`")))?;
-        let data = memory.data(&store);
-        let end = ptr
-            .checked_add(len)
-            .ok_or_else(|| WasmError::Trap(wasmtime::Error::msg("describe: ptr/len overflow")))?;
-        if end > data.len() {
-            return Err(WasmError::Trap(wasmtime::Error::msg(format!(
-                "describe: range {ptr}..{end} outside guest memory ({} bytes)",
-                data.len()
-            ))));
-        }
-        Ok(data[ptr..end].to_vec())
+        read_packed(&memory, &store, packed, "describe")
     }
 
     /// Invoke a guest method via the `invoke` ABI.
@@ -275,10 +429,11 @@ impl WasmEngine {
     /// - `{"error": "msg"}` — plugin-level failure surfaced as
     ///   [`WasmError::PluginError`].
     ///
-    /// Traps, fuel exhaustion, and missing exports surface as the
-    /// usual typed [`WasmError`] variants. The store is built fresh
-    /// per call, so no invocation can observe another's local state
-    /// (persistent state still flows through the engine-side KV map).
+    /// Traps, fuel exhaustion, the wall-clock deadline, memory-cap
+    /// hits, and missing exports surface as the usual typed
+    /// [`WasmError`] variants. The store is built fresh per call, so
+    /// no invocation can observe another's local state (persistent
+    /// state still flows through the engine-side KV store).
     pub fn call_invoke(
         &self,
         module: &Module,
@@ -286,18 +441,9 @@ impl WasmEngine {
         method: &str,
         params: &Value,
     ) -> Result<Value, WasmError> {
-        let state = self.plugin_state(plugin);
-        let permissions = self.plugin_permissions(plugin);
-        let mut store = Store::new(
-            &self.engine,
-            HostState::for_plugin_with_state(plugin, state, permissions)
-                .with_bus(self.bus.clone())
-                .with_media(self.call_lookup.clone(), self.media_fabric.clone())
-                .with_originator(self.originator.get().cloned()),
-        );
-        store.set_fuel(DEFAULT_FUEL).map_err(WasmError::Fuel)?;
-        store.set_epoch_deadline(u64::MAX);
-
+        let fuel = self.fuel;
+        let deadline = self.invoke_timeout;
+        let mut store = self.new_store(plugin, fuel, deadline)?;
         let mut linker = Linker::new(&self.engine);
         register(&mut linker)?;
 
@@ -322,7 +468,8 @@ impl WasmEngine {
             &memory,
             method.as_bytes(),
             "method",
-            DEFAULT_FUEL,
+            fuel,
+            deadline,
         )?;
         let params_ptr = alloc_and_write(
             &mut store,
@@ -330,7 +477,8 @@ impl WasmEngine {
             &memory,
             &params_bytes,
             "params",
-            DEFAULT_FUEL,
+            fuel,
+            deadline,
         )?;
 
         let method_len = i32_from_len(method.len(), "method")?;
@@ -338,164 +486,78 @@ impl WasmEngine {
 
         let packed = invoke
             .call(&mut store, (method_ptr, method_len, params_ptr, params_len))
-            .map_err(|e| classify_trap(e, DEFAULT_FUEL, None))?;
+            .map_err(|e| classify_trap(e, fuel, deadline))?;
 
         let body = read_packed(&memory, &store, packed, "invoke")?;
         decode_invoke_response(&body)
     }
+}
 
-    /// Run `entry` with a fuel budget **and** a wall-clock deadline.
-    /// When `deadline` elapses the engine's epoch is incremented
-    /// once; the guest's store had its epoch deadline set to 1, so
-    /// the next WASM instruction traps with [`WasmError::Timeout`].
-    /// The timer thread is cancelled as soon as the guest returns.
-    pub fn run_with_deadline(
-        &self,
-        module: &Module,
-        entry: &str,
-        fuel: u64,
-        plugin: &str,
-        deadline: Duration,
-    ) -> Result<(), WasmError> {
-        self.run_internal(module, entry, fuel, plugin, Some(deadline))
-    }
+/// Number of epoch ticks a store deadline of `deadline` maps to. The
+/// `+ 1` covers the partial tick already in progress when the store
+/// is armed, so a guest always gets at least `deadline`.
+fn ticks_for(deadline: Duration) -> u64 {
+    let tick = EPOCH_TICK.as_millis().max(1);
+    u64::try_from(deadline.as_millis().div_ceil(tick))
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+}
 
-    fn run_internal(
-        &self,
-        module: &Module,
-        entry: &str,
-        fuel: u64,
-        plugin: &str,
-        deadline: Option<Duration>,
-    ) -> Result<(), WasmError> {
-        let state = self.plugin_state(plugin);
-        let permissions = self.plugin_permissions(plugin);
-        let mut store = Store::new(
-            &self.engine,
-            HostState::for_plugin_with_state(plugin, state, permissions)
-                .with_bus(self.bus.clone())
-                .with_media(self.call_lookup.clone(), self.media_fabric.clone())
-                .with_originator(self.originator.get().cloned()),
-        );
-        store.set_fuel(fuel).map_err(WasmError::Fuel)?;
-        // Configure the store's epoch deadline. When a deadline is
-        // supplied we arm a background thread to increment the
-        // engine's epoch once; setting the store deadline to 1 means
-        // that single increment traps the guest. Without a deadline
-        // we seed `u64::MAX` so the guest never spontaneously traps.
-        if deadline.is_some() {
-            store.set_epoch_deadline(1);
-        } else {
-            store.set_epoch_deadline(u64::MAX);
-        }
+/// Background thread that advances the engine epoch every
+/// [`EPOCH_TICK`]. Held by every `WasmEngine` clone through an `Arc`;
+/// dropping the last clone flags the thread to exit within one tick.
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+}
 
-        // Arm + stash the timer *before* we enter the guest — a
-        // malicious guest could otherwise spin before we got here.
-        let timer = deadline.map(|d| spawn_deadline_timer(self.engine.clone(), d));
-
-        let mut linker = Linker::new(&self.engine);
-        register(&mut linker)?;
-
-        let run_result = (|| -> Result<(), WasmError> {
-            let instance = linker
-                .instantiate(&mut store, module)
-                .map_err(WasmError::Link)?;
-            let entry_fn = instance
-                .get_typed_func::<(), ()>(&mut store, entry)
-                .map_err(|_| WasmError::MissingExport(entry.to_owned()))?;
-            entry_fn
-                .call(&mut store, ())
-                .map_err(|err| classify_trap(err, fuel, deadline))
-        })();
-
-        if let Some(t) = timer {
-            // Signal the timer thread to exit if it hasn't fired yet.
-            t.cancel();
-        }
-        run_result
+impl EpochTicker {
+    fn spawn(engine: Engine) -> Result<Self, WasmError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        thread::Builder::new()
+            .name("smiths-wasm-epoch".into())
+            .spawn(move || {
+                while !stop_for_thread.load(Ordering::Relaxed) {
+                    thread::sleep(EPOCH_TICK);
+                    engine.increment_epoch();
+                }
+            })
+            .map_err(|e| WasmError::Engine(wasmtime::Error::new(e).context("epoch ticker")))?;
+        Ok(Self { stop })
     }
 }
 
-/// Cancellable one-shot timer that increments `engine`'s epoch after
-/// `deadline`. The timer runs on a dedicated std thread so blocking
-/// `run_entry` callers don't need a tokio runtime.
-struct DeadlineTimer {
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl DeadlineTimer {
-    fn cancel(self) {
-        self.cancel
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
-}
-
-fn spawn_deadline_timer(engine: Engine, deadline: Duration) -> DeadlineTimer {
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let cancel_for_task = std::sync::Arc::clone(&cancel);
-    thread::spawn(move || {
-        // Chunk the sleep so cancellation responds within 10 ms even
-        // for long deadlines — matters when the guest returns quickly.
-        let chunk = Duration::from_millis(10);
-        let start = std::time::Instant::now();
-        loop {
-            if cancel_for_task.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-            let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
-                break;
-            };
-            if remaining.is_zero() {
-                break;
-            }
-            thread::sleep(chunk.min(remaining));
-        }
-        if !cancel_for_task.load(std::sync::atomic::Ordering::Relaxed) {
-            engine.increment_epoch();
-        }
-    });
-    DeadlineTimer { cancel }
 }
 
 /// Map a `wasmtime::Error` into our `WasmError` vocabulary. Fuel
-/// exhaustion, epoch timeout, and permission denial get their own
-/// variants because operators want to distinguish "hostile/noisy
-/// plugin" from "plugin bug" from "plugin was too slow" from
-/// "plugin exceeded its declared permissions".
-fn classify_trap(err: wasmtime::Error, fuel: u64, deadline: Option<Duration>) -> WasmError {
+/// exhaustion and epoch timeout get their own variants, and typed
+/// errors raised by host fns or the resource limiter (permission
+/// denial, memory cap, state budget) are recovered intact, because
+/// operators want to distinguish "hostile/noisy plugin" from "plugin
+/// bug" from "plugin was too slow" from "plugin exceeded its declared
+/// permissions or resources".
+fn classify_trap(err: wasmtime::Error, fuel: u64, deadline: Duration) -> WasmError {
     if let Some(trap) = err.downcast_ref::<Trap>() {
         if *trap == Trap::OutOfFuel {
             return WasmError::FuelExhausted { fuel };
         }
-        if *trap == Trap::Interrupt
-            && let Some(d) = deadline
-        {
+        if *trap == Trap::Interrupt {
             return WasmError::Timeout {
-                millis: u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
+                millis: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
             };
         }
     }
-    // A host fn can surface our typed errors (e.g. PermissionDenied)
-    // through the wasmtime error chain — preserve the typed variant.
-    if let Some(wasmtime_cause) = err.downcast_ref::<WasmError>() {
-        return match wasmtime_cause {
-            WasmError::PermissionDenied {
-                plugin,
-                permission,
-                op,
-            } => WasmError::PermissionDenied {
-                plugin: plugin.clone(),
-                permission: permission.clone(),
-                op: op.clone(),
-            },
-            // Fall through on anything else — reformat as a plain trap.
-            _ => WasmError::Trap(err),
-        };
+    match err.downcast::<WasmError>() {
+        Ok(typed) => typed,
+        Err(err) => WasmError::Trap(err),
     }
-    WasmError::Trap(err)
 }
 
-/// Allocate `bytes.len()` bytes inside the guest via its `alloc`
+/// Allocate `bytes.len` bytes inside the guest via its `alloc`
 /// export, write `bytes` there, and return the pointer. Used by the
 /// `invoke` ABI trampoline on both the method and params buffers.
 fn alloc_and_write(
@@ -505,11 +567,12 @@ fn alloc_and_write(
     bytes: &[u8],
     label: &str,
     fuel: u64,
+    deadline: Duration,
 ) -> Result<i32, WasmError> {
     let len = i32_from_len(bytes.len(), label)?;
     let ptr = alloc
         .call(&mut *store, len)
-        .map_err(|e| classify_trap(e, fuel, None))?;
+        .map_err(|e| classify_trap(e, fuel, deadline))?;
     let start = usize::try_from(ptr)
         .map_err(|_| WasmError::Trap(wasmtime::Error::msg(format!("{label}: negative ptr"))))?;
     let end = start.checked_add(bytes.len()).ok_or_else(|| {
@@ -581,4 +644,18 @@ fn decode_invoke_response(body: &[u8]) -> Result<Value, WasmError> {
     Err(WasmError::Trap(wasmtime::Error::msg(
         "invoke response missing both `result` and `error`",
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ticks_round_up_and_cover_the_partial_first_tick() {
+        assert_eq!(ticks_for(Duration::ZERO), 1);
+        assert_eq!(ticks_for(Duration::from_millis(1)), 2);
+        assert_eq!(ticks_for(Duration::from_millis(10)), 2);
+        assert_eq!(ticks_for(Duration::from_millis(11)), 3);
+        assert_eq!(ticks_for(Duration::from_secs(5)), 501);
+    }
 }

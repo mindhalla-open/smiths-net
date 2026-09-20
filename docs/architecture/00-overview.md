@@ -65,22 +65,27 @@ rest are documented core extensions for post-v1 phases; see
 
 1. **Rust + `tokio` multi-thread runtime.** Proven for telecom, single-binary
    deploy, ecosystem for RTP/SIP/TLS.
-2. **Event bus as the spine.** All subsystems publish/subscribe typed events
-   (`SipEvent`, `MediaEvent`, `ControlEvent`, `PluginEvent`). Modules do not
-   call each other directly outside the bus. Plugins become first-class
-   without special cases.
+2. **Event bus for notifications, trait seams for control.** Subsystems
+   publish typed events (`SipEvent`, `PluginEvent`, `SystemEvent`) that the
+   control plane and plugin hooks subscribe to. Control flow — placing a
+   call, allocating media, negotiating SDP — goes through trait objects
+   defined in `smiths-core` (`MediaFabric`, `SdpNegotiator`, `AiRegistry`,
+   `CallOriginator`) and wired by `smiths-cli` at startup, not through the
+   bus. Both directions keep sibling crates from depending on each other.
 3. **Two-tier plugins, one ABI.**
    - **WASM (wasmtime)** — for hot-path hooks (`on_rtp_frame`, inline SIP
      mutation) where latency and sandboxing matter. Any WASM-targeting
      language.
    - **Sidecar (child process + IPC)** — for control-path and AI hooks where
      you want true "any language" (Python, Node, Go, Java).
-   - Same hook names, same payload schema (protobuf), same host-function
-     surface.
+   - Same hook names, same payload shapes, same host-function surface.
+     The encoding differs per tier (JSON-RPC for sidecars, typed
+     envelopes for WASM) — see `10-plugin-wire-format.md`.
 4. **MCP as the AI front door.** LLMs never poke internals; they call typed
    tools and read typed resources. Audit and rate-limit live at this boundary.
-5. **Schema-first IPC.** `smiths-proto` owns all wire types. WASM guests,
-   sidecars, and MCP clients all consume the same schema.
+5. **Schema-first IPC.** `smiths-proto` owns the wire types the WASM host
+   and its guests share; sidecars and MCP clients speak JSON against the
+   same logical shapes.
 6. **Fail-closed plugins.** Plugin trap or timeout never crashes the engine;
    the call continues with plugin output discarded and a metric incremented.
 
@@ -117,6 +122,6 @@ The spec is followed. This overview adds:
 
 - Explicit **two-tier** plugin model (spec only specified WASM).
 - Event bus as an explicit architectural invariant.
-- Protobuf as the single wire schema across WASM + sidecar + MCP.
+- One logical schema across WASM + sidecar + MCP, encoded per tier.
 
 Everything else (hooks, MCP tools, non-goals, stack) stays as specified.

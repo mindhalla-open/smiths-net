@@ -13,15 +13,15 @@ output and control-plane tool output can never disagree.
 
 | Metric                           | Type    | Labels                 | Alert if                                  |
 |----------------------------------|---------|------------------------|-------------------------------------------|
-| `sip_requests_total`             | counter | `method`               | 5× baseline rate (DOS probe)              |
-| `sip_responses_total`            | counter | `code`                 | `code="5xx"` rate > 1/sec                 |
-| `sip_parse_errors_total`         | counter | —                      | > 10/sec (mangled peer or attacker)       |
-| `sip_dialogs_active`             | gauge   | —                      | Slope + constant = leaked dialogs         |
-| `sip_server_txns_active`         | gauge   | —                      | > 10× peak dialog count                   |
-| `sip_invite_2xx_retransmits_total`| counter| —                      | Slope change = lossy ACK or non-ACKing UAC |
-| `media_bridges_active`           | gauge   | —                      | Mismatch with `sip_dialogs_active`        |
-| `rtp_packets_forwarded_total`    | counter | `direction`            | Asymmetry = one-way audio                 |
-| `rtcp_sr_sent_total`             | counter | —                      | Stalled = bridge hung                     |
+| `smiths_sip_requests_total`             | counter | `method`               | 5× baseline rate (DOS probe)              |
+| `smiths_sip_responses_total`            | counter | `code`                 | `code="5xx"` rate > 1/sec                 |
+| `smiths_sip_parse_errors_total`         | counter | —                      | > 10/sec (mangled peer or attacker)       |
+| `smiths_sip_dialogs_active`             | gauge   | —                      | Slope + constant = leaked dialogs         |
+| `smiths_sip_server_txns_active`         | gauge   | —                      | > 10× peak dialog count                   |
+| `smiths_sip_invite_2xx_retransmits_total`| counter| —                      | Slope change = lossy ACK or non-ACKing UAC |
+| `smiths_media_bridges_active`           | gauge   | —                      | Mismatch with `smiths_sip_dialogs_active`        |
+| `smiths_rtp_packets_forwarded_total`    | counter | `direction`            | Asymmetry = one-way audio                 |
+| `smiths_rtcp_sr_sent_total`             | counter | —                      | Stalled = bridge hung                     |
 
 ## AI dispatcher (`smiths_core::Metrics`)
 
@@ -36,11 +36,11 @@ output and control-plane tool output can never disagree.
 
 | Metric                               | Type     | Labels                  | Alert if                                  |
 |--------------------------------------|----------|-------------------------|-------------------------------------------|
-| `tool_invocations_total`             | counter  | `tool`, `outcome`       | `outcome="error"` rate > 0.05             |
-| `tool_duration_seconds`              | histogram| `tool`                  | p99 > 2s                                  |
-| `plugin_invocations_total`           | counter  | `plugin`, `outcome`     | Used by slice 5.9 canary                  |
-| `plugin_invoke_duration_seconds`     | histogram| `plugin`                | p95 > SLO                                 |
-| `sidecar_restarts_total`             | counter  | `plugin`                | > 1/5min = plugin crash-loop              |
+| `smiths_tool_invocations_total`             | counter  | `tool`, `outcome`       | `outcome="error"` rate > 0.05             |
+| `smiths_tool_duration_seconds`              | histogram| `tool`                  | p99 > 2s                                  |
+| `smiths_plugin_invocations_total`           | counter  | `plugin`, `outcome`     | Used by slice 5.9 canary                  |
+| `smiths_plugin_invoke_duration_seconds`     | histogram| `plugin`                | p95 > SLO                                 |
+| `smiths_sidecar_restarts_total`             | counter  | `plugin`                | > 1/5min = plugin crash-loop              |
 
 ## Transcoding (`smiths_transcode::TranscodeMetrics`)
 
@@ -88,8 +88,8 @@ $ curl -X POST http://localhost:7878/rpc \
 ```
 
 `get_metric` accepts both the "bare" metric name
-(`plugin_invocations`) and the Prometheus-text form with the
-`_total` suffix (`plugin_invocations_total`). Counters get both
+(`smiths_plugin_invocations`) and the Prometheus-text form with the
+`_total` suffix (`smiths_plugin_invocations_total`). Counters get both
 aliases transparently.
 
 ## See also
@@ -98,5 +98,5 @@ aliases transparently.
 - `crates/smiths-transcode/src/metrics.rs` — transcoder metrics.
 - `crates/smiths-mixer/src/metrics.rs` — mixer metrics.
 - `crates/smiths-fax/src/metrics.rs` — FAX metrics.
-- `crates/smiths-mcp/src/tools.rs` — `ListMetricsTool`,
+- `crates/smiths-mcp/src/tools/metrics.rs` — `ListMetricsTool`,
   `GetMetricTool` impls.

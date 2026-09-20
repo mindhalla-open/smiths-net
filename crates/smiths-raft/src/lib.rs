@@ -1,4 +1,4 @@
-//! `smiths-raft` — Raft consensus layer for smiths-net (slice 6.3a/b).
+//! `smiths-raft` — Raft consensus layer for smiths-net (/b).
 //!
 //! Provides:
 //! - [`types::SmithsTypeConfig`] — `OpenRaft` type configuration.

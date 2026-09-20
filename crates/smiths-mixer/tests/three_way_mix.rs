@@ -1,5 +1,4 @@
-//! Slice 5.5 integration test — three participants, each hears the
-//! other two.
+//! Integration test — three participants, each hears the other two.
 //!
 //! Runs through the full `Conference` public API: three participants
 //! join, each pushes a distinct constant-amplitude PCM frame every
@@ -21,7 +20,9 @@
 
 use std::time::Duration;
 
-use smiths_mixer::{AgcConfig, Conference, ConferenceConfig, ConferenceId, MixerConfig, VadScore};
+use smiths_mixer::{
+    AgcConfig, Conference, ConferenceConfig, ConferenceId, JitterConfig, MixerConfig, VadScore,
+};
 use tokio::time::timeout;
 
 fn cfg() -> ConferenceConfig {
@@ -38,6 +39,13 @@ fn cfg() -> ConferenceConfig {
         },
         frame_interval: Duration::from_millis(10),
         vad_threshold: VadScore::DEFAULT_SPEECH,
+        // A one-frame cushion so each pushed frame is mixed on the
+        // very next tick and the sums below are exact.
+        jitter: JitterConfig {
+            initial_target: 1,
+            min_target: 1,
+            ..JitterConfig::default()
+        },
     }
 }
 

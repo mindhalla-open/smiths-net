@@ -1,4 +1,4 @@
-//! T.38 FAX-over-IP (slice 5.4 / P13).
+//! T.38 FAX-over-IP.
 //!
 //! Fax signaling survives on the PSTN today mostly because G.711
 //! audio transcoded through a packet network shreds the modem
@@ -11,7 +11,7 @@
 //! lost primary frame from one of the next N packets' redundancy
 //! copies.
 //!
-//! ## What this crate ships (slice 5.4)
+//! ## What this crate ships
 //!
 //! - [`udptl`] — UDPTL framing. Parse + emit primary IFP + secondary
 //!   (redundancy) IFP frames with per-packet length prefixes. Pure
@@ -29,7 +29,7 @@
 //!   The UAC calls this on CED-tone detection; the UAS answers with
 //!   its own [`sdp::answer_fax_offer`] output.
 //!
-//! ## What this crate does NOT do (slice 5.4)
+//! ## What this crate does NOT do
 //!
 //! - **IFP state machine.** T.38 carries a full fax FSM over the
 //!   wire (V.21 preamble, V.27ter/V.29/V.17 training, page data, MCF
@@ -45,7 +45,7 @@
 //! - **Bridge integration.** Wiring a `UdptlSession` into the UAS
 //!   / media-fabric renegotiation path (detect CED tone, emit
 //!   re-INVITE, swap the `dyn MediaSession` in place) is the same
-//!   call-FSM refactor the slice 5.1 video dual-bridge and slice
+//!   call-FSM refactor the  video dual-bridge and slice
 //!   5.3 transcoding work are queued behind. Primitives + SDP +
 //!   session type + renegotiation helper land here; wiring lands
 //!   alongside them.

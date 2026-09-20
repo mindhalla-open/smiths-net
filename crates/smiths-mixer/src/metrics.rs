@@ -1,5 +1,4 @@
-//! Prometheus metrics for the mixer + conferencing subsystem
-//! (slice 5.12).
+//! Prometheus metrics for the mixer + conferencing subsystem.
 //!
 //! Follows the same "clone an `Arc<Metrics>` into every subsystem
 //! that records" pattern `smiths-core::Metrics` establishes. The
@@ -7,7 +6,7 @@
 //! encodes it for `/metrics`; this module hands out typed
 //! counter / gauge handles.
 //!
-//! Five metrics ship — minimum viable surface for "is the mixer
+//! Six metrics ship — minimum viable surface for "is the mixer
 //! healthy?":
 //!
 //! - `smiths_mixer_conferences_active` (gauge)
@@ -15,7 +14,9 @@
 //! - `smiths_mixer_dominant_switches_total` (counter,
 //!   labels=`{conference}`)
 //! - `smiths_mixer_ingress_dropped_total` (counter,
-//!   labels=`{reason=queue_full|frame_size}`)
+//!   labels=`{reason=frame_size|duplicate|late|overflow}`)
+//! - `smiths_mixer_concealed_total` (counter, labels=`{conference}`)
+//!   — frames the jitter buffers had to conceal (loss or starvation)
 //! - `smiths_mixer_participants_active` (gauge)
 
 use std::sync::Arc;
@@ -39,7 +40,7 @@ pub struct ConferenceLabel {
 /// vocabulary so Prometheus doesn't explode on a typo.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct IngressDropReason {
-    /// `"queue_full"` or `"frame_size"`.
+    /// `"frame_size"`, `"duplicate"`, `"late"` or `"overflow"`.
     pub reason: String,
 }
 
@@ -57,6 +58,9 @@ pub struct MixerMetrics {
     pub dominant_switches: Family<ConferenceLabel, Counter>,
     /// Ingress frames dropped, keyed by reason.
     pub ingress_dropped: Family<IngressDropReason, Counter>,
+    /// Per-conference frames the jitter buffers concealed (missing
+    /// or late input replaced by a faded copy of the last frame).
+    pub concealed: Family<ConferenceLabel, Counter>,
     /// Active participants across every conference. Divide by
     /// `conferences_active` for the average room size.
     pub participants_active: Gauge,
@@ -71,6 +75,7 @@ impl MixerMetrics {
         let ticks = Family::<ConferenceLabel, Counter>::default();
         let dominant_switches = Family::<ConferenceLabel, Counter>::default();
         let ingress_dropped = Family::<IngressDropReason, Counter>::default();
+        let concealed = Family::<ConferenceLabel, Counter>::default();
         let participants_active = Gauge::default();
 
         registry.register(
@@ -94,6 +99,11 @@ impl MixerMetrics {
             ingress_dropped.clone(),
         );
         registry.register(
+            "smiths_mixer_concealed",
+            "Frames the ingress jitter buffers concealed, per conference.",
+            concealed.clone(),
+        );
+        registry.register(
             "smiths_mixer_participants_active",
             "Active participants across every conference.",
             participants_active.clone(),
@@ -104,6 +114,7 @@ impl MixerMetrics {
             ticks,
             dominant_switches,
             ingress_dropped,
+            concealed,
             participants_active,
         })
     }
@@ -134,15 +145,21 @@ mod tests {
             .inc();
         m.ingress_dropped
             .get_or_create(&IngressDropReason {
-                reason: "queue_full".into(),
+                reason: "late".into(),
             })
             .inc_by(3);
+        m.concealed
+            .get_or_create(&ConferenceLabel {
+                conference: "7".into(),
+            })
+            .inc();
 
         let mut out = String::new();
         prometheus_client::encoding::text::encode(&mut out, &registry).unwrap();
         assert!(out.contains("smiths_mixer_conferences_active 1"));
         assert!(out.contains("smiths_mixer_ticks_total"));
         assert!(out.contains("conference=\"7\""));
-        assert!(out.contains("reason=\"queue_full\""));
+        assert!(out.contains("reason=\"late\""));
+        assert!(out.contains("smiths_mixer_concealed_total"));
     }
 }

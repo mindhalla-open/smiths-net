@@ -1,22 +1,20 @@
 //! Engine-side User Agent Client.
 //!
 //! Places outbound INVITEs, handles the 100/200 round-trip, sends the
-//! 2xx ACK, tracks the resulting dialog, and later tears it down with
-//! a BYE. Outbound request/response correlation goes through the
-//! shared [`ResponseRouter`] so the UAS reader can forward responses
-//! coming in on the same socket.
-//!
-//! MVP scope — no transaction FSM with RFC 3261 timers A–K; one-shot
-//! send + wait with a configurable budget. Full FSM lands alongside
-//! the deferred dialog work.
-
-#![allow(clippy::cast_possible_truncation, clippy::needless_pass_by_value)]
+//! 2xx ACK (and re-sends it for every retransmitted 2xx, RFC 3261
+//! §13.2.2.4), tracks the resulting dialog, and later tears it down
+//! with a BYE. Both INVITE and BYE run through the RFC 3261 §17.1
+//! client transaction FSMs hosted by [`crate::txn::TransactionDriver`],
+//! which owns the retransmission timers (skipped on TCP / TLS) and the
+//! overall transaction timeout. Outbound request/response correlation
+//! goes through the shared [`ResponseRouter`] so the UAS reader can
+//! forward responses coming in on the same socket.
 
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -28,7 +26,7 @@ use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 
 use crate::response_router::ResponseRouter;
-use crate::transport::Transport;
+use crate::transport::{Transport, resolve_local_ip_for};
 
 /// Default overall budget for an INVITE / BYE transaction.
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
@@ -67,9 +65,7 @@ impl From<UacError> for CallError {
 
 /// Live outbound dialog.
 #[derive(Debug)]
-#[allow(dead_code)] // `call_id` kept for logs/debug when we grow more fields
 struct UacDialog {
-    call_id: String,
     local_tag: String,
     remote_tag: String,
     target_uri: String,
@@ -93,10 +89,12 @@ pub struct UacClient<T: Transport> {
     dialogs: Arc<DashMap<String, Arc<UacDialog>>>,
     metrics: Arc<Metrics>,
     deadline: Duration,
-    /// Transaction-layer driver. Today only BYE flows through it
-    /// (v0.17.0); INVITE migrates once the client-INVITE FSM
-    /// (timers A/B/D) lands.
+    /// Transaction-layer driver hosting the INVITE and BYE client
+    /// FSMs and the ACK-for-2xx replay window.
     txn_driver: crate::txn::TransactionDriver<T>,
+    /// `Via` protocol token for the bound transport (`UDP` / `TCP` /
+    /// `TLS`).
+    via_transport: &'static str,
 }
 
 impl<T: Transport> UacClient<T> {
@@ -114,10 +112,10 @@ impl<T: Transport> UacClient<T> {
         metrics: Arc<Metrics>,
     ) -> Self {
         let contact = format!("<sip:smiths@{local_sip_addr}>");
-        // The response router is owned by the driver now — both INVITE
-        // and BYE paths route responses through it, and the UAC has
-        // no direct use for the router after slice 3 (v0.18.0).
+        // The response router is owned by the driver — both INVITE
+        // and BYE paths route responses through it.
         let txn_driver = crate::txn::TransactionDriver::new(Arc::clone(&transport), router);
+        let via_transport = transport.kind().via_token();
         Self {
             transport,
             bus,
@@ -130,6 +128,7 @@ impl<T: Transport> UacClient<T> {
             metrics,
             deadline: DEFAULT_DEADLINE,
             txn_driver,
+            via_transport,
         }
     }
 
@@ -171,8 +170,9 @@ impl<T: Transport> UacClient<T> {
         let branch = fresh_branch();
         let cseq: u32 = 1;
 
-        let invite = build_invite(InviteFields {
+        let invite = build_invite(&InviteFields {
             request_uri: &target_uri,
+            via_transport: self.via_transport,
             via_sent_by: self.local_sip_addr,
             branch: &branch,
             from_uri: &self.contact,
@@ -248,9 +248,13 @@ impl<T: Transport> UacClient<T> {
 
         // Send the end-to-end ACK for the 2xx. Uses a NEW branch
         // per RFC 3261 §17.1.1.3 (ACK-for-2xx is its own transaction).
+        // The driver keeps a copy for 64·T1 and re-sends it whenever
+        // the peer retransmits the 2xx because this ACK was lost
+        // (§13.2.2.4).
         let ack_branch = fresh_branch();
-        let ack = build_ack_2xx(AckFields {
+        let ack = Bytes::from(build_ack_2xx(&AckFields {
             request_uri: &target_uri,
+            via_transport: self.via_transport,
             via_sent_by: self.local_sip_addr,
             branch: &ack_branch,
             from_uri: &self.contact,
@@ -259,13 +263,14 @@ impl<T: Transport> UacClient<T> {
             to_tag: &remote_tag,
             call_id: &call_id,
             cseq,
-        });
-        if let Err(e) = self.transport.send(Bytes::from(ack), peer).await {
+        }));
+        self.txn_driver
+            .register_ack_for_2xx(&branch, peer, ack.clone());
+        if let Err(e) = self.transport.send(ack, peer).await {
             warn!(%peer, ?e, "UAC → ACK failed (call will likely drop)");
         }
 
         let dialog = Arc::new(UacDialog {
-            call_id: call_id.clone(),
             local_tag,
             remote_tag,
             target_uri,
@@ -288,12 +293,10 @@ impl<T: Transport> UacClient<T> {
 
     /// Tear down an outbound dialog with a BYE.
     ///
-    /// Since **v0.17.0** this runs through the RFC 3261 §17.1.2
-    /// client non-INVITE transaction FSM via
-    /// [`crate::txn::TransactionDriver`]. The behavioural upshot vs
-    /// the prior ad-hoc path: if the BYE's first send is lost on
-    /// UDP, the driver retransmits at T1=500 ms, 1 s, 2 s, 4 s, …
-    /// up to the overall 30 s budget instead of giving up silently.
+    /// Runs through the RFC 3261 §17.1.2 client non-INVITE
+    /// transaction FSM via [`crate::txn::TransactionDriver`]: if the
+    /// BYE's first send is lost on UDP, the driver retransmits at
+    /// T1=500 ms, 1 s, 2 s, 4 s, … up to the overall 30 s budget.
     #[instrument(skip(self), fields(%call_id))]
     pub async fn hangup(&self, call_id: &str) -> Result<(), UacError> {
         let dialog = self
@@ -304,8 +307,9 @@ impl<T: Transport> UacClient<T> {
 
         let cseq = dialog.next_cseq.fetch_add(1, Ordering::Relaxed);
         let branch = fresh_branch();
-        let bye = build_bye(ByeFields {
+        let bye = build_bye(&ByeFields {
             request_uri: &dialog.target_uri,
+            via_transport: self.via_transport,
             via_sent_by: dialog.local_sip_addr,
             branch: &branch,
             from_uri: &format!("<sip:smiths@{}>", dialog.local_sip_addr),
@@ -393,6 +397,7 @@ impl<T: Transport> CallOriginator for UacClient<T> {
 
 struct InviteFields<'a> {
     request_uri: &'a str,
+    via_transport: &'a str,
     via_sent_by: SocketAddr,
     branch: &'a str,
     from_uri: &'a str,
@@ -404,13 +409,13 @@ struct InviteFields<'a> {
     sdp: &'a str,
 }
 
-fn build_invite(f: InviteFields<'_>) -> Vec<u8> {
+fn build_invite(f: &InviteFields<'_>) -> Vec<u8> {
     let mut out = String::new();
     let _ = write!(out, "INVITE {} SIP/2.0\r\n", f.request_uri);
     let _ = write!(
         out,
-        "Via: SIP/2.0/UDP {};branch={};rport\r\n",
-        f.via_sent_by, f.branch
+        "Via: SIP/2.0/{} {};branch={};rport\r\n",
+        f.via_transport, f.via_sent_by, f.branch
     );
     let _ = write!(
         out,
@@ -431,6 +436,7 @@ fn build_invite(f: InviteFields<'_>) -> Vec<u8> {
 
 struct AckFields<'a> {
     request_uri: &'a str,
+    via_transport: &'a str,
     via_sent_by: SocketAddr,
     branch: &'a str,
     from_uri: &'a str,
@@ -441,13 +447,13 @@ struct AckFields<'a> {
     cseq: u32,
 }
 
-fn build_ack_2xx(f: AckFields<'_>) -> Vec<u8> {
+fn build_ack_2xx(f: &AckFields<'_>) -> Vec<u8> {
     let mut out = String::new();
     let _ = write!(out, "ACK {} SIP/2.0\r\n", f.request_uri);
     let _ = write!(
         out,
-        "Via: SIP/2.0/UDP {};branch={};rport\r\n",
-        f.via_sent_by, f.branch
+        "Via: SIP/2.0/{} {};branch={};rport\r\n",
+        f.via_transport, f.via_sent_by, f.branch
     );
     let _ = write!(
         out,
@@ -462,6 +468,7 @@ fn build_ack_2xx(f: AckFields<'_>) -> Vec<u8> {
 
 struct ByeFields<'a> {
     request_uri: &'a str,
+    via_transport: &'a str,
     via_sent_by: SocketAddr,
     branch: &'a str,
     from_uri: &'a str,
@@ -472,13 +479,13 @@ struct ByeFields<'a> {
     cseq: u32,
 }
 
-fn build_bye(f: ByeFields<'_>) -> Vec<u8> {
+fn build_bye(f: &ByeFields<'_>) -> Vec<u8> {
     let mut out = String::new();
     let _ = write!(out, "BYE {} SIP/2.0\r\n", f.request_uri);
     let _ = write!(
         out,
-        "Via: SIP/2.0/UDP {};branch={};rport\r\n",
-        f.via_sent_by, f.branch
+        "Via: SIP/2.0/{} {};branch={};rport\r\n",
+        f.via_transport, f.via_sent_by, f.branch
     );
     let _ = write!(
         out,
@@ -495,9 +502,8 @@ fn build_bye(f: ByeFields<'_>) -> Vec<u8> {
 // Response parsing (minimal — just enough for the two transactions we run)
 // ---------------------------------------------------------------------
 
-/// Wait for a non-provisional response on `branch`. Resubscribes on
-/// the same branch when a 1xx arrives so the next response lands on
-/// a fresh oneshot.
+/// Reason phrase from a response's status line (`SIP/2.0 486 Busy
+/// Here` → `Busy Here`). Empty when the line is malformed.
 fn parse_reason(bytes: &[u8]) -> String {
     let text = std::str::from_utf8(bytes).unwrap_or("");
     let line = text.lines().next().unwrap_or("");
@@ -558,46 +564,38 @@ fn parse_target(target: &str) -> Result<(String, String), UacError> {
     Ok((inner.to_owned(), host_port))
 }
 
-fn fresh_call_id(local: &str) -> String {
+/// Process-wide counter mixed into every generated identifier so two
+/// ids minted in the same instant can never collide even if the
+/// CSPRNG ever repeated.
+fn next_serial() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    format!("{nanos:08x}{c:04x}@{local}")
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+fn fresh_call_id(local: &str) -> String {
+    format!(
+        "{:016x}{:04x}@{local}",
+        rand::random::<u64>(),
+        next_serial()
+    )
 }
 
 fn fresh_tag(prefix: &str) -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    format!("{prefix}-{nanos:08x}{c:04x}")
+    format!(
+        "{prefix}-{:08x}{:04x}",
+        rand::random::<u32>(),
+        next_serial()
+    )
 }
 
+/// RFC 3261 §8.1.1.7 branch: the magic cookie plus 64 random bits and
+/// a serial, unique across every request this process ever sends.
 fn fresh_branch() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let c = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-    format!("z9hG4bK-{nanos:016x}{c:04x}")
-}
-
-/// Ask the kernel which local IP it would use to reach `peer` when our
-/// configured bind IP is a wildcard. Mirrors the helper in `uas.rs`.
-async fn resolve_local_ip_for(bind_ip: IpAddr, peer: SocketAddr) -> IpAddr {
-    if !bind_ip.is_unspecified() {
-        return bind_ip;
-    }
-    match tokio::net::UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await {
-        Ok(s) => match s.connect(peer).await.and_then(|()| s.local_addr()) {
-            Ok(a) => a.ip(),
-            Err(_) => bind_ip,
-        },
-        Err(_) => bind_ip,
-    }
+    format!(
+        "z9hG4bK-{:016x}{:04x}",
+        rand::random::<u64>(),
+        next_serial()
+    )
 }
 
 #[cfg(test)]
@@ -630,5 +628,58 @@ mod tests {
     fn extract_body_after_double_crlf() {
         let bytes = b"SIP/2.0 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         assert_eq!(extract_body(bytes), "hello");
+    }
+
+    #[test]
+    fn parse_reason_takes_status_line_phrase() {
+        assert_eq!(parse_reason(b"SIP/2.0 486 Busy Here\r\n\r\n"), "Busy Here");
+        assert_eq!(parse_reason(b"garbage"), "");
+    }
+
+    #[test]
+    fn generated_identifiers_are_unique_and_well_formed() {
+        let a = fresh_branch();
+        let b = fresh_branch();
+        assert!(a.starts_with("z9hG4bK-") && b.starts_with("z9hG4bK-"));
+        assert_ne!(a, b);
+        assert_ne!(fresh_tag("uac"), fresh_tag("uac"));
+        assert_ne!(fresh_call_id("127.0.0.1"), fresh_call_id("127.0.0.1"));
+    }
+
+    #[test]
+    fn via_carries_the_transport_token() {
+        let sent_by: SocketAddr = "10.0.0.1:5060".parse().unwrap();
+        let invite = build_invite(&InviteFields {
+            request_uri: "sip:a@b",
+            via_transport: "TCP",
+            via_sent_by: sent_by,
+            branch: "z9hG4bK-x",
+            from_uri: "<sip:me@10.0.0.1>",
+            from_tag: "t",
+            to_uri: "sip:a@b",
+            call_id: "cid",
+            cseq: 1,
+            contact: "<sip:me@10.0.0.1>",
+            sdp: "",
+        });
+        let text = String::from_utf8(invite).unwrap();
+        assert!(text.contains("Via: SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bK-x;rport\r\n"));
+        let bye = build_bye(&ByeFields {
+            request_uri: "sip:a@b",
+            via_transport: "TLS",
+            via_sent_by: sent_by,
+            branch: "z9hG4bK-y",
+            from_uri: "<sip:me@10.0.0.1>",
+            from_tag: "t",
+            to_uri: "sip:a@b",
+            to_tag: "r",
+            call_id: "cid",
+            cseq: 2,
+        });
+        assert!(
+            String::from_utf8(bye)
+                .unwrap()
+                .contains("Via: SIP/2.0/TLS ")
+        );
     }
 }

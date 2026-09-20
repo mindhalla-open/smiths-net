@@ -38,7 +38,7 @@ pub struct UdptlSessionConfig {
     pub trace_sequence: bool,
     /// Prometheus metrics handle — when `Some`, the forwarders
     /// record datagram counts + parse errors through it. `None` on
-    /// tests that don't need Prometheus output. Slice 5.12.
+    /// tests that don't need Prometheus output.
     pub metrics: Option<Arc<FaxMetrics>>,
 }
 

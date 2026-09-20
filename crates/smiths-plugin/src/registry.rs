@@ -7,9 +7,10 @@
 //! control plane consumes it through the `smiths-core` seam and never
 //! links this crate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -21,9 +22,61 @@ use smiths_core::ai::{
 use smiths_core::metrics::{PluginLabel, PluginOutcomeLabel};
 use smiths_sidecar::Sidecar;
 
-use crate::manifest::Manifest;
+use crate::dispatcher::{Hook, MemoryDispatcher};
+use crate::loader::LoaderOpts;
+use crate::manifest::{DEFAULT_PRIORITY, Manifest};
 use crate::script_provider::ScriptProvider;
 use crate::wasm_provider::WasmProvider;
+
+/// Per-event wall-clock budget of the registry's hook dispatcher: one
+/// lifecycle event fans out to every registered plugin within this
+/// window, and stragglers are cut off / skipped.
+pub const DEFAULT_HOOK_BUDGET: Duration = Duration::from_secs(5);
+
+/// Map of every registered provider, shared between the registry and
+/// the hooks that resolve providers by name at dispatch time.
+type Providers = Arc<DashMap<String, Arc<dyn AiProvider>>>;
+
+/// Hook that invokes `method` on the plugin named `plugin`, looked up
+/// in the registry when the event fires. Holding only a `Weak` to
+/// the provider map means a reload (which replaces the provider
+/// `Arc`) is transparent and the registry doesn't keep itself alive
+/// through its own dispatcher.
+pub struct ProviderHook {
+    providers: Weak<DashMap<String, Arc<dyn AiProvider>>>,
+    plugin: String,
+    method: String,
+    name: String,
+}
+
+impl ProviderHook {
+    fn new(providers: &Providers, plugin: &str, method: &str) -> Self {
+        Self {
+            providers: Arc::downgrade(providers),
+            plugin: plugin.to_owned(),
+            method: method.to_owned(),
+            name: format!("{plugin}.{method}"),
+        }
+    }
+}
+
+#[async_trait]
+impl Hook for ProviderHook {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    async fn invoke(&self, payload: Value) -> Result<Value, String> {
+        let provider = self
+            .providers
+            .upgrade()
+            .and_then(|map| map.get(&self.plugin).map(|e| Arc::clone(e.value())))
+            .ok_or_else(|| format!("plugin `{}` is not loaded", self.plugin))?;
+        provider
+            .invoke(&self.method, payload)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
 
 /// Hot-reload a script plugin: re-read the manifest, recompile the
 /// source via `smiths_script`, and atomic-swap the new runtime into
@@ -33,7 +86,7 @@ use crate::wasm_provider::WasmProvider;
 /// capability set must match; a script whose new descriptor list
 /// changes is treated as a manifest change and the swap is
 /// refused.
-async fn reload_script(provider: Arc<ScriptProvider>) -> Result<(), ProviderError> {
+async fn reload_script(provider: Arc<ScriptProvider>) -> Result<Manifest, ProviderError> {
     let name = provider.name().to_owned();
     let dir = provider.dir().to_path_buf();
     let manifest = Manifest::from_dir(&dir)
@@ -61,9 +114,8 @@ async fn reload_script(provider: Arc<ScriptProvider>) -> Result<(), ProviderErro
         .map_err(|e| ProviderError(format!("reload `{name}`: describe_capabilities: {e}")))?;
     let descs = smiths_core::ai::parse_descriptors(raw)
         .map_err(|e| ProviderError(format!("reload `{name}`: {e}")))?;
-    let new_set: std::collections::BTreeSet<_> =
-        descs.iter().map(|d| d.capability.clone()).collect();
-    let old_set: std::collections::BTreeSet<_> = provider
+    let new_set: BTreeSet<_> = descs.iter().map(|d| d.capability.clone()).collect();
+    let old_set: BTreeSet<_> = provider
         .capabilities()
         .iter()
         .map(|d| d.capability.clone())
@@ -75,7 +127,7 @@ async fn reload_script(provider: Arc<ScriptProvider>) -> Result<(), ProviderErro
         )));
     }
     provider.swap_runtime(new_runtime);
-    Ok(())
+    Ok(manifest)
 }
 
 /// One registered plugin — its manifest, live sidecar handle, and the
@@ -95,6 +147,10 @@ pub struct PluginEntry {
     /// Optional metrics handle. When present, each `invoke` records
     /// `plugin_invocations` + `plugin_invoke_duration_seconds`.
     pub metrics: Option<Arc<Metrics>>,
+    /// Loader options the plugin was spawned with (bus bridge,
+    /// metrics, sandbox, timeouts). `reload` respawns with exactly
+    /// these so a reloaded plugin keeps its sandbox and bridges.
+    pub loader_opts: LoaderOpts,
 }
 
 #[async_trait]
@@ -172,18 +228,42 @@ pub(crate) fn record_invocation<T>(
 /// A parallel `sidecars` index keeps a strongly-typed handle on
 /// sidecar-only entries — the streaming-notification bridge and
 /// `reload` need it. WASM providers don't appear in that index.
-#[derive(Clone, Default)]
+///
+/// The registry also owns the hook dispatcher lifecycle events fan
+/// out through: the loader registers each manifest's `hooks` under
+/// the plugin's `priority`, config-listed `call_event_hooks` are
+/// added via [`Self::declare_config_hook`], and removal / reload
+/// keep the routes in step with the provider map.
+#[derive(Clone)]
 pub struct AiRegistry {
-    providers: Arc<DashMap<String, Arc<dyn AiProvider>>>,
+    providers: Providers,
     sidecars: Arc<DashMap<String, Arc<PluginEntry>>>,
     scripts: Arc<DashMap<String, Arc<ScriptProvider>>>,
-    /// Env-var overrides the loader will inject into every future
-    /// sidecar spawn (slice 5.8-b read-through). Rotated by the
-    /// CLI's `ai.*_api_key` adapter on config reload. Running
-    /// sidecars keep the env they were launched with; a restart
-    /// of the specific plugin (via `AiRegistry::reload(name)`) is
-    /// required for the new value to take effect.
+    /// Env-var overrides injected into every sidecar spawn from now
+    /// on. Rotated by the CLI's `ai.*_api_key` adapter on config
+    /// reload. Running sidecars keep the env they were launched
+    /// with; `AiRegistry::reload(name)` respawns with the current
+    /// snapshot.
     env_overrides: Arc<Mutex<BTreeMap<String, String>>>,
+    /// Priority-ordered lifecycle hook routes.
+    hooks: MemoryDispatcher,
+    /// Hooks declared through config (`call_event_hooks`) rather than
+    /// a manifest, per plugin name. Merged with the manifest's
+    /// `hooks` every time the plugin (re)loads.
+    config_hooks: Arc<DashMap<String, BTreeSet<String>>>,
+}
+
+impl Default for AiRegistry {
+    fn default() -> Self {
+        Self {
+            providers: Arc::new(DashMap::new()),
+            sidecars: Arc::new(DashMap::new()),
+            scripts: Arc::new(DashMap::new()),
+            env_overrides: Arc::new(Mutex::new(BTreeMap::new())),
+            hooks: MemoryDispatcher::with_budget(DEFAULT_HOOK_BUDGET),
+            config_hooks: Arc::new(DashMap::new()),
+        }
+    }
 }
 
 impl std::fmt::Debug for AiRegistry {
@@ -193,6 +273,8 @@ impl std::fmt::Debug for AiRegistry {
             .field("sidecars", &self.sidecars.len())
             .field("scripts", &self.scripts.len())
             .field("env_overrides", &self.env_snapshot().len())
+            .field("hooks", &self.hooks.len())
+            .field("config_hooks", &self.config_hooks.len())
             .finish()
     }
 }
@@ -222,7 +304,7 @@ impl AiRegistry {
             .insert(provider.name().to_owned(), provider as Arc<dyn AiProvider>);
     }
 
-    /// Register a loaded script plugin (slice 4.1). Mirrored into
+    /// Register a loaded script plugin. Mirrored into
     /// a script-only index so hot-reload / error-rollback paths can
     /// recover the typed `ScriptProvider` without downcasting.
     pub fn insert_script(&self, provider: Arc<ScriptProvider>) {
@@ -232,7 +314,7 @@ impl AiRegistry {
         self.scripts.insert(name, provider);
     }
 
-    /// Get a script-backed provider by name (slice 4.1).
+    /// Get a script-backed provider by name.
     #[must_use]
     pub fn get_script(&self, name: &str) -> Option<Arc<ScriptProvider>> {
         self.scripts.get(name).map(|e| Arc::clone(e.value()))
@@ -245,15 +327,63 @@ impl AiRegistry {
     }
 
     /// Remove a plugin entry by name across every backend index
-    /// (sidecar / script / unified `providers`). Returns `true` iff
-    /// the entry existed. Used by the hot-reload rollback when a
-    /// script script trips `ROLLBACK_AFTER` consecutive errors.
+    /// (sidecar / script / unified `providers`) and drop its hook
+    /// routes. Returns `true` iff the entry existed.
     #[must_use = "remove() returns whether the entry was present; ignoring it loses that signal"]
     pub fn remove(&self, name: &str) -> bool {
         let a = self.providers.remove(name).is_some();
         self.sidecars.remove(name);
         self.scripts.remove(name);
+        self.hooks.unregister_owner(name);
         a
+    }
+
+    /// The lifecycle hook dispatcher. Cheap to clone.
+    #[must_use]
+    pub fn hooks(&self) -> &MemoryDispatcher {
+        &self.hooks
+    }
+
+    /// Declare through config that `plugin` should receive `event`
+    /// (e.g. `[plugins] call_event_hooks`). Takes effect immediately
+    /// and again on every (re)load of that plugin, merged with the
+    /// manifest's own `hooks` and run at its `priority`.
+    pub fn declare_config_hook(&self, plugin: &str, event: &str) {
+        self.config_hooks
+            .entry(plugin.to_owned())
+            .or_default()
+            .insert(event.to_owned());
+        let priority = AiRegistryTrait::get(self, plugin)
+            .and_then(|_| self.sidecars.get(plugin).map(|e| e.manifest.priority))
+            .unwrap_or(DEFAULT_PRIORITY);
+        self.hooks.register_owned(
+            plugin,
+            event,
+            priority,
+            Arc::new(ProviderHook::new(&self.providers, plugin, event)),
+        );
+    }
+
+    /// (Re)register every hook `manifest` declares plus any config-
+    /// declared ones for the same plugin, replacing the plugin's
+    /// previous routes. Called by the loader after the provider is in
+    /// the map, so a dispatch never finds a registered-but-missing
+    /// plugin.
+    pub(crate) fn register_manifest_hooks(&self, manifest: &Manifest) {
+        let name = manifest.name.as_str();
+        self.hooks.unregister_owner(name);
+        let mut events: BTreeSet<String> = manifest.hooks.iter().cloned().collect();
+        if let Some(extra) = self.config_hooks.get(name) {
+            events.extend(extra.iter().cloned());
+        }
+        for event in events {
+            self.hooks.register_owned(
+                name,
+                &event,
+                manifest.priority,
+                Arc::new(ProviderHook::new(&self.providers, name, &event)),
+            );
+        }
     }
 
     /// Number of plugins registered (across all backends).
@@ -295,7 +425,7 @@ impl AiRegistry {
             .collect()
     }
 
-    /// Upsert an env-var override (slice 5.8-b). The loader's
+    /// Upsert an env-var override. The loader's
     /// next sidecar spawn injects these into the child's
     /// environment, so a just-rotated `OPENAI_API_KEY` picks up
     /// without an engine restart — but only for plugins that
@@ -346,6 +476,7 @@ impl AiRegistry {
         self.providers.clear();
         self.sidecars.clear();
         self.scripts.clear();
+        self.hooks.clear();
     }
 }
 
@@ -377,18 +508,25 @@ impl AiRegistryTrait for AiRegistry {
         // previous version stays available for auto-rollback. See
         // `script_provider::ROLLBACK_AFTER`.
         if let Some(provider) = self.get_script(name) {
-            return reload_script(provider).await;
+            let manifest = reload_script(provider).await?;
+            self.register_manifest_hooks(&manifest);
+            return Ok(());
         }
         let Some(existing) = self.get(name) else {
             return Err(ProviderError(format!("no loaded plugin named `{name}`")));
         };
         let dir = existing.dir.clone();
+        // Respawn with the options the plugin was originally loaded
+        // with, so the sandbox, metrics, timeouts, and the bus bridge
+        // survive the reload.
+        let opts = existing.loader_opts.clone();
         // Drop the old sidecar first so the OS releases stdio fds
         // before we spawn its replacement.
         existing.sidecar.shutdown().await;
         self.providers.remove(name);
         self.sidecars.remove(name);
-        crate::loader::load_one(&dir, self, crate::loader::LoaderOpts::default())
+        self.hooks.unregister_owner(name);
+        crate::loader::load_one(&dir, self, opts)
             .await
             .map(|_| ())
             .map_err(|e| ProviderError(format!("reload `{name}`: {e}")))
@@ -429,7 +567,9 @@ impl AiRegistryTrait for AiRegistry {
                 "reload_script_source `{name}`: rename into place: {e}"
             ))
         })?;
-        reload_script(provider).await
+        let manifest = reload_script(provider).await?;
+        self.register_manifest_hooks(&manifest);
+        Ok(())
     }
 }
 
@@ -439,10 +579,10 @@ mod tests {
 
     #[test]
     fn env_overrides_round_trip() {
-        // The slice 5.8-b `ai.*_api_key` read-through stashes
-        // rotated credentials through these setters; a snapshot
-        // read under the shared Arc must see every prior write
-        // from any clone of the registry.
+        // The `ai.*_api_key` read-through stashes rotated
+        // credentials through these setters; a snapshot read under
+        // the shared Arc must see every prior write from any clone
+        // of the registry.
         let reg = AiRegistry::new();
         assert!(reg.env_snapshot().is_empty());
         reg.set_env("OPENAI_API_KEY", "sk-one");

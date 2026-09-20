@@ -11,7 +11,7 @@ use std::time::SystemTime;
 
 use dashmap::DashMap;
 use serde::Serialize;
-use smiths_core::media::EndpointId;
+use smiths_core::media::{BridgeId, EndpointId};
 use smiths_core::{CallLookup, Event, EventBus, SipEvent};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -50,6 +50,11 @@ pub struct CallSnapshot {
     /// Same caveats as `media_endpoint`.
     #[serde(skip)]
     pub remote_rtp: Option<SocketAddr>,
+    /// Media bridge installed on this leg by the `bridge_calls`
+    /// tool, if any. Serialized as the raw bridge number so an
+    /// agent can correlate the two legs of one bridge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bridge_id: Option<BridgeId>,
 }
 
 /// Shared control-plane state. Cheap to clone.
@@ -92,6 +97,7 @@ impl ControlState {
                                         ended_at: None,
                                         media_endpoint,
                                         remote_rtp,
+                                        bridge_id: None,
                                     },
                                 );
                             }
@@ -126,6 +132,29 @@ impl ControlState {
     #[must_use]
     pub fn get_call(&self, call_id: &str) -> Option<CallSnapshot> {
         self.calls.get(call_id).map(|e| e.value().clone())
+    }
+
+    /// Record (or clear, with `None`) the bridge installed on
+    /// `call_id`. Returns `false` when the call is unknown.
+    #[must_use]
+    pub fn set_bridge(&self, call_id: &str, bridge: Option<BridgeId>) -> bool {
+        match self.calls.get_mut(call_id) {
+            Some(mut entry) => {
+                entry.bridge_id = bridge;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Every call currently recorded as a leg of `bridge`.
+    #[must_use]
+    pub fn calls_on_bridge(&self, bridge: BridgeId) -> Vec<String> {
+        self.calls
+            .iter()
+            .filter(|e| e.value().bridge_id == Some(bridge))
+            .map(|e| e.key().clone())
+            .collect()
     }
 
     /// Remove terminated calls whose `ended_at` is older than `now - ttl_secs`.
@@ -208,6 +237,36 @@ mod tests {
             CallPhase::Terminated
         );
 
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bridge_bookkeeping_tracks_both_legs() {
+        let bus = EventBus::new(16);
+        let cancel = CancellationToken::new();
+        let (state, _task) = ControlState::spawn(&bus, cancel.clone());
+        sleep(Duration::from_millis(10)).await;
+        for id in ["a", "b"] {
+            bus.publish(Event::Sip(SipEvent::DialogCreated {
+                call_id: id.into(),
+                media_endpoint: None,
+                remote_rtp: None,
+            }))
+            .unwrap();
+        }
+        sleep(Duration::from_millis(20)).await;
+        assert!(!state.set_bridge("zzz", Some(BridgeId(1))));
+        assert!(state.set_bridge("a", Some(BridgeId(1))));
+        assert!(state.set_bridge("b", Some(BridgeId(1))));
+        let mut legs = state.calls_on_bridge(BridgeId(1));
+        legs.sort();
+        assert_eq!(legs, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(state.get_call("a").unwrap().bridge_id, Some(BridgeId(1)));
+        // The id is visible on the wire snapshot.
+        let v = serde_json::to_value(state.get_call("a").unwrap()).unwrap();
+        assert_eq!(v["bridge_id"], 1);
+        assert!(state.set_bridge("a", None));
+        assert_eq!(state.calls_on_bridge(BridgeId(1)), vec!["b".to_owned()]);
         cancel.cancel();
     }
 }

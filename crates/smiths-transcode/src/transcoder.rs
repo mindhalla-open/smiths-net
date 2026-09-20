@@ -1,19 +1,23 @@
 //! Per-call transcoder: two codec pipelines back-to-back.
 //!
-//! A [`CallTranscoder`] pairs a decoder for leg A's codec with an
-//! encoder for leg B's — the bridge calls [`Self::transcode_a_to_b`]
-//! on every RTP payload arriving from A, and the mirrored
-//! [`Self::transcode_b_to_a`] on payloads arriving from B. The
-//! internal PCM16 exchange format means the two sides can be any
-//! combination of `{Pcmu, Pcma, Opus}` without an explicit matrix.
+//! A [`CallTranscoder`] pairs leg A's codec with leg B's — callers
+//! run [`Self::transcode_a_to_b`] on every RTP payload arriving from
+//! A, and the mirrored [`Self::transcode_b_to_a`] on payloads arriving
+//! from B. The internal PCM16 exchange format means the two sides can
+//! be any combination of `{Pcmu, Pcma, Opus}` without an explicit
+//! matrix. It is the single-owner form of the pipeline (load tests,
+//! offline conversion); the live transcoded session in `smiths-media`
+//! instead gives each leg its own decoder and encoder so the two
+//! directions run on separate tasks without a shared lock.
 //!
 //! The struct holds:
 //! - An admission [`TranscodeLease`] (dropped automatically on BYE).
-//! - A metrics handle for CPU-ms accounting.
+//! - A [`CpuClock`] for CPU-ms accounting.
 //! - Two boxed codec instances (stateful — Opus keeps an internal
 //!   decoder FIFO that must not be shared between calls).
+//! - A PCM scratch buffer reused across frames.
 //!
-//! Timing is measured with `Instant::now()` bracketing each codec
+//! Timing is measured with `Instant::now` bracketing each codec
 //! call. The overhead of two clock reads is ~50 ns on modern x86; on
 //! a 20-ms cadence that's 0.00025 % of the frame budget, far below
 //! the measurement noise floor.
@@ -24,11 +28,54 @@ use crate::budget::TranscodeLease;
 use crate::codec::{Codec, CodecKind, TranscodeError};
 use crate::metrics::TranscodeMetrics;
 
+/// Per-codec CPU time accumulator that credits whole milliseconds to
+/// [`TranscodeMetrics::record_cpu`]. G.711 steps take microseconds,
+/// so per-step millisecond rounding would record nothing at all;
+/// accumulating in microseconds and flushing on each full
+/// millisecond keeps the counter honest.
+#[derive(Debug)]
+pub struct CpuClock {
+    metrics: std::sync::Arc<TranscodeMetrics>,
+    pending_us: [u64; CodecKind::ALL.len()],
+}
+
+impl CpuClock {
+    /// Accumulator reporting to `metrics`.
+    #[must_use]
+    pub fn new(metrics: std::sync::Arc<TranscodeMetrics>) -> Self {
+        Self {
+            metrics,
+            pending_us: [0; CodecKind::ALL.len()],
+        }
+    }
+
+    /// Credit the time between `start` and `end` to `codec`.
+    pub fn credit(&mut self, codec: CodecKind, start: Instant, end: Instant) {
+        let us =
+            u64::try_from(end.saturating_duration_since(start).as_micros()).unwrap_or(u64::MAX);
+        let slot = &mut self.pending_us[codec.index()];
+        *slot = slot.saturating_add(us);
+        if *slot >= 1_000 {
+            self.metrics.record_cpu(codec, *slot / 1_000);
+            *slot %= 1_000;
+        }
+    }
+
+    /// Time one codec step and credit it.
+    pub fn timed<T>(&mut self, codec: CodecKind, step: impl FnOnce() -> T) -> T {
+        let t0 = Instant::now();
+        let out = step();
+        self.credit(codec, t0, Instant::now());
+        out
+    }
+}
+
 /// Two-direction codec pipeline for a single call.
 pub struct CallTranscoder {
     a: Box<dyn Codec>,
     b: Box<dyn Codec>,
-    metrics: std::sync::Arc<TranscodeMetrics>,
+    clock: CpuClock,
+    pcm: Vec<i16>,
     _lease: TranscodeLease,
 }
 
@@ -48,7 +95,8 @@ impl CallTranscoder {
         Self {
             a: codec_a,
             b: codec_b,
-            metrics,
+            clock: CpuClock::new(metrics),
+            pcm: Vec::new(),
             _lease: lease,
         }
     }
@@ -73,13 +121,8 @@ impl CallTranscoder {
     /// should treat any error as a reason to tear the call down —
     /// a wedged codec won't self-heal on the next frame.
     pub fn transcode_a_to_b(&mut self, payload: &[u8]) -> Result<Vec<u8>, TranscodeError> {
-        let t0 = Instant::now();
-        let pcm = self.a.decode(payload)?;
-        let t1 = Instant::now();
-        let out = self.b.encode(&pcm)?;
-        let t2 = Instant::now();
-        self.metrics.record_cpu(self.a.kind(), ms_since(t0, t1));
-        self.metrics.record_cpu(self.b.kind(), ms_since(t1, t2));
+        let mut out = Vec::new();
+        self.transcode_a_to_b_into(payload, &mut out)?;
         Ok(out)
     }
 
@@ -89,23 +132,42 @@ impl CallTranscoder {
     /// # Errors
     /// As per [`transcode_a_to_b`](Self::transcode_a_to_b).
     pub fn transcode_b_to_a(&mut self, payload: &[u8]) -> Result<Vec<u8>, TranscodeError> {
-        let t0 = Instant::now();
-        let pcm = self.b.decode(payload)?;
-        let t1 = Instant::now();
-        let out = self.a.encode(&pcm)?;
-        let t2 = Instant::now();
-        self.metrics.record_cpu(self.b.kind(), ms_since(t0, t1));
-        self.metrics.record_cpu(self.a.kind(), ms_since(t1, t2));
+        let mut out = Vec::new();
+        self.transcode_b_to_a_into(payload, &mut out)?;
         Ok(out)
     }
-}
 
-fn ms_since(start: Instant, end: Instant) -> u64 {
-    // `as_millis` is `u128` — callsites only ever see sub-second
-    // intervals, so truncating is safe in practice.
-    #[allow(clippy::cast_possible_truncation)]
-    let ms = end.saturating_duration_since(start).as_millis() as u64;
-    ms
+    /// Buffer-reusing form of [`transcode_a_to_b`](Self::transcode_a_to_b).
+    ///
+    /// # Errors
+    /// As per [`transcode_a_to_b`](Self::transcode_a_to_b).
+    pub fn transcode_a_to_b_into(
+        &mut self,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), TranscodeError> {
+        let Self {
+            a, b, clock, pcm, ..
+        } = self;
+        clock.timed(a.kind(), || a.decode_into(payload, pcm))?;
+        clock.timed(b.kind(), || b.encode_into(pcm, out))
+    }
+
+    /// Buffer-reusing form of [`transcode_b_to_a`](Self::transcode_b_to_a).
+    ///
+    /// # Errors
+    /// As per [`transcode_a_to_b`](Self::transcode_a_to_b).
+    pub fn transcode_b_to_a_into(
+        &mut self,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), TranscodeError> {
+        let Self {
+            a, b, clock, pcm, ..
+        } = self;
+        clock.timed(b.kind(), || b.decode_into(payload, pcm))?;
+        clock.timed(a.kind(), || a.encode_into(pcm, out))
+    }
 }
 
 #[cfg(test)]
@@ -151,6 +213,33 @@ mod tests {
         assert_eq!(pcma.len(), pcmu_frame.len());
         let back = t.transcode_b_to_a(&pcma).unwrap();
         assert_eq!(back.len(), pcmu_frame.len());
+    }
+
+    #[test]
+    fn cpu_clock_flushes_whole_milliseconds() {
+        let m = metrics();
+        let mut clock = CpuClock::new(std::sync::Arc::clone(&m));
+        let t0 = Instant::now();
+        // 3 × 400 µs = 1.2 ms → one ms credited, 200 µs carried.
+        for _ in 0..3 {
+            clock.credit(
+                CodecKind::Pcmu,
+                t0,
+                t0 + std::time::Duration::from_micros(400),
+            );
+        }
+        assert_eq!(m.cpu_ms_for(CodecKind::Pcmu), 1);
+        clock.credit(
+            CodecKind::Pcmu,
+            t0,
+            t0 + std::time::Duration::from_micros(800),
+        );
+        assert_eq!(
+            m.cpu_ms_for(CodecKind::Pcmu),
+            2,
+            "carry-over reaches the next ms"
+        );
+        assert_eq!(m.cpu_ms_for(CodecKind::Pcma), 0);
     }
 
     #[test]

@@ -1,19 +1,31 @@
-//! Host-candidate gathering for the ICE MVP.
+//! Candidate gathering.
 //!
 //! "Host" candidates are the endpoint's **directly-bound** IP:port
-//! pairs — no STUN / TURN involved. For a typical deployment this
-//! covers LAN peers and any environment where the peer is reachable
-//! without NAT traversal. Server-reflexive and relay candidates land
-//! in later slices once `STUN` and `TURN` servers are wired in.
+//! pairs — no STUN / TURN involved; they cover LAN peers and any
+//! environment where the peer is reachable without NAT traversal.
+//! [`CandidateGatherer::gather_all`] adds server-reflexive
+//! candidates (one Binding round trip per configured STUN server)
+//! and a relay candidate (a TURN allocation) on top.
 //!
-//! The output is a `Vec<smiths_sdp::IceCandidate>` — one per bound
-//! address — ready to slot straight into the answer's `m=audio`
-//! block.
+//! Intended caller: the CLI's WebRTC signaling handler, when
+//! `webrtc.ice.stun_servers` is set, gathers on the media socket the
+//! fabric allocated and puts the result into the answer's
+//! `a=candidate` lines; the `smiths-sdp` negotiator alone only emits
+//! the host candidate.
+//!
+//! The output is a `Vec<smiths_sdp::IceCandidate>` — ready to slot
+//! straight into the answer's `m=audio` block and into
+//! [`crate::IceAgent::new`].
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
 
 use smiths_sdp::IceCandidate;
 use thiserror::Error;
+use tokio::net::UdpSocket;
+
+use crate::turn::{LongTermCredential, TurnClient};
 
 /// Errors raised by [`CandidateGatherer`].
 #[derive(Debug, Error)]
@@ -23,10 +35,19 @@ pub enum CandidateError {
     Io(String),
 }
 
-/// Fluent builder for host-candidate generation. Wraps nothing
-/// clever — it exists so callers can extend the bind list before
-/// calling [`Self::gather`], which is an entry point other slices
-/// can easily test.
+/// Result of [`CandidateGatherer::gather_all`].
+pub struct Gathered {
+    /// Host, then srflx, then relay candidates.
+    pub candidates: Vec<IceCandidate>,
+    /// The TURN allocation backing the relay candidate, when one was
+    /// obtained. Keep it alive (and refresh it) for as long as the
+    /// relay candidate may be used.
+    pub turn: Option<TurnClient>,
+}
+
+/// Fluent builder for candidate generation. Callers register the
+/// bound addresses and then call [`Self::gather`] (host only) or
+/// [`Self::gather_all`].
 #[derive(Clone, Debug, Default)]
 pub struct CandidateGatherer {
     /// `(address, port)` tuples to emit candidates for. The first
@@ -62,53 +83,58 @@ impl CandidateGatherer {
         Ok(out)
     }
 
-    /// Gather host, srflx, and relay candidates concurrently.
-    /// - `socket`: bound socket to gather from.
-    /// - `stun_servers`: list of STUN servers for srflx gathering.
-    /// - `turn_server`: optional TURN server + credentials for relay gathering.
+    /// Gather host, srflx and relay candidates.
+    ///
+    /// - `socket`: the bound media socket srflx / relay candidates
+    ///   are based on (its own address should be among the binds).
+    /// - `stun_servers`: queried concurrently with a 1 s budget each;
+    ///   every distinct observed address becomes an `srflx`
+    ///   candidate.
+    /// - `turn_server`: optional TURN server + credentials; a
+    ///   successful allocation becomes a `relay` candidate and the
+    ///   [`TurnClient`] is returned so the caller can refresh it and
+    ///   install permissions. Allocation failure is logged and
+    ///   skipped — the host candidates are still returned.
     pub async fn gather_all(
         &self,
-        socket: &tokio::net::UdpSocket,
+        socket: &Arc<UdpSocket>,
         stun_servers: &[SocketAddr],
-        turn_server: Option<(SocketAddr, crate::turn::LongTermCredential)>,
+        turn_server: Option<(SocketAddr, LongTermCredential)>,
         component: u8,
-    ) -> Result<Vec<IceCandidate>, CandidateError> {
-        let mut out = self.gather(component)?;
+    ) -> Result<Gathered, CandidateError> {
+        let mut candidates = self.gather(component)?;
         let local_addr = socket
             .local_addr()
             .map_err(|e| CandidateError::Io(e.to_string()))?;
 
-        // 1. Gather srflx candidates.
         if !stun_servers.is_empty() {
-            let srflx_addrs = crate::stun::gather_srflx_candidates(
-                socket,
-                stun_servers,
-                std::time::Duration::from_secs(1),
-            )
-            .await;
+            let srflx_addrs =
+                crate::stun::gather_srflx_candidates(socket, stun_servers, Duration::from_secs(1))
+                    .await;
             for (idx, addr) in srflx_addrs.into_iter().enumerate() {
-                out.push(make_srflx_candidate(addr, local_addr, component, idx));
+                candidates.push(make_srflx_candidate(addr, local_addr, component, idx));
             }
         }
 
-        // 2. Gather relay candidates.
+        let mut turn = None;
         if let Some((server, cred)) = turn_server {
-            match crate::turn::allocate_relay_addr(
-                socket,
-                server,
-                &cred,
-                std::time::Duration::from_secs(2),
-            )
-            .await
+            match TurnClient::allocate(Arc::clone(socket), server, cred, Duration::from_secs(2))
+                .await
             {
-                Ok(relay_addr) => {
-                    out.push(make_relay_candidate(relay_addr, local_addr, component, 0));
+                Ok(client) => {
+                    candidates.push(make_relay_candidate(
+                        client.relay_addr(),
+                        local_addr,
+                        component,
+                        0,
+                    ));
+                    turn = Some(client);
                 }
                 Err(e) => tracing::debug!(?e, "TURN allocation failed during gathering"),
             }
         }
 
-        Ok(out)
+        Ok(Gathered { candidates, turn })
     }
 }
 
@@ -253,6 +279,17 @@ mod tests {
         let rtp_pri = host_candidate_priority(&IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
         let control_pri = host_candidate_priority(&IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
         assert!(rtp_pri > control_pri);
+    }
+
+    #[test]
+    fn srflx_and_relay_rank_below_host() {
+        let base: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let host = make_host_candidate(base, 1, 0);
+        let srflx = make_srflx_candidate("203.0.113.9:6000".parse().unwrap(), base, 1, 0);
+        let relay = make_relay_candidate("198.51.100.2:7000".parse().unwrap(), base, 1, 0);
+        assert!(host.priority > srflx.priority && srflx.priority > relay.priority);
+        assert_eq!(srflx.related_address, Some(base.ip()));
+        assert_eq!(relay.related_port, Some(base.port()));
     }
 
     #[test]

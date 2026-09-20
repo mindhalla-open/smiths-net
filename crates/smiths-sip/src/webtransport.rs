@@ -1,4 +1,4 @@
-//! WebTransport signaling scaffold (slice 5.7 / P19).
+//! WebTransport signaling scaffold.
 //!
 //! Browsers that speak WebTransport can open a signaling session
 //! against the engine over HTTP/3 + QUIC datagrams without
@@ -7,10 +7,10 @@
 //! a later slice can drop in the QUIC runtime (`quinn` +
 //! `h3-webtransport`) and have a place to plug in.
 //!
-//! ## Shared with WebRTC-native (slice 5.10)
+//! ## Shared with WebRTC-native
 //!
 //! The same [`WtSignal`] JSON frame shape is reused by the
-//! WebRTC-native signaling adapter (slice 5.10 scaffold) — that
+//! WebRTC-native signaling adapter ( scaffold) — that
 //! adapter carries the frames over plain WebSocket, this one
 //! over WebTransport. Sharing the wire format means a browser
 //! demo built against one transport's listener lights up the
@@ -40,7 +40,7 @@
 //! - **Integration with the UAS.** Once the listener runs,
 //!   sessions need to install dialogs in the `DialogRecord` map so
 //!   `list_calls` / `end_call` / MCP observability work
-//!   identically to SIP. Piggy-backs on the slice 5.6 `DialogSessions`
+//!   identically to SIP. Piggy-backs on the  `DialogSessions`
 //!   substrate; the wiring is small but sits on the future-runtime
 //!   side of the seam.
 //! - **TLS / cert story.** Browsers accept WebTransport only over
@@ -63,7 +63,7 @@ use tracing::warn;
 
 /// Stable identifier for one WebTransport signaling session.
 ///
-/// Opaque u64 minted by the listener at `accept()` time. Distinct
+/// Opaque u64 minted by the listener at `accept` time. Distinct
 /// from `DialogKey` because one WebTransport session can carry
 /// multiple dialog lifecycles (re-INVITEs, multiple logical calls
 /// over one signaling channel); the future UAS wiring maps

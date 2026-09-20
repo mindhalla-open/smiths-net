@@ -17,7 +17,7 @@ use serde_json::Value;
 use smiths_core::Config;
 use smiths_core::ConfigReloader;
 use smiths_core::Metrics;
-use smiths_core::ai::AiRegistry;
+use smiths_core::ai::{AiDispatcher, AiRegistry};
 use smiths_core::call::{CallOriginator, RegistrationView};
 use smiths_core::media::MediaFabric;
 use smiths_core::storage::{CdrStore, RecordingStore, VectorStore};
@@ -26,6 +26,7 @@ use smiths_mixer::ConferenceRegistry;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+use crate::cluster::ClusterStatusSource;
 use crate::control::ControlState;
 
 /// Context passed to every tool invocation.
@@ -51,50 +52,57 @@ pub struct ToolContext {
     /// return a clean `NotFound` instead of panicking.
     pub originator: Option<Arc<dyn CallOriginator>>,
     /// Read-only view over the subscriber DB's live registrations
-    /// (slice 2.1). `None` when no backend is wired (e.g.
+    ///. `None` when no backend is wired (e.g.
     /// `[auth] backend = "none"`); `sip://registrations` returns an
     /// empty snapshot in that case rather than 404-ing.
     pub registrations: Option<Arc<dyn RegistrationView>>,
-    /// CDR store (slice 2.3). `None` when `[storage] backend =
+    /// CDR store. `None` when `[storage] backend =
     /// "none"`; `list_cdr` returns an empty page in that case.
     pub cdr: Option<Arc<dyn CdrStore>>,
     /// Engine-wide Prometheus metrics. `None` only in old test
-    /// fixtures; tools that observe histograms (the slice 3.3
-    /// pipeline tools) fall back to `Metrics::noop()` when absent
+    /// fixtures; tools that observe histograms (the
+    /// pipeline tools) fall back to `Metrics::noop` when absent
     /// so the observe call still goes somewhere reasonable.
     pub metrics: Option<Arc<Metrics>>,
-    /// Vector store (slice 3.4). `None` when `[storage.vector]
+    /// Vector store. `None` when `[storage.vector]
     /// backend = "none"`; `search_calls_semantic` returns a clean
     /// `NotFound` in that case.
     pub vector: Option<Arc<dyn VectorStore>>,
-    /// Recording store (slice 3.4). `None` when `[storage.recording]
+    /// Recording store. `None` when `[storage.recording]
     /// backend = "none"`; `transcribe_call` / `summarize_call` then
     /// require the `audio_base64` argument as before.
     pub recording: Option<Arc<dyn RecordingStore>>,
-    /// IVR prompt library (slice 4.2). `None` when the operator
+    /// IVR prompt library. `None` when the operator
     /// hasn't configured a root; `record_prompt` returns a clean
     /// `NotFound` in that case.
     pub prompts: Option<PromptLibrary>,
-    /// Conference registry (slice 5.5). `None` when no mixer fabric
+    /// Conference registry. `None` when no mixer fabric
     /// is wired; `create_conference` / `join_conference` /
     /// `leave_conference` return a clean `NotFound` in that case.
     pub conferences: Option<Arc<dyn ConferenceRegistry>>,
-    /// Shared Prometheus registry (slice 5.12). Wired by the CLI
+    /// Shared Prometheus registry. Wired by the CLI
     /// from the same `Arc<Mutex<Registry>>` the `/metrics`
     /// endpoint encodes from, so `list_metrics` / `get_metric`
     /// MCP tools can never disagree with a scrape. `None` in
     /// tests and in transport-free contexts.
     pub metrics_registry: Option<Arc<Mutex<Registry>>>,
-    /// Config hot-reload handle (slice 7.3). `None` in test contexts;
+    /// Config hot-reload handle. `None` in test contexts;
     /// `put_config` returns `NotFound` without it.
     pub reloader: Option<Arc<ConfigReloader>>,
-    /// Filesystem path the engine loaded its config from (slice 7.3).
+    /// Filesystem path the engine loaded its config from.
     /// Used by `put_config(persist=true)` to write back to the same file.
     pub config_path: Option<PathBuf>,
-    /// In-memory ring buffer of `put_config` calls (slice 7.3).
+    /// In-memory ring buffer of `put_config` calls.
     /// Shared between the `put_config` tool and the `config://history`
     /// resource.
     pub config_history: Option<crate::config_history::ConfigHistory>,
+    /// Live HA status provider backing `cluster://status`. `None`
+    /// makes the resource report `status: "unverified"`.
+    pub cluster_status: Option<Arc<dyn ClusterStatusSource>>,
+    /// AI dispatcher over `plugins`, built once so its per-provider
+    /// health / breaker state persists across tool calls instead of
+    /// being reset on every invocation.
+    pub dispatcher: Arc<AiDispatcher>,
 }
 
 impl ToolContext {
@@ -106,11 +114,13 @@ impl ToolContext {
         config: Arc<Config>,
         media: Arc<dyn MediaFabric>,
     ) -> Self {
+        let dispatcher = Arc::new(AiDispatcher::new(Arc::clone(&plugins)));
         Self {
             state,
             plugins,
             config,
             media,
+            dispatcher,
             originator: None,
             registrations: None,
             cdr: None,
@@ -123,7 +133,16 @@ impl ToolContext {
             reloader: None,
             config_path: None,
             config_history: None,
+            cluster_status: None,
         }
+    }
+
+    /// Attach a [`ClusterStatusSource`] so `cluster://status` reports
+    /// the live HA role and peer state instead of `unverified`.
+    #[must_use]
+    pub fn with_cluster_status(mut self, source: Arc<dyn ClusterStatusSource>) -> Self {
+        self.cluster_status = Some(source);
+        self
     }
 
     /// Attach a [`ConferenceRegistry`] so the conferencing MCP tools
@@ -168,10 +187,14 @@ impl ToolContext {
     }
 
     /// Attach the engine's metrics handle so pipeline tools can
-    /// observe their histograms. Without it they fall through to a
-    /// scratch `Metrics::noop()` so no code path panics.
+    /// observe their histograms and the shared AI dispatcher counts
+    /// invocations / fail-overs. Without it they fall through to a
+    /// scratch `Metrics::noop` so no code path panics.
     #[must_use]
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.dispatcher = Arc::new(
+            AiDispatcher::new(Arc::clone(&self.plugins)).with_metrics(Arc::clone(&metrics)),
+        );
         self.metrics = Some(metrics);
         self
     }
@@ -232,10 +255,14 @@ pub enum ToolError {
     /// The caller referenced something that doesn't exist (e.g. unknown call id).
     #[error("not found: {0}")]
     NotFound(String),
-    /// Caller doesn't have permission. Placeholder — hooked up once
-    /// auth lands.
+    /// The caller was denied: the shared rate limiter rejected the
+    /// call, or an adapter-level authorization check failed.
     #[error("forbidden: {0}")]
     Forbidden(String),
+    /// The referent exists but is in a state that rejects the
+    /// operation (e.g. bridging a call that carries no media).
+    #[error("conflict: {0}")]
+    Conflict(String),
     /// Unexpected internal failure.
     #[error("internal: {0}")]
     Internal(String),
@@ -254,8 +281,10 @@ pub trait Tool: Send + Sync {
     /// object. Empty schema = no arguments.
     fn input_schema(&self) -> Value;
 
-    /// Execute. Implementations should validate `args` against their
-    /// schema; the registry does not do that for them.
+    /// Execute. The dispatcher has already checked `args` against
+    /// [`Self::input_schema`] (required fields, primitive types,
+    /// enums); implementations still own semantic validation such as
+    /// ranges and cross-field rules.
     async fn call(&self, args: Value, ctx: &ToolContext) -> Result<Value, ToolError>;
 }
 
@@ -304,16 +333,27 @@ impl ToolRegistry {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    //! Tiny [`AiRegistry`] + [`MediaFabric`] doubles used by MCP
-    //! tests without dragging in the real plugin host.
+    //! Test doubles shared by the crate's unit tests: an empty
+    //! [`AiRegistry`], a static registry of canned providers, a
+    //! [`MediaFabric`] that errors on every operation, and one that
+    //! records every operation for assertions.
 
     use std::net::SocketAddr;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use async_trait::async_trait;
-    use smiths_core::Config;
-    use smiths_core::ai::{AiProvider, AiRegistry};
-    use smiths_core::media::{BridgeId, EndpointId, MediaEndpoint, MediaError, MediaFabric};
+    use serde_json::{Value, json};
+    use smiths_core::ai::{AiProvider, AiRegistry, CapabilityDescriptor, ProviderError};
+    use smiths_core::media::{
+        BridgeId, BridgeLeg, EndpointId, MediaEndpoint, MediaError, MediaFabric,
+    };
+    use smiths_core::{Config, Event, EventBus, SipEvent};
+    use tokio_util::sync::CancellationToken;
+
+    use super::ToolContext;
+    use crate::control::ControlState;
 
     /// Registry with no providers. Every lookup returns `None`.
     pub(crate) struct EmptyRegistry;
@@ -329,6 +369,85 @@ pub(crate) mod test_support {
         async fn shutdown_all(&self) {}
     }
 
+    /// Registry over a fixed provider list.
+    pub(crate) struct StaticRegistry(pub(crate) Vec<Arc<dyn AiProvider>>);
+
+    #[async_trait]
+    impl AiRegistry for StaticRegistry {
+        fn get(&self, name: &str) -> Option<Arc<dyn AiProvider>> {
+            self.0.iter().find(|p| p.name() == name).cloned()
+        }
+        fn snapshot(&self) -> Vec<Arc<dyn AiProvider>> {
+            self.0.clone()
+        }
+        async fn shutdown_all(&self) {}
+    }
+
+    /// Provider that answers every `invoke` with a canned value and
+    /// records the `(method, params)` pairs it saw.
+    pub(crate) struct FakeProvider {
+        name: String,
+        capabilities: Vec<CapabilityDescriptor>,
+        response: Value,
+        pub(crate) calls: Mutex<Vec<(String, Value)>>,
+    }
+
+    impl FakeProvider {
+        /// A provider named `name` advertising `capability` with the
+        /// given `extra` descriptor fields (voices, controls,...).
+        pub(crate) fn new(
+            name: &str,
+            capability: &str,
+            extra: &Value,
+            response: Value,
+        ) -> Arc<Self> {
+            let mut descriptor: CapabilityDescriptor = serde_json::from_value(json!({
+                "capability": capability,
+                "plugin": name,
+                "model_id": "fake",
+            }))
+            .expect("descriptor");
+            if let Some(obj) = extra.as_object() {
+                for (k, v) in obj {
+                    descriptor.extra.insert(k.clone(), v.clone());
+                }
+            }
+            Arc::new(Self {
+                name: name.to_owned(),
+                capabilities: vec![descriptor],
+                response,
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        pub(crate) fn last_call(&self) -> Option<(String, Value)> {
+            self.calls.lock().unwrap().last().cloned()
+        }
+    }
+
+    #[async_trait]
+    impl AiProvider for FakeProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn version(&self) -> &'static str {
+            "0.0.1"
+        }
+        fn description(&self) -> &'static str {
+            "fake provider"
+        }
+        fn abi(&self) -> &'static str {
+            "1.0"
+        }
+        fn capabilities(&self) -> &[CapabilityDescriptor] {
+            &self.capabilities
+        }
+        async fn invoke(&self, method: &str, params: Value) -> Result<Value, ProviderError> {
+            self.calls.lock().unwrap().push((method.to_owned(), params));
+            Ok(self.response.clone())
+        }
+    }
+
     /// `MediaFabric` that errors on every operation. Every test that
     /// exercises the signaling / tool surface but doesn't touch
     /// media passes this in.
@@ -342,11 +461,7 @@ pub(crate) mod test_support {
         ) -> Result<Arc<dyn MediaEndpoint>, MediaError> {
             Err(MediaError::PortExhausted("null fabric".into()))
         }
-        async fn bridge(
-            &self,
-            _: smiths_core::BridgeLeg,
-            _: smiths_core::BridgeLeg,
-        ) -> Result<BridgeId, MediaError> {
+        async fn bridge(&self, _: BridgeLeg, _: BridgeLeg) -> Result<BridgeId, MediaError> {
             Err(MediaError::PortExhausted("null fabric".into()))
         }
         async fn release_bridge(&self, _: BridgeId) {}
@@ -358,6 +473,68 @@ pub(crate) mod test_support {
             _: &[u8],
         ) -> Result<(), MediaError> {
             Err(MediaError::PortExhausted("null fabric".into()))
+        }
+    }
+
+    /// One packet the [`FakeFabric`] was asked to send.
+    #[derive(Clone, Debug)]
+    pub(crate) struct SentPacket {
+        pub(crate) src: EndpointId,
+        pub(crate) dest: SocketAddr,
+        pub(crate) bytes: Vec<u8>,
+    }
+
+    /// `MediaFabric` that records bridges, releases, and packets so
+    /// tests can assert on the media-plane side effects of a tool.
+    #[derive(Default)]
+    pub(crate) struct FakeFabric {
+        next_bridge: AtomicU64,
+        pub(crate) bridges: Mutex<Vec<(BridgeId, BridgeLeg, BridgeLeg)>>,
+        pub(crate) released: Mutex<Vec<BridgeId>>,
+        pub(crate) sent: Mutex<Vec<SentPacket>>,
+    }
+
+    impl FakeFabric {
+        pub(crate) fn sent(&self) -> Vec<SentPacket> {
+            self.sent.lock().unwrap().clone()
+        }
+        pub(crate) fn released(&self) -> Vec<BridgeId> {
+            self.released.lock().unwrap().clone()
+        }
+        pub(crate) fn bridges(&self) -> Vec<(BridgeId, BridgeLeg, BridgeLeg)> {
+            self.bridges.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl MediaFabric for FakeFabric {
+        async fn allocate(
+            &self,
+            _: std::net::IpAddr,
+        ) -> Result<Arc<dyn MediaEndpoint>, MediaError> {
+            Err(MediaError::PortExhausted("fake fabric".into()))
+        }
+        async fn bridge(&self, a: BridgeLeg, b: BridgeLeg) -> Result<BridgeId, MediaError> {
+            let id = BridgeId(self.next_bridge.fetch_add(1, Ordering::Relaxed) + 100);
+            self.bridges.lock().unwrap().push((id, a, b));
+            Ok(id)
+        }
+        async fn release_bridge(&self, id: BridgeId) {
+            self.released.lock().unwrap().push(id);
+        }
+        async fn release_endpoint(&self, _: EndpointId) {}
+        async fn send_packet(
+            &self,
+            src: EndpointId,
+            dest: SocketAddr,
+            bytes: &[u8],
+        ) -> Result<(), MediaError> {
+            self.sent.lock().unwrap().push(SentPacket {
+                src,
+                dest,
+                bytes: bytes.to_vec(),
+            });
+            Ok(())
         }
     }
 
@@ -375,5 +552,92 @@ pub(crate) mod test_support {
     /// don't exercise media.
     pub(crate) fn null_media() -> Arc<dyn MediaFabric> {
         Arc::new(NullMedia)
+    }
+
+    /// Everything a tool test needs: a context whose state drains
+    /// `bus`, plus the cancel token that stops the drain task.
+    pub(crate) struct TestEngine {
+        pub(crate) ctx: ToolContext,
+        pub(crate) bus: EventBus,
+        pub(crate) fabric: Arc<FakeFabric>,
+        pub(crate) cancel: CancellationToken,
+    }
+
+    impl TestEngine {
+        /// Context over an empty AI registry and a recording fabric.
+        pub(crate) fn new() -> Self {
+            Self::with_registry(empty_registry())
+        }
+
+        /// Context over `registry` and a recording fabric.
+        pub(crate) fn with_registry(registry: Arc<dyn AiRegistry>) -> Self {
+            let bus = EventBus::new(32);
+            let cancel = CancellationToken::new();
+            let (state, _task) = ControlState::spawn(&bus, cancel.clone());
+            let fabric = Arc::new(FakeFabric::default());
+            let media: Arc<dyn MediaFabric> = Arc::clone(&fabric) as Arc<dyn MediaFabric>;
+            let ctx = ToolContext::new(state, registry, default_config(), media);
+            Self {
+                ctx,
+                bus,
+                fabric,
+                cancel,
+            }
+        }
+
+        /// Publish `DialogCreated` for `call_id` with an optional
+        /// media leg and wait for the control state to absorb it.
+        pub(crate) async fn dialog_created(
+            &self,
+            call_id: &str,
+            leg: Option<(EndpointId, SocketAddr)>,
+        ) {
+            self.bus
+                .publish(Event::Sip(SipEvent::DialogCreated {
+                    call_id: call_id.to_owned(),
+                    media_endpoint: leg.map(|l| l.0),
+                    remote_rtp: leg.map(|l| l.1),
+                }))
+                .expect("bus has a subscriber");
+            self.wait_for_call(call_id).await;
+        }
+
+        /// Publish `DialogTerminated` for `call_id` and wait for it
+        /// to land.
+        pub(crate) async fn dialog_terminated(&self, call_id: &str) {
+            self.bus
+                .publish(Event::Sip(SipEvent::DialogTerminated {
+                    call_id: call_id.to_owned(),
+                }))
+                .expect("bus has a subscriber");
+            for _ in 0..100 {
+                if self
+                    .ctx
+                    .state
+                    .get_call(call_id)
+                    .is_some_and(|c| c.ended_at.is_some())
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("dialog {call_id} never terminated in control state");
+        }
+
+        async fn wait_for_call(&self, call_id: &str) {
+            for _ in 0..100 {
+                if self.ctx.state.get_call(call_id).is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("dialog {call_id} never reached control state");
+        }
+    }
+
+    impl Drop for TestEngine {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+        }
     }
 }

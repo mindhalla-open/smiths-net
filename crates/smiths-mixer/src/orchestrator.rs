@@ -1,6 +1,6 @@
 //! Concrete [`ConferenceOrchestrator`] that builds a
 //! [`ConferenceParticipantSession`] when the UAS's MCP layer
-//! joins a live dialog into a conference (slice 5.6e-runtime).
+//! joins a live dialog into a conference.
 //!
 //! Pairs with the trait seam defined in `smiths-sip::uas`. The
 //! MCP `join_conference` tool's future wiring looks up the
@@ -242,7 +242,7 @@ mod tests {
 
         assert_eq!(conf.stats().await.participants, 1);
         session.stop().await;
-        // `stop()` drops the participant from the conference.
+        // `stop` drops the participant from the conference.
         assert_eq!(conf.stats().await.participants, 0);
         conf.shutdown().await;
     }

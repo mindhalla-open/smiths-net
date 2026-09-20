@@ -139,7 +139,7 @@ pub enum SipEvent {
         detail: String,
     },
     /// DTMF keypress detected on a call leg (RFC 4733 telephone-event
-    /// path, slice 2.4 / P7). `duration_ms` is derived from the RTP
+    /// path, ). `duration_ms` is derived from the RTP
     /// timestamp delta of the retransmit stream.
     Dtmf {
         /// `Call-ID` of the dialog the press belongs to. `None` on
@@ -150,7 +150,7 @@ pub enum SipEvent {
         /// Keypress details — digit, duration, leg.
         keypress: crate::dtmf::DtmfKeypress,
     },
-    /// WebTransport signaling frame arrived / left (slice 5.7 /
+    /// WebTransport signaling frame arrived / left ( /
     /// P19). Stringly-typed on the bus so subscribers that don't
     /// link `smiths-sip` (testkit, MCP observability) don't pull
     /// in `WtSignal` just to render an event feed. Rich views —

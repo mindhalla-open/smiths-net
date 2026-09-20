@@ -1,20 +1,18 @@
-//! Lightweight throughput / latency bench for SIP-over-TCP under
-//! simulated loss (slice 4.3 / P17 / Small 1). Runs two synthetic
-//! SIP OPTIONS round trips in a loop and prints p50 / p95 / mean
-//! latency. Baseline for the future QUIC comparison — same
-//! test harness will stand up a quinn listener and rerun the
-//! loop once the `sip-quic` runtime lands.
+//! Lightweight latency bench for SIP-over-TCP on loopback. Runs a
+//! synthetic SIP OPTIONS round trip through `TcpTransport` in a loop
+//! and prints p50 / p95 / mean latency — a clean-path baseline for
+//! comparing other stream transports (QUIC) with the same harness.
 //!
-//! Loss is simulated at the proxy by dropping an adjustable
-//! fraction of outbound datagrams (half-connection, client →
-//! server). TCP's retransmit loop masks the drops so the SIP
-//! layer just sees inflated latency — exactly the head-of-line-
-//! blocking pattern QUIC is meant to flatten.
+//! No packet loss is injected: the peer is a plain in-process TCP
+//! echo listener on the loopback interface, so the numbers measure
+//! framing, channel hops and scheduling overhead only. Loss and
+//! reordering can only be simulated below the socket layer (a
+//! kernel `netem` / `dummynet` rule), which is out of scope for an
+//! in-process test.
 //!
-//! `#[ignore]` by default so CI doesn't pay the cost of spinning
-//! up N listeners per run. Run with `cargo test -p smiths-sip
-//! --test tcp_loss_bench -- --ignored --nocapture` to see
-//! numbers on your host.
+//! `#[ignore]` by default so CI doesn't pay the cost. Run with
+//! `cargo test -p smiths-sip --test tcp_loss_bench -- --ignored
+//! --nocapture` to see numbers on your host.
 
 #![allow(clippy::print_stdout)] // bench prints to stdout on purpose
 
@@ -126,7 +124,7 @@ async fn sip_tcp_options_round_trip_latency_baseline() {
         mean
     );
     // Sanity ceiling — localhost loopback should never exceed 50 ms
-    // per RT. Gives the QUIC baseline test a template to fit inside.
+    // per round trip.
     assert!(p95 < Duration::from_millis(50), "p95 too high: {p95:?}");
 
     cancel.cancel();

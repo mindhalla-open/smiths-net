@@ -1,8 +1,5 @@
 //! Prometheus metrics for the transcoding subsystem.
 //!
-//! Two metrics ship today (slice 5.3's acceptance bar is "operators
-//! can see the CPU envelope"):
-//!
 //! - `smiths_transcode_active` — gauge of currently-live
 //!   transcoders. Ticks up on [`CpuBudget::try_admit`](crate::CpuBudget::try_admit)
 //!   success, ticks down when the returned lease is dropped. Mirrors
@@ -11,12 +8,17 @@
 //!
 //! - `smiths_transcode_cpu_ms_total` — cumulative CPU ms spent in
 //!   encode+decode across every transcoder, keyed by codec kind. The
-//!   bridge records `Duration` from an internal `Instant` each time it
-//!   runs a transcode step; this counter lets operators graph cost
+//!   session records `Duration` from an internal `Instant` each time
+//!   it runs a codec step; this counter lets operators graph cost
 //!   per-codec and alert when the dispatcher's estimate drifts from
-//!   reality.
+//!   reality. The per-kind counter handles are resolved once at
+//!   registration so recording on the per-packet path is a single
+//!   atomic add, not a label lookup.
 //!
-//! Both are registered on the same `Registry` the engine uses for
+//! - `smiths_transcode_admissions_refused_total` — INVITEs refused
+//!   because the budget was full.
+//!
+//! All are registered on the same `Registry` the engine uses for
 //! every other metric (scraped by the health HTTP server), so no
 //! separate `/transcode-metrics` endpoint — operators see everything
 //! at one `GET /metrics`.
@@ -60,6 +62,8 @@ pub struct TranscodeMetrics {
     /// a non-zero slope means operators need to raise
     /// `max_concurrent_calls` or add more worker cores.
     pub admissions_refused: Counter,
+    /// `cpu_ms` counter handles indexed by [`CodecKind::index`].
+    cpu_ms_by_kind: [Counter; CodecKind::ALL.len()],
 }
 
 impl TranscodeMetrics {
@@ -87,10 +91,19 @@ impl TranscodeMetrics {
             admissions_refused.clone(),
         );
 
+        let cpu_ms_by_kind = CodecKind::ALL.map(|kind| {
+            cpu_ms
+                .get_or_create(&CodecLabel {
+                    codec: kind.as_str().to_owned(),
+                })
+                .clone()
+        });
+
         Arc::new(Self {
             active,
             cpu_ms,
             admissions_refused,
+            cpu_ms_by_kind,
         })
     }
 
@@ -104,13 +117,15 @@ impl TranscodeMetrics {
     }
 
     /// Credit `ms` milliseconds of CPU to the given codec. Called from
-    /// the bridge after each encode or decode step.
+    /// the transcoded session after each encode or decode step.
     pub fn record_cpu(&self, codec: CodecKind, ms: u64) {
-        self.cpu_ms
-            .get_or_create(&CodecLabel {
-                codec: codec.as_str().to_owned(),
-            })
-            .inc_by(ms);
+        self.cpu_ms_by_kind[codec.index()].inc_by(ms);
+    }
+
+    /// Current `cpu_ms` total for one codec.
+    #[must_use]
+    pub fn cpu_ms_for(&self, codec: CodecKind) -> u64 {
+        self.cpu_ms_by_kind[codec.index()].get()
     }
 }
 
@@ -135,5 +150,8 @@ mod tests {
         assert!(out.contains("pcmu"));
         assert!(out.contains("opus"));
         assert!(out.contains("smiths_transcode_admissions_refused_total 1"));
+        assert_eq!(m.cpu_ms_for(CodecKind::Pcmu), 3);
+        assert_eq!(m.cpu_ms_for(CodecKind::Opus), 17);
+        assert_eq!(m.cpu_ms_for(CodecKind::Pcma), 0);
     }
 }

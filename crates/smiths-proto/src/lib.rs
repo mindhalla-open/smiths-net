@@ -29,14 +29,13 @@
 //! v1 is frozen. New fields may be added with fresh tag numbers.
 //! Existing tags never change meaning.
 
-// `no_std` survives only when the flatbuffers feature is off;
-// the `flatbuffers` crate pulls `std`. Plugin authors who need a
-// `no_std` build stay on the default-features-off compile
+// `no_std` survives only when the `fixed-frame` feature is off:
+// that module uses `std::str` / `std::error::Error`. Plugin authors
+// who need a `no_std` build compile with default features off
 // (`smiths-proto = { version = ..., default-features = false }`).
-#![cfg_attr(not(feature = "flatbuffers"), no_std)]
-// Slice 1.7: match smiths-core / smiths-sdp. Every public wire
-// type carries a doc line so downstream plugin authors can read
-// the generated types without the .proto source.
+#![cfg_attr(not(feature = "fixed-frame"), no_std)]
+// Every public wire type carries a doc line so downstream plugin
+// authors can read the types without a.proto source.
 #![warn(missing_docs)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -48,8 +47,8 @@ use alloc::vec::Vec;
 
 use prost::Message;
 
-#[cfg(feature = "flatbuffers")]
-pub mod flatbuffers_io;
+#[cfg(feature = "fixed-frame")]
+pub mod fixed_frame;
 
 /// Envelope carrying exactly one of request / response / notification.
 /// A single optional `kind` field on the wire. Extra `oneof` members
@@ -147,13 +146,13 @@ pub fn decode<M: Message + Default>(bytes: &[u8]) -> Result<M, prost::DecodeErro
 }
 
 // ---------------------------------------------------------------------
-// Slice 5.2 / P18 — pluggable wire format
+// Pluggable wire format
 // ---------------------------------------------------------------------
 
 /// Per-packet RTP frame the engine hands to a streaming-RTP plugin
-/// (the target of the `media.streaming_rtp` capability, slice 2.5).
-/// Roughly 50 frames/sec/leg at 20 ms packetization — the hot path
-/// the wire-format trait exists to optimise.
+/// (the target of the `media.streaming_rtp` capability). Roughly 50
+/// frames/sec/leg at 20 ms packetization — the hot path the
+/// wire-format trait exists to optimise.
 #[derive(Clone, PartialEq, Message)]
 pub struct RtpFrame {
     /// Call-ID the frame belongs to. Kept so a plugin receiving
@@ -183,40 +182,38 @@ pub struct RtpFrame {
     pub payload: Vec<u8>,
 }
 
-/// Wire format identifier. Appears on the plugin manifest as
-/// `wire_format = "proto" | "flatbuffers"` and is the dimension
-/// the [`WireFormat`] trait selects over.
+/// Wire format identifier — the dimension the [`WireFormat`] trait
+/// selects over.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum WireFormatKind {
-    /// Protobuf (prost). The pre-5.2 default; every plugin that
-    /// omits the manifest field ends up here.
+    /// Protobuf (prost). The default.
     #[default]
     Proto,
-    /// Flat zero-copy layout (slice 5.2 / P18). Requires the
-    /// `flatbuffers` Cargo feature on the reader side.
-    Flatbuffers,
+    /// Fixed-offset zero-copy layout ([`fixed_frame`]). Requires the
+    /// `fixed-frame` Cargo feature on the reader side.
+    FixedFrame,
 }
 
 impl WireFormatKind {
-    /// Parse a manifest token case-insensitively. Unknown tokens
-    /// return `None` so the plugin loader can surface a targeted
-    /// error rather than silently falling back to a default.
+    /// Parse a token case-insensitively. Unknown tokens return
+    /// `None` so a caller can surface a targeted error rather than
+    /// silently falling back to a default.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         let lower = s.to_ascii_lowercase();
         match lower.as_str() {
             "proto" | "protobuf" | "prost" => Some(Self::Proto),
-            "flatbuffers" | "flatbuf" | "fbs" => Some(Self::Flatbuffers),
+            "fixed-frame" | "fixed_frame" | "fixed" => Some(Self::FixedFrame),
             _ => None,
         }
     }
 
-    /// Wire-format token emitted on round-trip serialization.
+    /// Token emitted on round-trip serialization.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Proto => "proto",
-            Self::Flatbuffers => "flatbuffers",
+            Self::FixedFrame => "fixed-frame",
         }
     }
 }
@@ -238,18 +235,18 @@ impl core::fmt::Display for WireFormatError {
     }
 }
 
-#[cfg(feature = "flatbuffers")]
+#[cfg(feature = "fixed-frame")]
 impl std::error::Error for WireFormatError {}
 
 /// Encoder / decoder pair for the plugin wire. The trait exists so
-/// the engine can pick between `proto` (today's default, schema-
-/// evolution-friendly) and `flatbuffers` (zero-copy reads, ≥2×
-/// throughput on the `RtpFrame` hot path) per plugin without the
-/// caller caring which is which.
+/// a transport can pick between `proto` (the default, schema-
+/// evolution-friendly) and `fixed-frame` (zero-copy reads on the
+/// `RtpFrame` hot path) without the caller caring which is which.
 ///
 /// Both impls are symmetric — an `Envelope` or `RtpFrame` encoded
-/// with one can only be decoded with the same impl. The plugin
-/// manifest's `wire_format` field is the coordination point.
+/// with one can only be decoded with the same impl. Neither is
+/// selected by any plugin manifest today; the engine's transports
+/// use JSON-RPC (sidecars) and the `invoke` ABI (WASM).
 pub trait WireFormat {
     /// Which format this impl implements.
     fn kind(&self) -> WireFormatKind;
@@ -273,8 +270,7 @@ pub trait WireFormat {
 }
 
 /// Protobuf wire format — uses the prost derives already on
-/// [`Envelope`] and [`RtpFrame`]. Pre-5.2 default; every plugin
-/// that omits `wire_format` in its manifest ends up here.
+/// [`Envelope`] and [`RtpFrame`]. The default.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProtoWireFormat;
 
@@ -300,8 +296,8 @@ impl WireFormat for ProtoWireFormat {
     }
 }
 
-#[cfg(feature = "flatbuffers")]
-pub use flatbuffers_io::FlatbuffersWireFormat;
+#[cfg(feature = "fixed-frame")]
+pub use fixed_frame::FixedFrameWireFormat;
 
 #[cfg(test)]
 mod tests {

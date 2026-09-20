@@ -26,6 +26,7 @@ pub fn outcome_label(result: &Result<Value, ToolError>) -> &'static str {
         Err(ToolError::InvalidArguments(_)) => "invalid_arguments",
         Err(ToolError::NotFound(_)) => "not_found",
         Err(ToolError::Forbidden(_)) => "forbidden",
+        Err(ToolError::Conflict(_)) => "conflict",
         Err(ToolError::Internal(_)) => "internal",
     }
 }
@@ -94,6 +95,10 @@ mod tests {
         assert_eq!(
             outcome_label(&Err(ToolError::Forbidden("x".into()))),
             "forbidden"
+        );
+        assert_eq!(
+            outcome_label(&Err(ToolError::Conflict("x".into()))),
+            "conflict"
         );
         assert_eq!(
             outcome_label(&Err(ToolError::Internal("x".into()))),

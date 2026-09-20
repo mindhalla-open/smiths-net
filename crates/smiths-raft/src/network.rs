@@ -1,4 +1,4 @@
-//! TCP-based Raft network transport (slice 6.3b).
+//! TCP-based Raft network transport.
 //!
 //! Each Raft RPC (`AppendEntries`, `InstallSnapshot`, `Vote`) is sent as a
 //! JSON-lines message over a fresh TCP connection. This is intentionally

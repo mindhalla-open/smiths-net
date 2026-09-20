@@ -1,8 +1,8 @@
-//! Error-rate probe (slice 5.9-followup).
+//! Error-rate probe.
 //!
 //! Runs alongside the canary deadline: while a pending
 //! [`crate::ConfigReloader`] apply is in flight, this task samples
-//! `plugin_invocations_total{outcome}` and `sip_parse_errors_total`
+//! `smiths_plugin_invocations_total{outcome}` and `smiths_sip_parse_errors_total`
 //! every second, maintains a 30-second trailing window, and trips
 //! the first time either metric crosses its configured ceiling.
 //! Tripping calls
@@ -59,7 +59,7 @@ pub const TICK: Duration = Duration::from_secs(1);
 
 /// Ceiling thresholds the probe checks each tick. Matches
 /// [`crate::config::CanaryConfig`] one-for-one; the CLI's
-/// `CanaryConfig::into()` copies the block in without
+/// `CanaryConfig::into` copies the block in without
 /// translation.
 #[derive(Clone, Copy, Debug)]
 pub struct ProbeConfig {

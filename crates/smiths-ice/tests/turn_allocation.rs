@@ -364,3 +364,260 @@ async fn full_turn_flow_relay_then_channel_bind_then_data_echo() {
     cancel.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(2), server_handle).await;
 }
+
+// ---------------------------------------------------------------------
+// Expiry, error classes and the TurnClient round trip
+// ---------------------------------------------------------------------
+
+use smiths_ice::turn::{METHOD_REFRESH, Relayed};
+use smiths_ice::{TurnClient, TurnClientError};
+
+/// Boot a server on an ephemeral loopback port with the given
+/// allocation lifetime; returns `(server_addr, credential, cancel,
+/// metrics)`.
+async fn boot_server(
+    lifetime: Duration,
+) -> (
+    SocketAddr,
+    LongTermCredential,
+    CancellationToken,
+    Arc<Metrics>,
+    Arc<TurnServer>,
+) {
+    let metrics = {
+        let mut scratch = prometheus_client::registry::Registry::default();
+        Metrics::register(&mut scratch)
+    };
+    let cred = LongTermCredential::new("alice", "smiths-turn", "open-sesame");
+    let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = probe.local_addr().unwrap();
+    drop(probe);
+    let cfg = TurnServerConfig {
+        bind: server_addr,
+        realm: "smiths-turn".into(),
+        relay_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        allocation_lifetime: lifetime,
+        credentials: vec![cred.clone()],
+    };
+    let cancel = CancellationToken::new();
+    let server = Arc::new(TurnServer::new(cfg).with_metrics(Arc::clone(&metrics)));
+    let server_run = Arc::clone(&server);
+    let cancel_task = cancel.clone();
+    tokio::spawn(async move { server_run.run(cancel_task).await });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    (server_addr, cred, cancel, metrics, server)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn error_replies_use_the_request_method_class() {
+    let (server_addr, _cred, cancel, _metrics, _server) =
+        boot_server(Duration::from_secs(60)).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.connect(server_addr).await.unwrap();
+    let mut buf = vec![0u8; 2048];
+
+    // Refresh without an allocation: the server has to challenge
+    // first (no MESSAGE-INTEGRITY) — and the challenge is typed as a
+    // Refresh error response (0x0114), not an Allocate one.
+    let msg = stun_request(
+        METHOD_REFRESH,
+        [7u8; 12],
+        &[(ATTR_LIFETIME, vec![0, 0, 0, 30])],
+    );
+    client.send(&msg).await.unwrap();
+    let n = timeout(Duration::from_secs(2), client.recv(&mut buf))
+        .await
+        .expect("refresh reply timed out")
+        .unwrap();
+    let ty = u16::from_be_bytes([buf[0], buf[1]]);
+    assert_eq!(ty, 0x0114, "error response must carry the Refresh method");
+    assert_eq!(&buf[8..20], &[7u8; 12], "transaction id echoed");
+
+    // CreatePermission likewise → 0x0118.
+    let msg = stun_request(METHOD_CREATE_PERMISSION, [8u8; 12], &[]);
+    client.send(&msg).await.unwrap();
+    let n2 = timeout(Duration::from_secs(2), client.recv(&mut buf))
+        .await
+        .expect("create-permission reply timed out")
+        .unwrap();
+    let ty = u16::from_be_bytes([buf[0], buf[1]]);
+    assert_eq!(
+        ty, 0x0118,
+        "error response must carry the CreatePermission method"
+    );
+    let _ = (n, n2);
+
+    // A nonce the server never issued → 438 Stale Nonce with a fresh one.
+    let mut msg = stun_request(
+        METHOD_ALLOCATE,
+        [9u8; 12],
+        &[
+            (ATTR_REQUESTED_TRANSPORT, vec![17, 0, 0, 0]),
+            (ATTR_USERNAME, b"alice".to_vec()),
+            (ATTR_REALM, b"smiths-turn".to_vec()),
+            (ATTR_NONCE, b"made-up-nonce".to_vec()),
+        ],
+    );
+    add_message_integrity(
+        &mut msg,
+        &LongTermCredential::new("alice", "smiths-turn", "open-sesame").long_term_key,
+    );
+    client.send(&msg).await.unwrap();
+    let n = timeout(Duration::from_secs(2), client.recv(&mut buf))
+        .await
+        .expect("stale-nonce reply timed out")
+        .unwrap();
+    let body_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let body = &buf[20..20 + body_len];
+    let err = find_attr(body, 0x0009).expect("ERROR-CODE");
+    assert_eq!((err[2], err[3]), (4, 38), "438 Stale Nonce");
+    assert!(find_attr(body, ATTR_NONCE).is_some(), "fresh nonce offered");
+    let _ = n;
+
+    cancel.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_allocation_is_refused_and_reaped() {
+    let (server_addr, cred, cancel, metrics, server) = boot_server(Duration::from_secs(1)).await;
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let mut client = TurnClient::allocate(
+        Arc::clone(&socket),
+        server_addr,
+        cred,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("allocate");
+    assert_eq!(
+        client.lifetime(),
+        Duration::from_secs(1),
+        "capped by the server"
+    );
+    assert_eq!(server.active_allocations().await, 1);
+    assert_eq!(metrics.turn_active_allocations.get(), 1);
+
+    // Past the lifetime the allocation is gone on access...
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    match client.create_permission(&[peer]).await {
+        Err(TurnClientError::ErrorResponse { code: 437, .. }) => {}
+        other => panic!("expected 437 Allocation Mismatch, got {other:?}"),
+    }
+    assert_eq!(server.active_allocations().await, 0);
+    // ...and the sweep releases it (gauge back to zero).
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(metrics.turn_active_allocations.get(), 0);
+
+    // A fresh Allocate on the same five-tuple succeeds again.
+    let client2 = TurnClient::allocate(
+        socket,
+        server_addr,
+        LongTermCredential::new("alice", "smiths-turn", "open-sesame"),
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("re-allocate after expiry");
+    assert_ne!(client2.relay_addr().port(), 0);
+    cancel.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_refresh_permission_channel_round_trip() {
+    let (server_addr, cred, cancel, metrics, _server) = boot_server(Duration::from_secs(120)).await;
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let mut client = TurnClient::allocate(
+        Arc::clone(&socket),
+        server_addr,
+        cred,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("allocate");
+    assert_eq!(client.relay_addr().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_eq!(client.lifetime(), Duration::from_secs(120));
+
+    // Refresh trims the lifetime to what we ask for.
+    let granted = client
+        .refresh(Duration::from_secs(30))
+        .await
+        .expect("refresh");
+    assert_eq!(granted, Duration::from_secs(30));
+
+    // Peer on its own socket.
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let mut peer_buf = vec![0u8; 2048];
+
+    // Without a permission the relay drops our data.
+    client.send_indication(peer_addr, b"dropped").await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(200), peer.recv_from(&mut peer_buf))
+            .await
+            .is_err(),
+        "no permission → nothing relayed"
+    );
+
+    client
+        .create_permission(&[peer_addr])
+        .await
+        .expect("permission");
+    client
+        .send_indication(peer_addr, b"hello via relay")
+        .await
+        .unwrap();
+    let (n, from) = timeout(Duration::from_secs(2), peer.recv_from(&mut peer_buf))
+        .await
+        .expect("peer never got the relayed data")
+        .unwrap();
+    assert_eq!(&peer_buf[..n], b"hello via relay");
+    assert_eq!(from, client.relay_addr());
+
+    // Peer → relay → client arrives as a Data indication.
+    peer.send_to(b"pong", client.relay_addr()).await.unwrap();
+    assert_eq!(
+        client.recv().await.expect("data indication"),
+        Relayed::Data {
+            peer: peer_addr,
+            data: b"pong".to_vec()
+        }
+    );
+
+    // Channel binding switches both directions to ChannelData.
+    client
+        .channel_bind(0x4000, peer_addr)
+        .await
+        .expect("channel bind");
+    client.send_channel(0x4000, b"fast path").await.unwrap();
+    let (n, _) = timeout(Duration::from_secs(2), peer.recv_from(&mut peer_buf))
+        .await
+        .expect("peer never got the channel data")
+        .unwrap();
+    assert_eq!(&peer_buf[..n], b"fast path");
+    peer.send_to(b"fast reply", client.relay_addr())
+        .await
+        .unwrap();
+    assert_eq!(
+        client.recv().await.expect("channel data"),
+        Relayed::Channel {
+            channel: 0x4000,
+            data: b"fast reply".to_vec()
+        }
+    );
+    // Rebinding the channel to another peer is refused.
+    let other: SocketAddr = "127.0.0.1:65000".parse().unwrap();
+    match client.channel_bind(0x4000, other).await {
+        Err(TurnClientError::ErrorResponse { code: 400, .. }) => {}
+        other => panic!("expected 400 on conflicting ChannelBind, got {other:?}"),
+    }
+
+    // Releasing with lifetime 0 tears the allocation down.
+    let granted = client.refresh(Duration::ZERO).await.expect("release");
+    assert_eq!(granted, Duration::ZERO);
+    assert_eq!(metrics.turn_active_allocations.get(), 0);
+    match client.create_permission(&[peer_addr]).await {
+        Err(TurnClientError::ErrorResponse { code: 437, .. }) => {}
+        other => panic!("expected 437 after release, got {other:?}"),
+    }
+    cancel.cancel();
+}

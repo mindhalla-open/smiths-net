@@ -1,1 +1,0 @@
-/Users/shkabenkov/Documents/coding/own/mindhalla/smiths-net/plugins/cookbook/wasm/rust/call-control/target/wasm32-unknown-unknown/release/call_control.wasm: /Users/shkabenkov/Documents/coding/own/mindhalla/smiths-net/plugins/cookbook/wasm/rust/call-control/src/lib.rs

@@ -87,7 +87,7 @@ where
 
     // Build and arm the watcher synchronously before returning — if we
     // did this inside the spawned task, there'd be a window where the
-    // caller could mutate `root` before `watcher.watch()` ran, and
+    // caller could mutate `root` before `watcher.watch` ran, and
     // `PollWatcher` would bake those changes into its initial snapshot
     // and never emit an event for them. Flaked the hot-reload test
     // under CI load.
@@ -120,7 +120,7 @@ where
                 debug!(dir = %root.display(), "plugin watcher: dir missing, idle");
                 // Keep the watcher around anyway so tests / callers
                 // observe consistent behaviour; we just never call
-                // `watch()` on it, so no events are produced.
+                // `watch` on it, so no events are produced.
                 Some(w)
             }
         }
@@ -199,13 +199,35 @@ fn is_reload_worthy(event: &Event) -> bool {
     )
 }
 
-/// Map a changed file path back to its plugin name. A plugin
-/// directory is a direct child of `root`; the plugin name is the
-/// directory's basename.
+/// Map a changed file path back to its plugin name.
+///
+/// Plugins may sit several levels below `root` (see
+/// [`crate::loader::MAX_SCAN_DEPTH`]), so the nearest ancestor of
+/// `path` that holds a `plugin.toml` is the plugin directory; its
+/// manifest's `name` is what the registry knows the plugin as. If
+/// that manifest is unreadable (mid-edit, or the change removed it)
+/// the directory basename is used; if no manifest exists at all, the
+/// first path component below `root`.
 fn plugin_name_for_path(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
-    let first = rel.components().next()?;
-    match first {
+    let mut dir = if path.is_dir() {
+        Some(path)
+    } else {
+        path.parent()
+    };
+    while let Some(d) = dir {
+        if d == root || !d.starts_with(root) {
+            break;
+        }
+        if d.join("plugin.toml").is_file() {
+            return crate::manifest::Manifest::from_dir(d)
+                .ok()
+                .map(|m| m.name)
+                .or_else(|| d.file_name().map(|n| n.to_string_lossy().into_owned()));
+        }
+        dir = d.parent();
+    }
+    match rel.components().next()? {
         std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
         _ => None,
     }
@@ -222,6 +244,28 @@ mod tests {
         assert_eq!(
             plugin_name_for_path(&root, &file).as_deref(),
             Some("ai-tts")
+        );
+    }
+
+    #[test]
+    fn nested_plugin_resolves_to_its_manifest_name() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin = root.path().join("cookbook/script/rhai/demo");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(
+            plugin.join("plugin.toml"),
+            "name = \"custom-name\"\ntype = \"script\"\nentry = \"./main.rhai\"\n",
+        )
+        .unwrap();
+        let changed = plugin.join("main.rhai");
+        assert_eq!(
+            plugin_name_for_path(root.path(), &changed).as_deref(),
+            Some("custom-name")
+        );
+        // A change to the plugin directory itself resolves the same way.
+        assert_eq!(
+            plugin_name_for_path(root.path(), &plugin).as_deref(),
+            Some("custom-name")
         );
     }
 

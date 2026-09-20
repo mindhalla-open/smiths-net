@@ -54,12 +54,12 @@ use webrtc_util::conn::Conn;
 ///   stray traffic — STUN keep-alives, port-scanners, re-orderings
 ///   from a previous dialog, etc.
 /// - `send(buf)` is always directed at [`Self::peer`]; the
-///   underlying socket is **never** `connect()`ed, so the
+///   underlying socket is **never** `connect`ed, so the
 ///   bridge can continue to use `send_to` after the handshake
 ///   completes without a re-association.
-/// - `local_addr()` reports the socket's bound address, as
+/// - `local_addr` reports the socket's bound address, as
 ///   `DTLSConn` expects.
-/// - `close()` is a no-op — the fabric owns the socket's lifetime
+/// - `close` is a no-op — the fabric owns the socket's lifetime
 ///   through its endpoint map, and closing it here would break
 ///   the bridge that's about to reuse it.
 #[derive(Clone, Debug)]

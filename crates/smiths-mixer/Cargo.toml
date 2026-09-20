@@ -4,7 +4,7 @@ edition      = { workspace = true }
 rust-version = { workspace = true }
 version      = { workspace = true }
 license      = { workspace = true }
-description  = "N:N audio conferencing mixer (slice 5.5 / P14): leave-one-out sum + AGC + VAD + MixerFabric."
+description  = "N:N audio conferencing mixer: jitter-buffered ingress, leave-one-out sum + AGC + VAD, MixerFabric."
 
 [dependencies]
 smiths-core  = { workspace = true }
@@ -13,6 +13,8 @@ smiths-sip   = { workspace = true }
 async-trait  = { workspace = true }
 dashmap      = { workspace = true }
 prometheus-client = { workspace = true }
+# Random initial RTP sequence number / timestamp per RFC 3550 §5.1.
+rand         = { workspace = true }
 thiserror    = { workspace = true }
 tokio        = { workspace = true, features = ["net", "rt", "sync", "macros", "time"] }
 tokio-util   = { workspace = true }

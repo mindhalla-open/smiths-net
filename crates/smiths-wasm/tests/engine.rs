@@ -1,13 +1,11 @@
-//! Walking-skeleton WASM engine tests.
+//! WASM engine tests.
 //!
 //! Uses inline WebAssembly Text (WAT) so the tests don't need a
-//! cross-compile toolchain. Scenarios:
-//!
-//! 1. Guest calls the `smiths::log` host fn and returns.
-//! 2. Guest hits `unreachable`: the engine reports a trap and the
-//!    process survives.
-//! 3. Guest spins forever: fuel runs out and the engine reports
-//!    `FuelExhausted`.
+//! cross-compile toolchain. Scenarios cover the host-fn surface,
+//! permission gating, fuel exhaustion, wall-clock deadlines (per
+//! store, so concurrent guests don't interfere), the linear-memory
+//! cap, the persistent-state byte budget, and `send_rtp`
+//! backpressure.
 
 // Test fakes use `unimplemented!()` / `unreachable!()` in methods the
 // scenario doesn't exercise — that's the idiomatic "shouldn't be hit"
@@ -725,4 +723,293 @@ fn call_invoke_error_envelope_becomes_plugin_error() {
         WasmError::PluginError(msg) => assert_eq!(msg, "nope"),
         other => panic!("expected PluginError, got {other:?}"),
     }
+}
+
+/// Tight infinite loop: only fuel or the epoch deadline can stop it.
+const SPIN_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "run")
+    (loop $L br $L)))
+"#;
+
+#[test]
+fn memory_growth_beyond_cap_traps_with_memory_limit() {
+    // Grows one page (64 KiB) per iteration until the host says no.
+    let wat = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "run")
+    (loop $L
+      (drop (memory.grow (i32.const 1)))
+      br $L)))
+"#;
+    let cap = 4 * 65_536;
+    let engine = WasmEngine::new().unwrap().with_memory_limit(cap);
+    let module = compile(&engine, wat);
+    let err = engine.run_entry(&module, "run", FUEL, "hog").unwrap_err();
+    match err {
+        WasmError::MemoryLimit {
+            plugin,
+            limit,
+            requested,
+        } => {
+            assert_eq!(plugin, "hog");
+            assert_eq!(limit, cap);
+            assert_eq!(requested, 5 * 65_536);
+        }
+        other => panic!("expected MemoryLimit, got {other:?}"),
+    }
+}
+
+#[test]
+fn invoke_deadline_traps_infinite_loop_with_unbounded_fuel() {
+    // `invoke` spins forever; fuel is effectively unlimited so only
+    // the engine's configured invoke timeout can end the call.
+    let wat = r#"
+(module
+  (memory (export "memory") 1)
+  (global $HEAP (mut i32) (i32.const 512))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $HEAP))
+    (global.set $HEAP (i32.add (global.get $HEAP) (local.get $len)))
+    (local.get $ptr))
+  (func (export "invoke") (param i32 i32 i32 i32) (result i64)
+    (loop $L br $L)
+    i64.const 0))
+"#;
+    let timeout = std::time::Duration::from_millis(150);
+    let engine = WasmEngine::new()
+        .unwrap()
+        .with_fuel(u64::MAX / 2)
+        .with_invoke_timeout(timeout);
+    let module = compile(&engine, wat);
+    let started = std::time::Instant::now();
+    let err = engine
+        .call_invoke(&module, "spinner", "run", &serde_json::Value::Null)
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(err, WasmError::Timeout { millis } if millis == 150),
+        "expected Timeout(150), got {err:?}"
+    );
+    assert!(
+        elapsed >= timeout && elapsed < std::time::Duration::from_secs(2),
+        "deadline should fire near {timeout:?}; took {elapsed:?}"
+    );
+}
+
+#[test]
+fn concurrent_guests_with_different_deadlines_do_not_interfere() {
+    let engine = WasmEngine::new().unwrap();
+    let module = compile(&engine, SPIN_WAT);
+
+    // Long-deadline guest on its own thread; short-deadline guest on
+    // this one. If deadlines leaked across stores, the short one
+    // firing would also trap the long one early.
+    let slow_engine = engine.clone();
+    let slow_module = module.clone();
+    let slow = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let res = slow_engine.run_with_deadline(
+            &slow_module,
+            "run",
+            u64::MAX / 2,
+            "slow",
+            std::time::Duration::from_millis(600),
+        );
+        (res, started.elapsed())
+    });
+
+    let started = std::time::Instant::now();
+    let fast = engine.run_with_deadline(
+        &module,
+        "run",
+        u64::MAX / 2,
+        "fast",
+        std::time::Duration::from_millis(100),
+    );
+    let fast_elapsed = started.elapsed();
+    let (slow, slow_elapsed) = slow.join().expect("slow guest thread");
+
+    assert!(
+        matches!(fast, Err(WasmError::Timeout { millis: 100 })),
+        "fast guest: {fast:?}"
+    );
+    assert!(
+        matches!(slow, Err(WasmError::Timeout { millis: 600 })),
+        "slow guest: {slow:?}"
+    );
+    assert!(
+        fast_elapsed < std::time::Duration::from_millis(450),
+        "fast guest should trap near 100 ms; took {fast_elapsed:?}"
+    );
+    assert!(
+        slow_elapsed >= std::time::Duration::from_millis(500),
+        "slow guest must not be cut short by the fast guest's deadline; took {slow_elapsed:?}"
+    );
+}
+
+#[test]
+fn state_set_beyond_budget_traps_with_state_budget_exceeded() {
+    // key "k" + 8-byte value = 9 bytes fits a 16-byte budget; a second
+    // 9-byte entry would make 18 and must be refused.
+    let wat = r#"
+(module
+  (import "smiths" "state_set" (func $set (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "k")
+  (data (i32.const 1) "j")
+  (data (i32.const 8) "abcdefgh")
+  (func (export "run")
+    (call $set (i32.const 0) (i32.const 1) (i32.const 8) (i32.const 8))
+    drop
+    (call $set (i32.const 1) (i32.const 1) (i32.const 8) (i32.const 8))
+    drop))
+"#;
+    let engine = WasmEngine::new().unwrap().with_state_budget(16);
+    engine.set_plugin_permissions("budgeted", ["state"]);
+    let module = compile(&engine, wat);
+    let err = engine
+        .run_entry(&module, "run", FUEL, "budgeted")
+        .unwrap_err();
+    match err {
+        WasmError::StateBudgetExceeded {
+            plugin,
+            budget,
+            would_use,
+        } => {
+            assert_eq!(plugin, "budgeted");
+            assert_eq!(budget, 16);
+            assert_eq!(would_use, 18);
+        }
+        other => panic!("expected StateBudgetExceeded, got {other:?}"),
+    }
+    // The refused write left the store untouched.
+    let state = engine.plugin_state("budgeted");
+    assert_eq!(state.len(), 1);
+    assert_eq!(state.used_bytes(), 9);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_rtp_drops_and_counts_when_queue_is_full() {
+    use async_trait::async_trait;
+    use smiths_core::CallLookup;
+    use smiths_core::media::{BridgeId, EndpointId, MediaEndpoint, MediaError, MediaFabric};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Fabric whose sends never complete, so the drain task blocks on
+    // the first packet and the queue fills up behind it.
+    #[derive(Default)]
+    struct StuckFabric {
+        attempts: AtomicUsize,
+    }
+    #[async_trait]
+    impl MediaFabric for StuckFabric {
+        async fn allocate(
+            &self,
+            _: std::net::IpAddr,
+        ) -> Result<Arc<dyn MediaEndpoint>, MediaError> {
+            unimplemented!()
+        }
+        async fn bridge(
+            &self,
+            _: smiths_core::BridgeLeg,
+            _: smiths_core::BridgeLeg,
+        ) -> Result<BridgeId, MediaError> {
+            unimplemented!()
+        }
+        async fn release_bridge(&self, _: BridgeId) {}
+        async fn release_endpoint(&self, _: EndpointId) {}
+        async fn send_packet(
+            &self,
+            _: EndpointId,
+            _: SocketAddr,
+            _: &[u8],
+        ) -> Result<(), MediaError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+    struct FixedLookup;
+    impl CallLookup for FixedLookup {
+        fn endpoint_for(&self, _: &str) -> Option<(EndpointId, SocketAddr)> {
+            Some((EndpointId(1), "127.0.0.1:9999".parse().unwrap()))
+        }
+    }
+
+    // 1500 packets against a queue of RTP_QUEUE_CAPACITY (1024).
+    let wat = r#"
+(module
+  (import "smiths" "send_rtp" (func $send (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "call-42")
+  (data (i32.const 16) "\01\02\03\04")
+  (func (export "run")
+    (local $i i32)
+    (local.set $i (i32.const 1500))
+    (loop $L
+      (drop (call $send (i32.const 0) (i32.const 7) (i32.const 16) (i32.const 4)))
+      (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+      (br_if $L (local.get $i)))))
+"#;
+    let fabric = Arc::new(StuckFabric::default());
+    let engine = WasmEngine::new().unwrap().with_media(
+        Arc::new(FixedLookup),
+        Arc::clone(&fabric) as Arc<dyn MediaFabric>,
+    );
+    engine.set_plugin_permissions("flood", ["send_rtp"]);
+    let module = compile(&engine, wat);
+    engine
+        .run_entry(&module, "run", FUEL, "flood")
+        .expect("dropping packets is not a trap");
+
+    // The drain took at most one packet (and is stuck on it); every
+    // packet past the queue capacity was dropped and counted.
+    let sent = 1500u64;
+    let capacity = smiths_wasm::RTP_QUEUE_CAPACITY as u64;
+    let dropped = engine.rtp_dropped();
+    assert!(
+        dropped == sent - capacity || dropped == sent - capacity - 1,
+        "expected ~{} drops, got {dropped}",
+        sent - capacity
+    );
+    for _ in 0..50 {
+        if fabric.attempts.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        fabric.attempts.load(Ordering::SeqCst),
+        1,
+        "drain task should be stuck on exactly one packet"
+    );
+}
+
+#[test]
+fn timer_set_outside_a_tokio_runtime_traps_descriptively() {
+    let wat = r#"
+(module
+  (import "smiths" "timer_set" (func $timer (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "run")
+    (call $timer (i32.const 1) (i32.const 1))
+    drop))
+"#;
+    let bus = smiths_core::EventBus::new(4);
+    let engine = WasmEngine::new().unwrap().with_bus(bus);
+    engine.set_plugin_permissions("no-rt", ["timers"]);
+    let module = compile(&engine, wat);
+    let err = engine.run_entry(&module, "run", FUEL, "no-rt").unwrap_err();
+    // The host-fn message sits in the trap's cause chain, which the
+    // Debug rendering includes.
+    assert!(
+        matches!(&err, WasmError::Trap(e) if format!("{e:?}").contains("no tokio runtime")),
+        "expected runtime-missing trap, got {err:?}"
+    );
 }

@@ -5,7 +5,7 @@
 //! directly — no system libsqlite3 required, which keeps the
 //! single-binary distribution story intact.
 //!
-//! ## Three-table schema (slice 2.1 spec)
+//! ## Schema
 //!
 //! ```sql
 //! CREATE TABLE realms (
@@ -16,7 +16,8 @@
 //!     id       INTEGER PRIMARY KEY,
 //!     realm_id INTEGER NOT NULL REFERENCES realms(id) ON DELETE CASCADE,
 //!     username TEXT    NOT NULL,
-//!     password TEXT    NOT NULL,
+//!     ha1_md5    TEXT    NOT NULL,   -- hex MD5(user:realm:password)
+//!     ha1_sha256 TEXT    NOT NULL,   -- hex SHA-256(user:realm:password)
 //!     UNIQUE(realm_id, username)
 //! );
 //! CREATE TABLE contacts (
@@ -28,10 +29,20 @@
 //! );
 //! ```
 //!
+//! plus the `cdr` / `kv` tables that back `smiths_core::storage`.
+//!
+//! Passwords are never stored: `users` keeps only the two digest
+//! HA1 hashes, one per supported algorithm, so a leaked database
+//! file yields nothing reusable outside this realm. Lookups return
+//! [`Credentials`] in HA1 form for the algorithm the registrar asked
+//! for ([`CredentialStore::lookup_for`]).
+//!
 //! A single internal `_schema_version` table tracks applied
 //! migrations. [`MigrationRunner`] is idempotent: opening an already-
 //! migrated DB is a no-op; opening an older DB runs the missing
-//! steps in order and logs each as it applies.
+//! steps in order and logs each as it applies. The v3 step hashes
+//! any plaintext rows left by an older schema and drops the
+//! `password` column.
 //!
 //! ## Threading model
 //!
@@ -42,7 +53,7 @@
 //! optimization would be premature.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use rusqlite::{Connection, OptionalExtension as _, params};
 use smiths_core::storage::{CallDetailRecord, CdrFilter, CdrStore, KvStore, StorageError};
@@ -50,6 +61,7 @@ use smiths_core::{RegistrationSnapshot, RegistrationView};
 use thiserror::Error;
 use tracing::{debug, info};
 
+use super::digest::{Algorithm, ha1};
 use super::{Binding, CredentialStore, Credentials, RegistrationError, RegistrationStore};
 
 /// Errors raised while opening / migrating / reading the `SQLite` store.
@@ -68,6 +80,14 @@ pub enum SqliteStoreError {
         /// Highest version this binary understands.
         max_supported: i32,
     },
+    /// [`SqliteAuthStore::upsert_user`] was handed HA1-only
+    /// credentials. The store keeps one hash per algorithm and cannot
+    /// derive the second from a single opaque HA1; use
+    /// [`SqliteAuthStore::upsert_user_ha1`] with both hashes instead.
+    #[error(
+        "sqlite auth store needs a plaintext password (or both HA1 hashes) to provision a user"
+    )]
+    PlaintextRequired,
 }
 
 impl From<rusqlite::Error> for SqliteStoreError {
@@ -84,7 +104,7 @@ impl From<SqliteStoreError> for RegistrationError {
 
 /// Highest schema version this binary knows how to create / read.
 /// Bump when adding a migration to [`MIGRATIONS`].
-pub const CURRENT_SCHEMA_VERSION: i32 = 2;
+pub const CURRENT_SCHEMA_VERSION: i32 = 3;
 
 /// Ordered list of migration steps. Index 0 is applied first. Each
 /// step is run inside a single transaction; a failure rolls back
@@ -107,6 +127,13 @@ const MIGRATIONS: &[(&str, i32)] = &[
         // too (each file migrates independently — the unused tables
         // just sit empty).
         2,
+    ),
+    (
+        "v3 — users store HA1 hashes instead of plaintext passwords",
+        // Rebuilds `users` with `ha1_md5` / `ha1_sha256` columns,
+        // hashing every existing plaintext row once, and drops the
+        // `password` column.
+        3,
     ),
 ];
 
@@ -205,11 +232,66 @@ fn apply_migration(target: i32, tx: &rusqlite::Transaction<'_>) -> Result<(), Sq
                  );",
             )?;
         }
+        3 => migrate_users_to_ha1(tx)?,
         other => {
             return Err(SqliteStoreError::Sqlite(format!(
                 "unknown migration target v{other}"
             )));
         }
+    }
+    Ok(())
+}
+
+/// v3: replace the plaintext `password` column with per-algorithm
+/// HA1 hashes. Existing rows are hashed in Rust (`SQLite` has no
+/// digest functions) inside the migration's transaction, then the
+/// old table is dropped and the rebuilt one takes its name.
+fn migrate_users_to_ha1(tx: &rusqlite::Transaction<'_>) -> Result<(), SqliteStoreError> {
+    tx.execute_batch(
+        "CREATE TABLE users_v3 (
+             id         INTEGER PRIMARY KEY,
+             realm_id   INTEGER NOT NULL REFERENCES realms(id) ON DELETE CASCADE,
+             username   TEXT    NOT NULL,
+             ha1_md5    TEXT    NOT NULL,
+             ha1_sha256 TEXT    NOT NULL,
+             UNIQUE(realm_id, username)
+         );",
+    )?;
+    let rows: Vec<(i64, i64, String, String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT u.id, u.realm_id, r.name, u.username, u.password
+             FROM users u JOIN realms r ON r.id = u.realm_id",
+        )?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
+        mapped.collect::<Result<_, _>>()?
+    };
+    for (id, realm_id, realm, username, password) in &rows {
+        tx.execute(
+            "INSERT INTO users_v3(id, realm_id, username, ha1_md5, ha1_sha256)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![
+                id,
+                realm_id,
+                username,
+                ha1(Algorithm::Md5, username, realm, password),
+                ha1(Algorithm::Sha256, username, realm, password),
+            ],
+        )?;
+    }
+    tx.execute_batch("DROP TABLE users; ALTER TABLE users_v3 RENAME TO users;")?;
+    if !rows.is_empty() {
+        info!(
+            users = rows.len(),
+            "sqlite auth: hashed plaintext passwords into HA1 columns"
+        );
     }
     Ok(())
 }
@@ -261,22 +343,66 @@ impl SqliteAuthStore {
         &self.path
     }
 
-    /// Provision a user. Creates the realm row if it doesn't exist.
-    /// Operators will typically seed the DB via this API (or a later
-    /// CLI subcommand); there's no "register through SIP" flow for
+    /// Serialize access to the connection. A poisoned mutex means a
+    /// caller panicked mid-statement; `rusqlite` rolls back any open
+    /// transaction when its guard drops, so the connection itself is
+    /// still consistent and safe to keep using.
+    fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Provision a user from plaintext credentials. Creates the realm
+    /// row if it doesn't exist. Only the MD5 and SHA-256 HA1 hashes
+    /// are written — the password itself never touches disk.
+    /// Operators will typically seed the DB via this API (or a CLI
+    /// subcommand); there's no "register through SIP" flow for
     /// credentials — REGISTER authenticates, it doesn't provision.
+    ///
+    /// Fails with [`SqliteStoreError::PlaintextRequired`] for
+    /// HA1-only credentials; use [`Self::upsert_user_ha1`] for those.
     pub fn upsert_user(&self, creds: &Credentials) -> Result<(), SqliteStoreError> {
-        let mut conn = self.conn.lock().expect("sqlite auth store poisoned");
+        if creds.ha1.is_some() && creds.password.is_empty() {
+            return Err(SqliteStoreError::PlaintextRequired);
+        }
+        let md5 = ha1(
+            Algorithm::Md5,
+            &creds.username,
+            &creds.realm,
+            &creds.password,
+        );
+        let sha256 = ha1(
+            Algorithm::Sha256,
+            &creds.username,
+            &creds.realm,
+            &creds.password,
+        );
+        self.upsert_user_ha1(&creds.realm, &creds.username, &md5, &sha256)
+    }
+
+    /// Provision a user from pre-computed hashes: `ha1_md5` is
+    /// `MD5(user:realm:password)` and `ha1_sha256` its SHA-256 twin,
+    /// both hex. For operators whose provisioning pipeline never
+    /// handles plaintext.
+    pub fn upsert_user_ha1(
+        &self,
+        realm: &str,
+        username: &str,
+        ha1_md5: &str,
+        ha1_sha256: &str,
+    ) -> Result<(), SqliteStoreError> {
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT OR IGNORE INTO realms(name) VALUES(?1)",
-            params![creds.realm],
+            params![realm],
         )?;
         tx.execute(
-            "INSERT INTO users(realm_id, username, password)
-             VALUES((SELECT id FROM realms WHERE name = ?1), ?2, ?3)
-             ON CONFLICT(realm_id, username) DO UPDATE SET password = excluded.password",
-            params![creds.realm, creds.username, creds.password],
+            "INSERT INTO users(realm_id, username, ha1_md5, ha1_sha256)
+             VALUES((SELECT id FROM realms WHERE name = ?1), ?2, ?3, ?4)
+             ON CONFLICT(realm_id, username) DO UPDATE
+                 SET ha1_md5 = excluded.ha1_md5,
+                     ha1_sha256 = excluded.ha1_sha256",
+            params![realm, username, ha1_md5, ha1_sha256],
         )?;
         tx.commit()?;
         Ok(())
@@ -284,7 +410,7 @@ impl SqliteAuthStore {
 
     /// Delete a user. Idempotent — missing rows don't error.
     pub fn delete_user(&self, realm: &str, username: &str) -> Result<(), SqliteStoreError> {
-        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let conn = self.conn();
         conn.execute(
             "DELETE FROM users
              WHERE username = ?1
@@ -295,11 +421,11 @@ impl SqliteAuthStore {
     }
 
     /// Garbage-collect every binding whose expiry is already past.
-    /// Called before serving `snapshot()` so MCP readers never see
+    /// Called before serving `snapshot` so MCP readers never see
     /// stale rows; operators can also invoke it directly from a
     /// scheduled job.
     pub fn gc_expired(&self, now_unix: i64) -> Result<usize, SqliteStoreError> {
-        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let conn = self.conn();
         let removed = conn.execute(
             "DELETE FROM contacts WHERE expires_at_unix <= ?1",
             params![now_unix],
@@ -313,22 +439,27 @@ impl SqliteAuthStore {
 
 impl CredentialStore for SqliteAuthStore {
     fn lookup(&self, realm: &str, username: &str) -> Option<Credentials> {
-        let conn = self.conn.lock().expect("sqlite auth store poisoned");
-        conn.query_row(
-            "SELECT u.username, r.name, u.password
+        self.lookup_for(realm, username, Algorithm::Md5)
+    }
+
+    fn lookup_for(&self, realm: &str, username: &str, algorithm: Algorithm) -> Option<Credentials> {
+        let column = match algorithm {
+            Algorithm::Md5 => "u.ha1_md5",
+            Algorithm::Sha256 => "u.ha1_sha256",
+        };
+        let sql = format!(
+            "SELECT u.username, r.name, {column}
              FROM users u
              JOIN realms r ON r.id = u.realm_id
-             WHERE r.name = ?1 AND u.username = ?2",
-            params![realm, username],
-            |row| {
-                Ok(Credentials {
-                    username: row.get(0)?,
-                    realm: row.get(1)?,
-                    password: row.get(2)?,
-                    ha1: None,
-                })
-            },
-        )
+             WHERE r.name = ?1 AND u.username = ?2"
+        );
+        let conn = self.conn();
+        conn.query_row(&sql, params![realm, username], |row| {
+            let username: String = row.get(0)?;
+            let realm: String = row.get(1)?;
+            let ha1: String = row.get(2)?;
+            Ok(Credentials::from_ha1(username, realm, ha1))
+        })
         .optional()
         .ok()
         .flatten()
@@ -337,7 +468,7 @@ impl CredentialStore for SqliteAuthStore {
 
 impl RegistrationStore for SqliteAuthStore {
     fn bind(&self, binding: &Binding) -> Result<Binding, RegistrationError> {
-        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO contacts(aor, contact, expires_at_unix)
              VALUES(?1, ?2, ?3)
@@ -350,7 +481,7 @@ impl RegistrationStore for SqliteAuthStore {
     }
 
     fn unbind(&self, aor: &str, contact: &str) -> Result<(), RegistrationError> {
-        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let conn = self.conn();
         let removed = conn
             .execute(
                 "DELETE FROM contacts WHERE aor = ?1 AND contact = ?2",
@@ -365,7 +496,7 @@ impl RegistrationStore for SqliteAuthStore {
 
     fn lookup_bindings(&self, aor: &str) -> Result<Vec<Binding>, RegistrationError> {
         let now = crate::auth::unix_now_secs();
-        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let conn = self.conn();
         let mut stmt = conn
             .prepare(
                 "SELECT aor, contact, expires_at_unix
@@ -391,7 +522,7 @@ impl RegistrationStore for SqliteAuthStore {
 
     fn snapshot(&self) -> Result<Vec<Binding>, RegistrationError> {
         let now = crate::auth::unix_now_secs();
-        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let conn = self.conn();
         let mut stmt = conn
             .prepare(
                 "SELECT aor, contact, expires_at_unix
@@ -426,7 +557,7 @@ fn to_storage(err: &rusqlite::Error) -> StorageError {
 
 impl CdrStore for SqliteAuthStore {
     fn record(&self, cdr: &CallDetailRecord) -> Result<(), StorageError> {
-        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO cdr(call_id, from_uri, to_uri, started_at_unix,
                              ended_at_unix, duration_secs, result)
@@ -488,7 +619,7 @@ impl CdrStore for SqliteAuthStore {
         sql.push_str(" ORDER BY started_at_unix DESC LIMIT ?");
         args.push(Box::new(i64::from(filter.limit)));
 
-        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let conn = self.conn();
         let mut stmt = conn.prepare(&sql).map_err(|e| to_storage(&e))?;
         let param_refs: Vec<&dyn rusqlite::ToSql> =
             args.iter().map(std::convert::AsRef::as_ref).collect();
@@ -513,7 +644,7 @@ impl CdrStore for SqliteAuthStore {
     }
 
     fn truncate(&self) -> Result<(), StorageError> {
-        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let conn = self.conn();
         conn.execute("DELETE FROM cdr", [])
             .map_err(|e| to_storage(&e))?;
         Ok(())
@@ -522,7 +653,7 @@ impl CdrStore for SqliteAuthStore {
 
 impl KvStore for SqliteAuthStore {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
-        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let conn = self.conn();
         conn.query_row("SELECT value FROM kv WHERE key = ?1", params![key], |row| {
             row.get::<_, Vec<u8>>(0)
         })
@@ -531,7 +662,7 @@ impl KvStore for SqliteAuthStore {
     }
 
     fn put(&self, key: &str, value: &[u8]) -> Result<(), StorageError> {
-        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO kv(key, value) VALUES(?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -542,7 +673,7 @@ impl KvStore for SqliteAuthStore {
     }
 
     fn delete(&self, key: &str) -> Result<bool, StorageError> {
-        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let conn = self.conn();
         let removed = conn
             .execute("DELETE FROM kv WHERE key = ?1", params![key])
             .map_err(|e| to_storage(&e))?;
@@ -558,7 +689,7 @@ impl KvStore for SqliteAuthStore {
             .replace('%', "\\%")
             .replace('_', "\\_");
         let pattern = format!("{escaped}%");
-        let conn = self.conn.lock().expect("sqlite auth store poisoned");
+        let conn = self.conn();
         let mut stmt = conn
             .prepare("SELECT key FROM kv WHERE key LIKE ?1 ESCAPE '\\' ORDER BY key")
             .map_err(|e| to_storage(&e))?;
@@ -607,35 +738,209 @@ mod tests {
         }
     }
 
+    use std::sync::Arc;
+
     #[test]
     fn fresh_store_runs_all_migrations_once() {
         let store = SqliteAuthStore::open_in_memory().unwrap();
         // Second migrate should be a no-op; opening again on the
         // same in-memory DB isn't possible, so rerun on the
         // internal connection.
-        let mut guard = store.conn.lock().unwrap();
+        let mut guard = store.conn();
         let v = MigrationRunner::run(&mut guard).unwrap();
         assert_eq!(v, CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
-    fn upsert_and_lookup_round_trip() {
+    fn upsert_and_lookup_round_trip_returns_ha1_not_plaintext() {
         let store = SqliteAuthStore::open_in_memory().unwrap();
         store.upsert_user(&test_creds("alice")).unwrap();
         let got = store.lookup("smiths.local", "alice").unwrap();
         assert_eq!(got.username, "alice");
-        assert_eq!(got.password, "hunter2");
+        assert_eq!(got.realm, "smiths.local");
+        assert!(got.password.is_empty(), "plaintext must never come back");
+        assert_eq!(
+            got.ha1.as_deref(),
+            Some(ha1(Algorithm::Md5, "alice", "smiths.local", "hunter2").as_str()),
+            "plain lookup serves the MD5 hash"
+        );
+        let sha = store
+            .lookup_for("smiths.local", "alice", Algorithm::Sha256)
+            .unwrap();
+        assert_eq!(
+            sha.ha1.as_deref(),
+            Some(ha1(Algorithm::Sha256, "alice", "smiths.local", "hunter2").as_str())
+        );
     }
 
     #[test]
-    fn upsert_replaces_password_on_conflict() {
+    fn upsert_replaces_hashes_on_conflict() {
         let store = SqliteAuthStore::open_in_memory().unwrap();
         store.upsert_user(&test_creds("bob")).unwrap();
         let mut new_creds = test_creds("bob");
         new_creds.password = "NEW-secret".into();
         store.upsert_user(&new_creds).unwrap();
         let got = store.lookup("smiths.local", "bob").unwrap();
-        assert_eq!(got.password, "NEW-secret");
+        assert_eq!(
+            got.ha1.as_deref(),
+            Some(ha1(Algorithm::Md5, "bob", "smiths.local", "NEW-secret").as_str())
+        );
+    }
+
+    #[test]
+    fn upsert_rejects_ha1_only_credentials() {
+        let store = SqliteAuthStore::open_in_memory().unwrap();
+        let err = store
+            .upsert_user(&Credentials::from_ha1("eve", "smiths.local", "deadbeef"))
+            .unwrap_err();
+        assert!(matches!(err, SqliteStoreError::PlaintextRequired));
+    }
+
+    #[test]
+    fn upsert_user_ha1_stores_both_hashes_verbatim() {
+        let store = SqliteAuthStore::open_in_memory().unwrap();
+        store
+            .upsert_user_ha1("smiths.local", "carol", "md5hash", "sha256hash")
+            .unwrap();
+        assert_eq!(
+            store
+                .lookup_for("smiths.local", "carol", Algorithm::Md5)
+                .unwrap()
+                .ha1
+                .as_deref(),
+            Some("md5hash")
+        );
+        assert_eq!(
+            store
+                .lookup_for("smiths.local", "carol", Algorithm::Sha256)
+                .unwrap()
+                .ha1
+                .as_deref(),
+            Some("sha256hash")
+        );
+    }
+
+    #[test]
+    fn password_column_is_gone_after_migration() {
+        let store = SqliteAuthStore::open_in_memory().unwrap();
+        let columns = user_columns(&store.conn());
+        assert!(!columns.iter().any(|c| c == "password"), "{columns:?}");
+        assert!(columns.iter().any(|c| c == "ha1_md5"));
+        assert!(columns.iter().any(|c| c == "ha1_sha256"));
+    }
+
+    /// Column names of the `users` table.
+    fn user_columns(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn.prepare("PRAGMA table_info(users)").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn v2_plaintext_rows_are_hashed_on_upgrade() {
+        // Hand-build a v2 database (plaintext `password` column) with
+        // two users, then open it through the store: the v3 step must
+        // hash both rows, keep the ids, and drop the plaintext.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE _schema_version (version INTEGER PRIMARY KEY);
+                 INSERT INTO _schema_version(version) VALUES(2);
+                 CREATE TABLE realms (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+                 CREATE TABLE users (
+                     id       INTEGER PRIMARY KEY,
+                     realm_id INTEGER NOT NULL REFERENCES realms(id) ON DELETE CASCADE,
+                     username TEXT    NOT NULL,
+                     password TEXT    NOT NULL,
+                     UNIQUE(realm_id, username)
+                 );
+                 CREATE TABLE contacts (
+                     id              INTEGER PRIMARY KEY,
+                     aor             TEXT    NOT NULL,
+                     contact         TEXT    NOT NULL,
+                     expires_at_unix INTEGER NOT NULL,
+                     UNIQUE(aor, contact)
+                 );
+                 CREATE TABLE cdr (
+                     call_id TEXT PRIMARY KEY, from_uri TEXT NOT NULL, to_uri TEXT NOT NULL,
+                     started_at_unix INTEGER NOT NULL, ended_at_unix INTEGER NOT NULL,
+                     duration_secs INTEGER NOT NULL, result TEXT NOT NULL
+                 );
+                 CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+                 INSERT INTO realms(id, name) VALUES(1, 'smiths.local');
+                 INSERT INTO realms(id, name) VALUES(2, 'other.example');
+                 INSERT INTO users(id, realm_id, username, password) VALUES(7, 1, 'alice', 'pw-a');
+                 INSERT INTO users(id, realm_id, username, password) VALUES(9, 2, 'bob', 'pw-b');",
+            )
+            .unwrap();
+        }
+
+        let store = SqliteAuthStore::open(&path).unwrap();
+        let columns = user_columns(&store.conn());
+        assert!(!columns.iter().any(|c| c == "password"), "{columns:?}");
+
+        let alice = store
+            .lookup_for("smiths.local", "alice", Algorithm::Md5)
+            .unwrap();
+        assert_eq!(
+            alice.ha1.as_deref(),
+            Some(ha1(Algorithm::Md5, "alice", "smiths.local", "pw-a").as_str())
+        );
+        let bob = store
+            .lookup_for("other.example", "bob", Algorithm::Sha256)
+            .unwrap();
+        assert_eq!(
+            bob.ha1.as_deref(),
+            Some(ha1(Algorithm::Sha256, "bob", "other.example", "pw-b").as_str())
+        );
+        // Row ids survive the rebuild.
+        let id: i64 = store
+            .conn()
+            .query_row("SELECT id FROM users WHERE username = 'bob'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(id, 9);
+        // Re-opening is a no-op at v3.
+        drop(store);
+        let reopened = SqliteAuthStore::open(&path).unwrap();
+        assert!(reopened.lookup("smiths.local", "alice").is_some());
+    }
+
+    #[test]
+    fn registrar_authenticates_sha256_against_sqlite_ha1() {
+        use crate::auth::digest::{Registrar, ha2, response_qop_auth};
+
+        let store = Arc::new(SqliteAuthStore::open_in_memory().unwrap());
+        store.upsert_user(&test_creds("alice")).unwrap();
+        let reg = Registrar::new("smiths.local", store);
+        for alg in [Algorithm::Md5, Algorithm::Sha256] {
+            let challenge = reg.challenge(alg, false);
+            let nonce = challenge
+                .split("nonce=\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap()
+                .to_owned();
+            let h1 = ha1(alg, "alice", "smiths.local", "hunter2");
+            let h2 = ha2(alg, "REGISTER", "sip:smiths.local");
+            let resp = response_qop_auth(alg, &h1, &nonce, "00000001", "cn", &h2);
+            let hdr = format!(
+                "Digest username=\"alice\", realm=\"smiths.local\", nonce=\"{nonce}\", \
+                 uri=\"sip:smiths.local\", response=\"{resp}\", algorithm={}, \
+                 qop=auth, nc=00000001, cnonce=\"cn\"",
+                alg.as_str()
+            );
+            assert_eq!(
+                reg.authenticate("REGISTER", "sip:smiths.local", &hdr),
+                Ok("alice".to_owned()),
+                "{alg:?}"
+            );
+        }
     }
 
     #[test]
@@ -741,7 +1046,7 @@ mod tests {
         assert_eq!(RegistrationStore::snapshot(&reopened).unwrap().len(), 1);
     }
 
-    // ---------- Slice 2.3: CDR + KV surface ----------
+    // ---------- : CDR + KV surface ----------
 
     fn cdr(call_id: &str, started: i64, ended: i64, result: &str) -> CallDetailRecord {
         CallDetailRecord {

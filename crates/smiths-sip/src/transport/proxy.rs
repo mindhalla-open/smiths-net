@@ -1,5 +1,5 @@
 //! Outbound-connect proxy shim for the TCP-based SIP transports
-//! (slice 3.5 / P16).
+//!.
 //!
 //! SIP over UDP cannot tunnel through SOCKS5 or HTTP-CONNECT — both
 //! proxies are stream protocols. The proxy layer therefore only wraps

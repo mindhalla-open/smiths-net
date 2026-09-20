@@ -42,11 +42,11 @@
 //!   Completed; absorbs late duplicate final responses so the driver
 //!   doesn't surface them to the TU twice.
 //!
-//! Reliable transport (TCP/TLS/SCTP) turns timer E into a no-op and
-//! timer K into zero — we don't implement that branch yet because
-//! the current driver story is UDP-first; add an
-//! `ClientNonInviteTxn::new_reliable` constructor when the TCP
-//! driver lands.
+//! ## Reliable transports
+//!
+//! With [`Transaction::set_reliable`] (TCP / TLS) timer E is never
+//! armed and timer K is zero: the final response is delivered and the
+//! transaction terminates in the same step (§17.1.2.2).
 
 use bytes::Bytes;
 
@@ -72,6 +72,8 @@ pub struct ClientNonInviteTxn {
     /// 0 after the first send; `doubling_backoff(attempt, T2)` gives
     /// the next interval.
     attempt: u32,
+    /// Reliable-transport profile: no timer E, zero timer K.
+    reliable: bool,
 }
 
 impl ClientNonInviteTxn {
@@ -90,15 +92,23 @@ impl ClientNonInviteTxn {
             state: TransactionState::Trying,
             request,
             attempt: 0,
+            reliable: false,
         }
+    }
+
+    /// Builder form of [`Transaction::set_reliable`].
+    #[must_use]
+    pub const fn with_reliable(mut self, reliable: bool) -> Self {
+        self.reliable = reliable;
+        self
     }
 
     /// Transition helper: move to Completed, arm timer K (wait for
     /// duplicate responses), cancel the retransmit path. Actions
-    /// common to both Trying→Completed and Proceeding→Completed.
+    /// common to both Trying→Completed and Proceeding→Completed. On
+    /// a reliable transport K is zero, so this terminates directly.
     fn enter_completed(&mut self, final_bytes: Bytes, status: u16) -> Vec<TransactionAction> {
-        self.state = TransactionState::Completed;
-        vec![
+        let mut actions = vec![
             // Deliver the final response to the TU first — dialog
             // layer updates its state before we retire the timers.
             TransactionAction::DeliverResponseToTu {
@@ -108,12 +118,19 @@ impl ClientNonInviteTxn {
             // Retransmit / timeout timers die here.
             TransactionAction::CancelTimer(TimerId::E),
             TransactionAction::CancelTimer(TimerId::F),
+        ];
+        if self.reliable {
+            self.state = TransactionState::Terminated;
+            actions.push(TransactionAction::Terminated);
+        } else {
+            self.state = TransactionState::Completed;
             // K absorbs duplicate final responses.
-            TransactionAction::ArmTimer {
+            actions.push(TransactionAction::ArmTimer {
                 id: TimerId::K,
                 after: T4,
-            },
-        ]
+            });
+        }
+        actions
     }
 }
 
@@ -124,6 +141,10 @@ impl Transaction for ClientNonInviteTxn {
 
     fn state(&self) -> TransactionState {
         self.state
+    }
+
+    fn set_reliable(&mut self, reliable: bool) {
+        self.reliable = reliable;
     }
 
     fn on_event(&mut self, event: TransactionEvent) -> Vec<TransactionAction> {
@@ -137,17 +158,19 @@ impl Transaction for ClientNonInviteTxn {
                 // subsequent fire (up to T2); we don't pre-compute
                 // all retries here — driver re-invokes us via the
                 // timer-fired event and we arm the next interval.
-                vec![
-                    TransactionAction::SendToPeer(self.request.clone()),
-                    TransactionAction::ArmTimer {
+                // Reliable transports never arm E.
+                let mut actions = vec![TransactionAction::SendToPeer(self.request.clone())];
+                if !self.reliable {
+                    actions.push(TransactionAction::ArmTimer {
                         id: TimerId::E,
                         after: T1,
-                    },
-                    TransactionAction::ArmTimer {
-                        id: TimerId::F,
-                        after: TIMEOUT_64T1,
-                    },
-                ]
+                    });
+                }
+                actions.push(TransactionAction::ArmTimer {
+                    id: TimerId::F,
+                    after: TIMEOUT_64T1,
+                });
+                actions
             }
 
             // --- Timer E in Trying — retransmit ------------------------
@@ -172,13 +195,14 @@ impl Transaction for ClientNonInviteTxn {
                 self.state = S::Proceeding;
                 // Proceeding uses a fixed T2 retransmit cadence
                 // (§17.1.2.2) — re-arm at that cadence immediately.
-                vec![
-                    TransactionAction::DeliverResponseToTu { status, bytes },
-                    TransactionAction::ArmTimer {
+                let mut actions = vec![TransactionAction::DeliverResponseToTu { status, bytes }];
+                if !self.reliable {
+                    actions.push(TransactionAction::ArmTimer {
                         id: TimerId::E,
                         after: T2,
-                    },
-                ]
+                    });
+                }
+                actions
             }
 
             // --- Provisional while in Proceeding — deliver + keep timer
@@ -498,6 +522,37 @@ mod tests {
         });
         let a2 = t.on_event(TransactionEvent::TimerFired(TimerId::E));
         assert!(a1.is_empty() && a2.is_empty());
+    }
+
+    #[test]
+    fn reliable_start_arms_only_timer_f() {
+        let mut t = new_txn().with_reliable(true);
+        let a = t.on_event(TransactionEvent::StartClient);
+        assert!(has_send(&a));
+        assert!(!has_timer(&a, TimerId::E), "no retransmit timer on TCP");
+        assert!(has_timer(&a, TimerId::F));
+        // A provisional must not re-arm E either.
+        let p = t.on_event(TransactionEvent::ResponseReceived {
+            status: 100,
+            bytes: Bytes::new(),
+        });
+        assert!(!has_timer(&p, TimerId::E));
+    }
+
+    #[test]
+    fn reliable_final_terminates_immediately() {
+        let mut t = new_txn();
+        t.set_reliable(true);
+        t.on_event(TransactionEvent::StartClient);
+        let a = t.on_event(TransactionEvent::ResponseReceived {
+            status: 200,
+            bytes: Bytes::new(),
+        });
+        assert_eq!(delivered_status(&a), Some(200));
+        assert!(has_cancel(&a, TimerId::F));
+        assert!(!has_timer(&a, TimerId::K), "timer K is zero on TCP");
+        assert!(has_terminated(&a));
+        assert_eq!(t.state(), TransactionState::Terminated);
     }
 
     #[test]

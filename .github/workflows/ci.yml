@@ -47,3 +47,38 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release
+
+  # Builds the production image for linux/amd64 exactly as release.yml
+  # does (same Dockerfile, same builder stage), without pushing, so a
+  # Dockerfile regression fails a PR instead of the next tagged
+  # release. The image is loaded into the runner and smoke-tested:
+  # `--version` proves the static binary runs on distroless, `validate`
+  # proves the bundled config is present and parses (a missing config
+  # file is a hard error). The builder layers (toolchain, cargo-zigbuild) are
+  # cached across runs; the cargo build itself reruns whenever the
+  # sources change.
+  docker:
+    name: docker image (linux/amd64, no push)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: smiths-net:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test image
+        run: |
+          docker run --rm smiths-net:ci --version
+          docker run --rm smiths-net:ci validate   # SMITHS_CONFIG is set in the image

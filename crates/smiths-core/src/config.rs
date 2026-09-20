@@ -23,15 +23,15 @@ use crate::reloader::Reloadable;
 /// Field-level attributes on nested sub-configs drive the
 /// [`crate::reloader::ApplyReport`] surface: `#[nested]` recurses,
 /// leaf fields classify with `#[reloadable]` /
-/// `#[restart_required]`, and unmarked fields are treated as
-/// out-of-scope for hot reload. Adding a new block means adding
-/// the annotations alongside the field — the macro fails to
-/// produce a matching diff string if either is missing, which is
-/// the whole point of replacing the hand-maintained `apply_report`.
+/// `#[restart_required]`. Every field must carry one of the three
+/// — the derive rejects an unmarked field at compile time, so a
+/// new knob is always either hot-reloadable or restart-required
+/// and never silently ignored by `apply`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Runtime-wide tuning knobs (thread pools, etc.).
+    #[nested]
     pub core: CoreConfig,
     /// Logging, health endpoint, metrics bind (metrics added later).
     #[nested]
@@ -48,10 +48,10 @@ pub struct Config {
     /// Plugin loader settings.
     #[nested]
     pub plugins: PluginsConfig,
-    /// Auth / subscriber-DB configuration (P8, slice 2.1).
+    /// Auth / subscriber-DB configuration (P8, ).
     #[nested]
     pub auth: AuthConfig,
-    /// Pluggable storage configuration (P23, slice 2.3). CDR + KV
+    /// Pluggable storage configuration (P23, ). CDR + KV
     /// backends share this section; auth has its own `[auth]`
     /// because its lifetime + security story differs.
     #[nested]
@@ -60,35 +60,36 @@ pub struct Config {
     /// buffer depth, comfort-noise on silence).
     #[nested]
     pub media: MediaConfig,
-    /// AI-provider configuration (P22 / slice 3.2). Keys here are
+    /// AI-provider configuration (P22 / ). Keys here are
     /// secrets — the `config://current` resource redacts them on
     /// render. Sidecars read their own API keys from environment
     /// variables; the operator threads them through here for
     /// single-source-of-truth deployments.
     #[nested]
     pub ai: AiConfig,
-    /// WebTransport signaling listener (slice 5.7 / P19). Off by
-    /// default — the runtime is a scaffold today, matching the
-    /// `[mcp.http3]` and `[sip] transports = ["quic"]` scaffolds.
-    /// Enabling today + building without `--features webtransport`
-    /// on `smiths-sip` is a config error that surfaces at boot.
+    /// WebTransport signaling listener. Off by default. No build
+    /// of the engine ships a WebTransport listener yet, so
+    /// `enabled = true` is rejected by [`Config::validate`] rather
+    /// than accepted and ignored.
+    #[nested]
     pub webtransport: WebTransportConfig,
-    /// Config hot-reload substrate (slice 5.8 scaffold). Off by
-    /// default; the runtime — `ArcSwap<Config>` + `#[reloadable]`
-    /// derive macro + SIGHUP handler — lands in a focused
-    /// follow-on. The config block exists today so operators can
-    /// express their intent in TOML + the future CLI knows how
-    /// to read it.
+    /// Config hot-reload driver: SIGHUP / `smiths-net reload` /
+    /// MCP `put_config` all funnel through
+    /// [`crate::ConfigReloader::apply`]; this block gates the
+    /// signal path and throttles reload frequency.
+    #[nested]
     pub reload: ReloadConfig,
-    /// Config canary + auto-rollback (slice 5.9 scaffold).
-    /// Builds on `[reload]` — thresholds trip a rollback of the
-    /// most recent `apply` when hard-failure probes fire.
+    /// Config canary + auto-rollback. Every `apply` arms a
+    /// deadline timer and an error-rate probe from these
+    /// thresholds; an unconfirmed change rolls back when either
+    /// fires.
+    #[nested]
     pub canary: CanaryConfig,
-    /// WebRTC-native signaling adapter (slice 5.10 scaffold).
-    /// Pairs with the 5.7 WebTransport scaffold; shares the
-    /// JSON-over-stream message shape. Runtime follow-on.
+    /// WebRTC-native signaling adapter (WebSocket + DTLS-SRTP +
+    /// ICE-lite + embedded TURN). Off by default.
+    #[nested]
     pub webrtc: WebRtcConfig,
-    /// HA cluster configuration (slice 6.2).
+    /// HA cluster configuration.
     #[nested]
     pub cluster: ClusterConfig,
 }
@@ -132,19 +133,20 @@ pub struct AiConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct MediaConfig {
     /// Opt every bridge into the Goertzel inband DTMF detector
-    /// (slice 2.5). Off by default — the RFC 4733 telephone-event
+    ///. Off by default — the RFC 4733 telephone-event
     /// path (always on when a DTMF sink is wired) covers most
     /// softphones. Enable when legs that never negotiate 4733
     /// (PSTN gateway crossings) need DTMF too.
+    #[restart_required]
     pub inband_dtmf: bool,
-    /// IVR prompt library (slice 4.2). Points at a directory of
+    /// IVR prompt library. Points at a directory of
     /// WAV files (`prompts/welcome.wav`, etc.) that IVR scripts
     /// refer to by relative path. When the path is empty, the
     /// `record_prompt` MCP tool returns `NotFound` — operators
     /// opt in by setting a concrete directory.
     #[nested]
     pub prompts: PromptsConfig,
-    /// Audio transcoding CPU budget + admission control (slice 5.3).
+    /// Audio transcoding CPU budget + admission control.
     /// Governs how many simultaneous calls the engine will accept
     /// that require codec conversion (today: `Opus ↔ G.711`).
     #[reloadable(path = "media.transcode")]
@@ -164,6 +166,7 @@ pub struct MediaConfig {
     /// Public IPv4/IPv6 published in SDP `c=` / `o=` for peers that
     /// cannot reach a private LAN address (home NAT / DMZ setups).
     /// Unset = auto-detect via routing table (often wrong behind NAT).
+    #[restart_required]
     pub advertise_ip: Option<String>,
 }
 
@@ -183,7 +186,7 @@ pub struct RtpPortRange {
 }
 
 /// `[media.transcode]` TOML block — CPU budget + admission control
-/// for audio transcoding (slice 5.3).
+/// for audio transcoding.
 ///
 /// ```toml
 /// [media.transcode]
@@ -232,6 +235,7 @@ pub struct PromptsConfig {
     /// Empty string disables the library — `record_prompt` then
     /// surfaces a clean "not wired" error instead of writing
     /// somewhere surprising.
+    #[restart_required]
     pub root: String,
     /// Maximum number of decoded prompts kept hot in the LRU.
     /// `0` falls back to the library's built-in default.
@@ -261,14 +265,17 @@ pub struct StorageConfig {
     #[restart_required(group = "storage backend")]
     pub backend: StorageBackend,
     /// SQLite-specific settings. Ignored when `backend != "sqlite"`.
+    #[restart_required(group = "storage backend")]
     pub sqlite: SqliteStorageConfig,
-    /// Embedding-indexed search surface (slice 3.4). Off by default
+    /// Embedding-indexed search surface. Off by default
     /// — `search_calls_semantic` returns a clean `NotFound` when
     /// this is `none`.
+    #[restart_required(group = "storage backend")]
     pub vector: VectorStoreConfig,
-    /// Per-call audio retention (slice 3.4). Off by default; the
+    /// Per-call audio retention. Off by default; the
     /// filesystem backend makes `transcribe_call` / `summarize_call`
     /// self-resolve audio from a bare `call_id`.
+    #[restart_required(group = "storage backend")]
     pub recording: RecordingStoreConfig,
 }
 
@@ -286,7 +293,7 @@ pub struct StorageConfig {
 /// good for tests and single-node deployments without durability.
 /// `sidecar` delegates to a loaded plugin that advertises the
 /// `storage.vector` capability (today: `store-qdrant`).
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct VectorStoreConfig {
     /// Which backend to wire up.
@@ -309,7 +316,8 @@ pub enum VectorBackend {
     Memory,
     /// Delegates to a loaded plugin via the `storage.vector`
     /// capability seam. The plugin name is taken from
-    /// [`VectorStoreConfig::plugin`].
+    /// [`VectorStoreConfig::plugin`]. The engine has no sidecar
+    /// adapter yet, so [`Config::validate`] rejects this value.
     Sidecar,
 }
 
@@ -328,7 +336,7 @@ pub enum VectorBackend {
 /// `<hex(call_id)>.cid` sidecar files. Sidecar backends (S3,
 /// Azure Blob, GCS) slot in the same way the vector sidecar does
 /// — by advertising the `storage.recording` capability.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RecordingStoreConfig {
     /// Which backend to wire up.
@@ -358,12 +366,13 @@ pub enum RecordingBackend {
     /// [`crate::FsRecordingStore`] at [`FsRecordingConfig::root`].
     Fs,
     /// Delegates to a loaded plugin via the `storage.recording`
-    /// capability seam (today: `store-s3-recording`).
+    /// capability seam. The engine has no sidecar adapter yet, so
+    /// [`Config::validate`] rejects this value.
     Sidecar,
 }
 
 /// `[storage.recording.fs]` settings.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct FsRecordingConfig {
     /// Root directory for stored recordings. Auto-created on
@@ -395,7 +404,7 @@ pub enum StorageBackend {
 }
 
 /// `[storage.sqlite]` settings.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SqliteStorageConfig {
     /// Filesystem path to the `SQLite` database. Auto-created.
@@ -435,10 +444,13 @@ pub struct AuthConfig {
     /// Must match the realm stored against each account; mismatched
     /// realms surface to UAs as `401 Unauthorized` with the engine's
     /// value.
+    #[restart_required(group = "auth backend")]
     pub realm: String,
     /// SQLite-specific settings. Ignored when `backend != "sqlite"`.
+    #[restart_required(group = "auth backend")]
     pub sqlite: SqliteAuthConfig,
     /// HTTP-webhook settings. Ignored when `backend != "http"`.
+    #[restart_required(group = "auth backend")]
     pub http: HttpAuthConfig,
 }
 
@@ -473,7 +485,7 @@ pub enum AuthBackend {
 }
 
 /// `[auth.sqlite]` settings.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SqliteAuthConfig {
     /// Filesystem path to the `SQLite` database. Opened with
@@ -494,7 +506,7 @@ impl Default for SqliteAuthConfig {
 /// Mirror of `smiths-sip::auth::http_store::HttpAuthConfig`. Kept in
 /// `smiths-core` so operators configure auth without the CLI having
 /// to reach sideways into `smiths-sip`.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct HttpAuthConfig {
     /// Full endpoint URL the engine POSTs challenges to. Required
@@ -548,10 +560,11 @@ pub enum HttpFailureMode {
 }
 
 /// Core runtime tuning.
-#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct CoreConfig {
     /// Tokio worker threads. `0` means auto (number of CPUs).
+    #[restart_required]
     pub worker_threads: usize,
 }
 
@@ -573,6 +586,7 @@ pub struct ObservabilityConfig {
     /// written to `<pcap_dir>/<call-id>.pcap`; the feature is
     /// gated behind the `pcap` Cargo feature on `smiths-media`
     /// because dependency size is non-trivial.
+    #[restart_required]
     pub pcap_dir: Option<std::path::PathBuf>,
 }
 
@@ -597,7 +611,11 @@ pub struct SipConfig {
     /// Enabled transports. Only `udp` is wired in Phase 1.
     #[restart_required(group = "sip bind / transports / tls paths")]
     pub transports: Vec<SipTransport>,
-    /// Grace period to finish in-flight transactions on shutdown.
+    /// Grace period (seconds) the shutdown driver gives live
+    /// dialogs after it has hung them up before it hard-cancels
+    /// the SIP tasks. `0` skips the wait. The `SMITHS_DRAIN_SECS`
+    /// environment variable overrides it at runtime.
+    #[reloadable]
     pub drain_timeout_secs: u64,
     /// Filesystem path to the PEM-encoded TLS server certificate.
     /// Required when `transports` contains `tls`. Ignored otherwise.
@@ -610,22 +628,43 @@ pub struct SipConfig {
     /// Per-source-IP rate limit on inbound SIP datagrams.
     #[reloadable(path = "sip.rate_limit")]
     pub rate_limit: SipRateLimit,
-    /// Outbound proxy / VPN shim (slice 3.5). Applies to the
+    /// Outbound proxy / VPN shim. Applies to the
     /// TCP-based SIP transports (TCP, TLS inner TCP) — SOCKS5 and
     /// HTTP-CONNECT are stream protocols so UDP can't ride them.
     /// The UDP path ignores this block.
+    #[restart_required]
     pub proxy: SipProxyConfig,
-    /// Optional embedded-`WireGuard` device (slice 3.5 / feature
+    /// Optional embedded-`WireGuard` device ( / feature
     /// `wireguard`). Operators who run `WireGuard` as a host sidecar
     /// leave this `mode = "none"`; operators on appliance-style
     /// hosts enable it to bring up the tunnel in-process.
+    #[restart_required]
     pub vpn: SipVpnConfig,
     /// Request-URI user-part prefix that marks *conference rooms*
-    /// (slice 5.6e-runtime). When set, an INVITE to
+    ///. When set, an INVITE to
     /// `sip:<prefix>…@engine` joins an N-party audio mixer (one
     /// participant per INVITE) instead of the classic 2-peer bridge.
     /// `None` (the default) = every room bridges as before.
+    #[restart_required]
     pub conference_prefix: Option<String>,
+    /// RFC 4028 session timers: when `true` every accepted INVITE
+    /// negotiates a `Session-Expires` refresh interval and the
+    /// engine tears down dialogs whose refresh never arrives.
+    #[restart_required(group = "sip session timer")]
+    pub session_timer_enabled: bool,
+    /// Default `Session-Expires` value (seconds) offered when the
+    /// peer doesn't ask for one.
+    #[restart_required(group = "sip session timer")]
+    pub session_expires_secs: u64,
+    /// Minimum session interval (`Min-SE`, seconds) the engine
+    /// accepts; shorter peer requests get `422 Session Interval Too
+    /// Small`.
+    #[restart_required(group = "sip session timer")]
+    pub min_se_secs: u64,
+    /// Hard ceiling on a dialog's lifetime (seconds). The engine
+    /// BYEs any call that lasts longer. `0` = unlimited.
+    #[restart_required]
+    pub max_call_duration_secs: u64,
 }
 
 /// `[sip.vpn]` — embedded userspace `WireGuard` device. Gated behind
@@ -642,12 +681,10 @@ pub struct SipConfig {
 /// interface_ip    = "10.42.0.5/24"
 /// ```
 ///
-/// The runtime plumbing (creating the tun interface, binding SIP
-/// against it) is a follow-on — the 0.42.0 release ships only the
-/// config surface. An engine built with `features = ["wireguard"]`
-/// and `mode = "wireguard"` warns at startup and falls back to
-/// `mode = "none"` until the runtime lands.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// No build of the engine brings the tunnel up in-process yet, so
+/// `mode = "wireguard"` is rejected by [`Config::validate`] instead
+/// of being accepted and ignored; run `WireGuard` as a host sidecar.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SipVpnConfig {
     /// Which VPN mode to activate.
@@ -678,9 +715,8 @@ pub enum VpnMode {
     /// sidecar or don't need a tunnel at all.
     #[default]
     None,
-    /// Embedded `boringtun` device. Only honored when the binary
-    /// was built with `--features wireguard`; otherwise the engine
-    /// falls back to `None` with a warning log.
+    /// Embedded `boringtun` device. Rejected by
+    /// [`Config::validate`] until a build ships the runtime device.
     Wireguard,
 }
 
@@ -700,7 +736,7 @@ pub enum VpnMode {
 /// opens a fresh TCP connection to a peer). Listener binds are
 /// unaffected — operators wanting ingress protection terminate TLS
 /// or run a reverse proxy in front of the engine.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SipProxyConfig {
     /// Which proxy protocol to wrap outbound TCP connects in.
@@ -767,6 +803,10 @@ impl Default for SipConfig {
             proxy: SipProxyConfig::default(),
             vpn: SipVpnConfig::default(),
             conference_prefix: None,
+            session_timer_enabled: true,
+            session_expires_secs: 1800,
+            min_se_secs: 90,
+            max_call_duration_secs: 0,
         }
     }
 }
@@ -787,7 +827,7 @@ pub enum BindSpec {
 }
 
 impl BindSpec {
-    /// Resolve this spec to a concrete socket address for `bind()`.
+    /// Resolve this spec to a concrete socket address for `bind`.
     ///
     /// Infallible today — the `Addr` variant is the only one. Will
     /// grow an async resolver once interface-name support lands.
@@ -885,12 +925,9 @@ pub enum SipTransport {
     Tcp,
     /// RFC 5630 SIP over TLS. Not yet wired in Phase 1.
     Tls,
-    /// SIP-over-QUIC per `draft-ietf-sipcore-sip-quic` (slice 4.3 /
-    /// P17). Requires the `smiths-sip/sip-quic` Cargo feature; the
-    /// runtime listener is a dedicated follow-on. Selecting this
-    /// transport today with the feature off is a config error;
-    /// selecting it with the feature on logs a clear "not yet
-    /// wired" warning at bind.
+    /// SIP-over-QUIC per `draft-ietf-sipcore-sip-quic`. No build
+    /// ships the QUIC listener yet, so selecting this transport is
+    /// rejected by [`Config::validate`].
     Quic,
 }
 
@@ -913,15 +950,34 @@ pub struct McpConfig {
     /// HTTP bind for MCP.
     #[restart_required(group = "mcp binds")]
     pub http_bind: SocketAddr,
-    /// Token-bucket rate limit applied to tool invocations.
+    /// Token-bucket rate limit applied to tool invocations. The
+    /// limiter is built once at boot.
+    #[restart_required]
     pub rate_limit: RateLimitConfig,
-    /// HTTP/3 (QUIC) bind for MCP (slice 4.3 / P17). Requires the
-    /// `smiths-mcp/mcp-http3` Cargo feature; off by default. The
-    /// runtime listener is a dedicated follow-on — 0.45.0 accepts
-    /// the config + advertises `h3` in `--version` so operators
-    /// aren't surprised later.
+    /// HTTP/3 (QUIC) bind for MCP. No build ships the h3 listener
+    /// yet, so `enabled = true` is rejected by [`Config::validate`].
     #[restart_required(group = "mcp binds")]
     pub http3: McpHttp3Config,
+    /// HTTP/1.1 + HTTP/2 adapter settings (`[mcp.http]`).
+    #[restart_required(group = "mcp binds")]
+    pub http: McpHttpConfig,
+}
+
+/// `[mcp.http]` — settings for the plain-HTTP MCP adapter.
+///
+/// ```toml
+/// [mcp.http]
+/// bearer_token = "s3cret" # optional; unset = no auth
+/// ```
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpHttpConfig {
+    /// When set, every MCP HTTP request must carry a matching
+    /// `Authorization: Bearer <token>` header or the adapter
+    /// returns `401 Unauthorized`. `None` disables auth — fine on
+    /// loopback, never on a public bind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
 }
 
 /// `[mcp.http3]` — HTTP/3 bind for the MCP adapter.
@@ -934,9 +990,8 @@ pub struct McpConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct McpHttp3Config {
-    /// Enable the h3 listener. Ignored when the binary was built
-    /// without `--features mcp-http3`; the CLI logs a clear warning
-    /// in that case.
+    /// Enable the h3 listener. Rejected by [`Config::validate`]
+    /// until a build ships the listener.
     pub enabled: bool,
     /// UDP bind for the QUIC listener. Distinct port from the TCP
     /// `http_bind` so operators can front only h3 with a public
@@ -953,12 +1008,9 @@ impl Default for McpHttp3Config {
     }
 }
 
-/// `[webtransport]` TOML block — browser-native signaling listener
-/// (slice 5.7 / P19). Today a scaffold: flipping `enabled = true`
-/// with a binary built without `--features webtransport` is a config
-/// error that surfaces at boot; flipping it on *with* the feature
-/// logs a "scaffold-only" warning and refuses to bind until the
-/// runtime follow-on slice lands.
+/// `[webtransport]` TOML block — browser-native signaling listener.
+/// No build ships the QUIC listener yet: `enabled = true` fails
+/// [`Config::validate`] so it can never be silently ignored.
 ///
 /// ```toml
 /// [webtransport]
@@ -967,22 +1019,24 @@ impl Default for McpHttp3Config {
 /// cert_path = "/etc/smiths/wt.crt"
 /// key_path  = "/etc/smiths/wt.key"
 /// ```
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebTransportConfig {
-    /// Enable the WebTransport listener. Ignored when the binary
-    /// was built without `--features webtransport` on `smiths-sip`;
-    /// the CLI logs a clear warning in that case.
+    /// Enable the WebTransport listener. Rejected by
+    /// [`Config::validate`] until a build ships the listener.
+    #[restart_required(group = "webtransport listener")]
     pub enabled: bool,
     /// UDP bind for the QUIC listener. Default picks a loopback
     /// port so accidentally flipping `enabled = true` can't
     /// surprise-expose anything.
+    #[restart_required(group = "webtransport listener")]
     pub bind: SocketAddr,
     /// Path to the TLS certificate (PEM) the listener serves.
-    /// Empty = unconfigured; the runtime rejects bind until the
-    /// operator points at a real cert.
+    /// Empty = unconfigured.
+    #[restart_required(group = "webtransport listener")]
     pub cert_path: String,
     /// Path to the matching private key (PEM).
+    #[restart_required(group = "webtransport listener")]
     pub key_path: String,
 }
 
@@ -997,46 +1051,48 @@ impl Default for WebTransportConfig {
     }
 }
 
-/// `[reload]` TOML block — config hot-reload substrate (slice
-/// 5.8 scaffold). The runtime — `ArcSwap<Config>`,
-/// `#[derive(Reloadable)]`, `Config::apply` returning
-/// `ApplyReport` — lands in a focused follow-on. The block
-/// exists today so the CLI can accept `--reload` on the command
-/// line without the build changing; the current behaviour is
-/// "refuse with `RestartRequired` for every field" until the
-/// derive macro lands.
+/// `[reload]` TOML block — gates the SIGHUP / `smiths-net reload`
+/// hot-reload path. The engine wraps its live config in an
+/// `ArcSwap`, diffs candidates with `#[derive(Reloadable)]`, and
+/// swaps only reloadable fields through
+/// [`crate::ConfigReloader::apply`]. Both knobs are themselves
+/// hot-reloadable: the signal driver reads the live values on
+/// every SIGHUP.
 ///
 /// ```toml
 /// [reload]
 /// enabled         = true     # accept SIGHUP + CLI `reload`
-/// signal          = "SIGHUP" # POSIX default; Windows uses a named event
-/// max_frequency_s = 10       # reject reloads arriving faster than this
+/// max_frequency_s = 10       # refuse reloads arriving faster than this
 /// ```
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReloadConfig {
-    /// Enable SIGHUP-triggered + CLI-triggered config reload.
-    /// Scaffold only today: flipping this on logs a loud
-    /// "runtime not yet wired" warning at startup.
+    /// Accept SIGHUP-triggered reloads (which is also what the
+    /// `smiths-net reload` subcommand sends). `false` makes the
+    /// engine log and ignore the signal; MCP `put_config` is
+    /// unaffected.
+    #[reloadable]
     pub enabled: bool,
-    /// Minimum seconds between reload attempts; extras are
-    /// refused with a clean diagnostic rather than queued.
+    /// Minimum seconds between SIGHUP reload attempts; a signal
+    /// arriving sooner is refused with a warning rather than
+    /// queued. `0` disables the throttle.
+    #[reloadable]
     pub max_frequency_s: u64,
 }
 
 impl Default for ReloadConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             max_frequency_s: 10,
         }
     }
 }
 
 /// `[canary]` TOML block — config-change canary window +
-/// auto-rollback thresholds (slice 5.9 scaffold). Depends on
-/// `[reload]`'s runtime. Once the derive macro + `Config::apply`
-/// land, this block controls:
+/// auto-rollback thresholds. Every successful `apply` arms a
+/// deadline timer and an error-rate probe from the *candidate's*
+/// values, so the block is hot-reloadable by construction:
 ///
 /// - `deadline_s` — how long the new config has to prove itself
 ///   before auto-rolling back to the prior snapshot.
@@ -1052,16 +1108,19 @@ impl Default for ReloadConfig {
 /// plugin_error_rate_ceiling         = 0.5
 /// sip_parse_errors_per_sec_ceiling  = 10
 /// ```
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct CanaryConfig {
     /// Seconds the new config gets before auto-rollback.
+    #[reloadable]
     pub deadline_s: u64,
     /// Plugin-invocation error-rate ceiling (0.0..=1.0) that
     /// triggers hard-failure rollback. `1.0` disables.
+    #[reloadable]
     pub plugin_error_rate_ceiling: f32,
     /// SIP parse-error rate (per second) that triggers
     /// hard-failure rollback. `u64::MAX` disables.
+    #[reloadable]
     pub sip_parse_errors_per_sec_ceiling: u64,
 }
 
@@ -1075,47 +1134,52 @@ impl Default for CanaryConfig {
     }
 }
 
-/// `[webrtc]` TOML block — WebRTC-native signaling + privacy
-/// (slices 5.10 + 5.11 scaffold). The runtime adapter and the
-/// privacy layers land in dedicated follow-on slices; the block
-/// exists today so operators can express their intent. Pairs
-/// with the 5.7 `[webtransport]` block: the JSON message shape
-/// is shared, 5.7 is the QUIC transport substrate, 5.10 is the
-/// WebSocket baseline.
+/// `[webrtc]` TOML block — WebRTC-native signaling adapter: a
+/// plain-HTTP WebSocket at `ws_bind` carrying JSON offers, answered
+/// through the shared SDP negotiator with DTLS-SRTP, ICE-lite
+/// candidates, tag-based rendezvous against SIP legs, and the
+/// `[webrtc.privacy]` candidate filter. The adapter does not
+/// terminate TLS itself: `wss://` comes from a reverse proxy in
+/// front of it, so `tls_cert` / `tls_key` are rejected by
+/// [`Config::validate`] rather than silently ignored.
 ///
 /// ```toml
 /// [webrtc]
 /// enabled  = true
 /// ws_bind  = "0.0.0.0:7881"
-/// tls_cert = "/etc/smiths/wt.crt"
-/// tls_key  = "/etc/smiths/wt.key"
 ///
 /// [webrtc.privacy]
 /// mode           = "open"         # "open" | "relay_only" | "strict"
 /// redaction_key  = ""             # required for `strict`
 /// ```
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Reloadable)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebRtcConfig {
     /// Enable the WebRTC-native signaling adapter.
+    #[restart_required(group = "webrtc bind / tls")]
     pub enabled: bool,
     /// WebSocket bind for the signaling adapter.
+    #[restart_required(group = "webrtc bind / tls")]
     pub ws_bind: SocketAddr,
-    /// Path to the TLS cert the adapter serves. Empty =
-    /// plaintext (disallowed in privacy `strict` mode).
+    /// Path to a TLS cert. Must stay empty: the adapter binds
+    /// plaintext and expects a TLS-terminating proxy for `wss://`.
+    #[restart_required(group = "webrtc bind / tls")]
     pub tls_cert: String,
-    /// Matching private key.
+    /// Matching private key. Must stay empty (see `tls_cert`).
+    #[restart_required(group = "webrtc bind / tls")]
     pub tls_key: String,
-    /// Privacy hardening knobs (slice 5.11).
+    /// Privacy hardening knobs. Hot-reloadable: mode flips and
+    /// key rotation take effect on the next offer.
+    #[reloadable(path = "webrtc.privacy")]
     pub privacy: WebRtcPrivacyConfig,
-    /// ICE surface (slice 5.10-ice). Off by default —
-    /// deployments without NATs keep the pre-5.10-ice
-    /// direct-peer-address shape.
+    /// ICE surface. Off by default — deployments without NATs
+    /// keep the direct-peer-address shape.
+    #[restart_required]
     pub ice: WebRtcIceConfig,
-    /// TURN server / client surface (slice 5.11-turn). Off
-    /// by default. `external_url` overrides the embedded
-    /// server + redirects clients through an operator's
-    /// existing `coturn`.
+    /// TURN server / client surface. Off by default.
+    /// `external_url` overrides the embedded server + redirects
+    /// clients through an operator's existing `coturn`.
+    #[restart_required]
     pub turn: WebRtcTurnConfig,
 }
 
@@ -1134,7 +1198,7 @@ impl Default for WebRtcConfig {
 }
 
 /// `[webrtc.ice]` — ICE candidate gathering + connectivity
-/// checks (slice 5.10-ice). When enabled, the WebRTC adapter
+/// checks. When enabled, the WebRTC adapter
 /// emits `a=ice-ufrag` / `a=ice-pwd` / `a=candidate:` lines
 /// on every answer + runs a `binding_ping` per bridge install
 /// to verify the pair before audio flows. ICE-Lite posture:
@@ -1143,11 +1207,11 @@ impl Default for WebRtcConfig {
 ///
 /// ```toml
 /// [webrtc.ice]
-/// enabled       = true
-/// host_binds    = ["0.0.0.0:50000"]  # empty = derive from ws_bind.ip()
-/// stun_servers  = []                  # future: gather srflx via these
+/// enabled      = true
+/// host_binds   = ["0.0.0.0:50000"]          # empty = derive from ws_bind.ip
+/// stun_servers = ["stun.example.net:3478"]  # srflx candidates via STUN Binding
 /// ```
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebRtcIceConfig {
     /// Master switch. `false` keeps the pre-5.10-ice
@@ -1158,16 +1222,14 @@ pub struct WebRtcIceConfig {
     /// empty, the gatherer derives one host candidate per
     /// allocated media endpoint (the default production shape).
     pub host_binds: Vec<SocketAddr>,
-    /// External STUN servers the engine queries for
-    /// server-reflexive candidates. Empty = host-only gathering
-    /// (MVP). Real srflx support lands with
-    /// `smiths-ice::binding_ping` extended for asymmetric
-    /// servers.
+    /// STUN servers the engine queries (one `Binding` request
+    /// each, 1 s timeout) for server-reflexive candidates on every
+    /// WebRTC answer. Empty = host-only gathering.
     pub stun_servers: Vec<SocketAddr>,
 }
 
 /// `[webrtc.turn]` — embedded RFC 8656 TURN server + optional
-/// external relay fallback (slice 5.11-turn). Off by default.
+/// external relay fallback. Off by default.
 ///
 /// ```toml
 /// [webrtc.turn]
@@ -1176,7 +1238,8 @@ pub struct WebRtcIceConfig {
 /// realm          = "turn.example.com"
 /// relay_ip       = "203.0.113.1"        # public IP to hand back
 /// allocation_lifetime_s = 600
-/// # One credential per operator account. Rotate via [reload].
+/// # One credential per operator account. Changing the list
+/// # requires a restart.
 /// credentials    = [
 ///   { username = "alice", password = "hunter2" },
 /// ]
@@ -1184,7 +1247,7 @@ pub struct WebRtcIceConfig {
 /// # clients this URL instead (typical coturn front-end).
 /// external_url   = ""
 /// ```
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebRtcTurnConfig {
     /// Enable the embedded TURN server.
@@ -1205,9 +1268,8 @@ pub struct WebRtcTurnConfig {
     /// faster.
     pub allocation_lifetime_s: u32,
     /// Static credentials served by the long-term
-    /// credential mechanism. Rotate via `[reload]` — the
-    /// reload driver resizes the credential map in place,
-    /// new `Allocate` requests use the refreshed set.
+    /// credential mechanism. The server hashes them once at
+    /// boot; changing the list requires a restart.
     pub credentials: Vec<WebRtcTurnCredential>,
     /// External TURN URL to hand clients instead of
     /// spawning the embedded server. When set, `enabled`
@@ -1232,7 +1294,7 @@ impl Default for WebRtcTurnConfig {
 
 /// One long-term credential entry for the embedded TURN
 /// server. Passwords are held in-memory only; never logged.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebRtcTurnCredential {
     /// `USERNAME` attribute value clients must present.
@@ -1243,8 +1305,8 @@ pub struct WebRtcTurnCredential {
     pub password: String,
 }
 
-/// `[webrtc.privacy]` — privacy hardening modes (slice 5.11
-/// scaffold). Three modes that compose additively:
+/// `[webrtc.privacy]` — privacy hardening modes. Three modes that
+/// compose additively:
 ///
 /// - `open` (default) — today's behavior, no hardening.
 /// - `relay_only` — reject offers carrying `host` / `srflx`
@@ -1255,8 +1317,8 @@ pub struct WebRtcTurnCredential {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebRtcPrivacyConfig {
-    /// Privacy mode. Scaffold only — runtime enforcement is a
-    /// follow-on slice.
+    /// Privacy mode. Enforced by the WebRTC adapter on every
+    /// offer (candidate filter) and every log line (redaction).
     pub mode: WebRtcPrivacyMode,
     /// `blake3` key for source-IP redaction when
     /// `mode = "strict"`. Rotate via
@@ -1295,6 +1357,7 @@ impl Default for McpConfig {
             http_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7878),
             rate_limit: RateLimitConfig::default(),
             http3: McpHttp3Config::default(),
+            http: McpHttpConfig::default(),
         }
     }
 }
@@ -1329,6 +1392,7 @@ pub struct A2aConfig {
     /// a matching `Authorization: Bearer <token>` header or the server
     /// returns `401 Unauthorized`. `None` disables auth — fine for
     /// local development, never for public deployments.
+    #[restart_required(group = "a2a bind")]
     pub bearer_token: Option<String>,
 }
 
@@ -1354,13 +1418,18 @@ pub struct PluginsConfig {
     /// Default is permissive (no limits, no `no_new_privs`) so tests
     /// and dev runs aren't surprised; production deployments should
     /// set conservative caps per the operator runbook.
+    #[restart_required]
     pub sandbox: SandboxConfig,
     /// Plugin names to notify when a SIP dialog goes live. The engine
     /// invokes each one's `on_dialog_created` method (params
     /// `{call_id, remote_rtp}`) so a call-control plugin can react to
     /// inbound calls without an explicit MCP request. Empty (default)
     /// = no call-event consumer is spawned.
+    #[restart_required]
     pub call_event_hooks: Vec<String>,
+    /// Resource limits for WASM-tier plugins (`[plugins.wasm]`).
+    #[restart_required]
+    pub wasm: PluginsWasmConfig,
 }
 
 impl Default for PluginsConfig {
@@ -1369,6 +1438,35 @@ impl Default for PluginsConfig {
             dir: std::path::PathBuf::from("plugins"),
             sandbox: SandboxConfig::default(),
             call_event_hooks: Vec::new(),
+            wasm: PluginsWasmConfig::default(),
+        }
+    }
+}
+
+/// `[plugins.wasm]` — limits applied to every WASM-tier plugin
+/// instance.
+///
+/// ```toml
+/// [plugins.wasm]
+/// memory_limit_mb = 64 # linear-memory ceiling per instance
+/// invoke_timeout_ms = 5000 # per-call wall-clock budget
+/// ```
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PluginsWasmConfig {
+    /// Linear-memory ceiling per WASM instance, in MiB. A guest
+    /// that grows past it traps instead of taking the host down.
+    pub memory_limit_mb: u64,
+    /// Wall-clock budget per guest invocation, in milliseconds.
+    /// The host interrupts the guest when it elapses.
+    pub invoke_timeout_ms: u64,
+}
+
+impl Default for PluginsWasmConfig {
+    fn default() -> Self {
+        Self {
+            memory_limit_mb: 64,
+            invoke_timeout_ms: 5_000,
         }
     }
 }
@@ -1386,7 +1484,7 @@ impl Default for PluginsConfig {
 /// set (tokio + the plugin's runtime). This struct is the MVP
 /// sandboxing item 8 called for: FD / memory / CPU / process caps
 /// plus the privilege-escalation gate.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SandboxConfig {
     /// `RLIMIT_NOFILE` soft + hard cap. Caps the number of file
@@ -1401,7 +1499,7 @@ pub struct SandboxConfig {
     /// the plugin exceeds it; by default that terminates the child.
     pub max_cpu_seconds: Option<u64>,
     /// `RLIMIT_NPROC` cap — how many additional processes this user
-    /// can spawn. Set `Some(0)` to forbid `fork()` / `exec()` from
+    /// can spawn. Set `Some(0)` to forbid `fork` / `exec` from
     /// the plugin entirely (it can't spawn helpers, launch shells,
     /// etc.).
     pub max_processes: Option<u64>,
@@ -1455,9 +1553,17 @@ pub enum LogFormat {
 impl Config {
     /// Load config from `path`, layering in `SMITHS__*` env overrides.
     ///
-    /// Missing files are tolerated — the returned config falls back to
-    /// defaults plus env. Unknown keys in the TOML are rejected.
+    /// A missing or unreadable file is an error: a mistyped
+    /// `--config` must never boot an engine on the defaults
+    /// (`0.0.0.0:5060`, no auth). Unknown keys in the TOML are
+    /// rejected.
     pub fn load(path: &Path) -> Result<Self, Error> {
+        if !path.is_file() {
+            return Err(Error::Config(format!(
+                "config file not found: {}",
+                path.display()
+            )));
+        }
         let fig = Figment::from(Serialized::defaults(Self::default()))
             .merge(Toml::file(path))
             .merge(Env::prefixed("SMITHS__").split("__"));
@@ -1472,14 +1578,246 @@ impl Config {
             .extract()
             .map_err(|e| Error::Config(e.to_string()))
     }
+
+    /// Validate cross-field invariants against the baseline
+    /// [`BuildSupport`] (no optional runtime available). Same as
+    /// [`Self::validate_with`] with `BuildSupport::default`.
+    ///
+    /// # Errors
+    /// The first [`ConfigValidationError`] found.
+    pub fn validate(&self) -> Result<(), ConfigValidationError> {
+        self.validate_with(&BuildSupport::default())
+    }
+
+    /// Validate cross-field invariants that pass TOML parsing but
+    /// would fail — or, worse, be silently ignored — at boot.
+    ///
+    /// `support` says which optional runtimes this build actually
+    /// ships. A toggle that enables a runtime the build lacks is a
+    /// hard [`ConfigValidationError::Unsupported`] so an operator
+    /// never reads "config accepted" as "feature active".
+    ///
+    /// # Errors
+    /// The first [`ConfigValidationError`] found; the engine
+    /// refuses to boot (or to hot-apply) on any of them.
+    #[allow(clippy::too_many_lines)] // one linear checklist; splitting it hides the order
+    pub fn validate_with(&self, support: &BuildSupport) -> Result<(), ConfigValidationError> {
+        use ConfigValidationError as E;
+
+        if self.sip.rate_limit.per_sec > 0 && self.sip.rate_limit.burst == 0 {
+            return Err(E::RateLimitBurstZero {
+                per_sec: self.sip.rate_limit.per_sec,
+            });
+        }
+        if self.sip.transports.contains(&SipTransport::Tls)
+            && (self.sip.tls_cert_path.is_none() || self.sip.tls_key_path.is_none())
+        {
+            return Err(E::TlsPathsMissing);
+        }
+        if self.sip.transports.contains(&SipTransport::Quic) && !support.sip_quic {
+            return Err(E::Unsupported {
+                field: "sip.transports",
+                reason: "`quic` is selected but this build has no SIP-over-QUIC listener",
+            });
+        }
+        if self.sip.vpn.mode == VpnMode::Wireguard && !support.wireguard {
+            return Err(E::Unsupported {
+                field: "sip.vpn.mode",
+                reason: "`wireguard` is set but this build cannot bring up an embedded tunnel; \
+                         run WireGuard as a host sidecar (docs/deployment/vpn.md)",
+            });
+        }
+        if self.sip.session_timer_enabled {
+            if self.sip.min_se_secs == 0 || self.sip.session_expires_secs == 0 {
+                return Err(E::SessionTimerInterval {
+                    session_expires_secs: self.sip.session_expires_secs,
+                    min_se_secs: self.sip.min_se_secs,
+                });
+            }
+            if self.sip.session_expires_secs < self.sip.min_se_secs {
+                return Err(E::SessionTimerInterval {
+                    session_expires_secs: self.sip.session_expires_secs,
+                    min_se_secs: self.sip.min_se_secs,
+                });
+            }
+        }
+        if let Some(range) = self.media.rtp_ports
+            && range.min >= range.max
+        {
+            return Err(E::RtpPortRange {
+                min: range.min,
+                max: range.max,
+            });
+        }
+        if self.cluster.mode != ClusterMode::Standalone && self.cluster.peer_addr.is_none() {
+            return Err(E::ClusterPeerAddrMissing {
+                mode: self.cluster.mode,
+            });
+        }
+        if self.auth.backend == AuthBackend::Http && self.auth.http.endpoint.trim().is_empty() {
+            return Err(E::AuthHttpEndpointMissing);
+        }
+        if self.mcp.http3.enabled && !support.mcp_http3 {
+            return Err(E::Unsupported {
+                field: "mcp.http3.enabled",
+                reason: "this build has no HTTP/3 listener",
+            });
+        }
+        if self.webtransport.enabled && !support.webtransport {
+            return Err(E::Unsupported {
+                field: "webtransport.enabled",
+                reason: "this build has no WebTransport listener",
+            });
+        }
+        if self.storage.vector.backend == VectorBackend::Sidecar && !support.vector_sidecar {
+            return Err(E::Unsupported {
+                field: "storage.vector.backend",
+                reason: "`sidecar` is set but this build has no vector-store sidecar adapter",
+            });
+        }
+        if self.storage.recording.backend == RecordingBackend::Sidecar && !support.recording_sidecar
+        {
+            return Err(E::Unsupported {
+                field: "storage.recording.backend",
+                reason: "`sidecar` is set but this build has no recording-store sidecar adapter",
+            });
+        }
+        let webrtc_tls_configured =
+            !self.webrtc.tls_cert.is_empty() || !self.webrtc.tls_key.is_empty();
+        if webrtc_tls_configured && !support.webrtc_tls {
+            return Err(E::Unsupported {
+                field: "webrtc.tls_cert",
+                reason: "the WebRTC signaling adapter binds plaintext; terminate TLS in a \
+                         reverse proxy (docs/deployment/webrtc.md) and leave tls_cert / \
+                         tls_key empty",
+            });
+        }
+        if self.webrtc.privacy.mode == WebRtcPrivacyMode::Strict {
+            if self.webrtc.privacy.redaction_key.is_empty() {
+                return Err(E::StrictPrivacyRedactionKeyMissing);
+            }
+            if !support.webrtc_tls {
+                return Err(E::Unsupported {
+                    field: "webrtc.privacy.mode",
+                    reason: "`strict` requires TLS-only signaling, which this build's adapter \
+                             cannot terminate; use `relay_only` behind a TLS proxy",
+                });
+            }
+            if self.webrtc.tls_cert.is_empty() || self.webrtc.tls_key.is_empty() {
+                return Err(E::StrictPrivacyTlsMissing);
+            }
+        }
+        if !(0.0..=1.0).contains(&self.canary.plugin_error_rate_ceiling) {
+            return Err(E::CanaryCeilingOutOfRange {
+                value: self.canary.plugin_error_rate_ceiling,
+            });
+        }
+        Ok(())
+    }
 }
 
-/// `[cluster]` TOML block — HA replication settings (slice 6.2).
+/// Which optional runtimes the running binary actually ships.
+/// [`Config::validate_with`] rejects any toggle that enables a
+/// runtime the build lacks. Every field defaults to `false`; a
+/// build flips a field to `true` only once the listener / adapter
+/// behind it exists and is wired at boot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+// One independent flag per optional runtime; they are read
+// individually by `validate_with`, so grouping them into an enum or
+// bitfield would only obscure which toggle failed.
+#[allow(clippy::struct_excessive_bools)]
+pub struct BuildSupport {
+    /// `sip.transports = ["quic"]` can be served.
+    pub sip_quic: bool,
+    /// `mcp.http3.enabled = true` can be served.
+    pub mcp_http3: bool,
+    /// `webtransport.enabled = true` can be served.
+    pub webtransport: bool,
+    /// `sip.vpn.mode = "wireguard"` brings up an embedded tunnel.
+    pub wireguard: bool,
+    /// `storage.vector.backend = "sidecar"` has an adapter.
+    pub vector_sidecar: bool,
+    /// `storage.recording.backend = "sidecar"` has an adapter.
+    pub recording_sidecar: bool,
+    /// The WebRTC signaling adapter terminates TLS itself.
+    pub webrtc_tls: bool,
+}
+
+/// Semantic config errors caught by [`Config::validate_with`].
+/// Each variant names the offending field(s) so the operator can
+/// fix the file without reading engine source.
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConfigValidationError {
+    /// `sip.rate_limit.per_sec > 0` with `burst = 0` — the bucket
+    /// would never admit a datagram.
+    #[error(
+        "sip.rate_limit: per_sec = {per_sec} but burst = 0 — the bucket would never admit traffic"
+    )]
+    RateLimitBurstZero {
+        /// Configured sustained rate.
+        per_sec: u32,
+    },
+    /// `sip.transports` includes `tls` but a PEM path is unset.
+    #[error("sip.transports includes `tls` but tls_cert_path / tls_key_path are unset")]
+    TlsPathsMissing,
+    /// `media.rtp_ports` window is empty or inverted.
+    #[error("media.rtp_ports: min ({min}) must be lower than max ({max})")]
+    RtpPortRange {
+        /// Configured lower bound.
+        min: u16,
+        /// Configured upper bound.
+        max: u16,
+    },
+    /// HA mode set without a peer to talk to.
+    #[error("cluster.mode = {mode:?} requires cluster.peer_addr")]
+    ClusterPeerAddrMissing {
+        /// Configured mode.
+        mode: ClusterMode,
+    },
+    /// `auth.backend = "http"` without a webhook URL.
+    #[error("auth.backend = http requires a non-empty auth.http.endpoint")]
+    AuthHttpEndpointMissing,
+    /// `webrtc.privacy.mode = "strict"` without a redaction key.
+    #[error("webrtc.privacy.mode = strict requires a non-empty webrtc.privacy.redaction_key")]
+    StrictPrivacyRedactionKeyMissing,
+    /// `webrtc.privacy.mode = "strict"` without TLS material.
+    #[error("webrtc.privacy.mode = strict requires webrtc.tls_cert and webrtc.tls_key")]
+    StrictPrivacyTlsMissing,
+    /// RFC 4028 intervals are inconsistent.
+    #[error(
+        "sip session timer: session_expires_secs ({session_expires_secs}) must be >= \
+         min_se_secs ({min_se_secs}) and both must be non-zero"
+    )]
+    SessionTimerInterval {
+        /// Configured `Session-Expires`.
+        session_expires_secs: u64,
+        /// Configured `Min-SE`.
+        min_se_secs: u64,
+    },
+    /// `canary.plugin_error_rate_ceiling` outside `0.0..=1.0`.
+    #[error("canary.plugin_error_rate_ceiling = {value} must be within 0.0..=1.0")]
+    CanaryCeilingOutOfRange {
+        /// Configured value.
+        value: f32,
+    },
+    /// A toggle enables a runtime this build does not ship.
+    #[error("{field}: {reason}")]
+    Unsupported {
+        /// Dotted path of the offending field.
+        field: &'static str,
+        /// Why the build cannot honor it.
+        reason: &'static str,
+    },
+}
+
+/// `[cluster]` TOML block — HA dialog replication.
 ///
 /// ```toml
 /// [cluster]
-/// mode      = "primary"               # "standalone" | "primary" | "secondary"
-/// peer_addr = "10.42.0.10:8000"       # address to dial/bind
+/// mode                    = "primary"             # "standalone" | "primary" | "secondary"
+/// peer_addr               = "10.42.0.10:8000"     # primary: bind; secondary: primary's address
+/// heartbeat_interval_secs = 5
 /// ```
 #[derive(Clone, Debug, Deserialize, Serialize, Reloadable)]
 #[serde(default, deny_unknown_fields)]
@@ -1488,24 +1826,26 @@ pub struct ClusterConfig {
     /// Secondary (replays deltas).
     #[restart_required]
     pub mode: ClusterMode,
-    /// Peer address for replication traffic (TCP).
-    /// When mode = Primary, this is the address to dial (the secondary).
-    /// When mode = Secondary, this is the address to bind (the listener).
+    /// Replication endpoint (TCP). Required outside `standalone`.
+    /// `primary` binds its replication listener here; `secondary`
+    /// dials this address (the primary's listener).
     #[restart_required]
     pub peer_addr: Option<SocketAddr>,
-    /// Interval between heartbeat pings between primary and secondary.
+    /// Seconds between heartbeat frames on the replication link.
+    /// The primary sends one per interval while idle; the
+    /// secondary redials after three silent intervals.
     #[reloadable]
     pub heartbeat_interval_secs: u32,
-    /// Directory to store Raft `SQLite` logs (slice 6.3a).
+    /// Directory to store Raft `SQLite` logs.
     #[restart_required]
     pub raft_dir: std::path::PathBuf,
-    /// Unique Raft node identifier (slice 6.3b).
+    /// Unique Raft node identifier.
     #[restart_required]
     pub node_id: u64,
-    /// Address to bind for inter-node Raft RPC traffic (slice 6.3b).
+    /// Address to bind for inter-node Raft RPC traffic.
     #[restart_required]
     pub raft_addr: Option<SocketAddr>,
-    /// Initial cluster peers for bootstrap, format: `"node_id@host:port"` (slice 6.3b).
+    /// Initial cluster peers for bootstrap, format: `"node_id@host:port"`.
     #[restart_required]
     pub initial_peers: Vec<String>,
 }
@@ -1618,5 +1958,539 @@ mod tests {
             assert_eq!(c.observability.health_bind.port(), 9999);
             Ok(())
         });
+    }
+
+    #[test]
+    fn load_missing_file_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.toml");
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("config file not found"), "{msg}");
+        assert!(msg.contains("does-not-exist.toml"), "{msg}");
+    }
+
+    #[test]
+    fn load_directory_path_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Config::load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn reload_is_enabled_by_default() {
+        let c = Config::default();
+        assert!(c.reload.enabled);
+        assert_eq!(c.reload.max_frequency_s, 10);
+    }
+
+    #[test]
+    fn new_sections_have_documented_defaults() {
+        let c = Config::default();
+        assert!(c.sip.session_timer_enabled);
+        assert_eq!(c.sip.session_expires_secs, 1800);
+        assert_eq!(c.sip.min_se_secs, 90);
+        assert_eq!(c.sip.max_call_duration_secs, 0);
+        assert_eq!(c.mcp.http.bearer_token, None);
+        assert_eq!(c.plugins.wasm.memory_limit_mb, 64);
+        assert_eq!(c.plugins.wasm.invoke_timeout_ms, 5_000);
+        assert!(c.validate().is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // Validation
+    // -----------------------------------------------------------------
+
+    fn expect_err(cfg: &Config) -> ConfigValidationError {
+        cfg.validate().unwrap_err()
+    }
+
+    #[test]
+    fn validate_catches_inconsistent_rate_limit() {
+        let mut cfg = Config::default();
+        cfg.sip.rate_limit.per_sec = 10;
+        cfg.sip.rate_limit.burst = 0;
+        assert!(matches!(
+            expect_err(&cfg),
+            ConfigValidationError::RateLimitBurstZero { per_sec: 10 }
+        ));
+    }
+
+    #[test]
+    fn validate_requires_tls_paths_for_tls_transport() {
+        let mut cfg = Config::default();
+        cfg.sip.transports = vec![SipTransport::Tls];
+        assert!(matches!(
+            expect_err(&cfg),
+            ConfigValidationError::TlsPathsMissing
+        ));
+        cfg.sip.tls_cert_path = Some("/c.pem".into());
+        cfg.sip.tls_key_path = Some("/k.pem".into());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_inverted_rtp_port_range() {
+        let mut cfg = Config::default();
+        cfg.media.rtp_ports = Some(RtpPortRange {
+            min: 20_000,
+            max: 20_000,
+        });
+        assert!(matches!(
+            expect_err(&cfg),
+            ConfigValidationError::RtpPortRange {
+                min: 20_000,
+                max: 20_000
+            }
+        ));
+        cfg.media.rtp_ports = Some(RtpPortRange {
+            min: 20_000,
+            max: 20_100,
+        });
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_requires_peer_addr_outside_standalone() {
+        for mode in [ClusterMode::Primary, ClusterMode::Secondary] {
+            let mut cfg = Config::default();
+            cfg.cluster.mode = mode;
+            assert!(matches!(
+                expect_err(&cfg),
+                ConfigValidationError::ClusterPeerAddrMissing { mode: m } if m == mode
+            ));
+            cfg.cluster.peer_addr = Some("127.0.0.1:9000".parse().unwrap());
+            assert!(cfg.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_requires_http_auth_endpoint() {
+        let mut cfg = Config::default();
+        cfg.auth.backend = AuthBackend::Http;
+        assert!(matches!(
+            expect_err(&cfg),
+            ConfigValidationError::AuthHttpEndpointMissing
+        ));
+        cfg.auth.http.endpoint = "https://iam.example/sip-auth".into();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_strict_privacy_needs_key_and_tls() {
+        let mut cfg = Config::default();
+        cfg.webrtc.privacy.mode = WebRtcPrivacyMode::Strict;
+        assert!(matches!(
+            expect_err(&cfg),
+            ConfigValidationError::StrictPrivacyRedactionKeyMissing
+        ));
+        cfg.webrtc.privacy.redaction_key = "k".into();
+        // Baseline build cannot terminate TLS, so strict is refused.
+        assert!(matches!(
+            expect_err(&cfg),
+            ConfigValidationError::Unsupported {
+                field: "webrtc.privacy.mode",
+                ..
+            }
+        ));
+        // A build that terminates TLS still needs the PEM paths.
+        let support = BuildSupport {
+            webrtc_tls: true,
+            ..BuildSupport::default()
+        };
+        assert!(matches!(
+            cfg.validate_with(&support).unwrap_err(),
+            ConfigValidationError::StrictPrivacyTlsMissing
+        ));
+        cfg.webrtc.tls_cert = "/c.pem".into();
+        cfg.webrtc.tls_key = "/k.pem".into();
+        assert!(cfg.validate_with(&support).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_session_timer_interval_below_min_se() {
+        let mut cfg = Config::default();
+        cfg.sip.session_expires_secs = 30;
+        cfg.sip.min_se_secs = 90;
+        assert!(matches!(
+            expect_err(&cfg),
+            ConfigValidationError::SessionTimerInterval { .. }
+        ));
+        cfg.sip.session_timer_enabled = false;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_canary_ceiling_out_of_range() {
+        let mut cfg = Config::default();
+        cfg.canary.plugin_error_rate_ceiling = 1.5;
+        assert!(matches!(
+            expect_err(&cfg),
+            ConfigValidationError::CanaryCeilingOutOfRange { .. }
+        ));
+    }
+
+    /// Every toggle that enables a runtime the baseline build lacks
+    /// is a hard validation error — never a warn-and-ignore.
+    #[test]
+    fn validate_rejects_unsupported_toggles_in_baseline_build() {
+        type Mutator = fn(&mut Config);
+        let cases: &[(&str, Mutator)] = &[
+            ("sip.transports", |c| {
+                c.sip.transports.push(SipTransport::Quic);
+            }),
+            ("sip.vpn.mode", |c| c.sip.vpn.mode = VpnMode::Wireguard),
+            ("mcp.http3.enabled", |c| c.mcp.http3.enabled = true),
+            ("webtransport.enabled", |c| c.webtransport.enabled = true),
+            ("storage.vector.backend", |c| {
+                c.storage.vector.backend = VectorBackend::Sidecar;
+            }),
+            ("storage.recording.backend", |c| {
+                c.storage.recording.backend = RecordingBackend::Sidecar;
+            }),
+            ("webrtc.tls_cert", |c| c.webrtc.tls_cert = "/c.pem".into()),
+            ("webrtc.tls_cert", |c| c.webrtc.tls_key = "/k.pem".into()),
+        ];
+        for (field, mutate) in cases {
+            let mut cfg = Config::default();
+            mutate(&mut cfg);
+            match cfg.validate() {
+                Err(ConfigValidationError::Unsupported { field: got, .. }) => {
+                    assert_eq!(got, *field, "wrong field reported");
+                }
+                other => panic!("{field}: expected Unsupported, got {other:?}"),
+            }
+        }
+        // The same toggles pass once the build advertises support.
+        let all = BuildSupport {
+            sip_quic: true,
+            mcp_http3: true,
+            webtransport: true,
+            wireguard: true,
+            vector_sidecar: true,
+            recording_sidecar: true,
+            webrtc_tls: true,
+        };
+        for (field, mutate) in cases {
+            let mut cfg = Config::default();
+            mutate(&mut cfg);
+            assert!(
+                cfg.validate_with(&all).is_ok(),
+                "{field} should pass with full BuildSupport"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Hot-reload classification completeness
+    // -----------------------------------------------------------------
+
+    /// Collect every leaf path of a serialized config (`a.b.c`).
+    /// Arrays and scalars are leaves; objects recurse.
+    fn leaf_paths(v: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, child) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    leaf_paths(child, &path, out);
+                }
+            }
+            _ => out.push(prefix.to_owned()),
+        }
+    }
+
+    type FieldMutator = fn(&mut Config);
+
+    /// One mutator per config leaf. `every_config_field_changes_the_apply_report`
+    /// walks the serialized default config and fails when a field
+    /// appears there without an entry here, so adding a knob forces
+    /// the author to prove `apply_report` sees it.
+    #[allow(clippy::too_many_lines)] // one row per config field, by design
+    fn field_mutators() -> Vec<(&'static str, FieldMutator)> {
+        vec![
+            ("core.worker_threads", |c| c.core.worker_threads = 7),
+            ("observability.log_level", |c| {
+                c.observability.log_level = "trace".into();
+            }),
+            ("observability.log_format", |c| {
+                c.observability.log_format = LogFormat::Pretty;
+            }),
+            ("observability.health_bind", |c| {
+                c.observability.health_bind.set_port(1);
+            }),
+            ("observability.pcap_dir", |c| {
+                c.observability.pcap_dir = Some("/p".into());
+            }),
+            ("sip.bind", |c| {
+                c.sip
+                    .bind
+                    .push(BindSpec::Addr("127.0.0.1:1".parse().unwrap()));
+            }),
+            ("sip.transports", |c| {
+                c.sip.transports.push(SipTransport::Tcp);
+            }),
+            ("sip.drain_timeout_secs", |c| c.sip.drain_timeout_secs += 1),
+            ("sip.tls_cert_path", |c| {
+                c.sip.tls_cert_path = Some("/c".into());
+            }),
+            ("sip.tls_key_path", |c| {
+                c.sip.tls_key_path = Some("/k".into());
+            }),
+            ("sip.rate_limit.per_sec", |c| c.sip.rate_limit.per_sec = 5),
+            ("sip.rate_limit.burst", |c| c.sip.rate_limit.burst = 5),
+            ("sip.proxy.mode", |c| c.sip.proxy.mode = ProxyMode::Socks5),
+            ("sip.proxy.address", |c| {
+                c.sip.proxy.address = Some("127.0.0.1:1".parse().unwrap());
+            }),
+            ("sip.proxy.username", |c| {
+                c.sip.proxy.username = Some("u".into());
+            }),
+            ("sip.proxy.password", |c| {
+                c.sip.proxy.password = Some("p".into());
+            }),
+            ("sip.vpn.mode", |c| c.sip.vpn.mode = VpnMode::Wireguard),
+            ("sip.vpn.private_key", |c| {
+                c.sip.vpn.private_key = Some("k".into());
+            }),
+            ("sip.vpn.peer_public_key", |c| {
+                c.sip.vpn.peer_public_key = Some("k".into());
+            }),
+            ("sip.vpn.peer_endpoint", |c| {
+                c.sip.vpn.peer_endpoint = Some("e".into());
+            }),
+            ("sip.vpn.allowed_ips", |c| {
+                c.sip.vpn.allowed_ips.push("10.0.0.0/8".into());
+            }),
+            ("sip.vpn.interface_ip", |c| {
+                c.sip.vpn.interface_ip = Some("i".into());
+            }),
+            ("sip.conference_prefix", |c| {
+                c.sip.conference_prefix = Some("conf".into());
+            }),
+            ("sip.session_timer_enabled", |c| {
+                c.sip.session_timer_enabled = false;
+            }),
+            ("sip.session_expires_secs", |c| {
+                c.sip.session_expires_secs += 1;
+            }),
+            ("sip.min_se_secs", |c| c.sip.min_se_secs += 1),
+            ("sip.max_call_duration_secs", |c| {
+                c.sip.max_call_duration_secs = 1;
+            }),
+            ("mcp.enabled_http", |c| c.mcp.enabled_http = true),
+            ("mcp.http_bind", |c| c.mcp.http_bind.set_port(1)),
+            ("mcp.rate_limit.per_sec", |c| c.mcp.rate_limit.per_sec = 5),
+            ("mcp.rate_limit.burst", |c| c.mcp.rate_limit.burst = 5),
+            ("mcp.http3.enabled", |c| c.mcp.http3.enabled = true),
+            ("mcp.http3.bind", |c| c.mcp.http3.bind.set_port(1)),
+            ("mcp.http.bearer_token", |c| {
+                c.mcp.http.bearer_token = Some("t".into());
+            }),
+            ("a2a.enabled", |c| c.a2a.enabled = true),
+            ("a2a.bind", |c| c.a2a.bind.set_port(1)),
+            ("a2a.bearer_token", |c| {
+                c.a2a.bearer_token = Some("t".into());
+            }),
+            ("plugins.dir", |c| c.plugins.dir = "/other".into()),
+            ("plugins.sandbox.max_fds", |c| {
+                c.plugins.sandbox.max_fds = Some(1);
+            }),
+            ("plugins.sandbox.max_memory_bytes", |c| {
+                c.plugins.sandbox.max_memory_bytes = Some(1);
+            }),
+            ("plugins.sandbox.max_cpu_seconds", |c| {
+                c.plugins.sandbox.max_cpu_seconds = Some(1);
+            }),
+            ("plugins.sandbox.max_processes", |c| {
+                c.plugins.sandbox.max_processes = Some(1);
+            }),
+            ("plugins.sandbox.no_new_privs", |c| {
+                c.plugins.sandbox.no_new_privs = true;
+            }),
+            ("plugins.sandbox.seccomp", |c| {
+                c.plugins.sandbox.seccomp = SeccompPolicy::Allowlist;
+            }),
+            ("plugins.sandbox.seccomp_extra_allow", |c| {
+                c.plugins.sandbox.seccomp_extra_allow.push("statx".into());
+            }),
+            ("plugins.call_event_hooks", |c| {
+                c.plugins.call_event_hooks.push("x".into());
+            }),
+            ("plugins.wasm.memory_limit_mb", |c| {
+                c.plugins.wasm.memory_limit_mb += 1;
+            }),
+            ("plugins.wasm.invoke_timeout_ms", |c| {
+                c.plugins.wasm.invoke_timeout_ms += 1;
+            }),
+            ("auth.backend", |c| c.auth.backend = AuthBackend::Sqlite),
+            ("auth.realm", |c| c.auth.realm = "other".into()),
+            ("auth.sqlite.path", |c| c.auth.sqlite.path = "/db".into()),
+            ("auth.http.endpoint", |c| {
+                c.auth.http.endpoint = "http://x".into();
+            }),
+            ("auth.http.timeout_ms", |c| c.auth.http.timeout_ms += 1),
+            ("auth.http.retries", |c| c.auth.http.retries += 1),
+            ("auth.http.bearer_token", |c| {
+                c.auth.http.bearer_token = Some("t".into());
+            }),
+            ("auth.http.breaker_threshold", |c| {
+                c.auth.http.breaker_threshold += 1;
+            }),
+            ("auth.http.breaker_cooldown_secs", |c| {
+                c.auth.http.breaker_cooldown_secs += 1;
+            }),
+            ("auth.http.failure_mode", |c| {
+                c.auth.http.failure_mode = HttpFailureMode::FailOpen;
+            }),
+            ("storage.backend", |c| {
+                c.storage.backend = StorageBackend::Sqlite;
+            }),
+            ("storage.sqlite.path", |c| {
+                c.storage.sqlite.path = "/db".into();
+            }),
+            ("storage.vector.backend", |c| {
+                c.storage.vector.backend = VectorBackend::Memory;
+            }),
+            ("storage.vector.plugin", |c| {
+                c.storage.vector.plugin = Some("p".into());
+            }),
+            ("storage.recording.backend", |c| {
+                c.storage.recording.backend = RecordingBackend::Fs;
+            }),
+            ("storage.recording.fs.root", |c| {
+                c.storage.recording.fs.root = "/rec".into();
+            }),
+            ("storage.recording.retention_days", |c| {
+                c.storage.recording.retention_days += 1;
+            }),
+            ("storage.recording.plugin", |c| {
+                c.storage.recording.plugin = Some("p".into());
+            }),
+            ("media.inband_dtmf", |c| c.media.inband_dtmf = true),
+            ("media.prompts.root", |c| {
+                c.media.prompts.root = "/prompts".into();
+            }),
+            ("media.prompts.capacity", |c| c.media.prompts.capacity += 1),
+            ("media.transcode.max_concurrent_calls", |c| {
+                c.media.transcode.max_concurrent_calls += 1;
+            }),
+            ("media.transcode.cpu_budget_ms_per_call", |c| {
+                c.media.transcode.cpu_budget_ms_per_call += 1;
+            }),
+            ("media.rtp_ports", |c| {
+                c.media.rtp_ports = Some(RtpPortRange { min: 1, max: 9 });
+            }),
+            ("media.advertise_ip", |c| {
+                c.media.advertise_ip = Some("1.2.3.4".into());
+            }),
+            ("ai.openai_api_key", |c| {
+                c.ai.openai_api_key = Some("k".into());
+            }),
+            ("ai.anthropic_api_key", |c| {
+                c.ai.anthropic_api_key = Some("k".into());
+            }),
+            ("webtransport.enabled", |c| c.webtransport.enabled = true),
+            ("webtransport.bind", |c| c.webtransport.bind.set_port(1)),
+            ("webtransport.cert_path", |c| {
+                c.webtransport.cert_path = "/c".into();
+            }),
+            ("webtransport.key_path", |c| {
+                c.webtransport.key_path = "/k".into();
+            }),
+            ("reload.enabled", |c| c.reload.enabled = !c.reload.enabled),
+            ("reload.max_frequency_s", |c| c.reload.max_frequency_s += 1),
+            ("canary.deadline_s", |c| c.canary.deadline_s += 1),
+            ("canary.plugin_error_rate_ceiling", |c| {
+                c.canary.plugin_error_rate_ceiling = 0.1;
+            }),
+            ("canary.sip_parse_errors_per_sec_ceiling", |c| {
+                c.canary.sip_parse_errors_per_sec_ceiling += 1;
+            }),
+            ("webrtc.enabled", |c| c.webrtc.enabled = true),
+            ("webrtc.ws_bind", |c| c.webrtc.ws_bind.set_port(1)),
+            ("webrtc.tls_cert", |c| c.webrtc.tls_cert = "/c".into()),
+            ("webrtc.tls_key", |c| c.webrtc.tls_key = "/k".into()),
+            ("webrtc.privacy.mode", |c| {
+                c.webrtc.privacy.mode = WebRtcPrivacyMode::RelayOnly;
+            }),
+            ("webrtc.privacy.redaction_key", |c| {
+                c.webrtc.privacy.redaction_key = "k".into();
+            }),
+            ("webrtc.ice.enabled", |c| c.webrtc.ice.enabled = true),
+            ("webrtc.ice.host_binds", |c| {
+                c.webrtc.ice.host_binds.push("127.0.0.1:1".parse().unwrap());
+            }),
+            ("webrtc.ice.stun_servers", |c| {
+                c.webrtc
+                    .ice
+                    .stun_servers
+                    .push("127.0.0.1:1".parse().unwrap());
+            }),
+            ("webrtc.turn.enabled", |c| c.webrtc.turn.enabled = true),
+            ("webrtc.turn.bind", |c| c.webrtc.turn.bind.set_port(1)),
+            ("webrtc.turn.realm", |c| c.webrtc.turn.realm = "r".into()),
+            ("webrtc.turn.relay_ip", |c| {
+                c.webrtc.turn.relay_ip = Some("1.2.3.4".parse().unwrap());
+            }),
+            ("webrtc.turn.allocation_lifetime_s", |c| {
+                c.webrtc.turn.allocation_lifetime_s += 1;
+            }),
+            ("webrtc.turn.credentials", |c| {
+                c.webrtc.turn.credentials.push(WebRtcTurnCredential {
+                    username: "u".into(),
+                    password: "p".into(),
+                });
+            }),
+            ("webrtc.turn.external_url", |c| {
+                c.webrtc.turn.external_url = "turn:x".into();
+            }),
+            ("cluster.mode", |c| c.cluster.mode = ClusterMode::Primary),
+            ("cluster.peer_addr", |c| {
+                c.cluster.peer_addr = Some("127.0.0.1:1".parse().unwrap());
+            }),
+            ("cluster.heartbeat_interval_secs", |c| {
+                c.cluster.heartbeat_interval_secs += 1;
+            }),
+            ("cluster.raft_dir", |c| c.cluster.raft_dir = "/raft".into()),
+            ("cluster.node_id", |c| c.cluster.node_id += 1),
+            ("cluster.raft_addr", |c| {
+                c.cluster.raft_addr = Some("127.0.0.1:1".parse().unwrap());
+            }),
+            ("cluster.initial_peers", |c| {
+                c.cluster.initial_peers.push("2@h:1".into());
+            }),
+        ]
+    }
+
+    /// Nothing in the config is outside the hot-reload universe:
+    /// every serialized leaf has a mutator, and every mutator
+    /// lands the field in `reloaded` or `restart_required`.
+    #[test]
+    fn every_config_field_changes_the_apply_report() {
+        let base = Config::default();
+        let json = serde_json::to_value(&base).unwrap();
+        let mut leaves = Vec::new();
+        leaf_paths(&json, "", &mut leaves);
+        let mutators = field_mutators();
+        for leaf in &leaves {
+            assert!(
+                mutators.iter().any(|(p, _)| p == leaf),
+                "config field `{leaf}` has no mutator in `field_mutators` — \
+                 add one so its hot-reload classification is tested"
+            );
+        }
+        for (path, mutate) in mutators {
+            let mut candidate = base.clone();
+            mutate(&mut candidate);
+            let report = base.apply_report(&candidate);
+            assert!(
+                !report.is_noop(),
+                "changing `{path}` produced an empty ApplyReport — \
+                 the field would be silently ignored on reload"
+            );
+        }
     }
 }

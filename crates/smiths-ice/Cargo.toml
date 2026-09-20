@@ -9,7 +9,6 @@ description  = "ICE / STUN MVP (host candidates only) for smiths-net."
 [dependencies]
 smiths-core = { workspace = true }
 smiths-sdp  = { workspace = true }
-futures     = { workspace = true }
 
 tokio      = { workspace = true }
 tokio-util = { workspace = true }
@@ -18,10 +17,9 @@ thiserror  = { workspace = true }
 tracing    = { workspace = true }
 rand       = { workspace = true }
 serde      = { workspace = true }
-# Slice 5.11-turn: MESSAGE-INTEGRITY uses HMAC-SHA-1 (RFC 8489
-# §14.2); RFC 8489 §14.3 hashes long-term credentials with MD5.
-# The crypto footprint is hand-picked — pulling in `ring` or
-# the full `rustls` stack just for two primitives is overkill.
+# MESSAGE-INTEGRITY is HMAC-SHA-1 (RFC 8489 §14.5); long-term
+# credentials hash with MD5 (RFC 8489 §9.2.2). Two small primitives
+# instead of `ring` or the full `rustls` stack.
 hmac = "0.12"
 sha1 = "0.10"
 md5 = "0.7"

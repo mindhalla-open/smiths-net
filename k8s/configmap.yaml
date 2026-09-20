@@ -6,28 +6,39 @@ metadata:
     app.kubernetes.io/name: smiths-net
     app.kubernetes.io/component: signaling
 data:
-  # Matches the live engine config shape. Operators swap the inline
-  # TOML for their own without touching the Deployment. Mounted at
-  # /etc/smiths-net/config.toml read-only via the volume below.
+  # Matches the live engine config shape (`smiths-net validate` accepts
+  # it; unknown keys are rejected at startup, not ignored). Operators
+  # swap the inline TOML for their own without touching the Deployment.
+  # Mounted at /etc/smiths-net/config.toml read-only via the volume
+  # below. Every key not listed keeps the engine default — see
+  # examples/config.toml for the full surface.
   config.toml: |
-    [core]
+    [observability]
     log_format = "json"
+    # The Deployment's liveness / readiness probes and the Prometheus
+    # scrape annotation hit this port; bind all interfaces so the
+    # kubelet can reach it (the engine default is 127.0.0.1:8080).
+    health_bind = "0.0.0.0:8080"
 
     [sip]
     # Kubernetes services bind ports for us — the pod binds 0.0.0.0
     # and relies on NetworkPolicy + LoadBalancer for addressing.
-    bind = "0.0.0.0:5060"
+    # `bind` is a list; every enabled transport listens on every
+    # entry. To serve TLS, add "tls" to `transports` and set
+    # `tls_cert_path` / `tls_key_path` (mount the PEM files into
+    # /etc/smiths-net); the Deployment's `sip-tls` port is only
+    # meaningful once a bind entry on 5061 exists.
+    bind = ["0.0.0.0:5060"]
     transports = ["udp", "tcp"]
-    drain_timeout_secs = 10
 
     [sip.rate_limit]
     per_sec = 50
     burst = 100
 
-    [observability]
-    health_bind = "0.0.0.0:8080"
-
     [plugins]
+    # Nothing is mounted here by default; the engine logs "plugins dir
+    # missing; skipping load" and runs without plugins. Mount a volume
+    # at this path to ship sidecar / WASM plugins.
     dir = "/etc/smiths-net/plugins"
 
     [plugins.sandbox]

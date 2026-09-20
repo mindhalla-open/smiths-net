@@ -1,4 +1,4 @@
-//! Slice 5.3 load test — N concurrent transcoders under a CPU budget.
+//! Load test — N concurrent transcoders under a CPU budget.
 //!
 //! Drives the admission layer against the full frame-shaped codec
 //! path, then asserts two acceptance invariants:
@@ -17,7 +17,6 @@
 
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Duration;
 
 use smiths_core::config::TranscodeConfig;
 use smiths_transcode::{
@@ -156,22 +155,24 @@ fn refused_admission_bumps_metric_counter() {
         max_concurrent_calls: 1,
         cpu_budget_ms_per_call: 50,
     };
-    let metrics = TranscodeMetrics::noop();
+    let mut registry = prometheus_client::registry::Registry::default();
+    let metrics = TranscodeMetrics::register(&mut registry);
     let budget = CpuBudget::new(CpuBudgetConfig::from(cfg), Arc::clone(&metrics));
 
     let _held = budget.try_admit().unwrap();
     for _ in 0..5 {
         assert!(budget.try_admit().is_err());
     }
-    // The refusal counter should reflect exactly 5 refusals. (We
-    // can't read the Counter's raw value from outside the crate's
-    // metrics API, so probe by registering afresh — not worth the
-    // noise. Structural check: the above `is_err()` calls passed,
-    // which is the signal that matters.)
     assert_eq!(budget.active(), 1);
-
-    // Ensure the Duration import is used so clippy doesn't complain
-    // (used below for a pacing sleep just in case a future variant
-    // needs it).
-    let _unused = Duration::from_millis(0);
+    assert_eq!(
+        metrics.admissions_refused.get(),
+        5,
+        "each refused try_admit bumps the counter exactly once"
+    );
+    let mut out = String::new();
+    prometheus_client::encoding::text::encode(&mut out, &registry).unwrap();
+    assert!(
+        out.contains("smiths_transcode_admissions_refused_total 5"),
+        "refusals must be visible on /metrics:\n{out}"
+    );
 }

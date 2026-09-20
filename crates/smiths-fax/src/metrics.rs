@@ -1,4 +1,4 @@
-//! Prometheus metrics for the T.38 FAX subsystem (slice 5.12).
+//! Prometheus metrics for the T.38 FAX subsystem.
 //!
 //! Three metrics ship — the minimum "is the relay healthy?"
 //! surface:

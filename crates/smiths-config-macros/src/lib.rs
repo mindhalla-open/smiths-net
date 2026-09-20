@@ -1,6 +1,8 @@
 //! `#[derive(Reloadable)]` — generates [`Reloadable`] diff logic
 //! for config structs so the reloadable-field list can't silently
-//! drift when a new field lands.
+//! drift when a new field lands. Every field must be classified
+//! (`#[reloadable]`, `#[restart_required]` or `#[nested]`); an
+//! unmarked field is a compile error.
 //!
 //! See the crate README for attribute semantics and the decision
 //! tree between `#[reloadable]` / `#[restart_required]` / `#[nested]`.
@@ -28,10 +30,6 @@ enum FieldCfg {
     /// `#[nested]` — recurse into a field whose type also impls
     /// `Reloadable`.
     Nested,
-    /// No attribute → skipped. The macro treats unmarked fields as
-    /// "outside the `apply_report` universe"; developer discipline
-    /// chooses whether that's intentional.
-    Skip,
 }
 
 /// Extract the `path = "..."` / `group = "..."` string value from
@@ -55,27 +53,35 @@ fn name_value_string(attr: &Attribute, key: &str) -> Option<String> {
     out
 }
 
-fn classify(field: &syn::Field) -> FieldCfg {
+/// Classify one field. Every field of a `Reloadable` struct must
+/// carry exactly one of the three attributes — an unmarked field is
+/// a compile error so a new config knob can never be silently
+/// ignored by the hot-reload diff.
+fn classify(field: &syn::Field) -> Result<FieldCfg, syn::Error> {
     for attr in &field.attrs {
         if attr.path().is_ident("reloadable") {
             let path = match &attr.meta {
                 Meta::List(_) => name_value_string(attr, "path"),
                 Meta::Path(_) | Meta::NameValue(_) => None,
             };
-            return FieldCfg::Reloadable { path };
+            return Ok(FieldCfg::Reloadable { path });
         }
         if attr.path().is_ident("restart_required") {
             let group = match &attr.meta {
                 Meta::List(_) => name_value_string(attr, "group"),
                 Meta::Path(_) | Meta::NameValue(_) => None,
             };
-            return FieldCfg::RestartRequired { group };
+            return Ok(FieldCfg::RestartRequired { group });
         }
         if attr.path().is_ident("nested") {
-            return FieldCfg::Nested;
+            return Ok(FieldCfg::Nested);
         }
     }
-    FieldCfg::Skip
+    Err(syn::Error::new_spanned(
+        field,
+        "Reloadable: every field needs a hot-reload classification — \
+         add #[reloadable], #[restart_required] or #[nested]",
+    ))
 }
 
 /// Build an expression that yields the dotted path for a field.
@@ -93,6 +99,85 @@ fn path_expr(field_name: &str, explicit: Option<&str>) -> TokenStream2 {
             ::std::format!("{}.{}", path_prefix, #field_name)
         }
     }
+}
+
+/// The four emit buckets one struct's fields sort into.
+struct Buckets {
+    reloadable_emits: Vec<TokenStream2>,
+    restart_plain: Vec<TokenStream2>,
+    /// Restart-required fields that share a `group` label, keyed by
+    /// it, so several fields can collapse to one report entry.
+    restart_groups: BTreeMap<String, Vec<TokenStream2>>,
+    nested_emits: Vec<TokenStream2>,
+}
+
+/// Sort every field into its emit bucket by attribute.
+fn collect_buckets(
+    fields: &syn::punctuated::Punctuated<syn::Field, syn::Token![,]>,
+) -> syn::Result<Buckets> {
+    let mut b = Buckets {
+        reloadable_emits: Vec::new(),
+        restart_plain: Vec::new(),
+        restart_groups: BTreeMap::new(),
+        nested_emits: Vec::new(),
+    };
+    for field in fields {
+        let fname = field.ident.as_ref().expect("named field");
+        let fname_str = fname.to_string();
+        match classify(field)? {
+            FieldCfg::Reloadable { path } => {
+                let path_expr = path_expr(&fname_str, path.as_deref());
+                b.reloadable_emits.push(quote! {
+                    if self.#fname != new.#fname {
+                        report.reloaded.push(#path_expr);
+                    }
+                });
+            }
+            FieldCfg::RestartRequired { group: Some(label) } => {
+                b.restart_groups
+                    .entry(label)
+                    .or_default()
+                    .push(quote!( self.#fname != new.#fname ));
+            }
+            FieldCfg::RestartRequired { group: None } => {
+                let path_expr = path_expr(&fname_str, None);
+                b.restart_plain.push(quote! {
+                    if self.#fname != new.#fname {
+                        report.restart_required.push(#path_expr);
+                    }
+                });
+            }
+            FieldCfg::Nested => {
+                let prefix = path_expr(&fname_str, None);
+                let tmp = format_ident!("__nested_prefix_{}", fname);
+                b.nested_emits.push(quote! {
+                    let #tmp = #prefix;
+                    <_ as crate::reloader::Reloadable>::diff_into(
+                        &self.#fname, &new.#fname, report, &#tmp,
+                    );
+                });
+            }
+        }
+    }
+    Ok(b)
+}
+
+/// One `if a != a' || b != b' { report.push(label) }` per group.
+fn group_emits(groups: BTreeMap<String, Vec<TokenStream2>>) -> Vec<TokenStream2> {
+    groups
+        .into_iter()
+        .map(|(label, conds)| {
+            // `conds` is non-empty by construction.
+            let mut iter = conds.into_iter();
+            let first = iter.next().expect("at least one cond per group");
+            let tail = iter;
+            quote! {
+                if #first #( || #tail )* {
+                    report.restart_required.push(::std::string::String::from(#label));
+                }
+            }
+        })
+        .collect()
 }
 
 #[proc_macro_derive(Reloadable, attributes(reloadable, restart_required, nested))]
@@ -120,65 +205,16 @@ pub fn derive_reloadable(input: TokenStream) -> TokenStream {
         }
     };
 
-    // Emit buckets. Restart-required fields with a `group` label get
-    // coalesced: multiple fields sharing the same label collapse to a
-    // single `if (f1 != f1') || (f2 != f2') || ... { report.push(label) }`.
-    let mut reloadable_emits: Vec<TokenStream2> = Vec::new();
-    let mut restart_plain: Vec<TokenStream2> = Vec::new();
-    let mut restart_groups: BTreeMap<String, Vec<TokenStream2>> = BTreeMap::new();
-    let mut nested_emits: Vec<TokenStream2> = Vec::new();
-
-    for field in fields {
-        let fname = field.ident.as_ref().expect("named field");
-        let fname_str = fname.to_string();
-        match classify(field) {
-            FieldCfg::Reloadable { path } => {
-                let path_expr = path_expr(&fname_str, path.as_deref());
-                reloadable_emits.push(quote! {
-                    if self.#fname != new.#fname {
-                        report.reloaded.push(#path_expr);
-                    }
-                });
-            }
-            FieldCfg::RestartRequired { group: Some(label) } => {
-                restart_groups
-                    .entry(label)
-                    .or_default()
-                    .push(quote!( self.#fname != new.#fname ));
-            }
-            FieldCfg::RestartRequired { group: None } => {
-                let path_expr = path_expr(&fname_str, None);
-                restart_plain.push(quote! {
-                    if self.#fname != new.#fname {
-                        report.restart_required.push(#path_expr);
-                    }
-                });
-            }
-            FieldCfg::Nested => {
-                let prefix = path_expr(&fname_str, None);
-                let tmp = format_ident!("__nested_prefix_{}", fname);
-                nested_emits.push(quote! {
-                    let #tmp = #prefix;
-                    <_ as crate::reloader::Reloadable>::diff_into(
-                        &self.#fname, &new.#fname, report, &#tmp,
-                    );
-                });
-            }
-            FieldCfg::Skip => {}
-        }
-    }
-
-    let group_emits = restart_groups.into_iter().map(|(label, conds)| {
-        // conds is non-empty by construction.
-        let mut iter = conds.into_iter();
-        let first = iter.next().expect("at least one cond per group");
-        let tail = iter;
-        quote! {
-            if #first #( || #tail )* {
-                report.restart_required.push(::std::string::String::from(#label));
-            }
-        }
-    });
+    let Buckets {
+        reloadable_emits,
+        restart_plain,
+        restart_groups,
+        nested_emits,
+    } = match collect_buckets(fields) {
+        Ok(b) => b,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let group_emits = group_emits(restart_groups);
 
     let has_path_prefix_use =
         !reloadable_emits.is_empty() || !restart_plain.is_empty() || !nested_emits.is_empty();
@@ -189,21 +225,25 @@ pub fn derive_reloadable(input: TokenStream) -> TokenStream {
     };
 
     let expanded = quote! {
-        impl #impl_gen crate::reloader::Reloadable for #name #ty_gen #where_gen {
-            fn diff_into(
-                &self,
-                new: &Self,
-                report: &mut crate::reloader::ApplyReport,
-                path_prefix: &str,
-            ) {
-                #prefix_silencer
-                #(#reloadable_emits)*
-                #(#restart_plain)*
-                #(#group_emits)*
-                #(#nested_emits)*
-            }
-        }
-    };
+           impl #impl_gen crate::reloader::Reloadable for #name #ty_gen #where_gen {
+    // A config diff asks "did the operator write a different
+    // value?", so exact inequality is the intended test even
+    // for float-valued knobs.
+               #[allow(clippy::float_cmp)]
+               fn diff_into(
+                   &self,
+                   new: &Self,
+                   report: &mut crate::reloader::ApplyReport,
+                   path_prefix: &str,
+               ) {
+                   #prefix_silencer
+                   #(#reloadable_emits)*
+                   #(#restart_plain)*
+                   #(#group_emits)*
+                   #(#nested_emits)*
+               }
+           }
+       };
 
     expanded.into()
 }

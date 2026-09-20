@@ -17,11 +17,16 @@ Runs fully offline.
 -->
 <p align="center"><em>▶ Demo clip coming soon — a fully local AI answering a live phone call (Whisper + llama.cpp + Silero, no cloud). See <a href="docs/launch/demo-storyboard.md">how it's made</a>.</em></p>
 
-> **Status:** pre-1.0, under active development. The core ships and is
-> exercised end-to-end — signaling over UDP/TCP/TLS, an RTP/SRTP/DTLS
-> media bridge, WASM + sidecar plugins, the MCP control plane, and an HA
-> Raft cluster (see the [CHANGELOG](CHANGELOG.md)). APIs still move and
-> some media-plane polish is outstanding. Early, but real — try the demo.
+> **Status:** pre-1.0, under active development. What ships and is
+> exercised end-to-end: signaling over UDP/TCP/TLS with the RFC 3261
+> transaction and dialog state machines, digest auth, an RTP/SRTP/DTLS
+> media bridge, G.711 transcoding, N-party mixing, WASM + sidecar
+> plugins, and the MCP control plane. **Experimental, not wired into
+> the engine:** the Raft crate (`smiths-raft`), the ICE agent
+> (`smiths-ice::agent`), and T.38 fax. HA today is one-way
+> primary→secondary dialog mirroring, not consensus. APIs still move.
+> See [CHANGELOG](CHANGELOG.md), and read the code before relying on a
+> capability.
 
 ## Why smiths-net
 
@@ -32,13 +37,14 @@ Runs fully offline.
   capability plugins. Run Whisper + llama.cpp + Silero on one GPU and
   answer a phone line with **zero bytes to the cloud** — or point the
   same `ai.*` capabilities at OpenAI / Anthropic / Gemini.
-- **One small static binary.** Target < 20 MB, < 64 MB RSS at idle;
-  ships as a `scratch`-based multi-arch Docker image. No system deps.
+- **One small static binary.** About 19 MB, ~13 MB RSS at idle; ships
+  as a distroless-static multi-arch Docker image. No system deps.
 - **Plugins in any language, one ABI.** Two tiers:
   - **WASM (wasmtime)** — sandboxed hot-path hooks; any WASM-targeting
     language (Rust, TinyGo, C, Zig).
-  - **Sidecar (subprocess + protobuf IPC)** — control-plane and AI
-    plugins; any language at all (Python, Node, Go, Java).
+  - **Sidecar (subprocess + newline-delimited JSON-RPC over stdio)** —
+    control-plane and AI plugins; any language at all (Python, Node,
+    Go, Java). A plugin is one file with no dependencies.
 - **Rust core, `unsafe`-free by policy.** `unsafe_code = "deny"`
   workspace-wide; the media/crypto hot path is pure Rust (SRTP, DTLS).
 
@@ -94,7 +100,7 @@ speakers with no network.)*
 **Or as a container:**
 
 ```bash
-docker build -t smiths-net .    # ~20 MB static musl image on scratch
+docker build -t smiths-net .    # static musl binary on distroless-static
 ```
 
 **Add the offline voice assistant** → follow

@@ -185,7 +185,7 @@ impl Resource for CallsResource {
     }
 }
 
-/// `sip://registrations` — live subscriber-DB bindings (slice 2.1).
+/// `sip://registrations` — live subscriber-DB bindings.
 ///
 /// Returns an empty snapshot when no [`smiths_core::RegistrationView`]
 /// is wired into the context. Operators can distinguish
@@ -237,7 +237,7 @@ impl Resource for CurrentConfigResource {
 }
 
 /// Walk the config JSON and replace known secret fields with `"***"`.
-/// Today: `a2a.bearer_token` + the `[ai]` API-key block (slice 3.2).
+/// Today: `a2a.bearer_token` + the `[ai]` API-key block.
 /// Extend as new secrets land.
 pub(crate) fn redact_secrets(v: &mut Value) {
     const SECRET_PATHS: &[&[&str]] = &[

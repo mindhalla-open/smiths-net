@@ -2,7 +2,7 @@
 Description=smiths-net — AI-first SIP engine
 After=network-online.target
 Wants=network-online.target
-Documentation=https://github.com/mindhalla/smiths-net
+Documentation=https://github.com/mindhalla-open/smiths-net
 
 [Service]
 Type=simple
@@ -11,9 +11,11 @@ Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=15s
 KillMode=mixed
-# SIGTERM trips graceful drain (503 + Retry-After: 0). `TimeoutStopSec`
-# above gives up to 15 s before systemd escalates to SIGKILL; tune
-# with `SMITHS_DRAIN_SECS` if your SLA demands longer.
+# SIGTERM trips the graceful drain: new INVITEs get 503 + Retry-After: 0
+# for SMITHS_DRAIN_SECS (default 5 s), then the process exits.
+# `TimeoutStopSec` above gives up to 15 s before systemd escalates to
+# SIGKILL; raise both together if your SLA demands a longer drain.
+# Environment=SMITHS_DRAIN_SECS=10
 
 # -- Identity + privileges --
 User=smiths
@@ -44,7 +46,13 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
-MemoryDenyWriteExecute=true
+# The embedded WASM plugin host (wasmtime / Cranelift) JIT-compiles
+# plugins: it maps code read-write, then flips the pages to
+# read-execute with mprotect(2). MemoryDenyWriteExecute= forbids that
+# transition (on current kernels through prctl(PR_SET_MDWE)), which
+# makes every WASM plugin fail to load. Keep it off unless you run
+# without WASM plugins.
+MemoryDenyWriteExecute=no
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM

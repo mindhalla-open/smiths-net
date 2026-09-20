@@ -2,17 +2,34 @@
 //!
 //! A [`Sidecar`] wraps one child process, an auto-restart supervisor
 //! task, and the JSON-RPC pending-response map. When the child dies
-//! unexpectedly, the supervisor respawns it with exponential backoff
-//! up to [`RestartPolicy::max_retries`]. External callers see the
-//! same API before and after a restart; inflight RPCs that happened
-//! to be outstanding at crash time resolve to [`Error::Closed`].
+//! unexpectedly, the supervisor respawns it with exponential backoff.
+//! External callers see the same API before and after a restart;
+//! inflight RPCs that happened to be outstanding at crash time
+//! resolve to [`Error::Closed`].
+//!
+//! ## Restart budget
+//!
+//! Every crash or failed spawn consumes one of
+//! [`RestartPolicy::max_retries`] attempts and grows the backoff.
+//! The budget and backoff reset only once a child has stayed up for
+//! [`RestartPolicy::min_uptime`] — a child that crashes on every
+//! start therefore restarts a bounded number of times with growing
+//! delays and is then left down, instead of looping forever at the
+//! initial backoff.
+//!
+//! ## Frame cap
+//!
+//! Frames from the child's stdout are newline-delimited JSON. A line
+//! longer than [`SpawnOptions::max_frame_bytes`] is a protocol
+//! violation: the reader logs it, the child is killed, and the
+//! supervisor's restart policy applies.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use smiths_core::metrics::PluginLabel;
 use smiths_core::{Metrics, SandboxConfig};
@@ -20,7 +37,7 @@ use smiths_core::{Metrics, SandboxConfig};
 use crate::sandbox;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::JoinHandle;
@@ -32,7 +49,12 @@ use crate::error::Error;
 use crate::rpc::{RpcRequest, RpcResponse};
 
 /// Default RPC timeout — conservative because AI models can be slow.
-const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default cap on one newline-delimited frame from the child (16 MiB).
+/// Generous enough for base64 audio in a single result; bounded so a
+/// misbehaving plugin cannot grow the reader's buffer without limit.
+pub const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Depth of the notification broadcast. Small on purpose —
 /// subscribers that fall behind lose intermediate partials, which is
@@ -58,9 +80,9 @@ pub struct PluginNotification {
 /// Restart policy applied when a sidecar child dies unexpectedly.
 #[derive(Clone, Copy, Debug)]
 pub struct RestartPolicy {
-    /// Max consecutive failed spawns before the supervisor gives up.
-    /// `0` disables auto-restart entirely — the supervisor tears down
-    /// on first crash, mirroring the pre-restart behaviour.
+    /// Max consecutive restart attempts (crashes or failed spawns)
+    /// before the supervisor gives up. `0` disables auto-restart
+    /// entirely — the supervisor tears down on first crash.
     pub max_retries: u32,
     /// Backoff before the first restart attempt after a crash.
     pub initial_backoff: Duration,
@@ -68,6 +90,11 @@ pub struct RestartPolicy {
     pub max_backoff: Duration,
     /// Multiplier applied to the current backoff each attempt.
     pub backoff_multiplier: f64,
+    /// A child that stays up at least this long is considered
+    /// healthy: when it eventually dies, the attempt counter and the
+    /// backoff start over. Children that die sooner keep consuming
+    /// the budget, which is what caps a crash loop.
+    pub min_uptime: Duration,
 }
 
 impl Default for RestartPolicy {
@@ -77,6 +104,7 @@ impl Default for RestartPolicy {
             initial_backoff: Duration::from_millis(250),
             max_backoff: Duration::from_secs(30),
             backoff_multiplier: 2.0,
+            min_uptime: Duration::from_secs(10),
         }
     }
 }
@@ -91,6 +119,7 @@ impl RestartPolicy {
             initial_backoff: Duration::ZERO,
             max_backoff: Duration::ZERO,
             backoff_multiplier: 1.0,
+            min_uptime: Duration::ZERO,
         }
     }
 
@@ -100,6 +129,38 @@ impl RestartPolicy {
             self.max_backoff
         } else {
             next
+        }
+    }
+}
+
+/// Everything [`Sidecar::spawn_with_options`] needs beyond the
+/// executable location.
+#[derive(Clone, Debug)]
+pub struct SpawnOptions {
+    /// Respawn behaviour after an unexpected exit.
+    pub policy: RestartPolicy,
+    /// Resource sandbox applied on every spawn (including respawns).
+    /// Default is permissive.
+    pub sandbox: SandboxConfig,
+    /// Timeout for [`Sidecar::call`]. Calls that need a different
+    /// bound use [`Sidecar::call_with_timeout`].
+    pub rpc_timeout: Duration,
+    /// Largest stdout frame the reader accepts; see the module docs.
+    pub max_frame_bytes: usize,
+    /// Extra environment variables for the child, layered over the
+    /// engine's own environment. Applied on every spawn, so a
+    /// restart picks up whatever the caller passed at spawn time.
+    pub env: BTreeMap<String, String>,
+}
+
+impl Default for SpawnOptions {
+    fn default() -> Self {
+        Self {
+            policy: RestartPolicy::default(),
+            sandbox: SandboxConfig::default(),
+            rpc_timeout: DEFAULT_RPC_TIMEOUT,
+            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            env: BTreeMap::new(),
         }
     }
 }
@@ -134,16 +195,18 @@ struct Inner {
     plugin_dir: PathBuf,
     entry: PathBuf,
     policy: RestartPolicy,
-    /// Resource-limit sandbox applied on every spawn (including
-    /// respawns). Default = permissive, so tests and single-shot
-    /// sidecars see no change.
-    sandbox: SandboxConfig,
+    /// Sandbox actions precomputed in the parent; cloned into each
+    /// spawn's `pre_exec` closure.
+    sandbox: sandbox::Plan,
+    rpc_timeout: Duration,
+    max_frame_bytes: usize,
+    env: BTreeMap<String, String>,
     /// Flipped by `shutdown` so the supervisor stops respawning.
     shutdown: CancellationToken,
     /// Supervisor task handle. Owned so `shutdown` can `await` it.
     supervisor: Mutex<Option<JoinHandle<()>>>,
     /// Engine-wide metrics handle, optional because tests don't wire
-    /// one. Set at most once via [`Sidecar::with_metrics`]; the
+    /// one. Set at most once via [`Sidecar::set_metrics`]; the
     /// supervise loop reads it on every respawn.
     metrics: OnceLock<Arc<Metrics>>,
 }
@@ -155,8 +218,26 @@ impl std::fmt::Debug for Inner {
             .field("plugin_dir", &self.plugin_dir)
             .field("entry", &self.entry)
             .field("policy", &self.policy)
+            .field("rpc_timeout", &self.rpc_timeout)
+            .field("max_frame_bytes", &self.max_frame_bytes)
             .finish_non_exhaustive()
     }
+}
+
+/// A live child and the handles the supervisor owns for it.
+struct Live {
+    child: Child,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    spawned_at: Instant,
+}
+
+/// Why `run_child` returned.
+enum ChildExit {
+    /// `shutdown` fired; the supervisor must exit.
+    Shutdown,
+    /// The child's stdout closed (it died or closed the pipe).
+    Died { uptime: Duration },
 }
 
 impl Sidecar {
@@ -166,33 +247,31 @@ impl Sidecar {
         plugin_dir: &Path,
         entry: &Path,
     ) -> Result<Self, Error> {
-        Self::spawn_with(
-            name,
-            plugin_dir,
-            entry,
-            RestartPolicy::default(),
-            SandboxConfig::default(),
-        )
-        .await
+        Self::spawn_with_options(name, plugin_dir, entry, SpawnOptions::default()).await
     }
 
     /// Spawn with an explicit restart policy and the default (empty)
-    /// sandbox. Kept for backward compatibility with callers that
-    /// don't care about resource caps.
+    /// sandbox. Kept for callers that don't care about resource caps.
     pub async fn spawn_with_policy(
         name: impl Into<String>,
         plugin_dir: &Path,
         entry: &Path,
         policy: RestartPolicy,
     ) -> Result<Self, Error> {
-        Self::spawn_with(name, plugin_dir, entry, policy, SandboxConfig::default()).await
+        Self::spawn_with_options(
+            name,
+            plugin_dir,
+            entry,
+            SpawnOptions {
+                policy,
+                ..SpawnOptions::default()
+            },
+        )
+        .await
     }
 
-    /// Spawn with an explicit restart policy + sandbox. The sandbox
-    /// applies to this spawn and every supervisor-driven respawn.
-    /// `RestartPolicy::no_restart()` + `SandboxConfig::default()` is
-    /// equivalent to the pre-sandboxing behaviour.
-    #[instrument(skip_all, fields(dir = %plugin_dir.display(), entry = %entry.display()))]
+    /// Spawn with an explicit restart policy + sandbox and the default
+    /// RPC timeout / frame cap.
     pub async fn spawn_with(
         name: impl Into<String>,
         plugin_dir: &Path,
@@ -200,10 +279,36 @@ impl Sidecar {
         policy: RestartPolicy,
         sandbox: SandboxConfig,
     ) -> Result<Self, Error> {
+        Self::spawn_with_options(
+            name,
+            plugin_dir,
+            entry,
+            SpawnOptions {
+                policy,
+                sandbox,
+                ..SpawnOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// Spawn with full [`SpawnOptions`]. The sandbox, environment, and
+    /// frame cap apply to this spawn and every supervisor-driven
+    /// respawn.
+    #[instrument(skip_all, fields(dir = %plugin_dir.display(), entry = %entry.display()))]
+    pub async fn spawn_with_options(
+        name: impl Into<String>,
+        plugin_dir: &Path,
+        entry: &Path,
+        options: SpawnOptions,
+    ) -> Result<Self, Error> {
         let name: String = name.into();
         let entry_abs = canonical_entry(plugin_dir, entry)?;
         let plugin_dir_abs =
             std::fs::canonicalize(plugin_dir).unwrap_or_else(|_| plugin_dir.to_path_buf());
+        // Compile the sandbox once, in the parent, so the child's
+        // pre-exec closure only issues syscalls.
+        let sandbox_plan = sandbox::prepare(&options.sandbox).map_err(Error::Io)?;
 
         let (notif_tx, _) = broadcast::channel::<PluginNotification>(NOTIFICATION_BUFFER);
         let inner = Arc::new(Inner {
@@ -214,8 +319,11 @@ impl Sidecar {
             process: Mutex::new(None),
             plugin_dir: plugin_dir_abs,
             entry: entry_abs,
-            policy,
-            sandbox,
+            policy: options.policy,
+            sandbox: sandbox_plan,
+            rpc_timeout: options.rpc_timeout,
+            max_frame_bytes: options.max_frame_bytes,
+            env: options.env,
             shutdown: CancellationToken::new(),
             supervisor: Mutex::new(None),
             metrics: OnceLock::new(),
@@ -223,10 +331,10 @@ impl Sidecar {
 
         // First spawn runs synchronously so the caller sees a clean
         // error (and doesn't have to race a background task for it).
-        let (child, stdin, stdout, stderr) = spawn_once(&inner).await?;
+        let (live, stdin) = spawn_once(&inner).await?;
         *inner.process.lock().await = Some(ProcessState { stdin });
 
-        let sup = tokio::spawn(supervise_loop(Arc::clone(&inner), child, stdout, stderr));
+        let sup = tokio::spawn(supervise_loop(Arc::clone(&inner), live));
         *inner.supervisor.lock().await = Some(sup);
 
         Ok(Self { inner })
@@ -236,6 +344,12 @@ impl Sidecar {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.inner.name
+    }
+
+    /// Timeout applied by [`Self::call`].
+    #[must_use]
+    pub fn rpc_timeout(&self) -> Duration {
+        self.inner.rpc_timeout
     }
 
     /// Attach an engine-wide metrics handle. Can only be called once
@@ -255,9 +369,10 @@ impl Sidecar {
         self.inner.notifications.subscribe()
     }
 
-    /// Send a JSON-RPC request and await the correlated response.
+    /// Send a JSON-RPC request and await the correlated response,
+    /// bounded by the spawn-time `rpc_timeout`.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, Error> {
-        self.call_with_timeout(method, params, DEFAULT_RPC_TIMEOUT)
+        self.call_with_timeout(method, params, self.inner.rpc_timeout)
             .await
     }
 
@@ -349,63 +464,40 @@ impl Clone for Sidecar {
     }
 }
 
-#[allow(clippy::too_many_lines)] // single-file supervisor loop; splitting hurts readability.
-/// Own one child from first byte of stdout through EOF; respawn on
-/// unexpected exit up to [`RestartPolicy::max_retries`]. Exits cleanly
-/// when `shutdown` fires.
-async fn supervise_loop(
-    inner: Arc<Inner>,
-    mut child: Child,
-    mut stdout: ChildStdout,
-    mut stderr: ChildStderr,
-) {
+/// Own the child from first byte of stdout through EOF; respawn on
+/// unexpected exit within the restart budget. Exits cleanly when
+/// `shutdown` fires.
+async fn supervise_loop(inner: Arc<Inner>, first: Live) {
+    let mut live = Some(first);
     let mut backoff = inner.policy.initial_backoff;
     let mut attempts: u32 = 0;
 
     loop {
-        let mut reader = spawn_stdout_reader(
-            stdout,
-            Arc::clone(&inner.pending),
-            inner.notifications.clone(),
-            inner.name.clone(),
-        );
-        let stderr_task = spawn_stderr_forwarder(stderr, inner.name.clone());
-
-        // Wait for shutdown or for stdout EOF. Only the reader is a
-        // correctness signal — once it returns, every frame already on
-        // the wire has been dispatched. stderr is log forwarding; a
-        // child that writes nothing to stderr closes that pipe first,
-        // and waking on it would race us into aborting the reader mid-
-        // dispatch and losing the last response frame.
-        tokio::select! {
-            biased;
-            () = inner.shutdown.cancelled() => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                reader.abort();
-                stderr_task.abort();
-                return;
+        if let Some(current) = live.take() {
+            match run_child(&inner, current).await {
+                ChildExit::Shutdown => return,
+                ChildExit::Died { uptime } => {
+                    *inner.process.lock().await = None;
+                    fail_pending(&inner.pending).await;
+                    if uptime >= inner.policy.min_uptime {
+                        // The child proved itself; a fresh crash gets
+                        // the full budget again.
+                        attempts = 0;
+                        backoff = inner.policy.initial_backoff;
+                    }
+                }
             }
-            _ = &mut reader => {}
         }
-        stderr_task.abort();
-
-        // Clean up this process and report pending RPCs as closed.
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        *inner.process.lock().await = None;
-        fail_pending(&inner.pending).await;
 
         if inner.policy.max_retries == 0 {
             info!(plugin = %inner.name, "no restart policy; supervisor exiting");
             return;
         }
-
         attempts += 1;
         if attempts > inner.policy.max_retries {
             warn!(
                 plugin = %inner.name,
-                attempts,
+                attempts = attempts - 1,
                 "restart attempts exhausted; supervisor giving up"
             );
             return;
@@ -414,18 +506,19 @@ async fn supervise_loop(
             plugin = %inner.name,
             attempt = attempts,
             backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
-            "sidecar crashed; scheduling respawn"
+            "sidecar down; scheduling respawn"
         );
-        sleep(backoff).await;
+        tokio::select! {
+            biased;
+            () = inner.shutdown.cancelled() => return,
+            () = sleep(backoff) => {}
+        }
+        backoff = inner.policy.next_backoff(backoff);
 
         match spawn_once(&inner).await {
-            Ok((new_child, new_stdin, new_stdout, new_stderr)) => {
-                *inner.process.lock().await = Some(ProcessState { stdin: new_stdin });
-                child = new_child;
-                stdout = new_stdout;
-                stderr = new_stderr;
-                attempts = 0;
-                backoff = inner.policy.initial_backoff;
+            Ok((new_live, stdin)) => {
+                *inner.process.lock().await = Some(ProcessState { stdin });
+                live = Some(new_live);
                 if let Some(m) = inner.metrics.get() {
                     m.sidecar_restarts
                         .get_or_create(&PluginLabel {
@@ -433,45 +526,48 @@ async fn supervise_loop(
                         })
                         .inc();
                 }
-                info!(plugin = %inner.name, "sidecar respawned");
+                info!(plugin = %inner.name, attempt = attempts, "sidecar respawned");
             }
             Err(e) => {
+                // Counts as a failed attempt; the loop comes back
+                // around with a longer backoff.
                 warn!(plugin = %inner.name, ?e, attempt = attempts, "respawn failed");
-                backoff = inner.policy.next_backoff(backoff);
-                // Loop back and retry spawn after another backoff.
-                // We still need something in `child`/`stdout`/`stderr`
-                // for the reader to poll — skip to the top with a fake
-                // exit: easiest is to `continue` but we don't have
-                // streams. Instead, keep retrying inline.
-                loop {
-                    if inner.shutdown.is_cancelled() || attempts > inner.policy.max_retries {
-                        return;
-                    }
-                    sleep(backoff).await;
-                    attempts += 1;
-                    match spawn_once(&inner).await {
-                        Ok((c, stdin, so, se)) => {
-                            *inner.process.lock().await = Some(ProcessState { stdin });
-                            child = c;
-                            stdout = so;
-                            stderr = se;
-                            attempts = 0;
-                            backoff = inner.policy.initial_backoff;
-                            if let Some(m) = inner.metrics.get() {
-                                m.sidecar_restarts
-                                    .get_or_create(&PluginLabel {
-                                        plugin: inner.name.clone(),
-                                    })
-                                    .inc();
-                            }
-                            break;
-                        }
-                        Err(err) => {
-                            warn!(plugin = %inner.name, ?err, attempt = attempts, "respawn still failing");
-                            backoff = inner.policy.next_backoff(backoff);
-                        }
-                    }
-                }
+            }
+        }
+    }
+}
+
+/// Drive one child until it exits or `shutdown` fires. Only the
+/// stdout reader is a correctness signal — once it returns, every
+/// frame already on the wire has been dispatched. stderr is log
+/// forwarding; a child that writes nothing to stderr closes that pipe
+/// first, and waking on it would race us into aborting the reader
+/// mid-dispatch and losing the last response frame.
+async fn run_child(inner: &Inner, mut live: Live) -> ChildExit {
+    let mut reader = spawn_stdout_reader(
+        live.stdout,
+        Arc::clone(&inner.pending),
+        inner.notifications.clone(),
+        inner.name.clone(),
+        inner.max_frame_bytes,
+    );
+    let stderr_task = spawn_stderr_forwarder(live.stderr, inner.name.clone());
+
+    tokio::select! {
+        biased;
+        () = inner.shutdown.cancelled() => {
+            let _ = live.child.start_kill();
+            let _ = live.child.wait().await;
+            reader.abort();
+            stderr_task.abort();
+            ChildExit::Shutdown
+        }
+        _ = &mut reader => {
+            stderr_task.abort();
+            let _ = live.child.start_kill();
+            let _ = live.child.wait().await;
+            ChildExit::Died {
+                uptime: live.spawned_at.elapsed(),
             }
         }
     }
@@ -488,16 +584,17 @@ fn canonical_entry(plugin_dir: &Path, entry: &Path) -> Result<PathBuf, Error> {
     std::fs::canonicalize(&raw).map_err(Error::Io)
 }
 
-/// Spawn one child and hand back its live handles.
+/// Spawn one child and hand back its live handles plus stdin.
 ///
 /// `async` is kept even though the body doesn't currently await on the
 /// hot path — respawn workflows benefit from a uniform await-point
 /// signature, and a future readiness ping (SIGSTART / health probe)
 /// lands here without ripple-changing call sites.
 #[allow(clippy::unused_async)]
-async fn spawn_once(inner: &Inner) -> Result<(Child, ChildStdin, ChildStdout, ChildStderr), Error> {
+async fn spawn_once(inner: &Inner) -> Result<(Live, ChildStdin), Error> {
     let mut cmd = Command::new(&inner.entry);
     cmd.current_dir(&inner.plugin_dir)
+        .envs(&inner.env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -505,9 +602,9 @@ async fn spawn_once(inner: &Inner) -> Result<(Child, ChildStdin, ChildStdout, Ch
 
     // Unix: attach the sandbox via `pre_exec`. The closure runs in
     // the forked child immediately before `execve` and must be
-    // async-signal-safe — every syscall goes through `rustix` (no
-    // allocator touches, no heap strings in the error path), which
-    // is why we can uphold that contract without libc unsafe code.
+    // async-signal-safe: the plan was compiled in the parent, so the
+    // closure only issues syscalls and never allocates (see
+    // `sandbox::apply_in_child`).
     //
     // `tokio::process::Command::pre_exec` is itself `unsafe fn` — the
     // workspace lint is `deny`, not `forbid`, so we carry a scoped
@@ -516,14 +613,10 @@ async fn spawn_once(inner: &Inner) -> Result<(Child, ChildStdin, ChildStdout, Ch
     // the codebase that touches `unsafe`.
     #[cfg(unix)]
     {
-        // SandboxConfig carries a Vec for the seccomp extra-allow
-        // list (v0.29.0), so it's Clone but no longer Copy. Cloning
-        // once per respawn is cheap and keeps the `pre_exec` closure
-        // owning its snapshot.
-        let sandbox_cfg = inner.sandbox.clone();
+        let plan = inner.sandbox.clone();
         #[allow(unsafe_code)]
         unsafe {
-            cmd.pre_exec(move || sandbox::apply_in_child(&sandbox_cfg));
+            cmd.pre_exec(move || sandbox::apply_in_child(&plan));
         }
     }
 
@@ -549,7 +642,15 @@ async fn spawn_once(inner: &Inner) -> Result<(Child, ChildStdin, ChildStdout, Ch
         .stderr
         .take()
         .ok_or_else(|| Error::Io(std::io::Error::other("no stderr")))?;
-    Ok((child, stdin, stdout, stderr))
+    Ok((
+        Live {
+            child,
+            stdout,
+            stderr,
+            spawned_at: Instant::now(),
+        },
+        stdin,
+    ))
 }
 
 /// Fail every in-flight request with `Error::Closed`. Called from the
@@ -565,33 +666,57 @@ async fn fail_pending(pending: &Pending) {
 /// Background task: drain `stdout` as newline-delimited JSON-RPC
 /// frames and route each response to its pending request by id.
 /// Plugin-initiated notifications (frames without `id`) are
-/// broadcast on `notifications` for streaming subscribers.
+/// broadcast on `notifications` for streaming subscribers. A frame
+/// longer than `max_frame_bytes` ends the task — the supervisor then
+/// treats the child as dead.
 fn spawn_stdout_reader(
     stdout: ChildStdout,
     pending: Pending,
     notifications: broadcast::Sender<PluginNotification>,
     name: String,
+    max_frame_bytes: usize,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
+        let mut reader = BufReader::new(stdout);
+        let mut buf: Vec<u8> = Vec::new();
+        // One frame may consume at most the cap plus its newline.
+        let limit = u64::try_from(max_frame_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    dispatch_frame(trimmed, &pending, &notifications, &name).await;
-                }
-                Ok(None) => {
-                    debug!(plugin = %name, "sidecar stdout closed");
-                    break;
-                }
+            buf.clear();
+            let n = match (&mut reader).take(limit).read_until(b'\n', &mut buf).await {
+                Ok(n) => n,
                 Err(e) => {
                     warn!(plugin = %name, ?e, "stdout read error");
                     break;
                 }
+            };
+            if n == 0 {
+                debug!(plugin = %name, "sidecar stdout closed");
+                break;
             }
+            if buf.last() != Some(&b'\n') {
+                if buf.len() > max_frame_bytes {
+                    warn!(
+                        plugin = %name,
+                        max_frame_bytes,
+                        "stdout frame exceeds the frame cap; dropping the child"
+                    );
+                } else {
+                    debug!(plugin = %name, "sidecar stdout closed mid-frame");
+                }
+                break;
+            }
+            let Ok(line) = std::str::from_utf8(&buf) else {
+                warn!(plugin = %name, "bad frame: not UTF-8");
+                continue;
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            dispatch_frame(trimmed, &pending, &notifications, &name).await;
         }
     })
 }
@@ -614,7 +739,7 @@ async fn dispatch_frame(
                 }
             } else if let Some(method) = resp.method {
                 // Plugin-initiated notification — fan out to
-                // `subscribe_notifications()` consumers. Send error
+                // `subscribe_notifications` consumers. Send error
                 // just means "no subscribers right now", which is
                 // normal when no streaming tool is active.
                 let _ = notifications.send(PluginNotification {
@@ -764,6 +889,7 @@ exit 0
                 initial_backoff: Duration::from_millis(20),
                 max_backoff: Duration::from_millis(50),
                 backoff_multiplier: 1.5,
+                ..RestartPolicy::default()
             },
         )
         .await
@@ -781,7 +907,7 @@ exit 0
         sidecar.shutdown().await;
     }
 
-    /// `no_restart()` policy: after one crash the Sidecar stays dead
+    /// `no_restart` policy: after one crash the Sidecar stays dead
     /// and subsequent calls return `Error::Closed`.
     #[tokio::test(flavor = "multi_thread")]
     async fn no_restart_policy_stays_down_after_crash() {
@@ -840,6 +966,238 @@ exit 1
             }
         }
         assert_eq!(ok, 32);
+        sidecar.shutdown().await;
+    }
+
+    /// A child that dies on every start is restarted at most
+    /// `max_retries` times, with the attempt counter never reset in
+    /// between, and is then left down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn crash_loop_is_capped_by_max_retries() {
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join("spawns.log");
+        let body = format!(
+            "#!/usr/bin/env bash\necho start >> '{}'\nexit 1\n",
+            marker.display()
+        );
+        make_script(dir.path(), "crashloop.sh", &body);
+
+        let sidecar = Sidecar::spawn_with_policy(
+            "crashloop",
+            dir.path(),
+            Path::new("./crashloop.sh"),
+            RestartPolicy {
+                max_retries: 2,
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(20),
+                backoff_multiplier: 2.0,
+                min_uptime: Duration::from_secs(10),
+            },
+        )
+        .await
+        .unwrap();
+
+        // 1 initial spawn + 2 retries, then the supervisor gives up.
+        // Generous window: the suite runs many bash-spawning tests in
+        // parallel, but the loop exits as soon as the count lands.
+        let mut spawns = 0;
+        for _ in 0..400 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            spawns = fs::read_to_string(&marker).map_or(0, |s| s.lines().count());
+            if spawns >= 3 {
+                break;
+            }
+        }
+        assert_eq!(spawns, 3, "expected initial spawn + 2 retries");
+        // Nothing else starts afterwards.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let spawns = fs::read_to_string(&marker).unwrap().lines().count();
+        assert_eq!(spawns, 3, "supervisor must stop after the retry budget");
+
+        let err = sidecar
+            .call_with_timeout("ping", Value::Null, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Closed), "got {err:?}");
+
+        sidecar.shutdown().await;
+    }
+
+    /// A child that stays up for `min_uptime` before dying gets its
+    /// retry budget back, so a plugin that crashes occasionally after
+    /// serving traffic keeps being restarted indefinitely.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn min_uptime_resets_the_retry_budget() {
+        let dir = tempdir().unwrap();
+        // Answers one RPC then exits: its uptime is however long we
+        // wait before calling it.
+        let body = r#"#!/usr/bin/env bash
+read -r line
+id=$(printf '%s' "$line" | sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p')
+printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+exit 0
+"#;
+        make_script(dir.path(), "oneshot.sh", body);
+
+        let sidecar = Sidecar::spawn_with_policy(
+            "budget-reset",
+            dir.path(),
+            Path::new("./oneshot.sh"),
+            RestartPolicy {
+                max_retries: 1,
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(10),
+                backoff_multiplier: 1.0,
+                min_uptime: Duration::from_millis(50),
+            },
+        )
+        .await
+        .unwrap();
+
+        // With max_retries = 1 and no reset, the third crash would
+        // exhaust the budget. Each child lives > min_uptime before we
+        // make it exit, so every crash starts with a fresh budget.
+        for round in 0..4 {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let out = sidecar
+                .call_with_timeout("ping", Value::Null, Duration::from_secs(5))
+                .await
+                .unwrap_or_else(|e| panic!("round {round}: {e}"));
+            assert_eq!(out["ok"], true);
+        }
+
+        sidecar.shutdown().await;
+    }
+
+    /// A frame longer than the cap kills the child (in-flight RPC
+    /// resolves to `Closed`); the restart policy then brings up a
+    /// fresh child that serves normal frames.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_frame_drops_the_child_and_respawn_recovers() {
+        let dir = tempdir().unwrap();
+        let body = r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p')
+  method=$(printf '%s' "$line" | sed -nE 's/.*"method"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p')
+  if [ "$method" = "huge" ]; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":"' "$id"
+    head -c 4096 /dev/zero | tr '\0' 'x'
+    printf '"}\n'
+  else
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+  fi
+done
+"#;
+        make_script(dir.path(), "huge.sh", body);
+
+        let sidecar = Sidecar::spawn_with_options(
+            "framecap",
+            dir.path(),
+            Path::new("./huge.sh"),
+            SpawnOptions {
+                policy: RestartPolicy {
+                    max_retries: 3,
+                    initial_backoff: Duration::from_millis(10),
+                    max_backoff: Duration::from_millis(10),
+                    backoff_multiplier: 1.0,
+                    min_uptime: Duration::ZERO,
+                },
+                max_frame_bytes: 1024,
+                ..SpawnOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = sidecar
+            .call_with_timeout("huge", Value::Null, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Closed), "got {err:?}");
+
+        // Respawned child answers a normal request.
+        let mut ok = None;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if let Ok(v) = sidecar
+                .call_with_timeout("ping", Value::Null, Duration::from_secs(2))
+                .await
+            {
+                ok = Some(v);
+                break;
+            }
+        }
+        assert_eq!(ok.expect("child should respawn")["ok"], true);
+
+        sidecar.shutdown().await;
+    }
+
+    /// `SpawnOptions::rpc_timeout` bounds `call`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rpc_timeout_is_configurable_per_sidecar() {
+        let dir = tempdir().unwrap();
+        // Reads a request and never answers it.
+        make_script(
+            dir.path(),
+            "mute.sh",
+            "#!/usr/bin/env bash\nwhile IFS= read -r line; do sleep 5; done\n",
+        );
+        let sidecar = Sidecar::spawn_with_options(
+            "mute",
+            dir.path(),
+            Path::new("./mute.sh"),
+            SpawnOptions {
+                policy: RestartPolicy::no_restart(),
+                rpc_timeout: Duration::from_millis(100),
+                ..SpawnOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(sidecar.rpc_timeout(), Duration::from_millis(100));
+
+        let started = std::time::Instant::now();
+        let err = sidecar.call("ping", Value::Null).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Timeout {
+                    timeout_ms: 100,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        sidecar.shutdown().await;
+    }
+
+    /// `SpawnOptions::env` is visible inside the child.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_env_reaches_the_child() {
+        let dir = tempdir().unwrap();
+        let body = r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -nE 's/.*"id"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p')
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"flag":"%s"}}\n' "$id" "$SMITHS_TEST_FLAG"
+done
+"#;
+        make_script(dir.path(), "env.sh", body);
+        let sidecar = Sidecar::spawn_with_options(
+            "env",
+            dir.path(),
+            Path::new("./env.sh"),
+            SpawnOptions {
+                policy: RestartPolicy::no_restart(),
+                env: BTreeMap::from([("SMITHS_TEST_FLAG".to_owned(), "hello".to_owned())]),
+                ..SpawnOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let out = sidecar.call("check", Value::Null).await.unwrap();
+        assert_eq!(out["flag"], "hello");
         sidecar.shutdown().await;
     }
 }

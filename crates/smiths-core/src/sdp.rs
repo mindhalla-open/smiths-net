@@ -124,10 +124,10 @@ pub struct SrtpKeys {
     /// Cipher suite both sides agreed on.
     pub suite: SrtpSuite,
     /// Peer-chosen key material (from the offer's `a=crypto:`). Length
-    /// equals `suite.key_material_len()`.
+    /// equals `suite.key_material_len`.
     pub peer_tx_key: Vec<u8>,
     /// Engine-chosen key material (emitted in the answer's `a=crypto:`).
-    /// Length equals `suite.key_material_len()`.
+    /// Length equals `suite.key_material_len`.
     pub local_tx_key: Vec<u8>,
 }
 
@@ -159,7 +159,18 @@ pub enum NegotiationOutcome {
         /// used by the bridge to send forward traffic. `None` if the
         /// offer declared port 0 or omitted a connection line.
         remote_media: Option<SocketAddr>,
-        /// Peer's video RTP endpoint (slice 5.1 / P11). Populated
+        /// Port the peer receives audio RTCP on, at the same address
+        /// as [`Self::Accepted::remote_media`]: the offer's `a=rtcp:`
+        /// port when present, the RTP port itself when `rtcp_mux` is
+        /// set, otherwise RTP port + 1 (RFC 3550 §11). `None`
+        /// whenever `remote_media` is `None`. The UAS uses it for the
+        /// media leg's RTCP peer.
+        remote_rtcp_port: Option<u16>,
+        /// `true` when the offer asked for `a=rtcp-mux` (RFC 5761)
+        /// and the answer accepted it: RTCP for the audio leg shares
+        /// the RTP port in both directions.
+        rtcp_mux: bool,
+        /// Peer's video RTP endpoint. Populated
         /// when the offer carried a non-zero `m=video` block with at
         /// least one codec in the passthrough set (H.264 / VP8 /
         /// VP9). `None` when the offer was audio-only, declared
@@ -181,25 +192,31 @@ pub enum NegotiationOutcome {
         /// Callers that see both fields populated should treat it
         /// as a negotiator bug.
         srtp: Option<SrtpKeys>,
-        /// DTLS-SRTP parameters (slice 5.10-dtls). `Some` when the
+        /// DTLS-SRTP parameters. `Some` when the
         /// offer used `UDP/TLS/RTP/SAVP[F]` with an acceptable
         /// `a=fingerprint:` + `a=setup:` combination. The media
         /// fabric runs the actual handshake; SRTP keys come out
         /// via the RFC 5764 §4.2 PRF once the handshake
         /// completes.
         dtls: Option<DtlsParams>,
-        /// Audio codec both sides agreed on (slice 5.6). `None`
+        /// Audio codec both sides agreed on. `None`
         /// when the offer had no audio m-line or no common codec
         /// (but then `Mismatch` would have fired). Recorded on the
         /// `DialogRecord`'s `per_leg_codec` map — the transcoding
         /// router (5.6b) compares the two legs' entries to decide
         /// whether a `CallTranscoder` is needed.
         audio_codec: Option<NegotiatedCodec>,
-        /// Video codec (slice 5.6). Populated only when the
+        /// RTP clock rate (Hz) of the negotiated audio codec —
+        /// 8 000 for G.711, 48 000 for Opus. The media leg needs it
+        /// to convert RTP timestamps to wall-clock time (jitter
+        /// buffer, RTCP sender reports). `None` when the audio
+        /// stream was rejected (port 0).
+        audio_clock_rate: Option<u32>,
+        /// Video codec. Populated only when the
         /// negotiator accepted a `m=video` block; `None` when
         /// video was declined or absent.
         video_codec: Option<NegotiatedCodec>,
-        /// ICE parameters (slice 5.10-ice). Populated when
+        /// ICE parameters. Populated when
         /// `ice_enabled` is true and the offer/answer both carry
         /// ICE attributes.
         ice: Option<IceParams>,
@@ -243,7 +260,7 @@ pub trait SdpNegotiator: Send + Sync {
         local_rtp_port: u16,
     ) -> NegotiationOutcome;
 
-    /// Multi-stream negotiation (slice 5.1 / P11). Same contract as
+    /// Multi-stream negotiation. Same contract as
     /// [`Self::negotiate_audio`] but carries an optional video port
     /// so the negotiator can emit a matching `m=video` block on the
     /// answer. `video_port = None` declines any video the offer

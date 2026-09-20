@@ -19,21 +19,37 @@
 //!
 //! The limiter is disabled by default (`per_sec == 0`) so dev
 //! deployments don't trip on their own test traffic.
+//!
+//! **Bounded state.** A bucket that has sat idle long enough to refill
+//! completely is indistinguishable from a fresh one, so such entries
+//! are evicted periodically ([`SipRateLimiter::evict_idle`], run
+//! every [`GC_EVERY_CALLS`] admissions). The table is also hard-capped
+//! ([`SipRateLimiter::with_max_sources`], default
+//! [`DEFAULT_MAX_SOURCES`]): once it is full of sources that are all
+//! still mid-burst, datagrams from *new* sources are dropped until an
+//! entry frees up — shedding load rather than growing without bound
+//! under a spoofed-source flood.
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use smiths_core::SipRateLimit;
+
+/// Default cap on tracked source IPs.
+pub const DEFAULT_MAX_SOURCES: usize = 100_000;
+
+/// Idle-entry sweep cadence, in `allow` calls.
+pub const GC_EVERY_CALLS: u64 = 4096;
 
 /// Cheaply-clonable shared rate limiter. An inner `Arc<DashMap>`
 /// keyed by source IP holds the per-source bucket state; the
 /// thresholds (`rate_per_sec`, `burst`) live in atomics so a
 /// config read-through adapter can live-swap them via
 /// [`Self::reconfigure`] without rebuilding the limiter
-/// (slice 5.8-b).
+///.
 #[derive(Clone)]
 pub struct SipRateLimiter {
     inner: Arc<Inner>,
@@ -41,12 +57,16 @@ pub struct SipRateLimiter {
 
 struct Inner {
     /// Refill rate (tokens per second). `0` = limiter disabled
-    /// (every `allow()` returns true). Atomic so
+    /// (every `allow` returns true). Atomic so
     /// [`SipRateLimiter::reconfigure`] can swap it live.
     rate_per_sec: AtomicU32,
     /// Bucket depth (max tokens). Atomic for the same reason.
     burst: AtomicU32,
     buckets: DashMap<IpAddr, Bucket>,
+    /// Hard cap on `buckets.len`.
+    max_sources: AtomicUsize,
+    /// `allow` calls since the last idle sweep.
+    calls_since_gc: AtomicU64,
 }
 
 #[derive(Copy, Clone)]
@@ -75,6 +95,8 @@ impl SipRateLimiter {
                 rate_per_sec: AtomicU32::new(cfg.per_sec),
                 burst: AtomicU32::new(burst),
                 buckets: DashMap::new(),
+                max_sources: AtomicUsize::new(DEFAULT_MAX_SOURCES),
+                calls_since_gc: AtomicU64::new(0),
             }),
         }
     }
@@ -86,10 +108,26 @@ impl SipRateLimiter {
         Self::new(SipRateLimit::default())
     }
 
-    /// Atomically swap the rate thresholds (slice 5.8-b
+    /// Override the cap on tracked sources. Values below 1 are
+    /// clamped to 1. Takes effect for the next `allow` call.
+    #[must_use]
+    pub fn with_max_sources(self, max_sources: usize) -> Self {
+        self.inner
+            .max_sources
+            .store(max_sources.max(1), Ordering::Release);
+        self
+    }
+
+    /// Current cap on tracked sources.
+    #[must_use]
+    pub fn max_sources(&self) -> usize {
+        self.inner.max_sources.load(Ordering::Acquire)
+    }
+
+    /// Atomically swap the rate thresholds (
     /// read-through). Per-source buckets keep their existing
     /// token counts — tokens earned under the old rate stay
-    /// valid, and the next `allow()` call refills using the
+    /// valid, and the next `allow` call refills using the
     /// new rate + new cap. No bucket reset, no traffic jolt.
     ///
     /// `per_sec == 0` disables the limiter immediately; a
@@ -107,7 +145,8 @@ impl SipRateLimiter {
     }
 
     /// `true` when `source` has a token to spend; `false` when the
-    /// bucket is empty (caller should drop the datagram).
+    /// bucket is empty (caller should drop the datagram) or the
+    /// source is new and the table is at its cap.
     ///
     /// When `rate_per_sec == 0` the limiter is off and this returns
     /// `true` immediately without touching the map.
@@ -117,13 +156,33 @@ impl SipRateLimiter {
         if rate_u32 == 0 {
             return true;
         }
+        if self.inner.calls_since_gc.fetch_add(1, Ordering::Relaxed) + 1 >= GC_EVERY_CALLS {
+            self.inner.calls_since_gc.store(0, Ordering::Relaxed);
+            let _ = self.evict_idle();
+        }
         let rate = f64::from(rate_u32);
         let burst = f64::from(self.inner.burst.load(Ordering::Acquire));
         let now = Instant::now();
-        let mut entry = self.inner.buckets.entry(source).or_insert(Bucket {
-            tokens: burst,
-            last: now,
-        });
+        // Read the occupancy *before* taking the entry: `len` locks
+        // every shard, and one of them is the shard the entry would
+        // already hold, which deadlocks the calling thread against
+        // itself. Racing admissions may overshoot the cap by a few
+        // entries, which is harmless for a shedding heuristic.
+        let at_capacity = self.inner.buckets.len() >= self.max_sources();
+        let mut entry = match self.inner.buckets.entry(source) {
+            dashmap::Entry::Occupied(e) => e.into_ref(),
+            dashmap::Entry::Vacant(e) => {
+                if at_capacity {
+                    // Full of sources that are all mid-burst: a sweep
+                    // would free nothing, so shed the newcomer.
+                    return false;
+                }
+                e.insert(Bucket {
+                    tokens: burst,
+                    last: now,
+                })
+            }
+        };
         // Refill by elapsed time × rate, clamped at burst.
         let elapsed = now.saturating_duration_since(entry.last).as_secs_f64();
         entry.tokens = (entry.tokens + elapsed * rate).min(burst);
@@ -134,6 +193,30 @@ impl SipRateLimiter {
         } else {
             false
         }
+    }
+
+    /// Drop every bucket that has been idle long enough to refill to
+    /// `burst` — such a bucket behaves exactly like a fresh entry, so
+    /// evicting it changes no admission decision. Returns the number
+    /// of entries removed. Runs automatically every
+    /// [`GC_EVERY_CALLS`] admissions; exposed for schedulers that
+    /// want a tighter cadence.
+    #[must_use = "returns the number of evicted entries"]
+    pub fn evict_idle(&self) -> usize {
+        let rate = self.inner.rate_per_sec.load(Ordering::Acquire);
+        if rate == 0 {
+            let n = self.inner.buckets.len();
+            self.inner.buckets.clear();
+            return n;
+        }
+        let burst = f64::from(self.inner.burst.load(Ordering::Acquire));
+        let refill = Duration::from_secs_f64(burst / f64::from(rate));
+        let now = Instant::now();
+        let before = self.inner.buckets.len();
+        self.inner
+            .buckets
+            .retain(|_, b| now.saturating_duration_since(b.last) < refill);
+        before - self.inner.buckets.len()
     }
 
     /// Current refill rate (tokens/sec). Read-only snapshot of
@@ -255,7 +338,7 @@ mod tests {
 
     #[test]
     fn reconfigure_bare_per_sec_sets_burst_to_match() {
-        // Mirrors the `new()` fallback: a config with `burst == 0`
+        // Mirrors the `new` fallback: a config with `burst == 0`
         // should treat `per_sec` as the bucket depth too. This is the
         // shape read-through config edits take when the operator only
         // writes `per_sec` under the `[sip.rate_limit]` stanza.
@@ -270,6 +353,76 @@ mod tests {
         });
         assert_eq!(lim.rate_per_sec(), 25);
         assert_eq!(lim.burst(), 25);
+    }
+
+    #[test]
+    fn idle_buckets_are_evicted_once_refilled() {
+        // 100 tok/s, burst 1 → a bucket is full again after 10 ms.
+        let lim = SipRateLimiter::new(SipRateLimit {
+            per_sec: 100,
+            burst: 1,
+        });
+        for i in 0..8u8 {
+            assert!(lim.allow(ip(10, 0, 0, i)));
+        }
+        assert_eq!(lim.tracked_sources(), 8);
+        assert_eq!(lim.evict_idle(), 0, "nothing idle yet");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(lim.evict_idle(), 8);
+        assert_eq!(lim.tracked_sources(), 0);
+        // Evicted sources are admitted again with a full bucket.
+        assert!(lim.allow(ip(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn periodic_sweep_runs_from_allow() {
+        let lim = SipRateLimiter::new(SipRateLimit {
+            per_sec: 100,
+            burst: 1,
+        });
+        assert!(lim.allow(ip(10, 0, 0, 1)));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Burn through the sweep cadence from a second source; the
+        // first source's refilled bucket must be gone afterwards.
+        for _ in 0..GC_EVERY_CALLS {
+            let _ = lim.allow(ip(10, 0, 0, 2));
+        }
+        assert!(
+            lim.tracked_sources() <= 1,
+            "idle source must be swept, got {}",
+            lim.tracked_sources()
+        );
+    }
+
+    #[test]
+    fn cap_sheds_new_sources_while_full_of_active_ones() {
+        // Long refill (burst 100 at 1 tok/s) so nothing is idle
+        // during the test.
+        let lim = SipRateLimiter::new(SipRateLimit {
+            per_sec: 1,
+            burst: 100,
+        })
+        .with_max_sources(3);
+        assert_eq!(lim.max_sources(), 3);
+        for i in 1..=3u8 {
+            assert!(lim.allow(ip(10, 0, 0, i)));
+        }
+        assert!(!lim.allow(ip(10, 0, 0, 4)), "4th source must be shed");
+        assert_eq!(lim.tracked_sources(), 3, "shed sources are not tracked");
+        // Known sources keep working.
+        assert!(lim.allow(ip(10, 0, 0, 2)));
+    }
+
+    #[test]
+    fn with_max_sources_clamps_to_one() {
+        let lim = SipRateLimiter::new(SipRateLimit {
+            per_sec: 1,
+            burst: 1,
+        })
+        .with_max_sources(0);
+        assert_eq!(lim.max_sources(), 1);
+        assert!(lim.allow(ip(10, 0, 0, 1)));
+        assert!(!lim.allow(ip(10, 0, 0, 2)));
     }
 
     #[test]

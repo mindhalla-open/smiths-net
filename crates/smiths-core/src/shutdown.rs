@@ -68,7 +68,7 @@ impl Shutdown {
     }
 }
 
-/// Stream of POSIX `SIGHUP` events (slice 5.8-c). The engine's
+/// Stream of POSIX `SIGHUP` events. The engine's
 /// config-reload driver subscribes to this and calls
 /// [`crate::ConfigReloader::apply`] on each tick; the underlying
 /// `tokio::signal::unix::Signal` coalesces bursts so a rapid-fire
@@ -109,7 +109,7 @@ pub struct HangupStream {
 
 #[cfg(unix)]
 impl HangupStream {
-    /// Wait for the next `SIGHUP`. Resolves to `Some(())` on a
+    /// Wait for the next `SIGHUP`. Resolves to `Some()` on a
     /// new signal, `None` when the underlying OS stream is torn
     /// down (shouldn't happen during normal operation).
     pub async fn recv(&mut self) -> Option<()> {

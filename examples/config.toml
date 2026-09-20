@@ -22,13 +22,25 @@ health_bind = "127.0.0.1:8080"
 # Socket addresses to bind for SIP. 0.0.0.0 = all interfaces.
 bind = ["0.0.0.0:5060"]
 
-# Enabled transports. "udp", "tcp", "tls" are live; "quic" is a
-# slice 4.3 scaffold — requires `--features sip-quic` and logs a
-# "not yet wired" warning at startup.
+# Enabled transports: "udp", "tcp", "tls". ("quic" is rejected by
+# `smiths-net validate` — no build ships the QUIC listener.)
 transports = ["udp"]
 
-# Grace period (seconds) to finish in-flight transactions on shutdown.
+# Shutdown drain window (seconds): after SIGTERM the engine BYEs every
+# live dialog and waits up to this long for the tables to empty before
+# it cancels the SIP tasks. `SMITHS_DRAIN_SECS` overrides at runtime.
+# Hot-reloadable.
 drain_timeout_secs = 10
+
+# RFC 4028 session timers. Every accepted INVITE negotiates a
+# Session-Expires refresh; a dialog whose refresh never arrives is torn
+# down. `min_se_secs` is the smallest interval accepted (RFC floor 90).
+session_timer_enabled = true
+session_expires_secs  = 1800
+min_se_secs           = 90
+
+# Hard ceiling on any dialog's lifetime, seconds. 0 = unlimited.
+max_call_duration_secs = 0
 
 # Conference rooms (slice 5.6e). When set, an INVITE whose Request-URI
 # user-part starts with this prefix joins an N-party audio mixer (one
@@ -47,10 +59,9 @@ mode    = "none"              # "none" | "socks5" | "http-connect"
 # username = "alice"
 # password = "s3cret"         # redacted in config://current
 
-# Embedded WireGuard (slice 3.5 / feature `wireguard`). See
-# docs/deployment/vpn.md for sidecar-vs-embedded tradeoffs. The
-# runtime device is a follow-on; 0.42.0 accepts the config and
-# logs a clear warning at startup so operators aren't surprised.
+# Embedded WireGuard. No build brings the tunnel up in-process, so
+# `mode = "wireguard"` is rejected by `smiths-net validate`; run
+# WireGuard as a host sidecar (docs/deployment/vpn.md).
 [sip.vpn]
 mode = "none"                 # "none" | "wireguard"
 # private_key     = "..."      # redacted in config://current
@@ -97,10 +108,10 @@ backend = "none"   # "none" | "sqlite"
 
 # Vector search (slice 3.4 / P23). `memory` is the in-process
 # cosine-similarity store — loses every record on restart, good for
-# dev loops. `sidecar` delegates to a plugin advertising
-# `storage.vector` (see plugins/examples/store-qdrant).
+# dev loops. `sidecar` is rejected by `smiths-net validate` until the
+# engine ships a sidecar adapter.
 [storage.vector]
-backend = "none"   # "none" | "memory" | "sidecar"
+backend = "none"   # "none" | "memory"
 # plugin  = "store-qdrant"
 
 # Per-call audio retention (slice 3.4 / P23). `fs` writes
@@ -108,7 +119,7 @@ backend = "none"   # "none" | "memory" | "sidecar"
 # Operators who enable it unlock the `call_id`-only path on
 # `transcribe_call` / `summarize_call` (no more inline audio_base64).
 [storage.recording]
-backend        = "none"   # "none" | "fs" | "sidecar"
+backend        = "none"   # "none" | "fs"  ("sidecar" is rejected until an adapter exists)
 retention_days = 0        # 0 disables the hourly sweeper; >0 deletes blobs older than N days
 # plugin = "store-s3-recording"
 
@@ -161,10 +172,17 @@ cpu_budget_ms_per_call = 50
 # anthropic_api_key = "sk-ant-..."
 
 [plugins]
-# Directory the loader scans at startup. Each subdirectory with a
-# `plugin.toml` becomes one sidecar or WASM plugin. Defaults to
-# "plugins" (relative to cwd).
-dir = "plugins"
+# Directory the loader scans at startup, recursing one level. Each
+# directory holding a `plugin.toml` becomes one sidecar, WASM or
+# script plugin; directories without one are containers and are
+# skipped. Defaults to "plugins" (relative to cwd).
+#
+# This points at `plugins/examples` rather than `plugins` on purpose:
+# `plugins/cookbook` is teaching material meant to be read (and built
+# in CI), and several of its samples deliberately show manifests the
+# loader rejects. Point `dir` at `plugins` only if you want those
+# loaded too.
+dir = "plugins/examples"
 
 # Call-event hooks (slice 5.6e / P24). Plugins listed here are invoked
 # automatically when a SIP dialog goes live: the engine calls each
@@ -173,6 +191,12 @@ dir = "plugins"
 # inbound calls without an explicit MCP request. Empty = no consumer
 # spawned.
 call_event_hooks = []
+
+# WASM-tier plugin limits. Applied to every `type = "wasm"` plugin
+# instance the loader creates.
+[plugins.wasm]
+memory_limit_mb   = 64      # linear-memory ceiling per instance
+invoke_timeout_ms = 5000    # per-call wall-clock budget
 
 # Sidecar sandbox (v0.23.0). Every field is optional; omit or set to
 # the default to leave that knob at "inherit". All are applied in the
@@ -215,3 +239,71 @@ call_event_hooks = []
 # Each entry is a syscall name; unknown names fail fast at spawn.
 # seccomp_extra_allow = ["io_uring_setup", "io_uring_enter", "io_uring_register"]
 
+
+# MCP over HTTP (`[mcp] enabled_http = true`). stdio MCP is always
+# available via `--mcp stdio`.
+[mcp]
+enabled_http = false
+http_bind    = "127.0.0.1:7878"
+
+# Bearer token every MCP HTTP request must carry
+# (`Authorization: Bearer <token>`). Unset = no auth — loopback only.
+[mcp.http]
+# bearer_token = "s3cret"
+
+# Config hot-reload. SIGHUP (or `smiths-net reload --pid N`) re-reads
+# the config file and applies every hot-reloadable field; fields that
+# need a restart are refused and reported. Both knobs are themselves
+# hot-reloadable.
+[reload]
+enabled         = true    # false = SIGHUP is logged and ignored
+max_frequency_s = 10      # refuse reloads arriving faster than this
+
+# Canary window for every applied reload: the change rolls back on its
+# own unless confirmed (MCP `confirm_config`) before `deadline_s`, or
+# earlier if an error-rate probe trips.
+[canary]
+deadline_s                       = 300
+plugin_error_rate_ceiling        = 0.5   # 1.0 disables
+sip_parse_errors_per_sec_ceiling = 10    # 18446744073709551615 disables
+
+# WebRTC-native signaling adapter: plain-HTTP WebSocket at ws_bind,
+# DTLS-SRTP media, tag-based rendezvous with SIP legs. Front it with a
+# TLS terminator for wss:// — `tls_cert` / `tls_key` are rejected.
+[webrtc]
+enabled = false
+ws_bind = "127.0.0.1:7881"
+
+# Privacy posture (hot-reloadable). "relay_only" rejects host/srflx
+# candidates; "strict" additionally redacts peer IPs and requires TLS
+# signaling, which this adapter cannot terminate — use "relay_only"
+# behind a TLS proxy.
+[webrtc.privacy]
+mode          = "open"     # "open" | "relay_only" | "strict"
+redaction_key = ""
+
+# ICE-lite candidates on every answer. `stun_servers` are queried (one
+# Binding request each, 1 s timeout) for server-reflexive candidates.
+[webrtc.ice]
+enabled      = false
+host_binds   = []
+stun_servers = []          # e.g. ["203.0.113.5:3478"]
+
+# Embedded TURN server, or `external_url` to hand clients an existing
+# coturn instead.
+[webrtc.turn]
+enabled               = false
+bind                  = "0.0.0.0:3478"
+realm                 = ""
+allocation_lifetime_s = 600
+credentials           = []
+external_url          = ""
+
+# HA dialog replication. A primary binds its replication listener on
+# `peer_addr`; a secondary dials the primary there. On every secondary
+# (re)connect the primary sends a full dialog snapshot, then streams
+# deltas; a dropped delta or failed write triggers a snapshot resync.
+[cluster]
+mode                    = "standalone"   # "standalone" | "primary" | "secondary"
+# peer_addr             = "10.42.0.10:8000"   # required outside standalone
+heartbeat_interval_secs = 5                   # hot-reloadable

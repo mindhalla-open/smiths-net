@@ -1,6 +1,6 @@
 //! `AiProvider` shim around a [`smiths_script::ScriptRuntime`].
 //!
-//! Script plugins (slice 4.1) compile once at load and serve every
+//! Script plugins compile once at load and serve every
 //! invocation through the hot engine. The provider supports hot-
 //! reload by atomic swap: the watcher compiles a new runtime, calls
 //! [`ScriptProvider::swap_runtime`], and the very next invocation
@@ -55,7 +55,7 @@ pub struct ScriptProvider {
 
 impl ScriptProvider {
     /// Wrap a freshly-compiled runtime. `capabilities` usually comes
-    /// from `runtime.describe()` at load time, validated through
+    /// from `runtime.describe` at load time, validated through
     /// [`smiths_core::ai::parse_descriptors`] before calling.
     #[allow(clippy::too_many_arguments)]
     #[must_use]

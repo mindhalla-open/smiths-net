@@ -10,7 +10,7 @@
 //! ```
 //!
 //! The handshake completes against a **fixed peer address** per
-//! slice 1.3's scope — ICE is slice 1.4's job; until that lands the
+//! the scope — ICE is the job; until that lands the
 //! DTLS layer talks to whatever endpoint the SDP answer named.
 //!
 //! ## What this crate does not do
@@ -21,7 +21,7 @@
 //!   `AES_CM_128_HMAC_SHA1_80` only.
 //! - **Multi-peer demux** — one leg = one `DtlsLeg` value.
 //!
-//! ## Integration points (slice 1.5, not 1.3)
+//! ## Integration points (, not 1.3)
 //!
 //! The media fabric owns a `DtlsLeg` per bridge leg, calls
 //! [`DtlsLeg::handshake`] before any RTP flows, and threads the
@@ -86,7 +86,7 @@ pub enum LegState {
 /// across calls; the cert's fingerprint is tied to the local leg.
 #[derive(Clone, Debug)]
 pub struct DtlsLegConfig {
-    /// Engine-minted cert (slice 1.2's [`SelfSignedCert`]).
+    /// Engine-minted cert (the [`SelfSignedCert`]).
     pub local_cert: SelfSignedCert,
     /// Role this leg plays per the offer/answer `a=setup:` negotiation.
     pub role: DtlsRole,
@@ -190,6 +190,24 @@ impl DtlsLeg {
 
         *self.state.lock().await = LegState::Handshaking;
 
+        match self.run_handshake(socket).await {
+            Ok(keys) => Ok(keys),
+            Err(e) => {
+                // A leg that failed mid-handshake is dead: mark it so
+                // callers polling `state()` see `Closed` rather than a
+                // leg stuck in `Handshaking` forever.
+                *self.state.lock().await = LegState::Closed;
+                Err(e)
+            }
+        }
+    }
+
+    /// The handshake proper. Every early return here is a failure the
+    /// caller turns into [`LegState::Closed`].
+    async fn run_handshake(
+        &self,
+        socket: Arc<dyn Conn + Send + Sync>,
+    ) -> Result<SrtpKeys, DtlsHandshakeError> {
         let config = self.build_dtls_config()?;
         let is_client = self.config.role == DtlsRole::Client;
         let conn = DTLSConn::new(socket, config, is_client, None)
@@ -277,7 +295,7 @@ impl DtlsLeg {
         //   ...
         //   -----END CERTIFICATE-----
         //
-        // We mint DER via rcgen (slice 1.2); round-trip through
+        // We mint DER via rcgen; round-trip through
         // PEM so the types line up without re-implementing DER →
         // Certificate conversion.
         let key_pem = der_to_pem("PRIVATE_KEY", &self.config.local_cert.key_der);
@@ -586,16 +604,92 @@ mod tests {
         }
     }
 
-    // Full handshake test against a live peer is gated behind
-    // `--ignored`. The harness requires an external openssl binary
-    // supporting DTLS 1.2 (`openssl s_client -dtls1_2`) and live UDP
-    // sockets; slice 1.3 lands the code + unit tests, slice 1.5 ties
-    // the integration suite to the headless-Chromium harness it adds.
-    #[test]
-    #[ignore = "requires openssl s_client -dtls1_2; see slice 1.5 headless harness"]
-    fn handshake_completes_against_openssl_s_client_placeholder() {
-        // Intentional no-op. Keeping the `#[test]` so the name shows
-        // up in the #[ignore] bucket and nobody accidentally deletes
-        // the slot.
+    fn leg_config(local: &SelfSignedCert, role: DtlsRole, peer: &SelfSignedCert) -> DtlsLegConfig {
+        DtlsLegConfig {
+            local_cert: local.clone(),
+            role,
+            peer_fingerprint: Fingerprint {
+                algorithm: "sha-256".into(),
+                value: peer.sha256_fingerprint.clone(),
+            },
+        }
+    }
+
+    /// Two connected loopback UDP sockets; `tokio::net::UdpSocket`
+    /// implements `webrtc_util::conn::Conn` directly.
+    async fn socket_pair() -> (Arc<tokio::net::UdpSocket>, Arc<tokio::net::UdpSocket>) {
+        let a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        a.connect(b.local_addr().unwrap()).await.unwrap();
+        b.connect(a.local_addr().unwrap()).await.unwrap();
+        (Arc::new(a), Arc::new(b))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loopback_handshake_between_two_legs_derives_mirror_keys() {
+        let client_cert = SelfSignedCert::generate("client").unwrap();
+        let server_cert = SelfSignedCert::generate("server").unwrap();
+        let client = DtlsLeg::new(leg_config(&client_cert, DtlsRole::Client, &server_cert));
+        let server = DtlsLeg::new(leg_config(&server_cert, DtlsRole::Server, &client_cert));
+        assert_eq!(client.state().await, LegState::Idle);
+
+        let (client_sock, server_sock) = socket_pair().await;
+        let client_conn: Arc<dyn Conn + Send + Sync> = client_sock;
+        let server_conn: Arc<dyn Conn + Send + Sync> = server_sock;
+        // Both sides must run concurrently: a DTLS handshake is a
+        // back-and-forth and running them sequentially deadlocks on
+        // the first ClientHello.
+        let (client_res, server_res) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(client.handshake(client_conn), server.handshake(server_conn))
+            })
+            .await
+            .expect("handshake must finish within 10 s");
+        let client_keys = client_res.expect("client handshake");
+        let server_keys = server_res.expect("server handshake");
+
+        assert_eq!(client.state().await, LegState::Active);
+        assert_eq!(server.state().await, LegState::Active);
+        // RFC 5764 §4.2: each side's transmit key is the other's
+        // receive key, and the two halves differ.
+        assert_eq!(client_keys.suite, SrtpSuite::AesCm128HmacSha1_80);
+        assert_eq!(client_keys.local_tx_key, server_keys.peer_tx_key);
+        assert_eq!(client_keys.peer_tx_key, server_keys.local_tx_key);
+        assert_ne!(client_keys.local_tx_key, client_keys.peer_tx_key);
+        assert_eq!(client_keys.local_tx_key.len(), 30);
+
+        client.close().await;
+        server.close().await;
+        assert_eq!(client.state().await, LegState::Closed);
+        assert_eq!(server.state().await, LegState::Closed);
+        // Closing again is a no-op.
+        client.close().await;
+        assert_eq!(client.state().await, LegState::Closed);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loopback_handshake_rejects_wrong_peer_fingerprint() {
+        let client_cert = SelfSignedCert::generate("client").unwrap();
+        let server_cert = SelfSignedCert::generate("server").unwrap();
+        let decoy_cert = SelfSignedCert::generate("decoy").unwrap();
+        // The client expects the decoy's fingerprint but the server
+        // presents its own cert.
+        let client = DtlsLeg::new(leg_config(&client_cert, DtlsRole::Client, &decoy_cert));
+        let server = DtlsLeg::new(leg_config(&server_cert, DtlsRole::Server, &client_cert));
+        let (client_sock, server_sock) = socket_pair().await;
+        let client_conn: Arc<dyn Conn + Send + Sync> = client_sock;
+        let server_conn: Arc<dyn Conn + Send + Sync> = server_sock;
+        let (client_res, _server_res) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(client.handshake(client_conn), server.handshake(server_conn))
+            })
+            .await
+            .expect("handshake must finish within 10 s");
+        let err = client_res.expect_err("client must reject the mismatched cert");
+        assert!(
+            matches!(err, DtlsHandshakeError::FingerprintMismatch { .. }),
+            "expected FingerprintMismatch, got {err:?}"
+        );
+        assert_eq!(client.state().await, LegState::Closed);
     }
 }

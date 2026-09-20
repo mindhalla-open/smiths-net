@@ -6,22 +6,18 @@
 //! tells the driver to do), and the `Transaction` trait.
 //!
 //! **Pure** means: no async, no I/O, no locks. FSMs are `on_event →
-//! actions`, synchronously. The `TransactionDriver` (next slice)
-//! wraps them with tokio tasks + a timer wheel to actually send bytes
-//! and fire timers. This split is deliberate — state machines
-//! exhaustively testable without booting a runtime.
+//! actions`, synchronously. [`driver::TransactionDriver`] wraps them
+//! with tokio tasks + timers to actually send bytes and fire timers.
+//! This split is deliberate — state machines are exhaustively
+//! testable without booting a runtime.
 //!
-//! ## Scope of slice 1 (v0.16.0)
-//!
-//! - Framework types land here.
-//! - [`client_non_invite::ClientNonInviteTxn`] — smallest of the four
-//!   RFC 3261 FSMs (3 states, 3 timers), covers outbound BYE / OPTIONS
-//!   / REGISTER once the driver wires it.
-//!
-//! Client-INVITE, server-INVITE, server-non-INVITE, dialog driver,
-//! and the async driver + wiring into UAC/UAS land in follow-on
-//! sessions. This module is additive today — `uas.rs` / `uac.rs` keep
-//! their ad-hoc paths unchanged.
+//! All four RFC 3261 FSMs live here and are wired into the engine:
+//! the UAC drives [`ClientInviteTxn`] / [`ClientNonInviteTxn`] and
+//! the UAS drives [`ServerInviteTxn`] / [`ServerNonInviteTxn`], all
+//! through the same driver. Each FSM has a reliable-transport mode
+//! ([`Transaction::set_reliable`], selected by the driver from the
+//! transport's [`crate::transport::TransportKind`]) that skips the
+//! retransmission timers and uses zero-length absorb windows.
 
 pub mod ack;
 pub mod client_invite;
@@ -79,10 +75,15 @@ pub enum Role {
 
 /// Lookup key for the driver's transaction table.
 ///
-/// RFC 3261 §17.2.3 defines matching for inbound messages: Via
-/// `branch` + `sent-by` + method uniquely identify a transaction.
-/// We key on `(branch, method, role)` because `sent-by` is implicit
-/// in how the driver received the datagram (per-socket).
+/// RFC 3261 §17.2.3 matches an inbound request to a server
+/// transaction on Via `branch` + `sent-by` + method; §17.1.3 matches
+/// a response to a client transaction on `branch` + `CSeq` method. The
+/// table is keyed on `(branch, method, role)`; the driver keeps the
+/// request's `sent-by` alongside each server entry
+/// ([`driver::TransactionDriver::start_server_with_sent_by`]) and
+/// refuses to treat a request from a different `sent-by` as a
+/// retransmission, and checks the `CSeq` method of every response
+/// before feeding it to a client FSM.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TransactionKey {
     /// `Via` branch parameter (RFC 3261 magic cookie + hex).
@@ -212,9 +213,76 @@ pub trait Transaction: Send {
     /// polling this.
     fn state(&self) -> TransactionState;
 
+    /// Select the timer profile for the underlying transport
+    /// (RFC 3261 §17). `true` — TCP / TLS — disables the
+    /// retransmission timers (A, E, G) and collapses the absorb
+    /// windows (D, I, J, K) to zero so the FSM terminates as soon as
+    /// its final exchange is done. Called by the driver before the
+    /// first event; the default keeps the unreliable (UDP) profile.
+    fn set_reliable(&mut self, reliable: bool) {
+        let _ = reliable;
+    }
+
     /// Drive the FSM with one event. The returned vector is the
     /// ordered set of actions the driver must execute. Empty vec =
     /// event was valid but produced no side-effects (e.g. a stray
     /// 1xx when we're already in Proceeding).
     fn on_event(&mut self, event: TransactionEvent) -> Vec<TransactionAction>;
+}
+
+/// `sent-by` (host[:port]) of the topmost `Via` header in a raw SIP
+/// message, as the peer wrote it. `None` when the message has no
+/// parseable `Via`.
+#[must_use]
+pub fn top_via_sent_by(bytes: &[u8]) -> Option<String> {
+    let value = header_value(bytes, &["via", "v"])?;
+    // "SIP/2.0/UDP host:port;branch=..." — sent-by is the token after
+    // the protocol, up to the first parameter.
+    let after_proto = value.split_whitespace().nth(1)?;
+    let sent_by = after_proto.split([';', ',']).next()?.trim();
+    (!sent_by.is_empty()).then(|| sent_by.to_owned())
+}
+
+/// Method token of the `CSeq` header in a raw SIP message
+/// (`CSeq: 1 INVITE` → `INVITE`).
+#[must_use]
+pub fn cseq_method(bytes: &[u8]) -> Option<String> {
+    let value = header_value(bytes, &["cseq"])?;
+    value.split_whitespace().nth(1).map(str::to_owned)
+}
+
+/// Value of the first header whose name matches one of `names`
+/// (case-insensitive, compact forms included), trimmed.
+fn header_value<'a>(bytes: &'a [u8], names: &[&str]) -> Option<&'a str> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let (headers, _) = text.split_once("\r\n\r\n").unwrap_or((text, ""));
+    headers.split("\r\n").skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        let name = name.trim();
+        names
+            .iter()
+            .any(|n| name.eq_ignore_ascii_case(n))
+            .then(|| value.trim())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REQ: &[u8] = b"INVITE sip:a@b SIP/2.0\r\nVia: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-1;rport\r\nCSeq: 7 INVITE\r\nContent-Length: 0\r\n\r\n";
+
+    #[test]
+    fn top_via_sent_by_extracts_host_port() {
+        assert_eq!(top_via_sent_by(REQ).as_deref(), Some("10.0.0.1:5060"));
+        let compact = b"SIP/2.0 200 OK\r\nv: SIP/2.0/TCP [::1]:5061;branch=x\r\n\r\n";
+        assert_eq!(top_via_sent_by(compact).as_deref(), Some("[::1]:5061"));
+        assert!(top_via_sent_by(b"OPTIONS sip:a SIP/2.0\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn cseq_method_extracts_token() {
+        assert_eq!(cseq_method(REQ).as_deref(), Some("INVITE"));
+        assert!(cseq_method(b"SIP/2.0 200 OK\r\n\r\n").is_none());
+    }
 }

@@ -1,9 +1,9 @@
-//! Dialog-table snapshot + replay (slice 6.1 / P15 HA MVP).
+//! Dialog-table snapshot + replay ( HA MVP).
 //!
 //! On graceful shutdown, the CLI writes every live
-//! [`DialogRecord`] in `UasServer::dialogs_handle()` to a JSON
+//! [`DialogRecord`] in `UasServer::dialogs_handle` to a JSON
 //! file. On the next boot, if that file exists, the CLI reads it
-//! and calls [`UasServer::restore_dialogs`] before `run()`. The
+//! and calls [`UasServer::restore_dialogs`] before `run`. The
 //! restored UAS picks up where the crashed one left off: ACKs to
 //! its Early dialogs still confirm, BYEs tear down both the
 //! restored record and the engine-local bookkeeping cleanly.
@@ -25,7 +25,7 @@
 //! ## What's NOT in this slice
 //!
 //! - **Live replication.** Writing deltas to a secondary as they
-//!   happen is slice 6.2; this slice only writes on shutdown.
+//!   happen is ; this slice only writes on shutdown.
 //!   A primary that crashes mid-call loses the in-progress
 //!   dialogs that hadn't been Confirmed yet.
 //! - **Media-plane resumption.** Restored dialogs have no bridge.
@@ -96,7 +96,7 @@ impl From<SnapshotError> for Error {
 /// Write every live dialog to `path`.
 ///
 /// `dialogs` is typically [`crate::UasServer::dialogs_handle`]
-/// cloned out before `run()` was spawned. Writes atomically via a
+/// cloned out before `run` was spawned. Writes atomically via a
 /// `<path>.tmp` scratch + rename so a partial write can never
 /// fool the replay path.
 ///
@@ -174,6 +174,16 @@ mod tests {
             pending_2xx: None,
             per_leg_codec: std::collections::BTreeMap::new(),
             ice: None,
+            remote_target: None,
+            route_set: Vec::new(),
+            local_uri: None,
+            remote_uri: None,
+            local_cseq: 0,
+            remote_cseq: None,
+            transport: None,
+            last_invite_branch: None,
+            local_media: None,
+            session_expires_secs: None,
         }
     }
 

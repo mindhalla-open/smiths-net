@@ -1,4 +1,4 @@
-//! Embedded DSL host for script-tier plugins (slice 4.1 / P24).
+//! Embedded DSL host for script-tier plugins.
 //!
 //! Today a Rhai-only implementation; the shape is engine-agnostic so
 //! Lua / Starlark can slot in behind [`ScriptEngineKind`] without the
@@ -15,7 +15,7 @@
 //! ```rhai
 //! // Returns a capability descriptor (or an array of them) shaped
 //! // like `describe_capabilities` returns from the plugin protocol.
-//! fn describe_capabilities() { ... }
+//! fn describe_capabilities { ... }
 //! ```
 //!
 //! Every other exported function is a capability method. The engine
@@ -28,9 +28,14 @@
 //!
 //! * **Op-count**: Rhai's built-in `limits::set_max_operations`.
 //!   Guards against runaway loops; the default is 1M ops/invoke.
-//! * **Wall-clock**: the runtime wraps each `call_fn` in a
-//!   `tokio::time::timeout` run on `spawn_blocking` since Rhai is
-//!   synchronous. Default 500 ms — tight enough to keep a dialplan
+//! * **Wall-clock**: each `call_fn` runs on `spawn_blocking` (Rhai is
+//!   synchronous) under a `tokio::time::timeout`. The timeout alone
+//!   would only abandon the blocking task, so the runtime also
+//!   installs a Rhai progress callback that *stops the script*: it
+//!   checks a stop flag the timed-out caller raises and a deadline
+//!   the script armed for itself when it started. Either trips the
+//!   script with a `Budget` error and releases the engine for the
+//!   next call. Default 500 ms — tight enough to keep a dialplan
 //!   script from blocking a worker thread, loose enough to allow
 //!   string-munging + lookup-table work.
 //!
@@ -39,7 +44,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use rhai::{AST, Dynamic, Engine, Map, Scope};
@@ -135,11 +141,104 @@ pub struct ScriptRuntime {
     /// the engine still serializes calls. One script = one execution
     /// lane; multiple concurrent calls queue behind the mutex.
     inner: Arc<Mutex<RhaiInner>>,
+    /// Stop-flag + deadline shared with the engine's progress
+    /// callback so a timed-out call actually terminates the script.
+    interrupt: Arc<Interrupt>,
 }
 
 struct RhaiInner {
     engine: Engine,
     ast: AST,
+}
+
+/// How often (in Rhai operations) the progress callback re-reads the
+/// clock for the in-script deadline. The stop flag is checked on
+/// every operation — it is two relaxed atomic loads — but
+/// `Instant::now` is not free, so the deadline is sampled.
+const DEADLINE_PROBE_EVERY_OPS: u64 = 256;
+
+/// Cooperative-interruption state shared between the async caller
+/// and the blocking thread running the Rhai engine.
+///
+/// Every call gets a unique generation number. The blocking side
+/// publishes the generation it is executing (under the engine
+/// mutex, so at most one call is active) plus its deadline; a caller
+/// whose timeout fired stores its own generation into `stop`. The
+/// progress callback terminates the script when `stop` matches the
+/// active generation — a stale stop request from an earlier call can
+/// never hit a later one because generations are never reused.
+struct Interrupt {
+    /// Source of unique call generations.
+    seq: AtomicU64,
+    /// Generation currently executing inside the engine; `0` = idle.
+    active: AtomicU64,
+    /// Generation that was asked to stop; `0` = none.
+    stop: AtomicU64,
+    /// Deadline of the active call as nanoseconds since `base`;
+    /// `0` = no deadline armed.
+    deadline_nanos: AtomicU64,
+    /// Reference point for `deadline_nanos`.
+    base: Instant,
+}
+
+impl Interrupt {
+    fn new() -> Self {
+        Self {
+            seq: AtomicU64::new(0),
+            active: AtomicU64::new(0),
+            stop: AtomicU64::new(0),
+            deadline_nanos: AtomicU64::new(0),
+            base: Instant::now(),
+        }
+    }
+
+    /// Hand out the next call generation (never `0`).
+    fn next_generation(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Mark `generation` as executing with a deadline `wall_clock`
+    /// from now. Called on the blocking thread once the engine mutex
+    /// is held.
+    fn begin(&self, generation: u64, wall_clock: Duration) {
+        let deadline = Instant::now() + wall_clock;
+        let nanos = u64::try_from(deadline.saturating_duration_since(self.base).as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.deadline_nanos.store(nanos, Ordering::Release);
+        self.active.store(generation, Ordering::Release);
+    }
+
+    /// Clear the active generation once the call returned.
+    fn end(&self) {
+        self.active.store(0, Ordering::Release);
+        self.deadline_nanos.store(0, Ordering::Release);
+    }
+
+    /// Ask the script running as `generation` to stop. No-op if that
+    /// generation already finished or hasn't started yet — in the
+    /// latter case the deadline armed by `begin` still bounds it.
+    fn request_stop(&self, generation: u64) {
+        self.stop.store(generation, Ordering::Release);
+    }
+
+    /// Progress-callback probe: `true` when the active script must
+    /// terminate now.
+    fn should_stop(&self, ops: u64) -> bool {
+        let active = self.active.load(Ordering::Acquire);
+        if active != 0 && self.stop.load(Ordering::Acquire) == active {
+            return true;
+        }
+        if !ops.is_multiple_of(DEADLINE_PROBE_EVERY_OPS) {
+            return false;
+        }
+        let deadline = self.deadline_nanos.load(Ordering::Acquire);
+        if deadline == 0 {
+            return false;
+        }
+        let now = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        now >= deadline
+    }
 }
 
 impl std::fmt::Debug for ScriptRuntime {
@@ -183,6 +282,14 @@ impl ScriptRuntime {
         let path = path.into();
         let mut engine = Engine::new();
         engine.set_max_operations(limits.max_operations);
+        // Cooperative interruption: Rhai invokes this on every
+        // operation; returning `Some` terminates the script with
+        // `ErrorTerminated`, which `call_rhai` maps to a `Budget`
+        // error. This is what makes the wall-clock budget release
+        // the engine instead of merely abandoning the blocking task.
+        let interrupt = Arc::new(Interrupt::new());
+        let probe = Arc::clone(&interrupt);
+        engine.on_progress(move |ops| probe.should_stop(ops).then_some(Dynamic::UNIT));
         let ast = engine.compile(&source).map_err(|e| ScriptError::Compile {
             path: path.display().to_string(),
             reason: e.to_string(),
@@ -193,6 +300,7 @@ impl ScriptRuntime {
             limits,
             path,
             inner: Arc::new(Mutex::new(RhaiInner { engine, ast })),
+            interrupt,
         })
     }
 
@@ -214,7 +322,7 @@ impl ScriptRuntime {
         &self.path
     }
 
-    /// Call `describe_capabilities()`. Every script must define it;
+    /// Call `describe_capabilities`. Every script must define it;
     /// the result is expected to be either a single object or an
     /// array of objects shaped like the plugin-protocol capability
     /// descriptor (caller parses through
@@ -227,14 +335,25 @@ impl ScriptRuntime {
     /// produced, or a [`ScriptError`] if the script errored, the
     /// method isn't defined, or the op-count / wall-clock budget
     /// tripped.
+    ///
+    /// On a wall-clock timeout the caller gets `Budget` immediately
+    /// *and* the script is interrupted through the engine's progress
+    /// callback, so the blocking worker (and the engine mutex) are
+    /// released within a few operations instead of running until the
+    /// op-count budget is exhausted.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, ScriptError> {
         let method_str = method.to_owned();
         let inner = Arc::clone(&self.inner);
+        let interrupt = Arc::clone(&self.interrupt);
         let wall_clock = self.limits.wall_clock;
+        let generation = self.interrupt.next_generation();
         let run = async move {
             tokio::task::spawn_blocking(move || {
                 let guard = inner.blocking_lock();
-                call_rhai(&guard.engine, &guard.ast, &method_str, &params)
+                interrupt.begin(generation, wall_clock);
+                let out = call_rhai(&guard.engine, &guard.ast, &method_str, &params);
+                interrupt.end();
+                out
             })
             .await
             .map_err(|e| ScriptError::Call {
@@ -242,15 +361,16 @@ impl ScriptRuntime {
                 reason: format!("blocking worker panicked: {e}"),
             })?
         };
-        match tokio::time::timeout(wall_clock, run).await {
-            Ok(res) => res,
-            Err(_) => Err(ScriptError::Budget {
-                reason: format!(
-                    "wall-clock timeout ({} ms) for method `{method}`",
-                    wall_clock.as_millis()
-                ),
-            }),
+        if let Ok(res) = tokio::time::timeout(wall_clock, run).await {
+            return res;
         }
+        self.interrupt.request_stop(generation);
+        Err(ScriptError::Budget {
+            reason: format!(
+                "wall-clock timeout ({} ms) for method `{method}`",
+                wall_clock.as_millis()
+            ),
+        })
     }
 
     /// Engine-agnostic convenience — call
@@ -273,7 +393,7 @@ fn call_rhai(
     // errors with a specific ArityMismatch. We peek at the AST first
     // to both (a) turn missing-function into the more helpful
     // `MethodMissing` variant and (b) pick whether to pass the
-    // params arg at all (nullary `describe_capabilities()` is the
+    // params arg at all (nullary `describe_capabilities` is the
     // idiomatic shape; every other method takes one `req` arg).
     let arity = ast
         .iter_functions()
@@ -287,6 +407,9 @@ fn call_rhai(
     let map_err = |e: Box<rhai::EvalAltResult>| match *e {
         rhai::EvalAltResult::ErrorTooManyOperations(_) => ScriptError::Budget {
             reason: "op-count exceeded".into(),
+        },
+        rhai::EvalAltResult::ErrorTerminated(..) => ScriptError::Budget {
+            reason: "wall-clock deadline reached; script interrupted".into(),
         },
         _ => ScriptError::Call {
             method: method.to_owned(),
@@ -484,6 +607,72 @@ mod tests {
             matches!(err, ScriptError::Budget { .. }),
             "expected Budget, got {err:?}"
         );
+    }
+
+    /// A runaway script with an effectively unlimited op budget must
+    /// be stopped by the wall-clock budget — not merely abandoned —
+    /// so the engine is free for the next call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wall_clock_timeout_interrupts_the_running_script() {
+        let wall_clock = Duration::from_millis(100);
+        let r = ScriptRuntime::from_source_rhai(
+            "spinner",
+            "fn spin(req) { let n = 0; loop { n += 1; } }\nfn fast(req) { 7 }".into(),
+            PathBuf::from("spinner.rhai"),
+            ScriptLimits {
+                max_operations: u64::MAX,
+                wall_clock,
+            },
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let err = r.call("spin", Value::Null).await.unwrap_err();
+        assert!(
+            matches!(err, ScriptError::Budget { .. }),
+            "expected Budget, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout must fire promptly; took {:?}",
+            started.elapsed()
+        );
+
+        // The spinner held the engine mutex. If it were still running,
+        // this call would queue behind it and hit its own 100 ms
+        // budget. Interruption frees the lane, so it completes.
+        let started = Instant::now();
+        let out = r.call("fast", Value::Null).await.unwrap();
+        assert_eq!(out, json!(7));
+        assert!(
+            started.elapsed() < wall_clock,
+            "follow-up call should not queue behind the interrupted script; took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A stop request raised for an earlier (timed-out) call must
+    /// not leak into a later call on the same runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_stop_request_does_not_kill_the_next_call() {
+        let r = ScriptRuntime::from_source_rhai(
+            "gen",
+            "fn spin(req) { let n = 0; loop { n += 1; } }\n\
+             fn work(req) { let n = 0; for i in 0..5000 { n += i; } n }"
+                .into(),
+            PathBuf::from("gen.rhai"),
+            ScriptLimits {
+                max_operations: u64::MAX,
+                wall_clock: Duration::from_millis(80),
+            },
+        )
+        .unwrap();
+        let err = r.call("spin", Value::Null).await.unwrap_err();
+        assert!(matches!(err, ScriptError::Budget { .. }));
+        // Thousands of operations after the stale stop request — must
+        // run to completion.
+        let out = r.call("work", Value::Null).await.unwrap();
+        assert_eq!(out, json!(12_497_500));
     }
 
     #[tokio::test]

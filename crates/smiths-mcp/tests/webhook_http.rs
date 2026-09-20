@@ -1,15 +1,14 @@
-//! Slice 4.4 / P20 — generic webhook adapter. Prove that a plain
-//! HTTP client can invoke a tool via `POST /hook/<tool>` with a
-//! bare JSON body (no JSON-RPC envelope) and get back either
-//! `{"result": ...}` on success or `{"error": "..."}` with the
-//! right HTTP status on failure.
+//! Generic webhook adapter: a plain HTTP client invokes a tool via
+//! `POST /hook/<tool>` with a bare JSON body (no JSON-RPC envelope)
+//! and gets back either `{"result": ...}` on success or
+//! `{"error": "..."}` with the right HTTP status on failure.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use smiths_core::media::{BridgeId, EndpointId, MediaEndpoint, MediaError, MediaFabric};
-use smiths_core::{Config, EventBus, Metrics, RateLimitConfig};
+use smiths_core::{Config, Event, EventBus, Metrics, RateLimitConfig, SipEvent};
 use smiths_mcp::{
     ControlState, ProtocolDispatch, RateLimiter, ToolContext, builtin_resources, tools,
 };
@@ -54,6 +53,13 @@ impl MediaFabric for NullMedia {
 }
 
 async fn spawn_webhook(bearer: Option<String>) -> (std::net::SocketAddr, CancellationToken) {
+    let (addr, _bus, cancel) = spawn_webhook_with_bus(bearer).await;
+    (addr, cancel)
+}
+
+async fn spawn_webhook_with_bus(
+    bearer: Option<String>,
+) -> (std::net::SocketAddr, EventBus, CancellationToken) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
@@ -70,18 +76,13 @@ async fn spawn_webhook(bearer: Option<String>) -> (std::net::SocketAddr, Cancell
     let rl = Arc::new(RateLimiter::new(&RateLimitConfig::default()));
     let metrics = Metrics::noop();
 
-    let dispatch = ProtocolDispatch {
-        registry,
-        rate_limiter: rl,
-        metrics,
-        ctx,
-    };
+    let dispatch = ProtocolDispatch::new(registry, resources, rl, metrics, ctx);
     let c2 = cancel.clone();
     tokio::spawn(async move {
-        let _ = smiths_mcp::webhook::serve_http(addr, dispatch, resources, bearer, c2).await;
+        let _ = smiths_mcp::webhook::serve_http(addr, dispatch, bearer, c2).await;
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    (addr, cancel)
+    (addr, bus, cancel)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -134,6 +135,49 @@ async fn webhook_invalid_arguments_returns_400() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+    // Schema validation runs before the tool: a wrongly-typed field
+    // is also 400 and names the offending path.
+    let resp = client
+        .post(format!("http://{addr}/hook/get_call_status"))
+        .json(&serde_json::json!({"call_id": 42}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("call_id"));
+    cancel.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn webhook_conflict_maps_to_409() {
+    let (addr, bus, cancel) = spawn_webhook_with_bus(None).await;
+    let client = reqwest::Client::new();
+    // Unknown call → 404.
+    let resp = client
+        .post(format!("http://{addr}/hook/unbridge_call"))
+        .json(&serde_json::json!({"call_id": "nope"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    // Known but unbridged call → 409.
+    bus.publish(Event::Sip(SipEvent::DialogCreated {
+        call_id: "known".into(),
+        media_endpoint: None,
+        remote_rtp: None,
+    }))
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let resp = client
+        .post(format!("http://{addr}/hook/unbridge_call"))
+        .json(&serde_json::json!({"call_id": "known"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("not bridged"));
     cancel.cancel();
 }
 
@@ -154,6 +198,7 @@ async fn webhook_agent_card_advertises_tools_and_adapters() {
         .map(|a| a["label"].as_str().unwrap())
         .collect();
     assert!(labels.contains(&"mcp-stdio"));
+    assert!(labels.contains(&"mcp-http"));
     assert!(labels.contains(&"a2a-http"));
     assert!(labels.contains(&"webhook-http"));
     cancel.cancel();

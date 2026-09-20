@@ -2,15 +2,15 @@
 //!
 //! Nothing here is production code. The goal is to give tests a tiny
 //! purpose-built UAC + UAS pair, a byte-level RTP packer, the standard
-//! G.711 μ-law codec, a minimal WAV writer, and a signal generator so
-//! end-to-end audio and signaling scenarios don't need external tools.
+//! G.711 μ-law codec, a minimal WAV writer, a signal generator, and a
+//! DTLS-SRTP loopback harness so end-to-end audio, signaling and
+//! WebRTC-media scenarios don't need external tools.
 
 pub mod dtmf_gen;
 pub mod fake_uac;
 pub mod fake_uas;
 pub mod signal;
 pub mod wav;
-#[cfg(feature = "browser")]
 pub mod webrtc_harness;
 
 // Codec and RTP packet types live in `smiths-media` now (production
@@ -22,3 +22,4 @@ pub use smiths_media::{RtpPacket, pcm16_to_pcmu, pcmu_to_pcm16};
 
 pub use fake_uac::FakeUac;
 pub use fake_uas::{CapturedRequest, FakeUas};
+pub use webrtc_harness::{DtlsLoopbackHarness, HarnessConfig, HarnessError, LoopbackStats};

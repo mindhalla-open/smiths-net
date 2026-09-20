@@ -27,7 +27,6 @@
 mod audio;
 mod codec;
 mod effect;
-mod jitter;
 mod rtp;
 mod sip;
 mod stun;
@@ -49,9 +48,9 @@ use tracing::warn;
 use audio::{AudioIo, pop_frame, push_samples};
 use codec::{FRAME_MS, FRAME_SAMPLES, pcm16_to_pcmu, pcmu_to_pcm16};
 use effect::{Voice, VoiceChanger};
-use jitter::JitterBuffer;
 use rtp::{PT_PCMU, RtpPacket};
 use sip::{SipUac, detect_local_ip};
+use smiths_media::jitter::JitterBuffer;
 
 #[derive(Parser)]
 #[command(
@@ -187,6 +186,58 @@ async fn run_loopback(audio: &AudioIo) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the engine to call. With `--host`, spawn a local engine
+/// first and return its child handle, which the caller must keep
+/// alive for the duration of the call.
+async fn resolve_engine(
+    host: bool,
+    engine: Option<SocketAddr>,
+    room: &str,
+) -> Result<(Option<tokio::process::Child>, SocketAddr)> {
+    if host {
+        let child = spawn_local_engine().await?;
+        println!("Local engine is up on 0.0.0.0:5060.");
+        if let Ok(lan) = detect_local_ip("8.8.8.8:80".parse().expect("literal addr")) {
+            println!("Others on your network can join with:");
+            println!("  smiths-softphone call --engine {lan}:5060 --room {room}");
+        }
+        return Ok((Some(child), SocketAddr::from(([127, 0, 0, 1], 5060))));
+    }
+    let engine = engine.ok_or_else(|| {
+        anyhow::anyhow!("provide --engine <ip:port>, or use --host to run a local engine")
+    })?;
+    Ok((None, engine))
+}
+
+/// Discover the public address of `rtp_sock` through `stun_server`,
+/// so the SDP advertises the address a NAT will actually map. Uses
+/// the RTP socket itself so the mapping matches the media flow.
+/// Returns `None` when no server was configured or discovery failed,
+/// in which case the caller advertises its local address.
+async fn discover_public_rtp(
+    rtp_sock: &UdpSocket,
+    stun_server: Option<String>,
+) -> Result<Option<SocketAddr>> {
+    let Some(server) = stun_server else {
+        return Ok(None);
+    };
+    let server_addr = tokio::net::lookup_host(&server)
+        .await
+        .context("resolve STUN server")?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("STUN server {server} resolved to no addresses"))?;
+    match stun::discover(rtp_sock, server_addr).await {
+        Ok(public) => {
+            println!("STUN: public RTP address is {public} (advertised to engine)");
+            Ok(Some(public))
+        }
+        Err(e) => {
+            warn!(?e, "STUN discovery failed; advertising local address");
+            Ok(None)
+        }
+    }
+}
+
 /// Place the call and run the bidirectional RTP loop.
 async fn run_call(
     audio: &AudioIo,
@@ -197,29 +248,9 @@ async fn run_call(
     voice: Voice,
     host: bool,
 ) -> Result<()> {
-    // `--host`: bring up a local engine others can connect to, then
-    // join it ourselves. The child is killed when this function returns
-    // (`kill_on_drop`). `_engine` must stay in scope for the call.
-    let _engine = if host {
-        let child = spawn_local_engine().await?;
-        println!("Local engine is up on 0.0.0.0:5060.");
-        if let Ok(lan) = detect_local_ip("8.8.8.8:80".parse().expect("literal addr")) {
-            println!("Others on your network can join with:");
-            println!("  smiths-softphone call --engine {lan}:5060 --room {room}");
-        }
-        Some(child)
-    } else {
-        None
-    };
-
-    let engine = if host {
-        SocketAddr::from(([127, 0, 0, 1], 5060))
-    } else {
-        engine.ok_or_else(|| {
-            anyhow::anyhow!("provide --engine <ip:port>, or use --host to run a local engine")
-        })?
-    };
-
+    // The child engine (when `--host`) is killed when this function
+    // returns, so `_engine` must stay in scope for the whole call.
+    let (_engine, engine) = resolve_engine(host, engine, room).await?;
     let local_ip = detect_local_ip(engine)?;
     // Bind our RTP socket first so we can advertise its port in the
     // SDP offer. `rtp_port` pins it for firewalling; 0 = ephemeral.
@@ -230,28 +261,7 @@ async fn run_call(
     );
     let rtp_port = rtp_sock.local_addr().context("RTP local_addr")?.port();
 
-    // Optional STUN: discover our public address through a NAT, using
-    // the RTP socket itself so the mapping matches the media flow.
-    let advertised = match stun_server {
-        Some(server) => {
-            let server_addr = tokio::net::lookup_host(&server)
-                .await
-                .context("resolve STUN server")?
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("STUN server {server} resolved to no addresses"))?;
-            match stun::discover(&rtp_sock, server_addr).await {
-                Ok(public) => {
-                    println!("STUN: public RTP address is {public} (advertised to engine)");
-                    Some(public)
-                }
-                Err(e) => {
-                    warn!(?e, "STUN discovery failed; advertising local address");
-                    None
-                }
-            }
-        }
-        None => None,
-    };
+    let advertised = discover_public_rtp(&rtp_sock, stun_server).await?;
 
     let mut uac = SipUac::connect(engine, local_ip, room, rtp_port, advertised).await?;
     println!("Calling room {room:?} on {engine} …");
@@ -276,19 +286,37 @@ async fn run_call(
     let playout = tokio::spawn(playout_loop(Arc::clone(&jitter), audio.playback()));
     let switch = tokio::spawn(voice_switch_loop(Arc::clone(&changer)));
 
-    tokio::signal::ctrl_c().await.context("wait for Ctrl-C")?;
-    println!("Hanging up …");
+    // The call ends on Ctrl-C (we send BYE) or when the far side
+    // hangs up (the engine sends BYE, which `watch_dialog` answers).
+    let ended_by_peer = tokio::select! {
+        r = tokio::signal::ctrl_c() => {
+            r.context("wait for Ctrl-C")?;
+            false
+        }
+        r = uac.watch_dialog() => {
+            if let Err(e) = r {
+                warn!(?e, "SIP dialog watcher failed");
+            }
+            true
+        }
+    };
+    if ended_by_peer {
+        println!("Far end hung up.");
+    } else {
+        println!("Hanging up …");
+    }
     send.abort();
     recv.abort();
     playout.abort();
     switch.abort();
-    if let Err(e) = uac.bye().await {
+    if !ended_by_peer && let Err(e) = uac.bye().await {
         warn!(?e, "BYE failed");
     }
     let s = jitter.lock().expect("jitter mutex").stats();
     println!(
         "Jitter buffer: {} inserted, {} played, {} concealed (loss {}, \
-         starve {}), {} dup, {} late, {} overflow, {} resync, {} rebuffer.",
+         starve {}), {} dup, {} late, {} overflow, {} resync, {} rebuffer, \
+         {} caught up.",
         s.inserted,
         s.played,
         s.concealed_loss + s.concealed_starve,
@@ -299,6 +327,7 @@ async fn run_call(
         s.overflow,
         s.resyncs,
         s.rebuffers,
+        s.catchup,
     );
     println!("Done.");
     Ok(())

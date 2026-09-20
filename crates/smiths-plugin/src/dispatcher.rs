@@ -2,14 +2,17 @@
 //!
 //! A [`Hook`] is a single named action one plugin exposes. A
 //! [`Dispatcher`] routes a named *event* to every hook registered for
-//! it, in priority order (low numbers first, RFC-3261-timer-style).
-//! The dispatcher enforces a per-event time budget so a single slow
-//! hook cannot hold up the rest.
+//! it, in priority order (low numbers first). The dispatcher enforces
+//! a per-event time budget so a single slow hook cannot hold up the
+//! rest: a hook that overruns the remaining budget is cut off and the
+//! hooks after it are skipped, each reported as `Err`.
 //!
-//! Today there's one in-memory implementation,
-//! [`MemoryDispatcher`]. When the WASM and script tiers wire in, they
-//! register their own `Hook` impls against the same trait — the
-//! engine never cares which tier a hook came from.
+//! [`MemoryDispatcher`] is the implementation the engine uses. The
+//! [`crate::AiRegistry`] owns one; the loader registers every hook a
+//! manifest declares (`hooks = [...]`, ordered by `priority`) and the
+//! call-event consumer ([`crate::spawn_call_event_hooks`]) dispatches
+//! SIP dialog events through it. Hooks are tracked per owning plugin
+//! so a reload or removal drops exactly that plugin's registrations.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -56,14 +59,22 @@ pub trait Dispatcher: Send + Sync {
     async fn dispatch(&self, event: &str, payload: Value) -> Vec<HookReport>;
 }
 
-/// One priority-ordered hook entry on an event's route list.
-type RouteEntry = (u16, Arc<dyn Hook>);
+/// One entry on an event's route list.
+#[derive(Clone)]
+struct Route {
+    priority: u16,
+    /// Who registered the hook — a plugin name for manifest hooks —
+    /// so [`MemoryDispatcher::unregister_owner`] can drop them.
+    owner: String,
+    hook: Arc<dyn Hook>,
+}
 
 /// In-memory implementation. Cheap to clone (`Arc<DashMap>` inside).
 #[derive(Clone)]
 pub struct MemoryDispatcher {
-    /// `event` → sorted `[(priority, hook)]`.
-    routes: Arc<DashMap<String, Vec<RouteEntry>>>,
+    /// `event` → routes sorted by priority (stable, so equal
+    /// priorities keep registration order).
+    routes: Arc<DashMap<String, Vec<Route>>>,
     /// Per-dispatch time budget. `None` = no cap.
     budget: Option<Duration>,
 }
@@ -88,6 +99,49 @@ impl MemoryDispatcher {
         }
     }
 
+    /// Per-dispatch budget, if any.
+    #[must_use]
+    pub fn budget(&self) -> Option<Duration> {
+        self.budget
+    }
+
+    /// Register `hook` for `event` on behalf of `owner`. Same
+    /// replace-on-duplicate semantics as [`Dispatcher::register`]
+    /// (keyed on the hook name), plus the owner tag that
+    /// [`Self::unregister_owner`] uses.
+    pub fn register_owned(&self, owner: &str, event: &str, priority: u16, hook: Arc<dyn Hook>) {
+        let mut entry = self.routes.entry(event.to_owned()).or_default();
+        let name = hook.name().to_owned();
+        entry.retain(|r| r.hook.name() != name);
+        entry.push(Route {
+            priority,
+            owner: owner.to_owned(),
+            hook,
+        });
+        entry.sort_by_key(|r| r.priority);
+    }
+
+    /// Drop every hook `owner` registered, across all events.
+    pub fn unregister_owner(&self, owner: &str) {
+        for mut entry in self.routes.iter_mut() {
+            entry.retain(|r| r.owner != owner);
+        }
+    }
+
+    /// Drop every route.
+    pub fn clear(&self) {
+        self.routes.clear();
+    }
+
+    /// Hook names registered for `event`, in dispatch order.
+    #[must_use]
+    pub fn hooks_for(&self, event: &str) -> Vec<String> {
+        self.routes
+            .get(event)
+            .map(|e| e.iter().map(|r| r.hook.name().to_owned()).collect())
+            .unwrap_or_default()
+    }
+
     /// Total number of registered hooks across all events.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -110,17 +164,12 @@ impl Default for MemoryDispatcher {
 #[async_trait]
 impl Dispatcher for MemoryDispatcher {
     fn register(&self, event: &str, priority: u16, hook: Arc<dyn Hook>) {
-        let mut entry = self.routes.entry(event.to_owned()).or_default();
-        let name = hook.name().to_owned();
-        // Drop any existing entry for this (event, name) — re-register
-        // semantics.
-        entry.retain(|(_, h)| h.name() != name);
-        entry.push((priority, hook));
-        entry.sort_by_key(|(p, _)| *p);
+        let owner = hook.name().to_owned();
+        self.register_owned(&owner, event, priority, hook);
     }
 
     async fn dispatch(&self, event: &str, payload: Value) -> Vec<HookReport> {
-        let hooks: Vec<RouteEntry> = self
+        let hooks: Vec<Route> = self
             .routes
             .get(event)
             .map(|e| e.value().clone())
@@ -132,7 +181,8 @@ impl Dispatcher for MemoryDispatcher {
 
         let start = Instant::now();
         let mut reports = Vec::with_capacity(hooks.len());
-        for (_, hook) in hooks {
+        for route in hooks {
+            let hook = route.hook;
             let name = hook.name().to_owned();
             let remaining = self
                 .budget
@@ -212,6 +262,7 @@ mod tests {
         let order: Vec<&str> = reports.iter().map(|r| r.hook.as_str()).collect();
         assert_eq!(order, vec!["a", "b", "c"]);
         assert_eq!(*calls.lock().unwrap(), vec!["a", "b", "c"]);
+        assert_eq!(dispatcher.hooks_for("on_invite"), vec!["a", "b", "c"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -254,5 +305,20 @@ mod tests {
         dispatcher.register("e", 10, hook("same", Arc::clone(&calls)));
         let reports = dispatcher.dispatch("e", Value::Null).await;
         assert_eq!(reports.len(), 1); // only the second registration remained
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unregister_owner_drops_only_that_owner_across_events() {
+        let dispatcher = MemoryDispatcher::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        dispatcher.register_owned("p1", "created", 10, hook("p1.created", Arc::clone(&calls)));
+        dispatcher.register_owned("p1", "ended", 10, hook("p1.ended", Arc::clone(&calls)));
+        dispatcher.register_owned("p2", "created", 20, hook("p2.created", Arc::clone(&calls)));
+        assert_eq!(dispatcher.len(), 3);
+
+        dispatcher.unregister_owner("p1");
+        assert_eq!(dispatcher.len(), 1);
+        assert_eq!(dispatcher.hooks_for("created"), vec!["p2.created"]);
+        assert!(dispatcher.hooks_for("ended").is_empty());
     }
 }

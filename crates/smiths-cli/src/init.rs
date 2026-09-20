@@ -1,4 +1,4 @@
-//! `smiths-net init` config wizard (slice 7.1).
+//! `smiths-net init` config wizard.
 //!
 //! Generates a valid `config.toml` by walking operators through
 //! interactive prompts with sensible defaults. Supports:

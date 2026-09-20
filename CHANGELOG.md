@@ -7,6 +7,96 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Security
+
+- **Digest nonces are now CSPRNG-generated and single-use per
+  nonce-count.** They were derived from the wall clock (despite a
+  comment claiming otherwise) and validated only by set membership, so
+  a captured `Authorization` header replayed for the whole 5-minute
+  TTL. Nonce state now tracks the last `nc`, rejects reuse, and issues
+  `stale=true` re-challenges.
+- **SRTP replay protection is on.** The SRTP context was built with
+  the no-replay-protection option while the surrounding comments
+  claimed the window was active.
+- **RTCP on SRTP legs is protected (SRTCP).** It was previously sent
+  in plaintext alongside encrypted RTP.
+- **WASM guests are bounded in memory and wall-clock time.** Production
+  invocations set no epoch deadline and installed no store limiter, so
+  only fuel bounded a guest; they also ran on the async worker rather
+  than `spawn_blocking`.
+- **Reloading a plugin keeps its sandbox.** `Registry::reload`
+  respawned sidecars with `LoaderOpts::default()`, silently dropping
+  the sandbox, metrics and the notification bridge.
+- **A missing config file is a hard error.** A typo'd `--config` used
+  to boot all-defaults on `0.0.0.0:5060` with auth disabled, and
+  `validate` reported ok for a path that did not exist.
+
+### Added
+
+- **`CANCEL` (RFC 3261 §9.2)**, which previously drew a `405`: `200` to
+  the `CANCEL`, `487` to the pending `INVITE`, early dialog and media
+  released, `481` when no transaction matches.
+- **In-dialog re-`INVITE`**, previously swallowed as a retransmit:
+  re-negotiation, hold (`sendonly`/`inactive`), and `CSeq` ordering
+  per §12.2.2.
+- **Session timers (RFC 4028)** and an absolute call-duration cap, so
+  a dialog whose `ACK` or `BYE` never arrives cannot pin a media
+  endpoint forever.
+- **Dialog route sets and remote targets.** Engine-originated `BYE`
+  now uses the stored `Contact`, reversed `Record-Route`, real
+  `From`/`To` with tags, and a per-dialog local `CSeq`.
+- **`bridge_calls` / `unbridge_call` MCP tools** — the README
+  advertised bridging, but no tool did it.
+- **MCP Streamable HTTP (2025-03-26)** with session ids alongside the
+  existing endpoints, and optional bearer auth on the HTTP transport.
+- **A real jitter buffer on the engine media path.** It existed only
+  in the softphone while `smiths-media` claimed to have one; it now
+  lives in `smiths-media::jitter` and paces the transcode and mixer
+  ingress.
+- **ICE connectivity checks are authenticated** (`MESSAGE-INTEGRITY`,
+  `USERNAME`, `FINGERPRINT`) with triggered checks and keepalives.
+  TURN gained refresh, permissions and channel binding.
+- **T.38 SDP parses off the wire.** `m=image ... udptl t38` failed to
+  parse at all, since every `m=` format was read as a `u8`.
+- **SDP**: `telephone-event` survives negotiation, `rtcp-mux`,
+  `a=rtcp`, `a=mid`, BUNDLE groups, `fmtp`/`ptime` and `rtcp-fb` are
+  honored, and a port-0 (rejected) stream is answered as rejected.
+- Tests grew from 746 to over 1000, including a binary-level
+  end-to-end call through the released binary.
+
+### Fixed
+
+- **Transcoded legs stamp the destination payload type.** A
+  PCMU→PCMA leg emitted A-law bytes under payload type 0; a unit test
+  asserted the bug.
+- **RTCP reports carry real numbers.** `fraction_lost`, `last_sr` and
+  DLSR were hard-coded to zero, the report block named the engine's
+  own SSRC, and inbound RRs were only logged.
+- **HA replication no longer drops deltas silently.** A full or closed
+  channel discarded them; secondaries now resync from a snapshot on
+  reconnect.
+- **Shutdown hangs up active calls** and bounds every task join.
+  `sip.drain_timeout_secs` was read from config and never used.
+- **Every config section is classified** reloadable or
+  restart-required. `[webrtc]`, `[core]`, `[webtransport]`, `[reload]`
+  and `[canary]` changes were silently ignored on reload.
+- **The Docker image builds.** It copied a `proto/` directory that
+  does not exist and pinned a toolchain below the workspace MSRV.
+- The WebRTC adapter shares the engine's media fabric instead of
+  allocating from a second one over the same port range.
+- `fuzz-nightly` referenced a `via_branch` target that did not exist;
+  it does now.
+
+### Changed
+
+- **Docs corrected against the code.** The README no longer claims an
+  HA Raft cluster (the crate is experimental and linked by nothing),
+  protobuf sidecar IPC (it is newline JSON-RPC), or a `scratch` image.
+  `01-crate-layout.md` now shows the real dependency graph, and
+  `10-plugin-wire-format.md` describes the formats that exist.
+- `smiths-proto::flatbuffers_io` is renamed `fixed_frame`: it is a
+  hand-rolled fixed-offset layout, not FlatBuffers.
+
 ### Added
 
 - **Adaptive playout jitter buffer** in `smiths-softphone`

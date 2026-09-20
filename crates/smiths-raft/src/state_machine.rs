@@ -1,6 +1,6 @@
-//! Raft state machine backed by the shared dialog `DashMap` (slice 6.3a/b).
+//! Raft state machine backed by the shared dialog `DashMap` (/b).
 //!
-//! The state machine's `apply()` replays `DialogDelta` log entries onto the
+//! The state machine's `apply` replays `DialogDelta` log entries onto the
 //! dialog table. This is the same table used by `UasServer`, so the Raft
 //! consensus layer is the authoritative source of call-state changes.
 
@@ -259,6 +259,16 @@ mod tests {
             pending_2xx: None,
             per_leg_codec: BTreeMap::default(),
             ice: None,
+            remote_target: None,
+            route_set: Vec::new(),
+            local_uri: None,
+            remote_uri: None,
+            local_cseq: 0,
+            remote_cseq: None,
+            transport: None,
+            last_invite_branch: None,
+            local_media: None,
+            session_expires_secs: None,
         }
     }
 

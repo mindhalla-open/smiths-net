@@ -1,27 +1,29 @@
 //! Response correlation for locally-originated SIP requests.
 //!
 //! The engine owns one socket per SIP transport bind, and the UAS
-//! reader loop receives everything — requests *and* responses. When a
-//! [`crate::UacClient`] sends a request it registers the Via-branch it
-//! used, then awaits a [`tokio::sync::oneshot`]. The UAS, on seeing a
-//! response, calls [`ResponseRouter::deliver`] to resolve the matching
-//! oneshot. Unknown branches are dropped with a debug log.
+//! reader loop receives everything — requests *and* responses. When
+//! the transaction driver starts a client transaction it registers
+//! the Via-branch it used and receives a channel; the UAS, on seeing
+//! a response, calls [`ResponseRouter::deliver`] to push the bytes
+//! into that channel. Unknown branches are dropped with a debug log.
 //!
-//! This is a single-shot correlator — one response per subscription.
-//! That matches SIP semantics: each request's final response resolves
-//! its transaction.
+//! A subscription stays live until [`ResponseRouter::cancel`] (or the
+//! receiver is dropped), so every response on a branch — a `100
+//! Trying` immediately followed by the `200 OK`, a retransmitted
+//! `2xx` arriving after the transaction closed — reaches the
+//! subscriber in order without a re-subscribe window in between.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 use tracing::debug;
 
 /// Thread-safe response correlator keyed by the Via `branch`.
 #[derive(Clone, Default)]
 pub struct ResponseRouter {
-    pending: Arc<DashMap<String, oneshot::Sender<Bytes>>>,
+    pending: Arc<DashMap<String, mpsc::UnboundedSender<Bytes>>>,
 }
 
 impl ResponseRouter {
@@ -31,32 +33,41 @@ impl ResponseRouter {
         Self::default()
     }
 
-    /// Register interest in the response carrying `branch`. Returns a
-    /// receiver that resolves once [`Self::deliver`] fires for the
-    /// same branch. Drops any prior subscription for the same branch.
-    pub fn subscribe(&self, branch: impl Into<String>) -> oneshot::Receiver<Bytes> {
-        let (tx, rx) = oneshot::channel();
+    /// Register interest in every response carrying `branch`. Returns
+    /// a receiver that yields each delivered response in arrival
+    /// order until [`Self::cancel`] runs for the branch. Replaces any
+    /// prior subscription for the same branch (its receiver then
+    /// observes end-of-stream).
+    ///
+    /// Unbounded so [`Self::deliver`] never blocks the transport
+    /// reader; a transaction receives a handful of responses over its
+    /// lifetime, so the buffer stays tiny in practice.
+    pub fn subscribe(&self, branch: impl Into<String>) -> mpsc::UnboundedReceiver<Bytes> {
+        let (tx, rx) = mpsc::unbounded_channel();
         self.pending.insert(branch.into(), tx);
         rx
     }
 
     /// Deliver the response bytes to whoever subscribed on `branch`.
     /// Returns `true` when a subscriber was notified, `false` when the
-    /// branch was unknown (stale response / no UAC).
+    /// branch was unknown (stale response / no UAC) or its receiver
+    /// has gone away — in which case the dead entry is dropped.
     pub fn deliver(&self, branch: &str, bytes: Bytes) -> bool {
-        if let Some((_, tx)) = self.pending.remove(branch) {
-            if tx.send(bytes).is_err() {
-                debug!(branch, "response subscriber dropped before delivery");
-            }
-            true
-        } else {
+        let Some(entry) = self.pending.get(branch) else {
             debug!(branch, "no subscriber for response branch");
-            false
+            return false;
+        };
+        if entry.value().send(bytes).is_ok() {
+            return true;
         }
+        drop(entry);
+        debug!(branch, "response subscriber dropped before delivery");
+        self.pending.remove(branch);
+        false
     }
 
-    /// Drop an outstanding subscription without receiving a response.
-    /// Used by [`crate::UacClient`] to unwind on cancellation.
+    /// Drop an outstanding subscription. Its receiver observes
+    /// end-of-stream on the next `recv`. No-op for unknown branches.
     pub fn cancel(&self, branch: &str) {
         self.pending.remove(branch);
     }
@@ -80,13 +91,17 @@ mod tests {
     use bytes::Bytes;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn deliver_resolves_subscriber() {
+    async fn deliver_resolves_subscriber_and_keeps_subscription() {
         let r = ResponseRouter::new();
-        let rx = r.subscribe("br-1");
+        let mut rx = r.subscribe("br-1");
+        assert!(r.deliver("br-1", Bytes::from_static(b"100 Trying")));
         assert!(r.deliver("br-1", Bytes::from_static(b"200 OK")));
-        let got = rx.await.unwrap();
-        assert_eq!(&got[..], b"200 OK");
+        assert_eq!(&rx.recv().await.unwrap()[..], b"100 Trying");
+        assert_eq!(&rx.recv().await.unwrap()[..], b"200 OK");
+        assert_eq!(r.len(), 1, "delivery must not consume the subscription");
+        r.cancel("br-1");
         assert!(r.is_empty());
+        assert!(rx.recv().await.is_none(), "cancel closes the channel");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -96,23 +111,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn deliver_to_dropped_receiver_evicts_entry() {
+        let r = ResponseRouter::new();
+        let rx = r.subscribe("br-dead");
+        drop(rx);
+        assert!(!r.deliver("br-dead", Bytes::from_static(b"x")));
+        assert!(r.is_empty(), "dead subscription must be evicted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn cancel_drops_subscription() {
         let r = ResponseRouter::new();
-        let rx = r.subscribe("br-2");
+        let mut rx = r.subscribe("br-2");
         r.cancel("br-2");
         assert!(r.is_empty());
-        // The oneshot sender was dropped — receiver sees `Err`.
-        assert!(rx.await.is_err());
+        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn second_subscribe_replaces_first() {
         let r = ResponseRouter::new();
-        let rx1 = r.subscribe("br-3");
-        let rx2 = r.subscribe("br-3");
+        let mut rx1 = r.subscribe("br-3");
+        let mut rx2 = r.subscribe("br-3");
         assert!(r.deliver("br-3", Bytes::from_static(b"hit")));
-        // Second subscription wins; first oneshot gets dropped → Err.
-        assert!(rx1.await.is_err());
-        assert_eq!(&rx2.await.unwrap()[..], b"hit");
+        // Second subscription wins; the first channel is closed.
+        assert!(rx1.recv().await.is_none());
+        assert_eq!(&rx2.recv().await.unwrap()[..], b"hit");
     }
 }

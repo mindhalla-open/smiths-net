@@ -4,7 +4,7 @@ edition      = { workspace = true }
 rust-version = { workspace = true }
 version      = { workspace = true }
 license      = { workspace = true }
-description  = "RTP/RTCP session, jitter buffer, media router (passthrough)."
+description  = "UDP media plane: SSRC-rewriting RTP bridge with SRTP/SRTCP and terminated RTCP, adaptive jitter buffer, transcoded session."
 
 [features]
 default = []
@@ -26,19 +26,20 @@ dashmap     = { workspace = true }
 thiserror   = { workspace = true }
 tracing     = { workspace = true }
 webrtc-srtp = { workspace = true }
-# Slice 5.10-dtls: a peer-bound `Conn` adapter around the fabric's
-# UDP socket. Re-use the transitive version `webrtc-dtls` already
+# The bridge resolves its Prometheus counter handles once per task
+# instead of looking labels up per packet.
+prometheus-client = { workspace = true }
+# A peer-bound `Conn` adapter around the fabric's UDP socket for the
+# DTLS handshake. Re-use the transitive version `webrtc-dtls` already
 # pins so there's no duplicate webrtc-util in the graph.
 webrtc-util = "0.11"
 
 [dev-dependencies]
 tokio             = { workspace = true, features = ["macros", "test-util"] }
 tempfile          = { workspace = true }
-# Slice 5.10-dtls end-to-end tests need live DTLS leg pairs +
-# a Prometheus registry to verify the outcome-label counters.
+# End-to-end DTLS tests need live DTLS leg pairs.
 smiths-dtls       = { workspace = true }
 smiths-sdp        = { workspace = true }
-prometheus-client = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,11 +1,11 @@
 //! DTLS identity helpers for the engine.
 //!
-//! Slice 1.2 covers the cert-generation half of DTLS-SRTP: mint a
+//!  covers the cert-generation half of DTLS-SRTP: mint a
 //! self-signed certificate the media fabric can use as the local DTLS
 //! identity, and derive the SHA-256 fingerprint the engine publishes
 //! in its SDP answer's `a=fingerprint:` line.
 //!
-//! The handshake that consumes these (slice 1.3) wraps `webrtc-dtls`;
+//! The handshake that consumes these wraps `webrtc-dtls`;
 //! this module intentionally knows nothing about the wire layer so
 //! tests — and the handshake crate — can both call it without
 //! bringing in the DTLS library.

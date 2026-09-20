@@ -1,11 +1,10 @@
 //! End-to-end: engine-side UAC places a call to a `FakeUas`, the
-
-#![allow(clippy::format_push_string, clippy::uninlined_format_args)]
-//!
 //! fake answers 200 OK with an SDP answer, UAC ACKs, and a later
 //! `hangup` sends BYE which the fake 200s. Verifies
 //! `DialogCreated` + `DialogTerminated` hit the bus with the right
-//! `call_id`.
+//! `call_id`, that a `100 Trying` sent back-to-back with the `200`
+//! never costs the UAC its final, and that a retransmitted `200` is
+//! answered with a fresh ACK (RFC 3261 §13.2.2.4).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,36 +34,98 @@ fn header<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
-/// Build a minimal 200 OK response for `req` (which we received over
-/// UDP). `body` is either an SDP answer or empty.
-fn build_200(req: &str, local_tag: &str, body: &str) -> Bytes {
-    let via = header(req, "via").unwrap_or("").to_owned();
-    let from = header(req, "from").unwrap_or("").to_owned();
-    let raw_to = header(req, "to").unwrap_or("").to_owned();
-    let to_with_tag = if raw_to.contains(";tag=") {
-        raw_to
-    } else {
-        format!("{raw_to};tag={local_tag}")
+/// Build a minimal response for `req` (which we received over UDP).
+/// `body` is either an SDP answer or empty; provisionals carry no
+/// To-tag.
+fn build_response(
+    req: &str,
+    status: u16,
+    reason: &str,
+    local_tag: Option<&str>,
+    body: &str,
+) -> Bytes {
+    use std::fmt::Write as _;
+
+    let via = header(req, "via").unwrap_or("");
+    let from = header(req, "from").unwrap_or("");
+    let raw_to = header(req, "to").unwrap_or("");
+    let to = match local_tag {
+        Some(tag) if !raw_to.contains(";tag=") => format!("{raw_to};tag={tag}"),
+        _ => raw_to.to_owned(),
     };
-    let call_id = header(req, "call-id").unwrap_or("").to_owned();
-    let cseq = header(req, "cseq").unwrap_or("").to_owned();
-    let content_type = if body.is_empty() {
-        String::new()
-    } else {
-        "Content-Type: application/sdp\r\n".to_owned()
-    };
+    let call_id = header(req, "call-id").unwrap_or("");
+    let cseq = header(req, "cseq").unwrap_or("");
     let mut out = String::new();
-    out.push_str("SIP/2.0 200 OK\r\n");
-    out.push_str(&format!("Via: {via}\r\n"));
-    out.push_str(&format!("From: {from}\r\n"));
-    out.push_str(&format!("To: {to_with_tag}\r\n"));
-    out.push_str(&format!("Call-ID: {call_id}\r\n"));
-    out.push_str(&format!("CSeq: {cseq}\r\n"));
-    out.push_str(&content_type);
-    out.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
-    out.push_str(body);
+    let _ = write!(out, "SIP/2.0 {status} {reason}\r\n");
+    let _ = write!(out, "Via: {via}\r\nFrom: {from}\r\nTo: {to}\r\n");
+    let _ = write!(out, "Call-ID: {call_id}\r\nCSeq: {cseq}\r\n");
+    if !body.is_empty() {
+        out.push_str("Content-Type: application/sdp\r\n");
+    }
+    let _ = write!(out, "Content-Length: {}\r\n\r\n{body}", body.len());
     Bytes::from(out.into_bytes())
 }
+
+/// 200 OK for `req` with `local_tag` as the To-tag.
+fn build_200(req: &str, local_tag: &str, body: &str) -> Bytes {
+    build_response(req, 200, "OK", Some(local_tag), body)
+}
+
+/// Engine-side transport + UAS + UAC wired to a shared response
+/// router, plus the bus they publish on.
+struct Engine {
+    uac: Arc<smiths_sip::UacClient<UdpTransport>>,
+    bus: EventBus,
+    cancel: CancellationToken,
+}
+
+async fn spawn_engine() -> Engine {
+    let engine_transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let engine_addr = engine_transport.local_addr().unwrap();
+    let engine_transport = Arc::new(engine_transport);
+
+    let bus = EventBus::new(64);
+    let cancel = CancellationToken::new();
+    let (tx, rx) = mpsc::channel(64);
+    engine_transport.spawn_reader(tx, cancel.clone());
+
+    let router = Arc::new(ResponseRouter::new());
+    let media_fabric: Arc<dyn MediaFabric> = Arc::new(UdpMediaFabric::new());
+    let negotiator: Arc<dyn SdpNegotiator> =
+        Arc::new(Negotiator::with_default_codecs(engine_addr.ip()));
+
+    let server = UasServer::new(
+        Arc::clone(&engine_transport),
+        bus.clone(),
+        Arc::clone(&media_fabric),
+        Arc::clone(&negotiator),
+    )
+    .unwrap()
+    .with_response_router(Arc::clone(&router));
+    tokio::spawn(server.run(rx, cancel.clone()));
+
+    let uac = Arc::new(smiths_sip::UacClient::new(
+        Arc::clone(&engine_transport),
+        bus.clone(),
+        Arc::clone(&media_fabric),
+        negotiator,
+        Arc::clone(&router),
+        engine_addr,
+        Metrics::noop(),
+    ));
+    Engine { uac, bus, cancel }
+}
+
+const ANSWER_SDP: &str = "v=0\r\n\
+     o=remote 1 1 IN IP4 127.0.0.1\r\n\
+     s=-\r\n\
+     c=IN IP4 127.0.0.1\r\n\
+     t=0 0\r\n\
+     m=audio 55000 RTP/AVP 0\r\n\
+     a=rtpmap:0 PCMU/8000\r\n\
+     a=sendrecv\r\n";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn uac_places_call_and_hangs_up_against_fake_uas() {
@@ -187,4 +248,105 @@ async fn uac_places_call_and_hangs_up_against_fake_uas() {
 
     responder.await.unwrap();
     cancel.cancel();
+}
+
+/// Fake UAS behaviour for the INVITE: what to send before the 200.
+#[derive(Clone, Copy)]
+enum InviteScript {
+    /// `100 Trying` immediately followed by the `200 OK`, no yield in
+    /// between — the two datagrams sit in the engine's socket buffer
+    /// together.
+    TryingThenOk,
+    /// `200 OK`, then once the ACK arrives re-send the `200` as if the
+    /// ACK had been lost, and expect a second ACK.
+    RetransmitOkAfterAck,
+}
+
+/// Run the scripted INVITE → ACK → BYE exchange against the engine
+/// and return the established call id.
+async fn run_call(script: InviteScript) -> String {
+    let fake = Arc::new(FakeUas::bind().await.unwrap());
+    let fake_addr = fake.local_addr().unwrap();
+    let engine = spawn_engine().await;
+    let mut bus_rx = engine.bus.subscribe();
+
+    let fake_for_task = Arc::clone(&fake);
+    let responder = tokio::spawn(async move {
+        let captured = fake_for_task.recv_request().await.unwrap();
+        let req_text = captured.as_str().into_owned();
+        assert!(req_text.starts_with("INVITE"), "expected INVITE");
+        assert!(
+            req_text.contains("Via: SIP/2.0/UDP "),
+            "UDP transport must stamp a UDP Via token"
+        );
+        let ok = build_200(&req_text, "remote-tag-7", ANSWER_SDP);
+        match script {
+            InviteScript::TryingThenOk => {
+                let trying = build_response(&req_text, 100, "Trying", None, "");
+                fake_for_task
+                    .send_raw(&trying, captured.peer)
+                    .await
+                    .unwrap();
+                fake_for_task.send_raw(&ok, captured.peer).await.unwrap();
+                let ack = fake_for_task.recv_request().await.unwrap();
+                assert!(ack.as_str().starts_with("ACK"), "expected ACK");
+            }
+            InviteScript::RetransmitOkAfterAck => {
+                fake_for_task.send_raw(&ok, captured.peer).await.unwrap();
+                let ack = fake_for_task.recv_request().await.unwrap();
+                assert!(ack.as_str().starts_with("ACK"), "expected ACK");
+                // Pretend the ACK was lost: retransmit the 200 twice.
+                for _ in 0..2 {
+                    fake_for_task.send_raw(&ok, captured.peer).await.unwrap();
+                    let re_ack = fake_for_task.recv_request().await.unwrap();
+                    assert!(
+                        re_ack.as_str().starts_with("ACK"),
+                        "retransmitted 200 must be re-ACKed, got: {}",
+                        re_ack.as_str().lines().next().unwrap_or("")
+                    );
+                    assert_eq!(re_ack.raw, ack.raw, "re-sent ACK must be byte-identical");
+                }
+            }
+        }
+        // BYE → 200 OK
+        let bye = fake_for_task.recv_request().await.unwrap();
+        let bye_text = bye.as_str().into_owned();
+        assert!(bye_text.starts_with("BYE"), "expected BYE");
+        let bye_200 = build_200(&bye_text, "remote-tag-7", "");
+        fake_for_task.send_raw(&bye_200, bye.peer).await.unwrap();
+    });
+
+    let target = format!("sip:echo@{fake_addr}");
+    let call_id = timeout(Duration::from_secs(5), engine.uac.place_call(&target))
+        .await
+        .expect("place_call must not hang")
+        .expect("place_call");
+    match timeout(Duration::from_secs(2), bus_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        Event::Sip(SipEvent::DialogCreated { call_id: cid, .. }) => assert_eq!(cid, call_id),
+        other => panic!("expected DialogCreated, got {other:?}"),
+    }
+    // Give the retransmit script room to run before tearing down.
+    if matches!(script, InviteScript::RetransmitOkAfterAck) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    engine.uac.hangup(&call_id).await.expect("hangup");
+    responder.await.unwrap();
+    engine.cancel.cancel();
+    call_id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uac_keeps_final_when_100_and_200_arrive_back_to_back() {
+    for _ in 0..5 {
+        let _ = run_call(InviteScript::TryingThenOk).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uac_re_acks_retransmitted_200() {
+    let _ = run_call(InviteScript::RetransmitOkAfterAck).await;
 }

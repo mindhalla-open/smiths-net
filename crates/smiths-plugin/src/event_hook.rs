@@ -1,43 +1,55 @@
 //! Auto-invoke plugins on call-lifecycle events.
 //!
 //! A small bus consumer: when a SIP dialog goes live
-//! (`SipEvent::DialogCreated`), it invokes the `on_dialog_created`
-//! method on each configured plugin via the [`AiRegistry`]. This lets
-//! a "call-control brain" plugin (e.g. `sip-client`) react to inbound
-//! calls without an explicit MCP request.
+//! (`SipEvent::DialogCreated`) or ends (`SipEvent::DialogTerminated`)
+//! it dispatches the matching hook (`on_dialog_created` /
+//! `on_dialog_terminated`) through the registry's
+//! [`MemoryDispatcher`], so plugins run in `priority` order and a
+//! slow one is cut off by the per-event budget instead of stalling
+//! the rest.
 //!
-//! It reuses the existing broadcast bus + `AiRegistry::invoke` rather
-//! than introducing a new hook-dispatch system. Which plugins to
-//! notify is config-driven (`[plugins] call_event_hooks = [...]`), so
-//! the engine only spawns the consumer when at least one is listed.
+//! Which plugins receive an event comes from two places, both
+//! resolved by plugin name at dispatch time (so a hot reload that
+//! swaps the provider is transparent):
+//!
+//! - manifests: `hooks = ["on_dialog_created",...]`, registered by
+//!   the loader;
+//! - config: `[plugins] call_event_hooks = ["name",...]` registers
+//!   `on_dialog_created` for each listed plugin at the default
+//!   priority, whether or not its manifest declares it.
 
-use std::sync::Arc;
-
-use serde_json::json;
-use smiths_core::ai::AiRegistry;
+use serde_json::{Value, json};
 use smiths_core::{Event, EventBus, SipEvent};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-/// Spawn the call-event consumer. On each `DialogCreated`, invokes
-/// `on_dialog_created` (params `{call_id, remote_rtp}`) on every plugin
-/// named in `plugins`. If `plugins` is empty the task exits immediately
-/// — callers can skip the spawn entirely, but guarding here keeps the
-/// call site simple.
+use crate::dispatcher::{Dispatcher, MemoryDispatcher};
+use crate::registry::AiRegistry;
+
+/// Hook dispatched on `SipEvent::DialogCreated`.
+pub const HOOK_DIALOG_CREATED: &str = "on_dialog_created";
+/// Hook dispatched on `SipEvent::DialogTerminated`.
+pub const HOOK_DIALOG_TERMINATED: &str = "on_dialog_terminated";
+
+/// Spawn the call-event consumer. `plugins` is the config-level list
+/// of plugin names to notify on `on_dialog_created` (in addition to
+/// whatever manifests declare); it may be empty. The task runs until
+/// `cancel` fires or the bus closes.
 #[must_use]
 pub fn spawn_call_event_hooks(
     bus: &EventBus,
-    registry: Arc<dyn AiRegistry>,
+    registry: &AiRegistry,
     plugins: Vec<String>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
+    for name in &plugins {
+        registry.declare_config_hook(name, HOOK_DIALOG_CREATED);
+    }
+    let hooks = registry.hooks().clone();
     let mut rx = bus.subscribe();
     tokio::spawn(async move {
-        if plugins.is_empty() {
-            return;
-        }
-        debug!(?plugins, "call-event hook consumer started");
+        debug!(config_plugins = ?plugins, "call-event hook consumer started");
         loop {
             tokio::select! {
                 biased;
@@ -48,19 +60,11 @@ pub fn spawn_call_event_hooks(
                             "call_id": call_id,
                             "remote_rtp": remote_rtp.map(|a| a.to_string()),
                         });
-                        for name in &plugins {
-                            let Some(provider) = registry.get(name) else {
-                                continue;
-                            };
-                            match provider.invoke("on_dialog_created", params.clone()).await {
-                                Ok(_) => {
-                                    debug!(plugin = %name, %call_id, "on_dialog_created delivered");
-                                }
-                                Err(e) => {
-                                    warn!(plugin = %name, %call_id, ?e, "on_dialog_created failed");
-                                }
-                            }
-                        }
+                        dispatch(&hooks, HOOK_DIALOG_CREATED, &call_id, params).await;
+                    }
+                    Ok(Event::Sip(SipEvent::DialogTerminated { call_id })) => {
+                        let params = json!({ "call_id": call_id });
+                        dispatch(&hooks, HOOK_DIALOG_TERMINATED, &call_id, params).await;
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -72,4 +76,22 @@ pub fn spawn_call_event_hooks(
         }
         debug!("call-event hook consumer exiting");
     })
+}
+
+/// Fan `params` out to every hook registered for `event` and log
+/// each outcome. Failures (plugin error, budget cut-off, plugin not
+/// loaded) are logged and never abort the consumer.
+async fn dispatch(hooks: &MemoryDispatcher, event: &str, call_id: &str, params: Value) {
+    for report in hooks.dispatch(event, params).await {
+        match report.outcome {
+            Ok(_) => debug!(
+                hook = %report.hook, %call_id, duration_ms = report.duration.as_millis(),
+                "{event} delivered"
+            ),
+            Err(e) => warn!(
+                hook = %report.hook, %call_id, error = %e,
+                "{event} failed"
+            ),
+        }
+    }
 }

@@ -83,7 +83,7 @@ pub trait ConferenceRegistry: Send + Sync {
 
 /// In-memory registry. Suitable for single-node deployments; a
 /// future "routing plugin" could delegate across nodes for
-/// horizontal scale but that's out of scope for slice 5.5.
+/// horizontal scale but that's out of scope here.
 #[derive(Default)]
 pub struct InMemoryConferenceRegistry {
     next_id: AtomicU64,

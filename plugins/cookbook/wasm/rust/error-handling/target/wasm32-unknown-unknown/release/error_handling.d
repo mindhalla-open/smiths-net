@@ -1,1 +1,0 @@
-/Users/shkabenkov/Documents/coding/own/mindhalla/smiths-net/plugins/cookbook/wasm/rust/error-handling/target/wasm32-unknown-unknown/release/error_handling.wasm: /Users/shkabenkov/Documents/coding/own/mindhalla/smiths-net/plugins/cookbook/wasm/rust/error-handling/src/lib.rs

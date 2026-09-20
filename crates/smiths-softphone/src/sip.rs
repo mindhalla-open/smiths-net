@@ -126,6 +126,32 @@ impl SipUac {
         Ok(())
     }
 
+    /// Keep reading the signaling socket for the life of the call and
+    /// return once the far end sends BYE (answered with `200 OK` so the
+    /// engine stops retransmitting). In-dialog OPTIONS pings get a
+    /// `200 OK`; any other request gets `405 Method Not Allowed`;
+    /// stray responses (retransmitted `200 OK` to our INVITE) are
+    /// ignored.
+    pub(crate) async fn watch_dialog(&mut self) -> Result<()> {
+        loop {
+            let msg = self.recv().await?;
+            let Some(method) = request_method(&msg) else {
+                continue; // a response, not a request
+            };
+            match method.as_str() {
+                "BYE" => {
+                    self.send(&response_to(&msg, 200, "OK")).await?;
+                    return Ok(());
+                }
+                "OPTIONS" => self.send(&response_to(&msg, 200, "OK")).await?,
+                _ => {
+                    self.send(&response_to(&msg, 405, "Method Not Allowed"))
+                        .await?;
+                }
+            }
+        }
+    }
+
     // ----- plumbing -----
 
     async fn send(&self, msg: &str) -> Result<()> {
@@ -208,6 +234,41 @@ pub(crate) fn detect_local_ip(engine: SocketAddr) -> Result<IpAddr> {
     Ok(probe.local_addr().context("probe local_addr")?.ip())
 }
 
+/// Method of a SIP request, or `None` when the start line is a status
+/// line (`SIP/2.0 …`) or malformed.
+fn request_method(msg: &str) -> Option<String> {
+    let line = msg.lines().next()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    let _uri = parts.next()?;
+    let version = parts.next()?;
+    (version.eq_ignore_ascii_case("SIP/2.0") && !method.eq_ignore_ascii_case("SIP/2.0"))
+        .then(|| method.to_ascii_uppercase())
+}
+
+/// Build a bodiless response to `request`, echoing the headers RFC 3261
+/// §8.2.6.2 requires (`Via`, `From`, `To`, `Call-ID`, `CSeq`) verbatim.
+fn response_to(request: &str, status: u16, reason: &str) -> String {
+    let mut lines = vec![format!("SIP/2.0 {status} {reason}")];
+    for line in request.lines().skip(1) {
+        if line.is_empty() {
+            break; // end of headers
+        }
+        let Some((name, _)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if ["via", "from", "to", "call-id", "cseq"]
+            .iter()
+            .any(|h| name.eq_ignore_ascii_case(h))
+        {
+            lines.push(line.to_owned());
+        }
+    }
+    lines.push("Content-Length: 0".to_owned());
+    format!("{}\r\n\r\n", lines.join("\r\n"))
+}
+
 /// Parse the numeric status from a SIP response's start line.
 fn status_code(msg: &str) -> Option<u16> {
     let line = msg.lines().next()?;
@@ -265,6 +326,90 @@ mod tests {
     fn parses_to_tag() {
         let msg = "SIP/2.0 200 OK\r\nTo: <sip:room@h>;tag=abc123\r\n\r\n";
         assert_eq!(header_tag(msg, "to").as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn classifies_requests_and_responses() {
+        assert_eq!(
+            request_method("BYE sip:x@h SIP/2.0\r\n").as_deref(),
+            Some("BYE")
+        );
+        assert_eq!(request_method("SIP/2.0 200 OK\r\n"), None);
+        assert_eq!(request_method("garbage"), None);
+    }
+
+    #[test]
+    fn response_echoes_dialog_headers() {
+        let bye = "BYE sip:softphone@1.2.3.4:5 SIP/2.0\r\n\
+                   Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-1\r\n\
+                   From: <sip:room@engine>;tag=e1\r\n\
+                   To: <sip:softphone@1.2.3.4:5>;tag=sp-1\r\n\
+                   Call-ID: abc\r\n\
+                   CSeq: 2 BYE\r\n\
+                   Max-Forwards: 70\r\n\
+                   Content-Length: 0\r\n\r\n";
+        let resp = response_to(bye, 200, "OK");
+        assert!(resp.starts_with("SIP/2.0 200 OK\r\n"));
+        assert!(resp.contains("Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-1\r\n"));
+        assert!(resp.contains("From: <sip:room@engine>;tag=e1\r\n"));
+        assert!(resp.contains("To: <sip:softphone@1.2.3.4:5>;tag=sp-1\r\n"));
+        assert!(resp.contains("Call-ID: abc\r\n"));
+        assert!(resp.contains("CSeq: 2 BYE\r\n"));
+        assert!(
+            !resp.contains("Max-Forwards"),
+            "only dialog headers are echoed"
+        );
+        assert!(resp.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[tokio::test]
+    async fn watch_dialog_answers_bye_with_200_and_returns() {
+        let engine = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let engine_addr = engine.local_addr().unwrap();
+        let mut uac = SipUac::connect(
+            engine_addr,
+            IpAddr::from([127, 0, 0, 1]),
+            "demo",
+            4000,
+            None,
+        )
+        .await
+        .unwrap();
+        let uac_addr = uac.sip_addr();
+        // The "engine" first pings with OPTIONS, then hangs up.
+        let options = "OPTIONS sip:softphone@x SIP/2.0\r\nVia: SIP/2.0/UDP e;branch=b1\r\n\
+                       From: <sip:a>;tag=1\r\nTo: <sip:b>;tag=2\r\nCall-ID: c\r\nCSeq: 5 OPTIONS\r\n\
+                       Content-Length: 0\r\n\r\n";
+        let bye = "BYE sip:softphone@x SIP/2.0\r\nVia: SIP/2.0/UDP e;branch=b2\r\n\
+                   From: <sip:a>;tag=1\r\nTo: <sip:b>;tag=2\r\nCall-ID: c\r\nCSeq: 6 BYE\r\n\
+                   Content-Length: 0\r\n\r\n";
+        engine.send_to(options.as_bytes(), uac_addr).await.unwrap();
+        engine.send_to(bye.as_bytes(), uac_addr).await.unwrap();
+        timeout(Duration::from_secs(2), uac.watch_dialog())
+            .await
+            .expect("watcher must return on BYE")
+            .unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = timeout(Duration::from_secs(2), engine.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let first = String::from_utf8_lossy(&buf[..n]).into_owned();
+        assert!(
+            first.starts_with("SIP/2.0 200 OK"),
+            "OPTIONS answered: {first}"
+        );
+        assert!(first.contains("CSeq: 5 OPTIONS"));
+        let (n, _) = timeout(Duration::from_secs(2), engine.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let second = String::from_utf8_lossy(&buf[..n]).into_owned();
+        assert!(
+            second.starts_with("SIP/2.0 200 OK"),
+            "BYE answered: {second}"
+        );
+        assert!(second.contains("CSeq: 6 BYE"));
     }
 
     #[test]

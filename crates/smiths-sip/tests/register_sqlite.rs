@@ -8,6 +8,8 @@
 //! 4. Authenticated REGISTER → 200 OK **and** the `Contact:` binding
 //!    lands in the `contacts` table — `store.snapshot()` returns it.
 //! 5. REGISTER with `Expires: 0` → 200 OK + the binding is removed.
+//! 6. The store holds HA1 hashes only, and a client answering with
+//!    `algorithm=SHA-256` authenticates against the SHA-256 column.
 
 #![cfg(feature = "auth-sqlite")]
 
@@ -205,5 +207,78 @@ async fn sqlite_backed_register_persists_contact_binding() {
     assert!(
         after.is_empty(),
         "Expires: 0 must remove the contact; got {after:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_store_serves_sha256_ha1_and_keeps_no_plaintext() {
+    let store = Arc::new(SqliteAuthStore::open_in_memory().unwrap());
+    store
+        .upsert_user(&Credentials::new("alice", "smiths.test", "s3cret"))
+        .unwrap();
+    let stored = store.lookup("smiths.test", "alice").unwrap();
+    assert!(stored.password.is_empty(), "no plaintext in the store");
+    assert_eq!(
+        stored.ha1.as_deref(),
+        Some(ha1(Algorithm::Md5, "alice", "smiths.test", "s3cret").as_str())
+    );
+
+    let uas_addr = spawn_uas_with_sqlite_store(store.clone()).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let ca = client.local_addr().unwrap();
+    let ruri = format!("sip:smiths.test@{uas_addr}");
+
+    let reg_req = format!(
+        concat!(
+            "REGISTER {ruri} SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP {ca};branch=z9hG4bK-sha-1;rport\r\n",
+            "From: Alice <sip:alice@smiths.test>;tag=alice\r\n",
+            "To: Alice <sip:alice@smiths.test>\r\n",
+            "Call-ID: sha-reg-cid@{ca}\r\n",
+            "CSeq: 1 REGISTER\r\n",
+            "Max-Forwards: 70\r\n",
+            "Contact: <sip:alice@{ca}>\r\n",
+            "Content-Length: 0\r\n\r\n",
+        ),
+        ruri = ruri,
+        ca = ca,
+    );
+    client.send_to(reg_req.as_bytes(), uas_addr).await.unwrap();
+    let challenge = recv_str(&client).await;
+    assert!(challenge.starts_with("SIP/2.0 401 Unauthorized\r\n"));
+    let nonce = param(&challenge, "nonce").unwrap();
+
+    // Answer with SHA-256: the registrar must fetch the SHA-256 HA1.
+    let h1 = ha1(Algorithm::Sha256, "alice", "smiths.test", "s3cret");
+    let h2 = ha2(Algorithm::Sha256, "REGISTER", &ruri);
+    let dr = response_qop_auth(Algorithm::Sha256, &h1, &nonce, "00000001", "cn-s", &h2);
+    let reg_authed = format!(
+        concat!(
+            "REGISTER {ruri} SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP {ca};branch=z9hG4bK-sha-2;rport\r\n",
+            "From: Alice <sip:alice@smiths.test>;tag=alice\r\n",
+            "To: Alice <sip:alice@smiths.test>\r\n",
+            "Call-ID: sha-reg-cid@{ca}\r\n",
+            "CSeq: 2 REGISTER\r\n",
+            "Max-Forwards: 70\r\n",
+            "Contact: <sip:alice@{ca}>\r\n",
+            "Authorization: Digest username=\"alice\", realm=\"smiths.test\", \
+             nonce=\"{nonce}\", uri=\"{ruri}\", response=\"{dr}\", \
+             algorithm=SHA-256, qop=auth, nc=00000001, cnonce=\"cn-s\"\r\n",
+            "Content-Length: 0\r\n\r\n",
+        ),
+        ruri = ruri,
+        ca = ca,
+        nonce = nonce,
+        dr = dr,
+    );
+    client
+        .send_to(reg_authed.as_bytes(), uas_addr)
+        .await
+        .unwrap();
+    let resp = recv_str(&client).await;
+    assert!(
+        resp.starts_with("SIP/2.0 200 OK\r\n"),
+        "SHA-256 digest must authenticate against the SHA-256 HA1:\n{resp}"
     );
 }

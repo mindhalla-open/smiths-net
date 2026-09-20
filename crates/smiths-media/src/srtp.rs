@@ -3,19 +3,38 @@
 //! Per-direction primitive: one instance encrypts engine→peer, a
 //! separate one decrypts peer→engine. The bridge composes four of
 //! these per call (two legs × two directions) and drives them from
-//! the forwarder hot path.
+//! the forwarder hot path. Each instance also carries the SRTCP half
+//! of the same master key, so the bridge's RTCP emitter and listener
+//! use the same transform as the RTP forwarders on that leg.
 //!
 //! `webrtc-srtp`'s [`Context`] is `&mut`-stateful (per-SSRC rollover
-//! counters, replay detector), so we wrap it in a [`tokio::sync::Mutex`]
+//! counters, replay detectors), so we wrap it in a [`std::sync::Mutex`]
 //! to match the `SrtpTransform` trait's `&self` signature. Contention
 //! is trivially low because each `AesCmHmacSha1_80Transform` is used
-//! by exactly one forwarder task in one direction.
+//! by exactly one forwarder task in one direction (plus the RTCP
+//! task at a few packets per second).
+//!
+//! Replay protection is **on** for both SRTP and SRTCP: every decrypt
+//! runs through a sliding-window replay detector
+//! ([`SRTP_REPLAY_WINDOW`] / [`SRTCP_REPLAY_WINDOW`] packets), so a
+//! captured packet re-injected later is rejected with
+//! [`SrtpError::Replayed`].
 
 use std::sync::Mutex;
 
 use smiths_core::{SrtpError, SrtpSuite, SrtpTransform};
 use webrtc_srtp::context::Context;
+use webrtc_srtp::option::{srtcp_replay_protection, srtp_replay_protection};
 use webrtc_srtp::protection_profile::ProtectionProfile;
+
+/// SRTP replay window in packets (RFC 3711 §3.3.2 requires at least
+/// 64; 128 tolerates the reordering long paths produce while still
+/// fitting comfortably in the detector's bitmap).
+pub const SRTP_REPLAY_WINDOW: usize = 128;
+
+/// SRTCP replay window in packets. RTCP runs at a few packets per
+/// second, so 64 covers minutes of reordering.
+pub const SRTCP_REPLAY_WINDOW: usize = 64;
 
 /// `AES_CM_128_HMAC_SHA1_80` transform. Currently the only suite the
 /// engine speaks; adding `AES_CM_128_HMAC_SHA1_32` is a 4-line
@@ -54,54 +73,73 @@ impl AesCmHmacSha1_80Transform {
             key,
             salt,
             ProtectionProfile::Aes128CmHmacSha1_80,
-            None,
-            None,
+            Some(srtp_replay_protection(SRTP_REPLAY_WINDOW)),
+            Some(srtcp_replay_protection(SRTCP_REPLAY_WINDOW)),
         )
         .map_err(|e| SrtpError::Other(format!("context init: {e}")))?;
         Ok(Self {
             ctx: Mutex::new(ctx),
         })
     }
+
+    fn with_ctx<T>(&self, f: impl FnOnce(&mut Context) -> T) -> Result<T, SrtpError> {
+        let mut guard = self
+            .ctx
+            .lock()
+            .map_err(|_| SrtpError::Other("srtp mutex poisoned".into()))?;
+        Ok(f(&mut guard))
+    }
+}
+
+/// Map a `webrtc-srtp` decrypt failure onto the typed error the bridge
+/// branches on: replay-detector rejections and auth-tag mismatches
+/// each get their own variant so they can be logged (and, later,
+/// counted) separately from malformed input.
+fn classify_decrypt_error(e: &webrtc_srtp::Error) -> SrtpError {
+    match e {
+        webrtc_srtp::Error::SrtpSsrcDuplicated(..)
+        | webrtc_srtp::Error::SrtcpSsrcDuplicated(..)
+        | webrtc_srtp::Error::ErrDuplicated => SrtpError::Replayed,
+        webrtc_srtp::Error::ErrFailedToVerifyAuthTag
+        | webrtc_srtp::Error::RtpFailedToVerifyAuthTag
+        | webrtc_srtp::Error::RtcpFailedToVerifyAuthTag => SrtpError::AuthFailed,
+        other => SrtpError::Other(other.to_string()),
+    }
 }
 
 impl SrtpTransform for AesCmHmacSha1_80Transform {
     fn protect_rtp(&self, plaintext: &[u8]) -> Result<Vec<u8>, SrtpError> {
-        let mut guard = self
-            .ctx
-            .lock()
-            .map_err(|_| SrtpError::Other("srtp mutex poisoned".into()))?;
-        let bytes = guard
-            .encrypt_rtp(plaintext)
-            .map_err(|e| SrtpError::Other(format!("encrypt: {e}")))?;
-        Ok(bytes.to_vec())
+        // `Bytes` → `Vec<u8>` reuses the allocation when the buffer is
+        // uniquely owned (always the case for a freshly built packet),
+        // so this is a move, not a copy.
+        self.with_ctx(|ctx| ctx.encrypt_rtp(plaintext))?
+            .map(Vec::from)
+            .map_err(|e| SrtpError::Other(format!("encrypt: {e}")))
     }
 
     fn unprotect_rtp(&self, ciphertext: &[u8]) -> Result<Vec<u8>, SrtpError> {
-        let mut guard = self
-            .ctx
-            .lock()
-            .map_err(|_| SrtpError::Other("srtp mutex poisoned".into()))?;
-        match guard.decrypt_rtp(ciphertext) {
-            Ok(bytes) => Ok(bytes.to_vec()),
-            Err(e) => {
-                let msg = e.to_string();
-                // `webrtc-srtp` uses distinct error strings for auth
-                // failure vs other decrypt errors; map the known
-                // auth-failure strings to our typed variant so the
-                // bridge can drop cleanly and log separately.
-                if msg.contains("authentication") || msg.contains("Auth") {
-                    Err(SrtpError::AuthFailed)
-                } else {
-                    Err(SrtpError::Other(msg))
-                }
-            }
-        }
+        self.with_ctx(|ctx| ctx.decrypt_rtp(ciphertext))?
+            .map(Vec::from)
+            .map_err(|e| classify_decrypt_error(&e))
+    }
+
+    fn protect_rtcp(&self, plaintext: &[u8]) -> Result<Vec<u8>, SrtpError> {
+        self.with_ctx(|ctx| ctx.encrypt_rtcp(plaintext))?
+            .map(Vec::from)
+            .map_err(|e| SrtpError::Other(format!("encrypt rtcp: {e}")))
+    }
+
+    fn unprotect_rtcp(&self, ciphertext: &[u8]) -> Result<Vec<u8>, SrtpError> {
+        self.with_ctx(|ctx| ctx.decrypt_rtcp(ciphertext))?
+            .map(Vec::from)
+            .map_err(|e| classify_decrypt_error(&e))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rtcp::build_sr;
 
     /// Minimal RTP packet for tests: V=2, PT=0 (PCMU), sequence,
     /// timestamp, SSRC, plus a short payload.
@@ -146,7 +184,7 @@ mod tests {
         let ct = tx.protect_rtp(&pkt).unwrap();
         let err = rx.unprotect_rtp(&ct).unwrap_err();
         assert!(
-            matches!(err, SrtpError::AuthFailed | SrtpError::Other(_)),
+            matches!(err, SrtpError::AuthFailed),
             "expected auth-failure, got {err:?}"
         );
     }
@@ -178,5 +216,67 @@ mod tests {
             let pt = rx.unprotect_rtp(&ct).expect("decrypt");
             assert_eq!(pt, pkt, "packet {seq} must round-trip");
         }
+    }
+
+    #[test]
+    fn replayed_rtp_packet_is_rejected() {
+        let tx = AesCmHmacSha1_80Transform::from_sdes(&test_km()).unwrap();
+        let rx = AesCmHmacSha1_80Transform::from_sdes(&test_km()).unwrap();
+        let pkt = rtp_packet(10, 1600, 0x0000_5678, b"once-only");
+        let ct = tx.protect_rtp(&pkt).unwrap();
+        assert_eq!(rx.unprotect_rtp(&ct).unwrap(), pkt, "first copy accepted");
+        let err = rx.unprotect_rtp(&ct).unwrap_err();
+        assert!(
+            matches!(err, SrtpError::Replayed),
+            "second copy must be rejected as a replay, got {err:?}"
+        );
+        // A fresh sequence number is still accepted afterwards.
+        let next = rtp_packet(11, 1760, 0x0000_5678, b"next");
+        let ct_next = tx.protect_rtp(&next).unwrap();
+        assert_eq!(rx.unprotect_rtp(&ct_next).unwrap(), next);
+    }
+
+    #[test]
+    fn rtp_packet_older_than_the_window_is_rejected() {
+        let tx = AesCmHmacSha1_80Transform::from_sdes(&test_km()).unwrap();
+        let rx = AesCmHmacSha1_80Transform::from_sdes(&test_km()).unwrap();
+        // Encrypt seq 1 but hold it back; deliver a run far past the
+        // replay window first, then try to slip seq 1 in.
+        let stale = tx
+            .protect_rtp(&rtp_packet(1, 0, 0x0000_9999, b"stale"))
+            .unwrap();
+        for seq in 2..=(u16::try_from(SRTP_REPLAY_WINDOW).expect("window fits u16") + 5) {
+            let ct = tx
+                .protect_rtp(&rtp_packet(seq, u32::from(seq) * 160, 0x0000_9999, b"run"))
+                .unwrap();
+            rx.unprotect_rtp(&ct).unwrap();
+        }
+        let err = rx.unprotect_rtp(&stale).unwrap_err();
+        assert!(matches!(err, SrtpError::Replayed), "got {err:?}");
+    }
+
+    #[test]
+    fn rtcp_round_trips_and_replay_is_rejected() {
+        let tx = AesCmHmacSha1_80Transform::from_sdes(&test_km()).unwrap();
+        let rx = AesCmHmacSha1_80Transform::from_sdes(&test_km()).unwrap();
+        let sr = build_sr(0xAABB_CCDD, 0x1122_3344_5566_7788, 160, 3, 480).to_vec();
+        let ct = tx.protect_rtcp(&sr).expect("encrypt rtcp");
+        assert!(ct.len() > sr.len(), "SRTCP adds index + auth tag");
+        assert_ne!(&ct[8..sr.len()], &sr[8..], "sender info is encrypted");
+        let pt = rx.unprotect_rtcp(&ct).expect("decrypt rtcp");
+        assert_eq!(pt, sr, "SR round-trips through SRTCP");
+        let err = rx.unprotect_rtcp(&ct).unwrap_err();
+        assert!(matches!(err, SrtpError::Replayed), "got {err:?}");
+    }
+
+    #[test]
+    fn rtcp_with_wrong_key_fails_authentication() {
+        let tx = AesCmHmacSha1_80Transform::from_sdes(&test_km()).unwrap();
+        let other_km: Vec<u8> = (30..60u8).collect();
+        let rx = AesCmHmacSha1_80Transform::from_sdes(&other_km).unwrap();
+        let sr = build_sr(1, 2, 3, 4, 5).to_vec();
+        let ct = tx.protect_rtcp(&sr).unwrap();
+        let err = rx.unprotect_rtcp(&ct).unwrap_err();
+        assert!(matches!(err, SrtpError::AuthFailed), "got {err:?}");
     }
 }

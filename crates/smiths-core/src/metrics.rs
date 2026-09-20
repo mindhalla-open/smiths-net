@@ -1,5 +1,9 @@
 //! Prometheus metrics registry for smiths-net.
 //!
+//! Every metric name carries the `smiths_` prefix so a scrape of a
+//! shared Prometheus can be filtered by namespace; counters gain the
+//! `_total` suffix on the wire per the `prometheus-client` encoder.
+//!
 //! One `Registry` + [`Metrics`] struct is built at boot; every
 //! subsystem that records data (UAS, MCP/A2A tool dispatch) gets an
 //! `Arc<Metrics>` clone and increments counters / observes histograms
@@ -24,21 +28,21 @@ pub const DEFAULT_LATENCY_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
-/// `sip_requests_total{method="..."}`.
+/// `smiths_sip_requests_total{method="..."}`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct SipMethodLabel {
     /// SIP method name — `"INVITE"`, `"OPTIONS"`, etc.
     pub method: String,
 }
 
-/// `sip_responses_total{code="..."}`.
+/// `smiths_sip_responses_total{code="..."}`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct SipCodeLabel {
     /// Decimal status code as a string (`"200"`, `"488"`, …).
     pub code: String,
 }
 
-/// `tool_invocations_total{tool="...", outcome="..."}`.
+/// `smiths_tool_invocations_total{tool="...", outcome="..."}`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ToolOutcomeLabel {
     /// Tool name — matches the MCP registry entry.
@@ -47,14 +51,14 @@ pub struct ToolOutcomeLabel {
     pub outcome: String,
 }
 
-/// `tool_duration_seconds{tool="..."}` histogram key.
+/// `smiths_tool_duration_seconds{tool="..."}` histogram key.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ToolLabel {
     /// Tool name — matches the MCP registry entry.
     pub tool: String,
 }
 
-/// `rtp_packets_forwarded_total{direction="..."}` label. `direction` is
+/// `smiths_rtp_packets_forwarded_total{direction="..."}` label. `direction` is
 /// either `"a_to_b"` or `"b_to_a"` — the bridge uses fixed strings so
 /// Prometheus cardinality stays bounded.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -63,7 +67,7 @@ pub struct RtpDirLabel {
     pub direction: String,
 }
 
-/// `plugin_invocations_total{plugin="...", outcome="..."}`.
+/// `smiths_plugin_invocations_total{plugin="...", outcome="..."}`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PluginOutcomeLabel {
     /// Plugin name as declared in its manifest.
@@ -72,7 +76,7 @@ pub struct PluginOutcomeLabel {
     pub outcome: String,
 }
 
-/// `smiths_ai_failovers_total{capability="..."}` label (slice 3.1).
+/// `smiths_ai_failovers_total{capability="..."}` label.
 /// One increment per dispatcher fail-over — the first-choice provider
 /// errored out and the dispatcher moved to the next candidate.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -81,10 +85,10 @@ pub struct AiCapabilityLabel {
     pub capability: String,
 }
 
-/// `smiths_ai_pipeline_duration_seconds{pipeline}` label (slice 3.3).
+/// `smiths_ai_pipeline_duration_seconds{pipeline}` label.
 /// Histogram keyed by a short pipeline name (`"transcribe_call"`,
 /// `"summarize_call"`) — the composite tools observe their own
-/// wall-clock end-to-end. Separate from `tool_duration_seconds` so
+/// wall-clock end-to-end. Separate from `smiths_tool_duration_seconds` so
 /// operators can grep per-pipeline latency without wading through
 /// every MCP tool's timing.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -93,7 +97,7 @@ pub struct AiPipelineLabel {
     pub pipeline: String,
 }
 
-/// `smiths_ai_tokens_total{provider, dir}` label (slice 3.2). The
+/// `smiths_ai_tokens_total{provider, dir}` label. The
 /// dispatcher scrapes `usage.{input,output}_tokens` off the plugin's
 /// response and credits the counters — zero-cost when a plugin
 /// doesn't report usage. Operators divide by wall-clock to get
@@ -106,7 +110,7 @@ pub struct AiTokensLabel {
     pub dir: String,
 }
 
-/// `plugin_invoke_duration_seconds{plugin="..."}` / other per-plugin
+/// `smiths_plugin_invoke_duration_seconds{plugin="..."}` / other per-plugin
 /// histograms and counters that only need the plugin-name dimension.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PluginLabel {
@@ -158,7 +162,7 @@ pub struct Metrics {
     /// Plugin invocation outcomes (AI sidecar or WASM), keyed by
     /// plugin name + outcome (`ok` / `error`).
     pub plugin_invocations: Family<PluginOutcomeLabel, Counter>,
-    /// Aggregate of `plugin_invocations{outcome="ok"}` across
+    /// Aggregate of `smiths_plugin_invocations{outcome="ok"}` across
     /// every plugin. Shadows the labelled family so the 5.9
     /// error-rate probe can sum "ok" invocations in one atomic
     /// read — `prometheus-client` 0.24's `Family` has no
@@ -167,7 +171,7 @@ pub struct Metrics {
     /// Incremented in tandem with the labelled counter by
     /// `record_invocation` in the plugin crate.
     pub plugin_invocations_ok: Counter,
-    /// Aggregate of `plugin_invocations{outcome="error"}` across
+    /// Aggregate of `smiths_plugin_invocations{outcome="error"}` across
     /// every plugin — paired with
     /// [`Self::plugin_invocations_ok`]. See that field's doc
     /// for the probe-read rationale.
@@ -176,48 +180,48 @@ pub struct Metrics {
     pub plugin_invoke_duration: Family<PluginLabel, Histogram, fn() -> Histogram>,
     /// Sidecar supervisor respawns, keyed by plugin name.
     pub sidecar_restarts: Family<PluginLabel, Counter>,
-    /// Dispatcher fail-overs (slice 3.1): cumulative count of times
+    /// Dispatcher fail-overs: cumulative count of times
     /// the AI dispatcher fell through to the next candidate because
     /// the first-choice provider timed out, errored, or was
     /// breaker-open. Keyed by capability so operators can tell LLM
     /// failures from TTS failures at a glance.
     pub ai_failovers: Family<AiCapabilityLabel, Counter>,
-    /// Dispatcher invocations (slice 3.1): one increment per
+    /// Dispatcher invocations: one increment per
     /// `AiDispatcher::invoke` call, keyed by capability. Divide
     /// `ai_failovers / ai_invocations` for the per-capability
     /// failure-rate.
     pub ai_invocations: Family<AiCapabilityLabel, Counter>,
-    /// AI token consumption (slice 3.2), credited on every
+    /// AI token consumption, credited on every
     /// dispatcher invocation that returns with a `usage.*_tokens`
     /// block. Labelled by `provider` (plugin name) and `dir` (`input`
     /// / `output`). Zero-cost for providers that don't report usage
     /// — the counter simply stays at 0 for that label combination.
     pub ai_tokens: Family<AiTokensLabel, Counter>,
-    /// End-to-end wall-clock of composite AI pipelines (slice 3.3)
+    /// End-to-end wall-clock of composite AI pipelines
     /// like `transcribe_call` and `summarize_call`. Observed
     /// once per tool invocation regardless of how many dispatcher
     /// hops the pipeline made.
     pub ai_pipeline_duration: Family<AiPipelineLabel, Histogram, fn() -> Histogram>,
     /// `smiths_snapshot_replay_dialogs_total` — cumulative count
     /// of dialog records restored from the HA snapshot file on
-    /// startup (slice 6.1). Zero on a cold boot (no snapshot);
+    /// startup. Zero on a cold boot (no snapshot);
     /// bumps by the snapshot's record count when a prior shutdown
     /// left one.
     pub snapshot_replay_dialogs: Counter,
     /// `smiths_config_canary_active` — `1` while a config
     /// change is in its canary window (between `apply` and
-    /// `confirm`/`rollback`), `0` otherwise (slice 5.9-mvp).
+    /// `confirm`/`rollback`), `0` otherwise.
     /// Dashboards alert when this stays at `1` past the
     /// configured deadline — something ate the operator's
     /// confirm signal.
     pub config_canary_active: Gauge,
     /// `smiths_config_rollbacks_total{reason}` — counter of
     /// rolled-back changes keyed by reason
-    /// (`manual` / `timeout` / `error_budget`). Slice 5.9-mvp.
+    /// (`manual` / `timeout` / `error_budget`).
     pub config_rollbacks: Family<ConfigRollbackLabel, Counter>,
     /// `smiths_config_reloaded_fields_total{field}` — bumped by
     /// each subsystem's read-through adapter when it actually
-    /// applied a live change (slice 5.8-b). Shows operators
+    /// applied a live change. Shows operators
     /// which fields the engine treated as hot-reloadable on
     /// the most recent apply — distinct from
     /// `ApplyReport::reloaded` (which says "the engine said it
@@ -228,7 +232,7 @@ pub struct Metrics {
     /// bumped every time the 5.9 error-rate probe tripped a
     /// configured ceiling and called `rollback_with_metrics`.
     /// Labelled by probe name (`plugin_error_rate` /
-    /// `sip_parse_errors`) so dashboards can tell which safety
+    /// `smiths_sip_parse_errors`) so dashboards can tell which safety
     /// net fired. Counter bumps exactly once per rollback —
     /// if both probes cross at the same tick only the one that
     /// wins the rollback races is credited.
@@ -243,31 +247,31 @@ pub struct Metrics {
     pub webrtc_dtls_handshakes: Family<WebRtcDtlsOutcomeLabel, Counter>,
     /// `smiths_webrtc_sessions_paired_total{partner}` —
     /// counter of WebRTC legs that successfully joined a
-    /// bridge via the rendezvous map (slice 5.10-bridge),
+    /// bridge via the rendezvous map,
     /// keyed by the partner leg's type.
     pub webrtc_sessions_paired: Family<WebRtcPartnerLabel, Counter>,
     /// `smiths_ice_candidates_gathered_total{type}` — counter
     /// of ICE candidates the engine emitted in SDP answers
-    /// (slice 5.10-ice). Labelled by RFC 8445 type so
+    ///. Labelled by RFC 8445 type so
     /// operators can see the `host` / `srflx` / `relay` mix.
     pub ice_candidates_gathered: Family<IceCandidateTypeLabel, Counter>,
     /// `smiths_ice_binding_checks_total{outcome}` — counter
-    /// per `STUN Binding` connectivity check. Slice 5.10-ice
+    /// per `STUN Binding` connectivity check.
     /// runs exactly one per bridge install; a richer
     /// ICE-agent pair check loop is future scope.
     pub ice_binding_checks: Family<IceBindingCheckLabel, Counter>,
     /// `smiths_turn_allocations_total{outcome}` — counter
     /// per `Allocate` response the embedded TURN server
-    /// emitted (slice 5.11-turn).
+    /// emitted.
     pub turn_allocations: Family<TurnAllocationOutcomeLabel, Counter>,
     /// `smiths_turn_active_allocations` — gauge of live TURN
-    /// allocations (slice 5.11-turn). Matches the size of
+    /// allocations. Matches the size of
     /// the server's allocation map; bumps on `Allocate`,
     /// decrements on `REFRESH lifetime=0` or expiry.
     pub turn_active_allocations: Gauge,
     /// `smiths_webrtc_candidates_rejected_total{reason}` —
     /// counter per candidate the privacy filter dropped
-    /// (slice 5.11-privacy). Rising slope in the
+    ///. Rising slope in the
     /// `"host"` bucket against `relay_only` deployments
     /// usually means clients aren't forcing their
     /// `iceTransportPolicy = "relay"` correctly.
@@ -308,7 +312,7 @@ pub struct ConfigProbeLabel {
 }
 
 /// `{outcome}` label on `smiths_webrtc_dtls_handshakes_total`
-/// (slice 5.10-dtls). Bounded vocabulary: `"success"`,
+///. Bounded vocabulary: `"success"`,
 /// `"peer_timeout"`, `"fingerprint_mismatch"`,
 /// `"cert_load_failed"`, `"other"`. Distinguished from the
 /// handshake's underlying `webrtc-dtls` error enum so
@@ -322,7 +326,7 @@ pub struct WebRtcDtlsOutcomeLabel {
 }
 
 /// `{partner}` label on `smiths_webrtc_sessions_paired_total`
-/// (slice 5.10-bridge). `"sip"` — the other leg is a SIP
+///. `"sip"` — the other leg is a SIP
 /// dialog bridged to this WebRTC session. `"webrtc"` — peer
 /// is another WebRTC leg via the same handler. `"none"` —
 /// reserved for the deadline-evicted case; bumped when an
@@ -334,7 +338,7 @@ pub struct WebRtcPartnerLabel {
 }
 
 /// `{type}` label on `smiths_ice_candidates_gathered_total`
-/// (slice 5.10-ice). `"host"` / `"srflx"` / `"relay"` /
+///. `"host"` / `"srflx"` / `"relay"` /
 /// `"prflx"` — RFC 8445 candidate-type vocabulary.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct IceCandidateTypeLabel {
@@ -343,7 +347,7 @@ pub struct IceCandidateTypeLabel {
 }
 
 /// `{outcome}` label on `smiths_ice_binding_checks_total`
-/// (slice 5.10-ice). `"success"` — peer replied with the
+///. `"success"` — peer replied with the
 /// expected `XOR-MAPPED-ADDRESS`. `"timeout"` — no reply
 /// within the per-check window. `"mismatch"` — reply came
 /// from an unexpected address (possible spoof / NAT hairpin).
@@ -354,7 +358,7 @@ pub struct IceBindingCheckLabel {
 }
 
 /// `{outcome}` label on `smiths_turn_allocations_total`
-/// (slice 5.11-turn). `"success"` — `Allocate` succeeded
+///. `"success"` — `Allocate` succeeded
 /// with a relay address. `"auth_failed"` — `401` challenge
 /// or `MESSAGE-INTEGRITY` mismatch. `"forbidden"` — `403`
 /// for an unauthorized transport/realm. `"other"` —
@@ -366,7 +370,7 @@ pub struct TurnAllocationOutcomeLabel {
 }
 
 /// `{reason}` label on `smiths_webrtc_candidates_rejected_total`
-/// (slice 5.11-privacy). `"host"` / `"srflx"` — the privacy
+///. `"host"` / `"srflx"` — the privacy
 /// filter rejected the offer because it carried a direct
 /// candidate in a mode that forbids them.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -419,60 +423,64 @@ impl Metrics {
         let webrtc_privacy_redactions = Counter::default();
 
         registry.register(
-            "sip_requests",
+            "smiths_sip_requests",
             "SIP requests received",
             sip_requests.clone(),
         );
-        registry.register("sip_responses", "SIP responses sent", sip_responses.clone());
         registry.register(
-            "sip_parse_errors",
+            "smiths_sip_responses",
+            "SIP responses sent",
+            sip_responses.clone(),
+        );
+        registry.register(
+            "smiths_sip_parse_errors",
             "SIP datagrams that failed to parse",
             sip_parse_errors.clone(),
         );
         registry.register(
-            "sip_dialogs_active",
+            "smiths_sip_dialogs_active",
             "Currently-live SIP dialogs",
             dialogs_active.clone(),
         );
         registry.register(
-            "media_bridges_active",
+            "smiths_media_bridges_active",
             "Currently-live media bridges",
             bridges_active.clone(),
         );
         registry.register(
-            "sip_server_txns_active",
+            "smiths_sip_server_txns_active",
             "Server-side SIP transaction FSM entries currently held by \
              the driver (per-branch, live until the method-appropriate \
              absorb timer fires).",
             sip_server_txns_active.clone(),
         );
         registry.register(
-            "sip_invite_2xx_retransmits",
+            "smiths_sip_invite_2xx_retransmits",
             "Per-dialog 2xx INVITE retransmissions (RFC 3261 §13.3.1.4).",
             sip_invite_2xx_retransmits.clone(),
         );
         registry.register(
-            "rtp_packets_forwarded",
+            "smiths_rtp_packets_forwarded",
             "RTP packets the bridge forwarded (post-rewrite)",
             rtp_packets_forwarded.clone(),
         );
         registry.register(
-            "rtcp_sr_sent",
+            "smiths_rtcp_sr_sent",
             "RTCP Sender Reports emitted by the bridge",
             rtcp_sr_sent.clone(),
         );
         registry.register(
-            "tool_invocations",
+            "smiths_tool_invocations",
             "MCP / A2A tool invocations",
             tool_invocations.clone(),
         );
         registry.register(
-            "tool_duration_seconds",
+            "smiths_tool_duration_seconds",
             "Tool call latency in seconds",
             tool_duration.clone(),
         );
         registry.register(
-            "plugin_invocations",
+            "smiths_plugin_invocations",
             "AiProvider::invoke outcomes, per plugin",
             plugin_invocations.clone(),
         );
@@ -481,12 +489,12 @@ impl Metrics {
         // confuse dashboards. The probe reads them via the
         // `Metrics` struct handle directly.
         registry.register(
-            "plugin_invoke_duration_seconds",
+            "smiths_plugin_invoke_duration_seconds",
             "AiProvider::invoke latency, per plugin",
             plugin_invoke_duration.clone(),
         );
         registry.register(
-            "sidecar_restarts",
+            "smiths_sidecar_restarts",
             "Sidecar supervisor respawns, per plugin",
             sidecar_restarts.clone(),
         );
@@ -656,10 +664,10 @@ mod tests {
 
         let mut out = String::new();
         prometheus_client::encoding::text::encode(&mut out, &registry).unwrap();
-        assert!(out.contains("sip_requests_total"));
+        assert!(out.contains("smiths_sip_requests_total"));
         assert!(out.contains("INVITE"));
-        assert!(out.contains("sip_dialogs_active 1"));
-        assert!(out.contains("tool_invocations_total"));
-        assert!(out.contains("tool_duration_seconds"));
+        assert!(out.contains("smiths_sip_dialogs_active 1"));
+        assert!(out.contains("smiths_tool_invocations_total"));
+        assert!(out.contains("smiths_tool_duration_seconds"));
     }
 }

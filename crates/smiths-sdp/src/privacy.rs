@@ -1,4 +1,4 @@
-//! WebRTC privacy enforcement helpers (slice 5.11-runtime).
+//! WebRTC privacy enforcement helpers.
 //!
 //! Three operator-selectable modes (`open` / `relay_only` /
 //! `strict`) layer additively:
@@ -81,7 +81,7 @@ pub fn strip_host_candidates_on(m: &mut MediaDescription) -> usize {
     before - m.candidates.len()
 }
 
-/// Keyed-hash IP redaction (slice 5.11 `strict` mode).
+/// Keyed-hash IP redaction ( `strict` mode).
 ///
 /// `blake3(key || ip_string).first(8)` rendered as 16-hex
 /// characters. Uses a simple keyed SHA-256 instead of pulling
@@ -117,10 +117,28 @@ fn hex_nibble(n: u8) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConnectionInfo, Direction, IceCandidate, MediaKind, Origin, SessionDescription};
+    use crate::{ConnectionInfo, IceCandidate, MediaKind, Origin, SessionDescription};
     use std::net::Ipv4Addr;
 
     fn make_sdp(candidates: Vec<(&str, &str)>) -> SessionDescription {
+        let mut audio = MediaDescription::new(MediaKind::Audio, 5004, "RTP/AVP");
+        audio.formats = vec!["0".into()];
+        audio.candidates = candidates
+            .into_iter()
+            .enumerate()
+            .map(|(i, (addr, kind))| IceCandidate {
+                foundation: format!("{i}"),
+                component: 1,
+                transport: "UDP".into(),
+                priority: 1,
+                address: addr.parse().unwrap(),
+                port: 10_000,
+                candidate_type: kind.to_owned(),
+                related_address: None,
+                related_port: None,
+                raw_params: vec![],
+            })
+            .collect();
         SessionDescription {
             origin: Origin {
                 username: "-".into(),
@@ -132,38 +150,9 @@ mod tests {
             connection: Some(ConnectionInfo {
                 address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             }),
-            media: vec![MediaDescription {
-                kind: MediaKind::Audio,
-                port: 5004,
-                protocol: "RTP/AVP".into(),
-                formats: vec![0],
-                rtpmap: vec![],
-                crypto: vec![],
-                direction: Direction::SendRecv,
-                connection: None,
-                fingerprint: None,
-                setup: None,
-                ice_ufrag: None,
-                ice_pwd: None,
-                ice_options: vec![],
-                candidates: candidates
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (addr, kind))| IceCandidate {
-                        foundation: format!("{i}"),
-                        component: 1,
-                        transport: "UDP".into(),
-                        priority: 1,
-                        address: addr.parse().unwrap(),
-                        port: 10_000,
-                        candidate_type: kind.to_owned(),
-                        related_address: None,
-                        related_port: None,
-                        raw_params: vec![],
-                    })
-                    .collect(),
-                end_of_candidates: false,
-            }],
+            groups: Vec::new(),
+            ice_lite: false,
+            media: vec![audio],
         }
     }
 

@@ -16,9 +16,9 @@
 
 use thiserror::Error;
 
-use smiths_sdp::{ConnectionInfo, Direction, MediaDescription, MediaKind, SessionDescription};
+use smiths_sdp::{ConnectionInfo, MediaKind, SessionDescription};
 
-use crate::sdp::{T38_FORMAT, T38Params, UDPTL_PROTOCOL};
+use crate::sdp::{T38Params, declined, t38_media};
 
 /// Errors from [`fax_renegotiate`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -39,19 +39,17 @@ pub enum FaxRenegotiateError {
 /// on when the dialog came up). `local_fax_port` is the UDPTL port
 /// the caller will bind for the relay; `local_addr` is the
 /// connection address to advertise (typically the engine's public
-/// address for this call).
+/// address for this call); `params` are the `a=T38…` attributes to
+/// offer.
 ///
 /// On success the returned SDP has:
 /// - The original audio m-line rewritten with `port=0`,
-///   `direction=inactive`.
-/// - A fresh `m=image <port> udptl t38` block appended.
+///   `direction=inactive` and every attribute but `a=mid` dropped.
+/// - A fresh `m=image <port> udptl t38` block carrying `params`
+///   appended.
 /// - The session-level `c=` line updated to `local_addr`.
 /// - `origin.session_version` bumped — RFC 3264 §5 requires the
 ///   answerer treat the SDP as changed.
-///
-/// The renderer [`crate::sdp::render_offer_with_params`] will splice
-/// in the `a=T38…` attribute lines when the SDP is serialized onto
-/// the wire.
 ///
 /// # Errors
 /// [`FaxRenegotiateError`] — see variant docs.
@@ -59,7 +57,7 @@ pub fn fax_renegotiate(
     active: &SessionDescription,
     local_addr: ConnectionInfo,
     local_fax_port: u16,
-    _params: &T38Params,
+    params: &T38Params,
 ) -> Result<SessionDescription, FaxRenegotiateError> {
     if active.media.iter().any(crate::sdp::is_t38_media) {
         return Err(FaxRenegotiateError::AlreadyFax);
@@ -70,41 +68,9 @@ pub fn fax_renegotiate(
         .position(|m| m.kind == MediaKind::Audio)
         .ok_or(FaxRenegotiateError::NoAudioMLine)?;
 
-    let mut media: Vec<MediaDescription> = active.media.clone();
-    // Decline the audio m-line per RFC 3264 §6: same kind + protocol,
-    // port 0, direction=inactive, strip every attribute.
-    let audio = &mut media[audio_idx];
-    audio.port = 0;
-    audio.direction = Direction::Inactive;
-    audio.rtpmap.clear();
-    audio.crypto.clear();
-    audio.connection = None;
-    audio.fingerprint = None;
-    audio.setup = None;
-    audio.ice_ufrag = None;
-    audio.ice_pwd = None;
-    audio.ice_options.clear();
-    audio.candidates.clear();
-    audio.end_of_candidates = false;
-
-    // Append the fax block.
-    media.push(MediaDescription {
-        kind: MediaKind::Image,
-        port: local_fax_port,
-        protocol: format!("{UDPTL_PROTOCOL} {T38_FORMAT}"),
-        formats: vec![],
-        rtpmap: vec![],
-        crypto: vec![],
-        direction: Direction::SendRecv,
-        connection: None,
-        fingerprint: None,
-        setup: None,
-        ice_ufrag: None,
-        ice_pwd: None,
-        ice_options: vec![],
-        candidates: vec![],
-        end_of_candidates: false,
-    });
+    let mut media = active.media.clone();
+    media[audio_idx] = declined(&active.media[audio_idx]);
+    media.push(t38_media(local_fax_port, params));
 
     let mut next = active.clone();
     next.connection = Some(local_addr);
@@ -116,7 +82,7 @@ pub fn fax_renegotiate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smiths_sdp::Origin;
+    use smiths_sdp::{Direction, MediaDescription, Origin, RtpMap};
     use std::net::IpAddr;
 
     fn origin() -> Origin {
@@ -134,29 +100,29 @@ mod tests {
         }
     }
 
-    fn audio_sdp() -> SessionDescription {
+    fn session_with(media: Vec<MediaDescription>) -> SessionDescription {
         SessionDescription {
             origin: origin(),
             session_name: "audio".into(),
             connection: Some(conn()),
-            media: vec![MediaDescription {
-                kind: MediaKind::Audio,
-                port: 5004,
-                protocol: "RTP/AVP".into(),
-                formats: vec![0],
-                rtpmap: vec![],
-                crypto: vec![],
-                direction: Direction::SendRecv,
-                connection: None,
-                fingerprint: None,
-                setup: None,
-                ice_ufrag: None,
-                ice_pwd: None,
-                ice_options: vec![],
-                candidates: vec![],
-                end_of_candidates: false,
-            }],
+            groups: Vec::new(),
+            ice_lite: false,
+            media,
         }
+    }
+
+    fn audio_sdp() -> SessionDescription {
+        let mut audio = MediaDescription::new(MediaKind::Audio, 5004, "RTP/AVP");
+        audio.formats = vec!["0".into()];
+        audio.rtpmap = vec![RtpMap {
+            payload_type: 0,
+            codec: "PCMU".into(),
+            clock_rate: 8_000,
+            channels: None,
+        }];
+        audio.ptime = Some(20);
+        audio.mid = Some("0".into());
+        session_with(vec![audio])
     }
 
     #[test]
@@ -166,9 +132,36 @@ mod tests {
         assert_eq!(next.media[0].kind, MediaKind::Audio);
         assert_eq!(next.media[0].port, 0);
         assert_eq!(next.media[0].direction, Direction::Inactive);
+        assert!(
+            next.media[0].rtpmap.is_empty(),
+            "declined m-line drops rtpmap"
+        );
+        assert_eq!(next.media[0].ptime, None, "declined m-line drops ptime");
+        assert_eq!(next.media[0].mid.as_deref(), Some("0"), "mid survives");
         assert_eq!(next.media[1].kind, MediaKind::Image);
         assert_eq!(next.media[1].port, 6250);
-        assert!(next.media[1].protocol.contains("udptl"));
+        assert_eq!(next.media[1].protocol, "udptl");
+        assert_eq!(next.media[1].formats, ["t38"]);
+    }
+
+    #[test]
+    fn renegotiate_honors_params_on_the_wire() {
+        let params = T38Params {
+            max_bit_rate: Some(9_600),
+            ..T38Params::sensible_offer()
+        };
+        let next = fax_renegotiate(&audio_sdp(), conn(), 6250, &params).unwrap();
+        assert_eq!(next.media[1].t38.as_ref(), Some(&params));
+        let wire = next.to_string();
+        assert!(wire.contains("m=audio 0 RTP/AVP 0\r\n"), "{wire}");
+        assert!(wire.contains("m=image 6250 udptl t38\r\n"), "{wire}");
+        assert!(wire.contains("a=T38MaxBitRate:9600\r\n"), "{wire}");
+        assert!(
+            wire.contains("a=T38FaxUdpEC:t38UDPRedundancy\r\n"),
+            "{wire}"
+        );
+        let reparsed = SessionDescription::parse(&wire).unwrap();
+        assert_eq!(reparsed.media[1].t38.as_ref(), Some(&params));
     }
 
     #[test]
@@ -179,28 +172,9 @@ mod tests {
 
     #[test]
     fn renegotiate_without_audio_is_an_error() {
-        let no_audio = SessionDescription {
-            origin: origin(),
-            session_name: "video".into(),
-            connection: Some(conn()),
-            media: vec![MediaDescription {
-                kind: MediaKind::Video,
-                port: 5006,
-                protocol: "RTP/AVP".into(),
-                formats: vec![96],
-                rtpmap: vec![],
-                crypto: vec![],
-                direction: Direction::SendRecv,
-                connection: None,
-                fingerprint: None,
-                setup: None,
-                ice_ufrag: None,
-                ice_pwd: None,
-                ice_options: vec![],
-                candidates: vec![],
-                end_of_candidates: false,
-            }],
-        };
+        let mut video = MediaDescription::new(MediaKind::Video, 5006, "RTP/AVP");
+        video.formats = vec!["96".into()];
+        let no_audio = session_with(vec![video]);
         assert_eq!(
             fax_renegotiate(&no_audio, conn(), 6250, &T38Params::default()),
             Err(FaxRenegotiateError::NoAudioMLine)
@@ -210,23 +184,7 @@ mod tests {
     #[test]
     fn renegotiate_on_active_fax_is_an_error() {
         let mut active = audio_sdp();
-        active.media.push(MediaDescription {
-            kind: MediaKind::Image,
-            port: 6250,
-            protocol: "udptl t38".into(),
-            formats: vec![],
-            rtpmap: vec![],
-            crypto: vec![],
-            direction: Direction::SendRecv,
-            connection: None,
-            fingerprint: None,
-            setup: None,
-            ice_ufrag: None,
-            ice_pwd: None,
-            ice_options: vec![],
-            candidates: vec![],
-            end_of_candidates: false,
-        });
+        active.media.push(t38_media(6250, &T38Params::default()));
         assert_eq!(
             fax_renegotiate(&active, conn(), 6300, &T38Params::default()),
             Err(FaxRenegotiateError::AlreadyFax)

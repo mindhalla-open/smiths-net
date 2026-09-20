@@ -28,7 +28,7 @@ wireguard = []
 # land in follow-on slices; the config surface + version bump ship
 # now so operators can pin the intended shape and CI matrices can
 # start exercising the feature builds.
-mcp-http3 = ["smiths-mcp/mcp-http3"]
+mcp-http3 = []
 sip-quic  = ["smiths-sip/sip-quic"]
 
 [dependencies]
@@ -61,7 +61,9 @@ axum               = { workspace = true, features = ["ws"] }
 clap               = { workspace = true }
 dashmap            = { workspace = true }
 prometheus-client  = { workspace = true }
+serde              = { workspace = true }
 serde_json         = { workspace = true }
+bytes              = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
@@ -75,9 +77,10 @@ toml               = "0.8"
 rustix             = { workspace = true }
 
 [dev-dependencies]
-tokio      = { workspace = true, features = ["macros", "test-util"] }
-serde_json = { workspace = true }
-tempfile   = { workspace = true }
+smiths-testkit = { workspace = true }
+tokio          = { workspace = true, features = ["macros", "test-util"] }
+serde_json     = { workspace = true }
+tempfile       = { workspace = true }
 
 [lints]
 workspace = true

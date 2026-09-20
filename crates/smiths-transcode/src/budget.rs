@@ -95,7 +95,7 @@ pub struct CpuBudget {
     /// changed, stored snapshot. The live
     /// `max_concurrent_calls` cap is on [`Self::max_concurrent`]
     /// so it can be hot-reloaded via a read-through adapter
-    /// (slice 5.8-b).
+    ///.
     config: CpuBudgetConfig,
     /// Live admission cap. Separate from `config` so a
     /// `ConfigReloader` read-through adapter can
@@ -154,11 +154,11 @@ impl CpuBudget {
         self.max_concurrent.load(Ordering::Acquire)
     }
 
-    /// Update the admission cap (slice 5.8-b read-through).
+    /// Update the admission cap ( read-through).
     /// Atomic — new [`Self::try_admit`] calls see the new cap
     /// on the very next admission. **Does not evict** any
     /// already-admitted [`TranscodeLease`]: if the new cap is
-    /// below `active()`, existing calls stay open (releasing
+    /// below `active`, existing calls stay open (releasing
     /// a lease through the cap correctly leaves it admitted),
     /// but no further admissions happen until `active` drops
     /// below the new cap. This matches the "don't tear down
@@ -204,7 +204,7 @@ impl CpuBudget {
 }
 
 /// RAII guard for an admitted transcoding call. Releases the slot
-/// on drop — no explicit `release()` call required, which means a
+/// on drop — no explicit `release` call required, which means a
 /// panicked call-handler can't leak a slot.
 ///
 /// The lease is `Send + Sync` so the UAS can stash it inside the

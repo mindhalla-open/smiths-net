@@ -2,10 +2,9 @@
 //! key. Engine bridges their media legs. UA-A streams PCMU RTP generated
 //! from a 1 kHz sine wave; UA-B receives, accumulates, and we verify the
 //! audio round-trips byte-for-byte. The received WAV is also written to
-//! `/tmp/smiths-call-received.wav` so a human can listen.
+//! a temporary directory (path logged) so a human can listen.
 
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,7 +27,6 @@ const PT_PCMU: u8 = 0;
 const SAMPLES_PER_FRAME: usize = 160; // 20 ms at 8 kHz
 const FRAMES: usize = 50; // 1 second of audio
 const RENDEZVOUS: &str = "call-1";
-const OUT_WAV: &str = "/tmp/smiths-call-received.wav";
 
 async fn start_engine() -> (SocketAddr, CancellationToken, JoinHandle<()>) {
     let t = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
@@ -152,9 +150,12 @@ async fn two_uas_call_preserves_audio_byte_for_byte() {
         "received μ-law tail differs from sent μ-law tail"
     );
 
-    // Decode and write to disk so a human can listen.
+    // Decode and write to a temp dir so a human can listen.
     let pcm_received = pcmu_to_pcm16(&received);
-    write_mono_pcm16(Path::new(OUT_WAV), 8_000, &pcm_received).expect("wav write");
+    let out_dir = tempfile::tempdir().expect("tempdir");
+    let out_wav = out_dir.path().join("smiths-call-received.wav");
+    write_mono_pcm16(&out_wav, 8_000, &pcm_received).expect("wav write");
+    assert!(out_wav.is_file(), "wav not written: {}", out_wav.display());
 
     // Tear down the call. A BYE from *either* leg now drops the whole
     // bridge (B2BUA semantics): the engine releases the media bridge and

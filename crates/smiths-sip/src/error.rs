@@ -20,7 +20,7 @@ pub enum Error {
 
     /// Catch-all for subsystem-specific failures the caller wants
     /// to flatten into the SIP error type (today: snapshot I/O —
-    /// slice 6.1).
+    /// ).
     #[error("{0}")]
     Other(String),
 }

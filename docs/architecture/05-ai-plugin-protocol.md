@@ -625,7 +625,7 @@ target architecture post-P22.
 
 - Exact WASM guest ABI (bytes in the linear memory) — separate doc
   alongside P3 plugin work.
-- Exact sidecar protobuf wire — part of `smiths-proto` schema
+- Exact sidecar wire framing — see `10-plugin-wire-format.md`
   freeze (P3/P4).
 - Observability (metrics + tracing spans) for AI calls — covered by
   the generic tool audit layer; specifics in the metrics catalog

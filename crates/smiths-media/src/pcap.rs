@@ -5,7 +5,7 @@
 //! so the operator can pull a per-call `.pcap` file for offline
 //! triage (Wireshark, tshark).
 //!
-//! **Placeholder.** Slice 1.9 ships the feature knob + module skeleton
+//! **Placeholder.**  ships the feature knob + module skeleton
 //! so the config surface is stable; a follow-on commit wires the
 //! actual pcap-file encoder (likely `pcap-file = "2"` under this
 //! feature) and the bridge-side callsite. Until then the writer is
@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 /// One tap per call. Holds the filesystem path the bridge writes
-/// packets to and an optional backing writer (slice 1.9+).
+/// packets to and an optional backing writer (+).
 pub struct PcapWriter {
     path: PathBuf,
     // `#[cfg(feature = "pcap")]` pcap_file::pcap::PcapWriter — a

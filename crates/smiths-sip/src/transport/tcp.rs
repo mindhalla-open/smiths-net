@@ -4,48 +4,48 @@
 //! connections are accepted by the `spawn_reader` accept loop;
 //! outbound connections are opened lazily on `send` when no pool
 //! entry exists for the peer. Per-connection writer and reader tasks
-//! share the connection through mpsc channels so the pool holds no
-//! locks across awaits.
+//! (shared with TLS, see [`super::stream`]) talk to the pool through
+//! mpsc channels so the pool holds no locks across awaits.
 //!
 //! Message framing follows §7.5: headers terminated by a double CRLF,
 //! body length dictated by `Content-Length`. Messages without a
 //! `Content-Length` header are treated as empty-bodied, matching the
 //! §20.14 requirement that stream transports always carry one.
+//!
+//! Inbound connections are capped ([`TcpTransport::with_max_connections`],
+//! default 1024) and closed after a period of inactivity
+//! ([`TcpTransport::with_idle_timeout`], default 5 minutes).
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use dashmap::DashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument, warn};
 
-use super::framing::{FrameOutcome, take_one_message};
 use super::proxy::{DirectConnector, ProxyConnector};
-use super::{Datagram, Transport};
-
-/// Per-connection writer mpsc depth. Small on purpose — backpressure
-/// propagates to the caller of `send` when a peer is slow to read.
-const WRITE_QUEUE_DEPTH: usize = 32;
+use super::stream::{ConnLimits, PeerMap, StreamContext, register_stream};
+use super::{Datagram, Transport, TransportKind};
 
 /// SIP TCP transport. Cheap to clone via `Arc`.
 #[derive(Clone)]
 pub struct TcpTransport {
     listener: Arc<TcpListener>,
-    peers: Arc<DashMap<SocketAddr, mpsc::Sender<Bytes>>>,
+    peers: PeerMap,
     /// Inbound routing state populated by `spawn_reader`. `send` uses
     /// this to open outbound connections when no pool entry exists.
     /// `OnceLock` so the trait-object-safe `send` stays immutable.
     inbound: Arc<OnceLock<InboundState>>,
-    /// Outbound-connect shim (slice 3.5). `DirectConnector` by
-    /// default — identical to calling `TcpStream::connect` — so the
-    /// proxy path is a zero-cost option when `[sip.proxy] mode =
-    /// "none"`.
+    /// Outbound-connect shim. `DirectConnector` by default —
+    /// identical to calling `TcpStream::connect` — so the proxy path
+    /// is a zero-cost option when `[sip.proxy] mode = "none"`.
     connector: Arc<dyn ProxyConnector>,
+    limits: ConnLimits,
 }
 
 #[derive(Clone)]
@@ -55,7 +55,7 @@ struct InboundState {
 }
 
 impl TcpTransport {
-    /// Bind a TCP listener. `bind.port() == 0` lets the OS assign one.
+    /// Bind a TCP listener. `bind.port == 0` lets the OS assign one.
     pub async fn bind(bind: SocketAddr) -> std::io::Result<Self> {
         let listener = TcpListener::bind(bind).await?;
         Ok(Self {
@@ -63,11 +63,12 @@ impl TcpTransport {
             peers: Arc::new(DashMap::new()),
             inbound: Arc::new(OnceLock::new()),
             connector: Arc::new(DirectConnector),
+            limits: ConnLimits::default(),
         })
     }
 
-    /// Install a [`ProxyConnector`] for outbound connects (slice 3.5).
-    /// The default is [`DirectConnector`]; swap in
+    /// Install a [`ProxyConnector`] for outbound connects. The
+    /// default is [`DirectConnector`]; swap in
     /// [`super::proxy::Socks5Connector`] or
     /// [`super::proxy::HttpConnectConnector`] to tunnel SIP-over-TCP
     /// through an outbound proxy without touching the listener path.
@@ -75,6 +76,31 @@ impl TcpTransport {
     pub fn with_proxy(mut self, connector: Arc<dyn ProxyConnector>) -> Self {
         self.connector = connector;
         self
+    }
+
+    /// Cap on simultaneously open connections admitted by the accept
+    /// loop; excess connections are closed immediately. `0` removes
+    /// the cap. Outbound connections opened by `send` are not
+    /// counted against it. Default 1024.
+    #[must_use]
+    pub const fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.limits.max_connections = max_connections;
+        self
+    }
+
+    /// Close a connection once no bytes have moved in either
+    /// direction for `idle`. `None` disables the timeout. Default
+    /// 5 minutes.
+    #[must_use]
+    pub const fn with_idle_timeout(mut self, idle: Option<Duration>) -> Self {
+        self.limits.idle_timeout = idle;
+        self
+    }
+
+    /// Number of connections currently in the pool (both directions).
+    #[must_use]
+    pub fn connections(&self) -> usize {
+        self.peers.len()
     }
 
     /// Spawn the accept loop. Per-peer reader tasks forward framed
@@ -95,6 +121,14 @@ impl TcpTransport {
 
         let listener = Arc::clone(&self.listener);
         let peers = Arc::clone(&self.peers);
+        let limits = self.limits;
+        let ctx = StreamContext {
+            label: "tcp",
+            peers: Arc::clone(&peers),
+            tx,
+            cancel: cancel.clone(),
+            idle_timeout: limits.idle_timeout,
+        };
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -105,7 +139,16 @@ impl TcpTransport {
                     }
                     res = listener.accept() => match res {
                         Ok((stream, peer)) => {
-                            register_connection(stream, peer, &peers, tx.clone(), cancel.clone());
+                            if !limits.admits(peers.len()) {
+                                warn!(
+                                    %peer,
+                                    cap = limits.max_connections,
+                                    "tcp connection cap reached; refusing"
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                            register_connection(&ctx, stream, peer);
                         }
                         Err(e) => {
                             error!(?e, "tcp accept error");
@@ -143,13 +186,14 @@ impl Transport for TcpTransport {
                 format!("tcp outbound via {}: {e}", self.connector.label()),
             )
         })?;
-        let sender = register_connection(
-            stream,
-            peer,
-            &self.peers,
-            state.tx.clone(),
-            state.cancel.clone(),
-        );
+        let ctx = StreamContext {
+            label: "tcp",
+            peers: Arc::clone(&self.peers),
+            tx: state.tx.clone(),
+            cancel: state.cancel.clone(),
+            idle_timeout: self.limits.idle_timeout,
+        };
+        let sender = register_connection(&ctx, stream, peer);
         sender.send(bytes).await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "tcp writer channel closed")
         })
@@ -158,113 +202,28 @@ impl Transport for TcpTransport {
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
     }
+
+    fn kind(&self) -> TransportKind {
+        TransportKind::Tcp
+    }
 }
 
-/// Install writer + reader tasks for one TCP stream and register its
-/// writer mpsc in the peer pool. Returns the writer handle so a caller
-/// that just opened an outbound connection can immediately push bytes.
+/// Split one TCP stream and hand both halves to the shared
+/// per-connection tasks. Returns the writer handle so a caller that
+/// just opened an outbound connection can immediately push bytes.
 fn register_connection(
+    ctx: &StreamContext,
     stream: TcpStream,
     peer: SocketAddr,
-    peers: &Arc<DashMap<SocketAddr, mpsc::Sender<Bytes>>>,
-    tx: mpsc::Sender<Datagram>,
-    cancel: CancellationToken,
 ) -> mpsc::Sender<Bytes> {
-    let (write_tx, write_rx) = mpsc::channel::<Bytes>(WRITE_QUEUE_DEPTH);
-    peers.insert(peer, write_tx.clone());
-
     let (read_half, write_half) = stream.into_split();
-    spawn_writer(
-        peer,
-        write_half,
-        write_rx,
-        cancel.clone(),
-        Arc::clone(peers),
-    );
-    spawn_framed_reader(peer, read_half, tx, cancel);
-
-    write_tx
-}
-
-fn spawn_writer(
-    peer: SocketAddr,
-    mut write_half: tokio::net::tcp::OwnedWriteHalf,
-    mut rx: mpsc::Receiver<Bytes>,
-    cancel: CancellationToken,
-    peers: Arc<DashMap<SocketAddr, mpsc::Sender<Bytes>>>,
-) {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => break,
-                msg = rx.recv() => match msg {
-                    Some(bytes) => {
-                        if let Err(e) = write_half.write_all(&bytes).await {
-                            warn!(%peer, ?e, "tcp write error");
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-        }
-        let _ = write_half.shutdown().await;
-        peers.remove(&peer);
-    });
-}
-
-fn spawn_framed_reader(
-    peer: SocketAddr,
-    mut read_half: tokio::net::tcp::OwnedReadHalf,
-    tx: mpsc::Sender<Datagram>,
-    cancel: CancellationToken,
-) {
-    tokio::spawn(async move {
-        let mut buf = BytesMut::with_capacity(8192);
-        loop {
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => break,
-                res = read_half.read_buf(&mut buf) => match res {
-                    Ok(0) => {
-                        debug!(%peer, "tcp peer closed");
-                        break;
-                    }
-                    Ok(_) => {
-                        loop {
-                            match take_one_message(&mut buf) {
-                                FrameOutcome::Complete(bytes) => {
-                                    if tx.send(Datagram { bytes, peer }).await.is_err() {
-                                        debug!("tcp reader: receiver dropped");
-                                        return;
-                                    }
-                                }
-                                FrameOutcome::Partial => break,
-                                FrameOutcome::Overflow => {
-                                    warn!(%peer, "tcp message exceeded cap; closing");
-                                    return;
-                                }
-                                FrameOutcome::BadLength => {
-                                    warn!(%peer, "tcp malformed Content-Length; closing");
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(%peer, ?e, "tcp read error");
-                        break;
-                    }
-                }
-            }
-        }
-    });
+    register_stream(ctx, peer, read_half, write_half)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn bind_and_roundtrip_one_message() {
@@ -287,6 +246,46 @@ mod tests {
             .unwrap();
         assert_eq!(&dg.bytes[..], frame);
 
+        // Reply on the same connection through the transport.
+        let reply = b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n";
+        server
+            .send(Bytes::from_static(reply), dg.peer)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], reply);
+        assert_eq!(server.connections(), 1);
+
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peer_close_releases_pool_entry() {
+        let cancel = CancellationToken::new();
+        let server = TcpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel::<Datagram>(16);
+        let _h = server.spawn_reader(tx, cancel.clone());
+
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+        client
+            .write_all(b"OPTIONS sip:x SIP/2.0\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let _ = rx.recv().await.unwrap();
+        assert_eq!(server.connections(), 1);
+        drop(client);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while server.connections() != 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.connections(), 0, "closed peer must leave the pool");
         cancel.cancel();
     }
 }

@@ -35,7 +35,7 @@ pub enum DialogState {
     Confirmed,
 }
 
-/// Stable identifier for one leg of a call (slice 5.6).
+/// Stable identifier for one leg of a call.
 ///
 /// Point-to-point calls have two legs — `LegId(0)` is the offerer
 /// (typically the UAC / calling UA), `LegId(1)` is the answerer.
@@ -58,7 +58,7 @@ impl std::fmt::Display for LegId {
     }
 }
 
-/// Kind of media a session carries (slice 5.6).
+/// Kind of media a session carries.
 ///
 /// Mirrors `smiths_sdp::MediaKind` but lives in `smiths-core` so the
 /// call FSM and the `SessionKey` data model don't pull in the SDP
@@ -69,9 +69,9 @@ impl std::fmt::Display for LegId {
 pub enum MediaKindTag {
     /// `m=audio` — voice, DTMF tones.
     Audio,
-    /// `m=video` — video passthrough (slice 5.1).
+    /// `m=video` — video passthrough.
     Video,
-    /// `m=image` — T.38 FAX-over-IP (slice 5.4).
+    /// `m=image` — T.38 FAX-over-IP.
     Image,
     /// `m=application` — MSRP, data-channel, BFCP, …
     Application,
@@ -112,7 +112,7 @@ impl std::fmt::Display for MediaKindTag {
 }
 
 /// Key that identifies one media session inside a dialog
-/// (slice 5.6). Two legs × audio+video = four keys for a full
+///. Two legs × audio+video = four keys for a full
 /// audio-plus-video call; a fax-renegotiated call briefly has two
 /// audio keys (being torn down) plus two image keys (replacing them)
 /// before the audio keys drop.
@@ -121,7 +121,7 @@ impl std::fmt::Display for MediaKindTag {
 /// sessions up by it; atomic [`DialogSessions::swap`] operates on it.
 pub type SessionKey = (LegId, MediaKindTag);
 
-/// Codec negotiated for one leg of a call (slice 5.6).
+/// Codec negotiated for one leg of a call.
 ///
 /// Parallel to `smiths_transcode::CodecKind` but lives in
 /// `smiths-core` so the call FSM can track codecs without the
@@ -143,7 +143,7 @@ pub enum NegotiatedCodec {
     G722,
     /// Opus — any sample rate the peer advertised.
     Opus,
-    /// H.264 video (slice 5.1 passthrough).
+    /// H.264 video ( passthrough).
     H264,
     /// VP8 video.
     Vp8,
@@ -236,7 +236,7 @@ pub struct DialogRecord {
     /// INVITE 2xx (registrar-only dialogs, etc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_2xx: Option<Vec<u8>>,
-    /// Per-leg negotiated codec (slice 5.6). Populated by the UAS at
+    /// Per-leg negotiated codec. Populated by the UAS at
     /// 200 OK INVITE time from the negotiator's output; empty for
     /// dialogs that never carried SDP (registrar-only calls, etc).
     /// The transcoding router (5.6b) compares the two legs' entries
@@ -247,13 +247,67 @@ pub struct DialogRecord {
     /// default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub per_leg_codec: BTreeMap<LegId, NegotiatedCodec>,
-    /// ICE parameters (slice 5.10-ice). Populated when the
+    /// ICE parameters. Populated when the
     /// dialog uses native ICE connectivity checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ice: Option<crate::sdp::IceParams>,
+    /// Remote target: the `Contact` URI of the request that created
+    /// the dialog (RFC 3261 §12.1.1). Request-URI of every request
+    /// the engine originates inside the dialog. `None` when the
+    /// INVITE carried no usable `Contact`; senders then fall back to
+    /// `sip:<peer_signal>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_target: Option<String>,
+    /// Route set: the `Record-Route` URIs of the dialog-creating
+    /// request in header order — the UAS keeps them as received
+    /// (§12.1.1; only a UAC reverses the list it learns from a
+    /// response). Emitted as `Route` headers on engine-originated
+    /// in-dialog requests (§12.2.1.1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_set: Vec<String>,
+    /// URI of the local party — the INVITE's `To` URI without
+    /// display name or parameters. Becomes `From` on requests the
+    /// engine sends in this dialog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_uri: Option<String>,
+    /// URI of the remote party — the INVITE's `From` URI. Becomes
+    /// `To` on requests the engine sends in this dialog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_uri: Option<String>,
+    /// `CSeq` number of the last request the engine sent inside this
+    /// dialog (§12.2.1.1 local sequence number). `0` = none yet;
+    /// the next request uses `local_cseq + 1`.
+    #[serde(default)]
+    pub local_cseq: u32,
+    /// Highest `CSeq` number received from the remote party (§12.2.2
+    /// remote sequence number). In-dialog requests with a lower
+    /// number are out of order and rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_cseq: Option<u32>,
+    /// Transport token of the top `Via` on the dialog-creating
+    /// request (`UDP`, `TCP`, `TLS`, …). Engine-originated requests
+    /// in the dialog advertise the same transport in their own
+    /// `Via`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// `Via` branch of the most recent INVITE transaction on this
+    /// dialog (initial INVITE or re-INVITE). A 2xx terminates the
+    /// server transaction immediately (§17.2.1), so this is what
+    /// tells a retransmitted INVITE apart from a new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_invite_branch: Option<String>,
+    /// Local RTP address of [`Self::media`], kept so a re-INVITE can
+    /// re-run offer/answer against the endpoint the dialog already
+    /// owns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_media: Option<SocketAddr>,
+    /// Session interval agreed under RFC 4028, in seconds. `None`
+    /// when the dialog runs without a session timer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_expires_secs: Option<u32>,
 }
 
-/// Dialog state mutation for replication (slice 6.2).
+/// Dialog state mutation for replication.
 ///
 /// Primary sends these to the secondary; secondary replays into its
 /// local `DashMap`.
@@ -416,7 +470,7 @@ mod tests {
 
     #[test]
     fn pre_slice_5_6_dialog_json_deserializes_with_empty_per_leg_codec() {
-        // Simulate an HA snapshot taken before slice 5.6: no
+        // Simulate an HA snapshot taken before : no
         // `per_leg_codec` field. Deserialization must succeed with
         // `#[serde(default)]` producing an empty map.
         let json = serde_json::json!({
@@ -431,6 +485,52 @@ mod tests {
         });
         let rec: DialogRecord = serde_json::from_value(json).unwrap();
         assert!(rec.per_leg_codec.is_empty());
+        assert!(rec.remote_target.is_none());
+        assert!(rec.route_set.is_empty());
+        assert_eq!(rec.local_cseq, 0);
+        assert!(rec.remote_cseq.is_none());
+        assert!(rec.transport.is_none());
+        assert!(rec.last_invite_branch.is_none());
+        assert!(rec.session_expires_secs.is_none());
+    }
+
+    #[test]
+    fn dialog_routing_fields_round_trip() {
+        let rec = DialogRecord {
+            call_id: "c@x".into(),
+            local_tag: "lt".into(),
+            remote_tag: "rt".into(),
+            state: DialogState::Confirmed,
+            peer_signal: "127.0.0.1:5060".parse().unwrap(),
+            rendezvous: None,
+            media: None,
+            remote_media: None,
+            pending_2xx: None,
+            per_leg_codec: BTreeMap::new(),
+            ice: None,
+            remote_target: Some("sip:bob@10.0.0.2:5060".into()),
+            route_set: vec!["<sip:p1.example;lr>".into(), "<sip:p2.example;lr>".into()],
+            local_uri: Some("sip:alice@example".into()),
+            remote_uri: Some("sip:bob@example".into()),
+            local_cseq: 3,
+            remote_cseq: Some(7),
+            transport: Some("TCP".into()),
+            last_invite_branch: Some("z9hG4bK-1".into()),
+            local_media: Some("10.0.0.1:40000".parse().unwrap()),
+            session_expires_secs: Some(1800),
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: DialogRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.remote_target, rec.remote_target);
+        assert_eq!(back.route_set, rec.route_set);
+        assert_eq!(back.local_uri, rec.local_uri);
+        assert_eq!(back.remote_uri, rec.remote_uri);
+        assert_eq!(back.local_cseq, 3);
+        assert_eq!(back.remote_cseq, Some(7));
+        assert_eq!(back.transport.as_deref(), Some("TCP"));
+        assert_eq!(back.last_invite_branch.as_deref(), Some("z9hG4bK-1"));
+        assert_eq!(back.local_media, rec.local_media);
+        assert_eq!(back.session_expires_secs, Some(1800));
     }
 
     #[test]
@@ -450,6 +550,16 @@ mod tests {
             pending_2xx: None,
             per_leg_codec: codecs.clone(),
             ice: None,
+            remote_target: None,
+            route_set: Vec::new(),
+            local_uri: None,
+            remote_uri: None,
+            local_cseq: 0,
+            remote_cseq: None,
+            transport: None,
+            last_invite_branch: None,
+            local_media: None,
+            session_expires_secs: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: DialogRecord = serde_json::from_str(&json).unwrap();

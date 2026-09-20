@@ -1,4 +1,4 @@
-//! WAV-backed prompt library for IVR playback (slice 4.2 / P9).
+//! WAV-backed prompt library for IVR playback.
 //!
 //! The IVR runtime refers to prompts by path (`"prompts/welcome.wav"`);
 //! resolving that path to decoded PCM is this module's job. Prompts
@@ -144,7 +144,7 @@ impl PromptLibrary {
         self
     }
 
-    /// Resize the LRU in place (slice 5.8-b read-through). Called
+    /// Resize the LRU in place ( read-through). Called
     /// by the CLI's config adapter when `media.prompts.capacity`
     /// changes live. Shares a clone-able handle — every
     /// `PromptLibrary` clone reads the new cap on the next `get`,

@@ -9,6 +9,7 @@ rust-version = "1.95"
 cargo-fuzz = true
 
 [dependencies]
+arbitrary     = { version = "1", features = ["derive"] }
 libfuzzer-sys = "0.4"
 rsip          = "0.4"
 smiths-sdp    = { path = "../crates/smiths-sdp" }
@@ -17,6 +18,14 @@ smiths-sip    = { path = "../crates/smiths-sip" }
 [[bin]]
 name              = "sip_parser"
 path              = "fuzz_targets/sip_parser.rs"
+test              = false
+doc               = false
+bench             = false
+doctest           = false
+
+[[bin]]
+name              = "via_branch"
+path              = "fuzz_targets/via_branch.rs"
 test              = false
 doc               = false
 bench             = false

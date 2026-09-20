@@ -1,4 +1,4 @@
-//! Replication abstraction for HA (slice 6.2).
+//! Replication abstraction for HA.
 //!
 //! Modules that mutate state (UAS) call the [`Replicator`] to broadcast
 //! deltas to the secondary. Standalone deployments use a no-op

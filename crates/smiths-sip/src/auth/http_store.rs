@@ -42,11 +42,15 @@
 //!
 //! ## Threading
 //!
-//! [`CredentialStore::lookup`] is a synchronous trait method, so we
-//! bridge with `tokio::task::block_in_place` + `Handle::block_on`.
-//! The enclosing tokio runtime **must be multi-threaded** (our
-//! default — see `crates/smiths-cli/src/main.rs`). Single-threaded
-//! runtimes will panic; document this on [`HttpAuthStore::new`].
+//! The store's native path is async: [`CredentialStore::lookup_async`]
+//! returns a future that awaits the webhook, and
+//! [`crate::auth::digest::Registrar::authenticate_async`] uses it.
+//! The synchronous [`CredentialStore::lookup_for`] bridges with
+//! `tokio::task::block_in_place` + `Handle::block_on` when called from
+//! a multi-thread runtime worker, spins a throwaway runtime when
+//! called outside tokio entirely, and fails the lookup (logged, no
+//! panic) on a `current_thread` runtime, where blocking the only
+//! worker would deadlock the request.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -55,12 +59,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::runtime::Handle;
+use tokio::runtime::{Handle, RuntimeFlavor};
 use tracing::{debug, info, warn};
 
 use crate::auth::digest::Algorithm;
 
-use super::{CredentialStore, Credentials};
+use super::{CredentialFuture, CredentialStore, Credentials};
 
 /// Configuration for an HTTP-webhook-backed credential store.
 #[derive(Clone, Debug)]
@@ -244,9 +248,10 @@ fn unix_now() -> u64 {
 impl HttpAuthStore {
     /// Build a store against `config`. The `reqwest::Client` is built
     /// once and reused across lookups (HTTP/1.1 keep-alive + TLS
-    /// session resumption). Must be called from a tokio
-    /// **multi-threaded** runtime — [`CredentialStore::lookup`] uses
-    /// `block_in_place` to bridge the sync trait.
+    /// session resumption). Async callers should go through
+    /// [`CredentialStore::lookup_async`] (or
+    /// [`crate::auth::digest::Registrar::authenticate_async`]); the
+    /// synchronous trait path needs a multi-thread runtime to bridge.
     pub fn new(config: HttpAuthConfig) -> Result<Self, HttpAuthError> {
         let client = Client::builder()
             .timeout(config.timeout)
@@ -370,16 +375,42 @@ impl HttpAuthStore {
 
 impl CredentialStore for HttpAuthStore {
     fn lookup(&self, realm: &str, username: &str) -> Option<Credentials> {
-        // Registrar hashes with whatever `algorithm` the peer's
-        // `Authorization:` header declared. The store doesn't see
-        // that detail on the sync trait — for MVP we ask the webhook
-        // for MD5 HA1 since every client in the wild still speaks
-        // MD5. A follow-on slice teaches the trait to pass
-        // `algorithm` through.
-        let handle = Handle::current();
-        let result = tokio::task::block_in_place(|| {
-            handle.block_on(self.authenticate(realm, username, Algorithm::Md5))
-        });
+        self.lookup_for(realm, username, Algorithm::Md5)
+    }
+
+    fn lookup_for(&self, realm: &str, username: &str, algorithm: Algorithm) -> Option<Credentials> {
+        let result = match Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                // On a multi-thread worker, `block_in_place` hands the
+                // worker's queue to another thread before we block.
+                tokio::task::block_in_place(|| {
+                    handle.block_on(self.authenticate(realm, username, algorithm))
+                })
+            }
+            Ok(_) => {
+                // A current_thread runtime has exactly one worker and
+                // we are on it: blocking here would stall the very
+                // reactor that drives the HTTP request.
+                warn!(
+                    %realm,
+                    %username,
+                    "http auth: synchronous lookup on a current_thread runtime is unsupported; \
+                     use Registrar::authenticate_async"
+                );
+                return None;
+            }
+            Err(_) => {
+                // No runtime at all (CLI tooling, plain unit tests):
+                // a throwaway single-thread runtime drives the call.
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(self.authenticate(realm, username, algorithm)),
+                    Err(e) => Err(HttpAuthError::Transport(format!("runtime: {e}"))),
+                }
+            }
+        };
         match result {
             Ok(opt) => opt,
             Err(e) => {
@@ -391,6 +422,23 @@ impl CredentialStore for HttpAuthStore {
                 None
             }
         }
+    }
+
+    fn lookup_async<'a>(
+        &'a self,
+        realm: &'a str,
+        username: &'a str,
+        algorithm: Algorithm,
+    ) -> Option<CredentialFuture<'a>> {
+        Some(Box::pin(async move {
+            match self.authenticate(realm, username, algorithm).await {
+                Ok(opt) => opt,
+                Err(e) => {
+                    info!(?e, %realm, %username, "http auth lookup failed");
+                    None
+                }
+            }
+        }))
     }
 }
 
