@@ -1,11 +1,13 @@
 [package]
 name = "smiths-raft"
-version = "0.70.0"
-edition = "2024"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+description  = "Raft consensus over the smiths-net dialog table."
 
 [dependencies]
 smiths-core = { workspace = true }
-smiths-sip = { workspace = true }
 
 openraft = { version = "0.9", features = ["storage-v2", "serde"] }
 rusqlite = { workspace = true }
@@ -15,8 +17,13 @@ tokio = { workspace = true }
 dashmap = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+tokio-util  = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

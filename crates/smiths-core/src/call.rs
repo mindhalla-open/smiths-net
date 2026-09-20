@@ -309,10 +309,15 @@ pub struct DialogRecord {
 
 /// Dialog state mutation for replication.
 ///
-/// Primary sends these to the secondary; secondary replays into its
-/// local `DashMap`.
+/// Carried between HA nodes: the primary streams these to its
+/// secondary, and in Raft mode each one is a log entry.
+///
+/// Adjacently tagged (`{"type": ..., "data": ...}`) rather than
+/// internally tagged, because `Delete` wraps a tuple and serde cannot
+/// fold a sequence into a tagged object — an internally tagged
+/// representation fails at runtime on every delete.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum DialogDelta {
     /// Create or update a dialog record.
     Upsert(Box<DialogRecord>),
@@ -420,6 +425,38 @@ pub trait CallOriginator: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    /// An internally tagged enum cannot wrap a tuple, so `Delete`
+    /// used to fail to serialize at runtime — which meant no dialog
+    /// deletion ever replicated.
+    #[test]
+    fn dialog_delta_round_trips_both_variants() {
+        let key: DialogKey = ("call-1".into(), "lt".into(), "rt".into());
+        let delete = DialogDelta::Delete(key.clone());
+        let encoded = serde_json::to_string(&delete).expect("delete must serialize");
+        match serde_json::from_str::<DialogDelta>(&encoded).expect("decode") {
+            DialogDelta::Delete(k) => assert_eq!(k, key),
+            DialogDelta::Upsert(_) => panic!("variant changed across the wire"),
+        }
+
+        let record: DialogRecord = serde_json::from_value(serde_json::json!({
+            "call_id": "call-1",
+            "local_tag": "lt",
+            "remote_tag": "rt",
+            "state": "confirmed",
+            "peer_signal": "127.0.0.1:5060",
+            "rendezvous": null,
+            "media": null,
+            "remote_media": null,
+        }))
+        .expect("record");
+        let upsert = DialogDelta::Upsert(Box::new(record));
+        let encoded = serde_json::to_string(&upsert).expect("upsert must serialize");
+        match serde_json::from_str::<DialogDelta>(&encoded).expect("decode") {
+            DialogDelta::Upsert(r) => assert_eq!(r.key(), key),
+            DialogDelta::Delete(_) => panic!("variant changed across the wire"),
+        }
+    }
+
     use super::*;
 
     /// Compile-time proof: `DialogRecord` implements the traits the HA

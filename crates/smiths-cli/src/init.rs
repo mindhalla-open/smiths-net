@@ -305,10 +305,11 @@ fn prompt_sandbox(config: &mut Config) -> anyhow::Result<()> {
 fn prompt_cluster(config: &mut Config) -> anyhow::Result<()> {
     use dialoguer::Select;
 
-    let cluster_choices = &["standalone", "primary", "secondary"];
+    let cluster_choices = &["standalone", "primary", "secondary", "raft"];
     let cluster_default = match config.cluster.mode {
         smiths_core::ClusterMode::Primary => 1,
         smiths_core::ClusterMode::Secondary => 2,
+        smiths_core::ClusterMode::Raft => 3,
         smiths_core::ClusterMode::Standalone => 0,
     };
     let cluster_sel = Select::new()
@@ -319,6 +320,7 @@ fn prompt_cluster(config: &mut Config) -> anyhow::Result<()> {
     config.cluster.mode = match cluster_sel {
         1 => smiths_core::ClusterMode::Primary,
         2 => smiths_core::ClusterMode::Secondary,
+        3 => smiths_core::ClusterMode::Raft,
         _ => smiths_core::ClusterMode::Standalone,
     };
     Ok(())

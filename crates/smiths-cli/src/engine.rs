@@ -513,7 +513,7 @@ fn build_tool_context(
     .with_metrics(Arc::clone(&core.metrics))
     .with_metrics_registry(Arc::clone(&core.metrics_registry))
     .with_conferences(Arc::clone(&core.conference_registry))
-    .with_cluster_status(ha::cluster_status_source(ha.state.clone()));
+    .with_cluster_status(Arc::clone(&ha.status));
     if let Some(o) = sip.originator.clone() {
         ctx = ctx.with_originator(o);
     }

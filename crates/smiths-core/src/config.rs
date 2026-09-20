@@ -1649,10 +1649,17 @@ impl Config {
                 max: range.max,
             });
         }
-        if self.cluster.mode != ClusterMode::Standalone && self.cluster.peer_addr.is_none() {
+        if matches!(
+            self.cluster.mode,
+            ClusterMode::Primary | ClusterMode::Secondary
+        ) && self.cluster.peer_addr.is_none()
+        {
             return Err(E::ClusterPeerAddrMissing {
                 mode: self.cluster.mode,
             });
+        }
+        if self.cluster.mode == ClusterMode::Raft && self.cluster.raft_addr.is_none() {
+            return Err(E::ClusterRaftAddrMissing);
         }
         if self.auth.backend == AuthBackend::Http && self.auth.http.endpoint.trim().is_empty() {
             return Err(E::AuthHttpEndpointMissing);
@@ -1769,6 +1776,9 @@ pub enum ConfigValidationError {
         /// Configured upper bound.
         max: u16,
     },
+    /// `cluster.mode = "raft"` without an inter-node RPC bind.
+    #[error("cluster.mode = \"raft\" requires cluster.raft_addr")]
+    ClusterRaftAddrMissing,
     /// HA mode set without a peer to talk to.
     #[error("cluster.mode = {mode:?} requires cluster.peer_addr")]
     ClusterPeerAddrMissing {
@@ -1876,6 +1886,12 @@ pub enum ClusterMode {
     /// Secondary node: subscribes to deltas from the primary and
     /// replays them into its local table.
     Secondary,
+    /// Raft node: the dialog table is a replicated state machine.
+    /// Unlike `primary`/`secondary` this survives the loss of any
+    /// single node, and writes are only acknowledged once a quorum
+    /// has them. Needs `raft_addr`, `node_id` and `raft_dir`;
+    /// `peer_addr` is unused.
+    Raft,
 }
 
 #[cfg(test)]
@@ -2046,6 +2062,19 @@ mod tests {
             min: 20_000,
             max: 20_100,
         });
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_requires_raft_addr_in_raft_mode() {
+        let mut cfg = Config::default();
+        cfg.cluster.mode = ClusterMode::Raft;
+        assert!(matches!(
+            expect_err(&cfg),
+            ConfigValidationError::ClusterRaftAddrMissing
+        ));
+        // Raft does not use the primary/secondary replication link.
+        cfg.cluster.raft_addr = Some("127.0.0.1:9100".parse().unwrap());
         assert!(cfg.validate().is_ok());
     }
 

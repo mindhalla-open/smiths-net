@@ -1,8 +1,7 @@
 # Raft Log Schema and Dialog Delta Format
 
-This document describes the Raft consensus layer introduced in slice 6.3a
-(`smiths-raft`) and completed in 6.3b with snapshot support and multi-node
-network transport.
+How `smiths-raft` replicates the dialog table: the SQLite log schema, the
+inter-node RPC, and what a node does at boot.
 
 ## Overview
 
@@ -60,7 +59,7 @@ a `DialogDelta`.
 
 ```rust
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum DialogDelta {
     Upsert(Box<DialogRecord>),
     Delete(DialogKey),
@@ -68,6 +67,12 @@ pub enum DialogDelta {
 ```
 
 `DialogKey = (call_id: String, local_tag: String, remote_tag: String)`
+
+On the wire that is `{"type": "upsert", "data": {...}}` and
+`{"type": "delete", "data": ["call-1", "lt", "rt"]}`. The tag is
+*adjacent* rather than internal: serde cannot fold a sequence into a
+tagged object, so an internally tagged `Delete(DialogKey)` fails to
+serialize at runtime and no deletion ever replicates.
 
 ## Snapshot Format (6.3b)
 
@@ -122,13 +127,16 @@ On startup the `openraft::Raft` node:
 
 ```toml
 [cluster]
-mode           = "primary"
-node_id        = 1
-raft_dir       = "/var/lib/smiths/raft"
-raft_addr      = "10.42.0.1:9000"
-initial_peers  = ["2@10.42.0.2:9000", "3@10.42.0.3:9000"]
-peer_addr      = "10.42.0.10:8000"   # legacy 6.2 TCP replication
+mode          = "raft"
+node_id       = 1
+raft_dir      = "/var/lib/smiths/raft"
+raft_addr     = "10.42.0.1:9000"
+initial_peers = ["1@10.42.0.1:9000", "2@10.42.0.2:9000", "3@10.42.0.3:9000"]
 ```
+
+`mode = "raft"` is its own cluster mode. It does not use `peer_addr`, which
+belongs to the simpler `primary` / `secondary` one-way mirroring modes; a
+config that sets `raft` without `raft_addr` is rejected at validation.
 
 | Field | Type | Description |
 |-------|------|-------------|

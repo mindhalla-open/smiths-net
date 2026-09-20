@@ -4073,6 +4073,7 @@ dependencies = [
  "smiths-media",
  "smiths-mixer",
  "smiths-plugin",
+ "smiths-raft",
  "smiths-sdp",
  "smiths-sip",
  "smiths-testkit",
@@ -4270,7 +4271,7 @@ dependencies = [
 
 [[package]]
 name = "smiths-raft"
-version = "0.70.0"
+version = "0.73.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4280,9 +4281,10 @@ dependencies = [
  "serde",
  "serde_json",
  "smiths-core",
- "smiths-sip",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

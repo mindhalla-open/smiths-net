@@ -1,11 +1,12 @@
-//! HA plumbing: dialog snapshot I/O and the primary / secondary
-//! replication wiring.
+//! HA plumbing: dialog snapshot I/O and the replication wiring for
+//! every cluster mode.
 //!
 //! The snapshot file (`--snapshot-path`) is read once at boot and
-//! written once at shutdown; replication runs continuously between
-//! a primary and a secondary. Both roles share one dialog table
-//! across every SIP bind so the snapshot and the replication stream
-//! cover the whole engine.
+//! written once at shutdown. Beyond that, `primary` / `secondary`
+//! stream deltas one way over TCP, while `raft` replicates the dialog
+//! table as a consensus state machine. Every mode shares one dialog
+//! table across all SIP binds, so the snapshot and the replication
+//! stream cover the whole engine.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,8 +33,11 @@ pub(crate) struct HaRuntime {
     /// Dialog table shared by every SIP bind (`Some` outside
     /// standalone mode).
     pub dialogs: Option<Arc<DialogTable>>,
-    /// Live replication counters, when replication is on.
+    /// Live replication counters, for the one-way modes.
     pub state: Option<Arc<ReplicationState>>,
+    /// What `cluster://status` reports, supplied by whichever mode is
+    /// running so no mode has to guess on another's behalf.
+    pub status: Arc<dyn ClusterStatusSource>,
     /// Background service tasks to join on shutdown.
     pub tasks: Vec<JoinHandle<()>>,
 }
@@ -90,8 +94,42 @@ pub(crate) async fn start(
             replicator: Arc::new(NoopReplicator),
             dialogs: None,
             state: None,
+            status: cluster_status_source(None),
             tasks: Vec::new(),
         }),
+        (ClusterMode::Raft, _) => {
+            // `Config::validate` already refused a raft mode without
+            // an address; keep the guard for callers that skipped it.
+            let raft_addr = cluster
+                .raft_addr
+                .context("cluster.mode = \"raft\" requires cluster.raft_addr")?;
+            let dialogs: Arc<DialogTable> = Arc::new(DialogTable::new());
+            let node = smiths_raft::start_node(
+                smiths_raft::RaftNodeConfig {
+                    node_id: cluster.node_id,
+                    raft_addr,
+                    raft_dir: cluster.raft_dir.clone(),
+                    initial_peers: cluster.initial_peers.clone(),
+                },
+                Arc::clone(&dialogs),
+                cancel.clone(),
+            )
+            .await
+            .context("starting the raft node")?;
+            let (replicator, pump) =
+                smiths_raft::RaftReplicator::new(node.raft.clone(), cancel.clone());
+            let mut node = node;
+            let mut tasks = std::mem::take(&mut node.tasks);
+            tasks.push(pump);
+            let status_node = Arc::new(node);
+            Ok(HaRuntime {
+                replicator: Arc::new(replicator),
+                dialogs: Some(dialogs),
+                state: None,
+                status: Arc::new(move || status_node.status_json()),
+                tasks,
+            })
+        }
         (mode, None) => {
             // `Config::validate` refuses this; keep the guard so a
             // caller that skipped validation still fails loudly.
@@ -121,6 +159,7 @@ pub(crate) async fn start(
             Ok(HaRuntime {
                 replicator,
                 dialogs: Some(dialogs),
+                status: cluster_status_source(Some(Arc::clone(&state))),
                 state: Some(state),
                 tasks: vec![task],
             })
@@ -142,6 +181,7 @@ pub(crate) async fn start(
             Ok(HaRuntime {
                 replicator: Arc::new(NoopReplicator),
                 dialogs: Some(dialogs),
+                status: cluster_status_source(Some(Arc::clone(&state))),
                 state: Some(state),
                 tasks: vec![task],
             })
@@ -215,6 +255,79 @@ mod tests {
         cancel.cancel();
         for t in rt.tasks {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), t).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn raft_mode_starts_and_reports_live_consensus_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("probe")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let cluster = ClusterConfig {
+            mode: ClusterMode::Raft,
+            raft_addr: Some(format!("127.0.0.1:{port}").parse().unwrap()),
+            raft_dir: dir.path().to_path_buf(),
+            node_id: 1,
+            ..ClusterConfig::default()
+        };
+        let cancel = CancellationToken::new();
+        let rt = start(&cluster, cancel.clone()).await.expect("raft starts");
+        assert!(rt.dialogs.is_some(), "raft shares a dialog table");
+        assert!(
+            rt.state.is_none(),
+            "raft does not use the one-way replication counters"
+        );
+
+        // The single node is its own quorum, so it must reach
+        // `leader` — and say so from openraft's metrics, not from a
+        // hard-coded string.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let status = rt.status.status();
+            if status["status"] == "leader" {
+                assert_eq!(status["role"], "raft");
+                assert_eq!(status["node_id"], 1);
+                assert_eq!(status["is_leader"], true);
+                assert_eq!(status["leader"], 1);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "raft never elected a leader; last status: {status}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // A committed delta lands in the shared table.
+        let record: DialogRecord = serde_json::from_value(serde_json::json!({
+            "call_id": "c1",
+            "local_tag": "lt",
+            "remote_tag": "rt",
+            "state": "confirmed",
+            "peer_signal": "127.0.0.1:5060",
+            "rendezvous": null,
+            "media": null,
+            "remote_media": null,
+        }))
+        .expect("record");
+        let dialogs = rt.dialogs.clone().expect("table");
+        rt.replicator
+            .replicate(smiths_core::DialogDelta::Upsert(Box::new(record)));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while dialogs.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "delta never applied through raft"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        cancel.cancel();
+        for t in rt.tasks {
+            t.abort();
         }
     }
 

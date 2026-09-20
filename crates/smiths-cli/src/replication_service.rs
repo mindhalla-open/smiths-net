@@ -182,6 +182,9 @@ impl ReplicationState {
             (ClusterMode::Primary, true) => "leader",
             (ClusterMode::Secondary, true) => "follower",
             (ClusterMode::Primary | ClusterMode::Secondary, false) => "degraded",
+            // Raft reports through its own status source, not the
+            // primary/secondary replication link.
+            (ClusterMode::Raft, _) => "raft",
         };
         let mut v = serde_json::to_value(&s).unwrap_or_else(|_| serde_json::json!({}));
         if let serde_json::Value::Object(map) = &mut v {

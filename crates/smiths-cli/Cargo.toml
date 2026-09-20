@@ -47,6 +47,9 @@ smiths-mcp         = { workspace = true }
 smiths-mixer       = { workspace = true }
 smiths-plugin      = { workspace = true }
 smiths-transcode   = { workspace = true }
+# Consensus HA (`cluster.mode = "raft"`); the one-way primary /
+# secondary modes need nothing from it.
+smiths-raft        = { workspace = true }
 # Slice 5.10-dtls: thread `DtlsLegConfig` + `DtlsRole` into the
 # handler so the WebRTC adapter can drive the fabric's
 # handshake off the negotiator's `DtlsParams`.

@@ -304,6 +304,18 @@ external_url          = ""
 # (re)connect the primary sends a full dialog snapshot, then streams
 # deltas; a dropped delta or failed write triggers a snapshot resync.
 [cluster]
-mode                    = "standalone"   # "standalone" | "primary" | "secondary"
-# peer_addr             = "10.42.0.10:8000"   # required outside standalone
+# "standalone"  — single node, no replication.
+# "primary"     — streams dialog deltas to one secondary (peer_addr = bind).
+# "secondary"   — replays deltas from the primary (peer_addr = its address).
+# "raft"        — the dialog table is a replicated state machine; survives
+#                 the loss of any single node. Uses raft_addr / node_id /
+#                 raft_dir / initial_peers below, not peer_addr.
+mode                    = "standalone"
+# peer_addr             = "10.42.0.10:8000"   # required for primary/secondary
 heartbeat_interval_secs = 5                   # hot-reloadable
+
+# --- raft mode only ---
+# raft_addr     = "10.42.0.10:8100"   # inter-node Raft RPC bind (required)
+# node_id       = 1                   # unique per node
+# raft_dir      = "/var/lib/smiths/raft"
+# initial_peers = ["1@10.42.0.10:8100", "2@10.42.0.11:8100", "3@10.42.0.12:8100"]
